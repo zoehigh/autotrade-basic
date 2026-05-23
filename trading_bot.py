@@ -15,8 +15,14 @@ import time
 sys.path.append("src")
 
 from config import SYMBOLS, TRADE_MODE
-from strategy import 무상태_무한매수법
-from trader import place_overseas_order, place_overseas_reservation_order, ReservationOrderRequired
+from strategy import 무한매수법_V4
+from state import load_state, save_state, update_T_from_history
+from trader import (
+    place_overseas_order,
+    place_overseas_reservation_order,
+    get_overseas_order_history,
+    ReservationOrderRequired,
+)
 from telegram import send_telegram
 
 
@@ -62,23 +68,34 @@ def run_one_symbol(symbol_config):
     symbol = symbol_config["symbol"]
     exchange = symbol_config["exchange"]
     splits = symbol_config["splits"]
-    take_profit = symbol_config["take_profit"]
-    big_buy_range = symbol_config["big_buy_range"]
+    symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
 
     print(f"\n{'=' * 60}")
     print(f"종목 처리 시작: {symbol} ({exchange})")
     print(f"{'=' * 60}")
 
-    print(f"\n[Step 1] 전략 실행 중...")
+    # ── Step 1: T값 로드 및 어제 체결 반영 ──────────────────────
+    print(f"\n[Step 1] T값 로드 중...")
 
-    strategy_result = 무상태_무한매수법(
+    state = load_state(symbol)
+
+    order_history = get_overseas_order_history(symbol, exchange, days=30)
+    state = update_T_from_history(symbol, state, order_history)
+
+    T = state["T"]
+    print(f"  현재 T값: {T}")
+
+    # ── Step 2: 전략 실행 ────────────────────────────────────────
+    print(f"\n[Step 2] 전략 실행 중...")
+
+    strategy_result = 무한매수법_V4(
         symbol=symbol,
         exchange_code=exchange,
         splits=splits,
-        take_profit_rate=take_profit,
-        big_buy_range=big_buy_range,
+        symbol_type=symbol_type,
         seed=seed,
+        T=T,
     )
 
     print(f"✓ 전략 실행 완료")
@@ -86,11 +103,13 @@ def run_one_symbol(symbol_config):
     print(f"  보유 수량: {strategy_result['position_qty']}주")
     print(f"  평단가: ${strategy_result['avg_price']}")
     print(f"  주문 가능 금액: ${strategy_result['orderable_cash']:.2f}")
-    print(f"  단위 수량: {strategy_result['unit_qty']}주")
+    print(f"  T값: {T} / {splits}")
+    if strategy_result['star_point']:
+        print(f"  별지점: ${strategy_result['star_point']:.2f}")
 
     orders = strategy_result["orders"]
 
-    print(f"\n[Step 2] 생성된 주문 목록 ({len(orders)}개)")
+    print(f"\n[Step 3] 생성된 주문 목록 ({len(orders)}개)")
     print("-" * 60)
 
     if len(orders) == 0:
@@ -108,7 +127,7 @@ def run_one_symbol(symbol_config):
         else:
             print("  가격: 시장가")
 
-    print(f"\n[Step 3] 주문 실행 중...")
+    print(f"\n[Step 4] 주문 실행 중...")
     print("-" * 60)
 
     order_exchange_code = convert_exchange_code(exchange)
@@ -220,6 +239,10 @@ def run_one_symbol(symbol_config):
     print(f"{symbol} 처리 완료")
     print("=" * 60)
 
+    # ── Step 4: T값 저장 (LIVE 주문이 하나라도 성공한 경우에만) ──
+    if TRADE_MODE == "LIVE" and len(executed_orders) > 0:
+        save_state(symbol, state)
+
     if TRADE_MODE == "DRY":
         print("\n💡 DRY 모드로 실행되었습니다.")
         print("   실제 주문은 실행되지 않았으며, 주문 정보만 출력되었습니다.")
@@ -275,8 +298,7 @@ def main():
             seed_info = f", 시드: ${cfg['seed']:.0f}" if cfg['seed'] > 0 else ""
             print(f"  - {cfg['symbol']}({cfg['exchange']}): "
                   f"분할={cfg['splits']}, "
-                  f"익절={cfg['take_profit']*100:.1f}%, "
-                  f"큰수={cfg['big_buy_range']*100:.1f}%"
+                  f"타입={cfg['symbol_type']}"
                   f"{seed_info}")
 
         # ========================================

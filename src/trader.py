@@ -573,8 +573,8 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
     """
     한국투자증권 API를 사용하여 해외주식의 최근 주문체결내역을 조회합니다.
     
-    최근 N일(기본 30일)의 체결내역을 조회하며, 최신 정보가 먼저 표시됩니다.
-    초기 조회만 수행하므로 최대 20건(실전) 또는 15건(모의)까지만 조회됩니다.
+    최근 N일(기본 30일)의 체결내역을 전부 조회합니다.
+    연속조회(tr_cont)를 통해 한 번에 최대 20건(실전) / 15건(모의)씩 여러 페이지를 모두 수집합니다.
     
     Parameters:
         symbol (str): 종목 코드 (예: "TQQQ", "AAPL", "TSLA")
@@ -641,7 +641,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
     
     # Step 5: 요청 헤더 설정
     order_history_tr_id = "TTTS3035R" if KIS_MODE == "real" else "VTTS3035R"
-    headers = {
+    base_headers = {
         "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
         "appkey": KIS_APP_KEY,
@@ -649,8 +649,8 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
         "tr_id": order_history_tr_id
     }
     
-    # Step 6: Query Parameter 설정
-    params = {
+    # Step 6: Query Parameter 기본값 설정
+    base_params = {
         "CANO": KIS_ACCOUNT_NO,           # 종합계좌번호 (8자리)
         "ACNT_PRDT_CD": ACNT_PRDT_CD,    # 계좌상품코드 (01)
         "PDNO": symbol.upper(),           # 상품번호 (종목 코드 - API 레벨에서 필터링)
@@ -663,53 +663,74 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
         "ORD_DT": "",                     # 주문일자 (Null)
         "ORD_GNO_BRNO": "",               # 주문채번지점번호 (Null)
         "ODNO": "",                       # 주문번호 (Null)
-        "CTX_AREA_NK200": "",             # 연속조회키200 (초기조회)
-        "CTX_AREA_FK200": ""              # 연속조회검색조건200 (초기조회)
+        "CTX_AREA_NK200": "",             # 연속조회키200 (초기조회는 공란)
+        "CTX_AREA_FK200": ""              # 연속조회검색조건200 (초기조회는 공란)
     }
-    
-    # Step 7: API 호출
+
+    # Step 7: 연속조회 루프 - 전체 체결 이력을 페이지 단위로 수집
+    # API는 한 번에 최대 20건(실전) / 15건(모의)을 반환합니다.
+    # 응답 헤더의 tr_cont가 "M"이면 다음 페이지가 있음을 의미합니다.
+    order_history = []
+    ctx_area_nk200 = ""
+    ctx_area_fk200 = ""
+    is_first_call = True
+
     try:
-        response = _request_with_rate_retry("GET", url, headers=headers, params=params)
-        response.raise_for_status()
-        
-        # Step 8: 응답 데이터 추출
-        response_data = response.json()
-        
-        # API 응답이 정상인지 확인
-        if response_data.get("rt_cd") != "0":
-            msg = response_data.get("msg1", "알 수 없는 에러")
-            raise Exception(f"API 호출 실패: {msg}")
-        
-        # Step 9: 주문체결내역 정보 추출
-        output = response_data.get("output", [])
-        
-        if not output:
-            return []  # 체결내역이 없음
-        
-        # 필요한 필드만 추출하여 정렬된 결과 반환
-        order_history = []
-        for item in output:
-            order_history.append({
-                "ord_dt": item.get("ord_dt", ""),              # 주문일자
-                "ord_tmd": item.get("ord_tmd", ""),            # 주문시각
-                "prdt_name": item.get("prdt_name", ""),        # 상품명 (종목명)
-                "sll_buy_dvsn_cd_name": item.get("sll_buy_dvsn_cd_name", ""),  # 매도/매수 (핵심)
-                "ft_ord_qty": item.get("ft_ord_qty", "0"),     # 주문수량
-                "ft_ccld_qty": item.get("ft_ccld_qty", "0"),   # 체결수량 (핵심)
-                "ft_ccld_unpr3": item.get("ft_ccld_unpr3", "0"),  # 체결단가
-                "ft_ccld_amt3": item.get("ft_ccld_amt3", "0"),    # 체결금액
-                "nccs_qty": item.get("nccs_qty", "0"),         # 미체결수량
-                "prcs_stat_name": item.get("prcs_stat_name", ""),  # 처리상태
-                "tr_mket_name": item.get("tr_mket_name", ""),  # 거래시장명
-                "tr_crcy_cd": item.get("tr_crcy_cd", ""),      # 거래통화코드
-                "odno": item.get("odno", ""),                  # 주문번호
-                "ovrs_excg_cd": item.get("ovrs_excg_cd", "")   # 거래소코드
-            })
-        
-        # Step 10: 데이터 정리 및 반환
-        # API에서 이미 해당 종목으로 필터링된 결과를 받았습니다
+        while True:
+            headers = dict(base_headers)
+            params = dict(base_params)
+
+            if not is_first_call:
+                # 2번째 이후 요청: 연속조회를 위한 헤더와 파라미터 추가
+                headers["tr_cont"] = "N"
+                params["CTX_AREA_NK200"] = ctx_area_nk200
+                params["CTX_AREA_FK200"] = ctx_area_fk200
+
+            response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+            response.raise_for_status()
+
+            response_data = response.json()
+
+            if response_data.get("rt_cd") != "0":
+                msg = response_data.get("msg1", "알 수 없는 에러")
+                raise Exception(f"API 호출 실패: {msg}")
+
+            # Step 8: 이번 페이지 체결내역 추출
+            output = response_data.get("output", [])
+
+            for item in output:
+                order_history.append({
+                    "ord_dt": item.get("ord_dt", ""),              # 주문일자
+                    "ord_tmd": item.get("ord_tmd", ""),            # 주문시각
+                    "prdt_name": item.get("prdt_name", ""),        # 상품명 (종목명)
+                    "sll_buy_dvsn_cd_name": item.get("sll_buy_dvsn_cd_name", ""),  # 매도/매수 (핵심)
+                    "ft_ord_qty": item.get("ft_ord_qty", "0"),     # 주문수량
+                    "ft_ccld_qty": item.get("ft_ccld_qty", "0"),   # 체결수량 (핵심)
+                    "ft_ccld_unpr3": item.get("ft_ccld_unpr3", "0"),  # 체결단가
+                    "ft_ccld_amt3": item.get("ft_ccld_amt3", "0"),    # 체결금액
+                    "nccs_qty": item.get("nccs_qty", "0"),         # 미체결수량
+                    "prcs_stat_name": item.get("prcs_stat_name", ""),  # 처리상태
+                    "tr_mket_name": item.get("tr_mket_name", ""),  # 거래시장명
+                    "tr_crcy_cd": item.get("tr_crcy_cd", ""),      # 거래통화코드
+                    "odno": item.get("odno", ""),                  # 주문번호
+                    "ovrs_excg_cd": item.get("ovrs_excg_cd", "")   # 거래소코드
+                })
+
+            # Step 9: 다음 페이지 여부 확인
+            # tr_cont가 "M"이면 더 가져올 데이터가 있음
+            tr_cont = response.headers.get("tr_cont", "")
+            if tr_cont != "M":
+                # "D", "E" 또는 빈 값이면 마지막 페이지
+                break
+
+            # 다음 페이지를 위해 연속조회 키 저장
+            ctx_area_nk200 = response_data.get("ctx_area_nk200", "")
+            ctx_area_fk200 = response_data.get("ctx_area_fk200", "")
+            is_first_call = False
+
+        print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
         return order_history
-    
+
     except requests.exceptions.RequestException as e:
         raise Exception(f"주문체결내역 조회 실패: {str(e)}")
 

@@ -90,6 +90,11 @@ def _parse_symbols():
 			"big_buy_range": float(os.getenv(f"{sym}_BIG_BUY_RANGE") or BIG_BUY_RANGE),
 			# 시드: 이 종목에 투입할 최대 금액 (달러). 0이면 계좌 전체 주문가능금액 사용
 			"seed": float(os.getenv(f"{sym}_SEED") or "0"),
+			# 별지점 공식 선택용 종목 타입: "TQQQ" 또는 "SOXL"
+			# - TQQQ: 20분할 별% = (15-1.5T)%, 40분할 별% = (15-0.75T)%
+			# - SOXL: 20분할 별% = (20-2T)%, 40분할 별% = (20-T)%
+			# 미설정 시 종목코드를 그대로 사용 (TQQQ → "TQQQ", SOXL → "SOXL")
+			"symbol_type": os.getenv(f"{sym}_SYMBOL_TYPE", sym).strip().upper(),
 		})
 	return result
 
