@@ -14,7 +14,9 @@ import time
 
 sys.path.append("src")
 
-from config import SYMBOLS, TRADE_MODE
+from datetime import datetime, timedelta
+
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
 from strategy import 무한매수법_V4
 from state import load_state, save_state, update_T_from_history
 from trader import (
@@ -24,6 +26,154 @@ from trader import (
     ReservationOrderRequired,
 )
 from telegram import send_telegram
+
+
+def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
+    """
+    한 사이클이 종료되었을 때 수익 리포트를 생성합니다.
+
+    사이클 시작일(cycle_start_date)부터 오늘까지의 체결 내역을 집계하여
+    총 매수금액, 총 매도금액, 추정 수수료, 순수익금, 수익률을 계산합니다.
+
+    Parameters:
+        symbol (str): 종목 코드
+        order_history (list): get_overseas_order_history()의 반환값
+        state (dict): 현재 상태 (cycle_start_date, effective_seed 포함)
+        seed (float): 이번 사이클에 사용된 시드 금액 (달러)
+        commission_rate (float): 매매 수수료율 (예: 0.0025 = 0.25%)
+
+    Returns:
+        dict: 리포트 결과
+            - total_buy_amount: 총 매수금액
+            - total_sell_amount: 총 매도금액
+            - estimated_commission: 추정 수수료 (매수 + 매도)
+            - net_profit: 순수익금 (수수료 차감)
+            - operational_return_pct: 운용 수익률 (%)
+            - seed_return_pct: 시드 대비 수익률 (%, seed > 0 인 경우)
+            - buy_count: 매수 체결 건수
+            - sell_count: 매도 체결 건수
+            - cycle_start_date: 사이클 시작일
+            - cycle_end_date: 사이클 종료일 (오늘)
+            - next_cycle_seed: 복리 재투자 시 다음 사이클 시드
+    """
+    cycle_start_date = state.get("cycle_start_date", "")
+    cycle_end_date = datetime.now().strftime("%Y-%m-%d")
+
+    # cycle_start_date를 YYYYMMDD 형식으로 변환하여 필터링에 사용
+    if cycle_start_date:
+        start_yyyymmdd = cycle_start_date.replace("-", "")
+        cycle_orders = [
+            o for o in order_history
+            if o.get("ord_dt", "") >= start_yyyymmdd
+            and int(float(o.get("ft_ccld_qty", "0"))) > 0
+        ]
+    else:
+        # 사이클 시작일 정보가 없으면 체결된 전체 이력을 사용합니다
+        cycle_orders = [
+            o for o in order_history
+            if int(float(o.get("ft_ccld_qty", "0"))) > 0
+        ]
+
+    total_buy_amount = 0.0
+    total_sell_amount = 0.0
+    buy_count = 0
+    sell_count = 0
+
+    for order in cycle_orders:
+        qty = float(order.get("ft_ccld_qty", "0"))
+        price = float(order.get("ft_ccld_unpr3", "0"))
+        amount = qty * price
+
+        if order.get("sll_buy_dvsn_cd_name") == "매수":
+            total_buy_amount += amount
+            buy_count += 1
+        elif order.get("sll_buy_dvsn_cd_name") == "매도":
+            total_sell_amount += amount
+            sell_count += 1
+
+    # 수수료는 매수와 매도 양방향 모두 부과됩니다
+    estimated_commission = (total_buy_amount + total_sell_amount) * commission_rate
+    net_profit = total_sell_amount - total_buy_amount - estimated_commission
+
+    operational_return_pct = None
+    if total_buy_amount > 0:
+        operational_return_pct = (net_profit / total_buy_amount) * 100
+
+    seed_return_pct = None
+    if seed > 0:
+        seed_return_pct = (net_profit / seed) * 100
+
+    next_cycle_seed = (seed + net_profit) if seed > 0 else None
+
+    return {
+        "symbol": symbol,
+        "cycle_start_date": cycle_start_date if cycle_start_date else "(기록 없음)",
+        "cycle_end_date": cycle_end_date,
+        "total_buy_amount": total_buy_amount,
+        "total_sell_amount": total_sell_amount,
+        "estimated_commission": estimated_commission,
+        "commission_rate_pct": commission_rate * 100,
+        "net_profit": net_profit,
+        "operational_return_pct": operational_return_pct,
+        "seed_return_pct": seed_return_pct,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "seed": seed,
+        "next_cycle_seed": next_cycle_seed,
+    }
+
+
+def format_cycle_report_message(report):
+    """
+    사이클 리포트 dict를 텔레그램 메시지 문자열로 변환합니다.
+
+    Parameters:
+        report (dict): generate_cycle_report()의 반환값
+
+    Returns:
+        str: 텔레그램에 전송할 메시지 문자열
+    """
+    symbol = report["symbol"]
+    start = report["cycle_start_date"]
+    end = report["cycle_end_date"]
+    buy_amt = report["total_buy_amount"]
+    sell_amt = report["total_sell_amount"]
+    commission = report["estimated_commission"]
+    commission_pct = report["commission_rate_pct"]
+    net = report["net_profit"]
+    buy_cnt = report["buy_count"]
+    sell_cnt = report["sell_count"]
+    seed = report["seed"]
+    next_seed = report["next_cycle_seed"]
+    op_return = report["operational_return_pct"]
+    seed_return = report["seed_return_pct"]
+
+    profit_sign = "+" if net >= 0 else ""
+    lines = [
+        f"🏁 사이클 종료 — {symbol}",
+        "",
+        f"기간: {start} ~ {end}",
+        f"매수 {buy_cnt}회 / 매도 {sell_cnt}회",
+        "",
+        f"총 매수금액:  ${buy_amt:>10,.2f}",
+        f"총 매도금액:  ${sell_amt:>10,.2f}",
+        f"추정 수수료:  ${commission:>10,.2f}  ({commission_pct:.2f}% × 매수·매도)",
+        "─" * 36,
+        f"순수익금:     ${profit_sign}{net:>9,.2f}",
+    ]
+
+    if op_return is not None:
+        lines.append(f"운용 수익률:  {profit_sign}{op_return:.2f}%")
+
+    if seed > 0 and seed_return is not None:
+        lines.append(f"시드 대비:    {profit_sign}{seed_return:.2f}%  (시드 ${seed:,.0f})")
+
+    if next_seed is not None:
+        reinvest_label = "복리 적용" if REINVEST else "참고값"
+        lines.append("")
+        lines.append(f"다음 사이클 시드: ${next_seed:,.2f}  ({reinvest_label})")
+
+    return "\n".join(lines)
 
 
 def convert_exchange_code(exchange_code):
@@ -80,11 +230,30 @@ def run_one_symbol(symbol_config):
 
     state = load_state(symbol)
 
-    order_history = get_overseas_order_history(symbol, exchange, days=30)
+    # 사이클 시작일 기준으로 주문 이력 조회 기간을 동적으로 계산합니다
+    # 한 사이클이 30일 이상 걸릴 수 있으므로, 충분한 기간을 조회합니다
+    cycle_start_date = state.get("cycle_start_date", "")
+    if cycle_start_date:
+        try:
+            start_dt = datetime.strptime(cycle_start_date, "%Y-%m-%d")
+            days_since_start = (datetime.now() - start_dt).days + 5
+            history_days = max(days_since_start, 30)
+        except ValueError:
+            history_days = 30
+    else:
+        history_days = 30
+
+    order_history = get_overseas_order_history(symbol, exchange, days=history_days)
     state = update_T_from_history(symbol, state, order_history)
 
     T = state["T"]
     print(f"  현재 T값: {T}")
+
+    # ── 복리 재투자: effective_seed가 있으면 env 시드 대신 사용 ──
+    effective_seed = state.get("effective_seed", 0.0)
+    if REINVEST and effective_seed > 0:
+        seed = effective_seed
+        print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
 
     # ── Step 2: 전략 실행 ────────────────────────────────────────
     print(f"\n[Step 2] 전략 실행 중...")
@@ -106,6 +275,42 @@ def run_one_symbol(symbol_config):
     print(f"  T값: {T} / {splits}")
     if strategy_result['star_point']:
         print(f"  별지점: ${strategy_result['star_point']:.2f}")
+
+    # ── 사이클 종료 감지 ─────────────────────────────────────────
+    # T > 0인데 보유 수량이 0이면 최종매도가 체결된 것으로 판단합니다.
+    position_qty = strategy_result["position_qty"]
+    if T > 0 and position_qty == 0:
+        print(f"\n{'=' * 60}")
+        print(f"🏁 {symbol} 사이클 종료 감지 (T={T}, 보유수량=0)")
+        print(f"{'=' * 60}")
+
+        report = generate_cycle_report(
+            symbol=symbol,
+            order_history=order_history,
+            state=state,
+            seed=seed,
+            commission_rate=COMMISSION_RATE,
+        )
+
+        report_message = format_cycle_report_message(report)
+        print(f"\n{report_message}")
+        send_telegram(report_message)
+
+        # 복리 재투자가 활성화된 경우 다음 사이클 시드를 state에 저장합니다.
+        # 손실이 발생한 경우에도 변경된 시드를 저장합니다.
+        if REINVEST and report["next_cycle_seed"] is not None:
+            state["effective_seed"] = round(report["next_cycle_seed"], 2)
+            print(f"  복리 재투자: 다음 사이클 시드 = ${state['effective_seed']:.2f}")
+        else:
+            state["effective_seed"] = 0.0
+
+        # T 초기화 및 사이클 시작일 리셋
+        state["T"] = 0.0
+        state["cycle_start_date"] = ""
+        save_state(symbol, state)
+
+        print(f"  T값 초기화 완료. 다음 실행 시 새 사이클이 시작됩니다.")
+        return
 
     orders = strategy_result["orders"]
 

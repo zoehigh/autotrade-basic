@@ -27,24 +27,31 @@ def load_state(symbol):
 
     if not os.path.exists(_STATE_FILE):
         print(f"[상태] {symbol} 상태 파일 없음 → T=0으로 시작합니다")
-        return {"T": 0.0, "last_updated": ""}
+        return {"T": 0.0, "last_updated": "", "cycle_start_date": "", "effective_seed": 0.0}
 
     try:
         with open(_STATE_FILE, "r", encoding="utf-8") as f:
             all_states = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         print(f"[상태] {symbol} 상태 파일 읽기 실패 ({e}) → T=0으로 시작합니다")
-        return {"T": 0.0, "last_updated": ""}
+        return {"T": 0.0, "last_updated": "", "cycle_start_date": "", "effective_seed": 0.0}
 
     if symbol not in all_states:
         print(f"[상태] {symbol} 상태 기록 없음 → T=0으로 시작합니다")
-        return {"T": 0.0, "last_updated": ""}
+        return {"T": 0.0, "last_updated": "", "cycle_start_date": "", "effective_seed": 0.0}
 
     state = all_states[symbol]
     T = float(state.get("T", 0.0))
     last_updated = state.get("last_updated", "")
+    cycle_start_date = state.get("cycle_start_date", "")
+    effective_seed = float(state.get("effective_seed", 0.0))
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
-    return {"T": T, "last_updated": last_updated}
+    return {
+        "T": T,
+        "last_updated": last_updated,
+        "cycle_start_date": cycle_start_date,
+        "effective_seed": effective_seed,
+    }
 
 
 def save_state(symbol, state_dict):
@@ -73,13 +80,16 @@ def save_state(symbol, state_dict):
     all_states[symbol] = {
         "T": float(state_dict.get("T", 0.0)),
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cycle_start_date": state_dict.get("cycle_start_date", ""),
+        "effective_seed": float(state_dict.get("effective_seed", 0.0)),
     }
 
     with open(_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(all_states, f, ensure_ascii=False, indent=2)
 
     T = all_states[symbol]["T"]
-    print(f"[상태] {symbol} 상태 저장 완료 → T={T}")
+    effective_seed = all_states[symbol]["effective_seed"]
+    print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}")
 
 
 def update_T_from_history(symbol, state, order_history):
@@ -131,9 +141,18 @@ def update_T_from_history(symbol, state, order_history):
 
     for order in yesterday_orders:
         buy_sell = order.get("sll_buy_dvsn_cd_name", "")
-        comment = order.get("prcs_stat_name", "")
 
         if buy_sell == "매수":
+            # T=0에서 첫 매수가 발생하면 사이클 시작일을 기록합니다
+            if T == 0 and not state.get("cycle_start_date"):
+                ord_dt = order.get("ord_dt", "")
+                if len(ord_dt) == 8:
+                    cycle_start = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}"
+                else:
+                    cycle_start = ord_dt
+                state["cycle_start_date"] = cycle_start
+                print(f"  → 새 사이클 시작일 기록: {cycle_start}")
+
             # 주문 코멘트로 1회 매수인지 절반 매수인지 구분
             # strategy.py에서 order의 comment 필드를 prcs_stat_name에 저장하지 않으므로
             # 현재는 모든 매수를 "1회 매수"로 처리합니다.
@@ -145,6 +164,7 @@ def update_T_from_history(symbol, state, order_history):
             # 쿼터매도: 보유수량의 1/4 매도
             # 지정가 최종매도: 나머지 전량 매도
             # 현재는 모든 매도를 쿼터매도로 처리합니다.
+            # 최종매도 감지 및 T 리셋은 trading_bot.py에서 position_qty 기준으로 처리합니다.
             T = T * 0.75
             print(f"  → 매도 체결: T = T * 0.75 → T={T}")
 

@@ -117,3 +117,15 @@ if _trade_mode not in ("DRY", "LIVE"):
 	TRADE_MODE = "DRY"
 else:
 	TRADE_MODE = _trade_mode
+
+# 매매 수수료율
+# 한국투자증권 해외주식 기본 수수료: 0.25% (계좌/이벤트에 따라 다를 수 있음)
+# .env 예: COMMISSION_RATE=0.0025
+COMMISSION_RATE = float(os.getenv("COMMISSION_RATE") or "0.0025")
+
+# 사이클 수익 복리 재투자 여부
+# true: 사이클 종료 후 순수익을 다음 사이클 시드에 자동으로 합산합니다
+# false (기본값): 매 사이클 동일한 시드로 운용합니다
+# .env 예: REINVEST=true
+_reinvest_raw = os.getenv("REINVEST", "false").strip().lower()
+REINVEST = _reinvest_raw == "true"
