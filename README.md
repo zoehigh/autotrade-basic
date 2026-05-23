@@ -104,8 +104,8 @@ uv run python trading_bot.py
 | `KIS_APP_SECRET` | ✅ | KIS Open API 앱 시크릿 |
 | `KIS_ACCOUNT_NO` | ✅ | 실전 계좌번호 |
 | `KIS_ACCOUNT_NO_DEMO` | ✅ | 모의 계좌번호 |
-| `TELEGRAM_BOT_TOKEN` | 선택 | 텔레그램 봇 토큰 |
-| `TELEGRAM_CHAT_ID` | 선택 | 텔레그램 채팅 ID |
+| `TELEGRAM_BOT_TOKEN_DEMO` | 선택 | 텔레그램 봇 토큰 |
+| `TELEGRAM_CHAT_ID_DEMO` | 선택 | 텔레그램 채팅 ID |
 
 ### 워크플로우별 비밀키(권장 네이밍)
 

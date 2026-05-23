@@ -35,6 +35,18 @@ on:
         description: '큰수 상승률'
         required: false
         type: string
+      quiet_hours:
+        description: '조용한 시간대 기능 (true/false)'
+        required: false
+        type: string
+      commission_rate:
+        description: '수수료율 (예: 0.0025)'
+        required: false
+        type: string
+      reinvest:
+        description: '복리 재투자 활성화 (true/false)'
+        required: false
+        type: string
     secrets:
       KIS_APP_KEY:
         required: true
@@ -99,6 +111,10 @@ jobs:
           SOXL_TAKE_PROFIT: ${{ vars.SOXL_TAKE_PROFIT }}
           SOXL_BIG_BUY_RANGE: ${{ vars.SOXL_BIG_BUY_RANGE }}
           SOXL_SEED: ${{ vars.SOXL_SEED }}
+
+          QUIET_HOURS: ${{ inputs.quiet_hours }}
+          COMMISSION_RATE: ${{ inputs.commission_rate }}
+          REINVEST: ${{ inputs.reinvest }}
 
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

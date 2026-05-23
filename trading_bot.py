@@ -25,7 +25,7 @@ from trader import (
     get_overseas_order_history,
     ReservationOrderRequired,
 )
-from telegram import send_telegram
+from notifier import notify
 
 
 def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
@@ -294,7 +294,7 @@ def run_one_symbol(symbol_config):
 
         report_message = format_cycle_report_message(report)
         print(f"\n{report_message}")
-        send_telegram(report_message)
+        notify(report_message)
 
         # 복리 재투자가 활성화된 경우 다음 사이클 시드를 state에 저장합니다.
         # 손실이 발생한 경우에도 변경된 시드를 저장합니다.
@@ -373,7 +373,7 @@ def run_one_symbol(symbol_config):
 수량: {order['quantity']}주
 주문번호: {result['odno']}
 시각: {result['ord_tmd']}"""
-                send_telegram(message)
+                notify(message)
             else:
                 print("✓ 주문 정보 출력 완료")
 
@@ -411,7 +411,7 @@ def run_one_symbol(symbol_config):
 수량: {order['quantity']}주
 예약주문번호: {resv_result['odno']}
 접수일자: {resv_result['rsvn_ord_rcit_dt']}"""
-                    send_telegram(message)
+                    notify(message)
                 except Exception as reservation_error:
                     print(f"✗ 예약주문 실패: {str(reservation_error)}")
                     failed_orders.append(
@@ -420,8 +420,9 @@ def run_one_symbol(symbol_config):
                             "error": f"예약주문 실패: {str(reservation_error)}",
                         }
                     )
-                    send_telegram(
-                        f"⚠️ 예약주문 실패\n\n{order['comment']}\n에러: {str(reservation_error)}"
+                    notify(
+                        f"⚠️ 예약주문 실패\n\n{order['comment']}\n에러: {str(reservation_error)}",
+                        urgent=True,
                     )
 
         except Exception as error:
@@ -437,7 +438,7 @@ def run_one_symbol(symbol_config):
 
 {order['comment']}
 에러: {str(error)}"""
-            send_telegram(message)
+            notify(message, urgent=True)
             continue
 
     print("\n" + "=" * 60)
@@ -491,7 +492,7 @@ def main():
         print("자동매매 봇 시작")
         print("=" * 60)
 
-        send_telegram("🚀 자동매매 시작")
+        notify("🚀 자동매매 시작")
 
         # ========================================
         # 설정 정보 출력
@@ -516,7 +517,7 @@ def main():
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]
                 print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
-                send_telegram(f"⚠️ {symbol} 오류\n\n{str(error)}")
+                notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
 
             if len(SYMBOLS) > 1:
                 time.sleep(1)
@@ -532,7 +533,7 @@ def main():
         message = f"""🚨 치명적 에러 발생
 
 {str(error)}"""
-        send_telegram(message)
+        notify(message, urgent=True)
 
         import traceback
 
