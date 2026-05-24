@@ -17,7 +17,7 @@ sys.path.append("src")
 from datetime import datetime, timedelta
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
-from strategy import 무한매수법_V4
+from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import load_state, save_state, update_T_from_history
 from trader import (
     place_overseas_order,
@@ -352,6 +352,17 @@ def run_one_symbol(symbol_config):
         try:
             order_price = order["price"] if order["price"] else 0
 
+            # BUY LOC 가격 보정: 현재가 대비 +20% 초과 시 브로커가 주문을 거부하므로 미리 조정합니다
+            if order["side"] == "BUY" and order_price > 0:
+                strategy_last_price = strategy_result.get("last_price", 0)
+                if strategy_last_price > 0:
+                    max_allowed_price = strategy_last_price * 1.19
+                    if order_price > max_allowed_price:
+                        corrected_price = adjust_price_to_tick(max_allowed_price)
+                        print(f"  ⚠️ LOC 가격 보정: ${order_price:.2f} → ${corrected_price:.2f} (현재가 ${strategy_last_price:.2f} × 1.19 기준)")
+                        notify(f"⚠️ LOC 가격 보정\n원가격: ${order_price:.2f}\n현재가: ${strategy_last_price:.2f}\n보정가: ${corrected_price:.2f}")
+                        order_price = corrected_price
+
             result = place_overseas_order(
                 symbol=symbol,
                 exchange_code=order_exchange_code,
@@ -370,6 +381,11 @@ def run_one_symbol(symbol_config):
                         "ord_tmd": result["ord_tmd"],
                     }
                 )
+
+                # 추가매수 주문은 T값 증가 대상에서 제외되므로 주문번호를 상태에 기록합니다
+                if "[추가매수]" in order.get("comment", ""):
+                    state.setdefault("additional_loc_odno", []).append(result["odno"])
+
                 print("✓ 주문 성공")
 
                 message = f"""✅ 주문 성공

@@ -7,6 +7,8 @@ from trader import (
     get_overseas_purchase_amount,
 )
 
+ADDITIONAL_LOC_LEVELS = 10  # 급락 대비 추가 LOC 주문 단계 수
+
 
 def adjust_price_to_tick(price):
     """
@@ -295,10 +297,10 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         elif avg_price > 0 and star_buy_price:
             if T < splits / 2:
                 # 전반전: 절반은 별지점 LOC, 절반은 평단 LOC
-                half_amount = unit_amount / 2
-                qty_at_star = math.floor(half_amount / last_price)
-                qty_at_avg = math.floor(half_amount / last_price)
                 avg_buy_price = adjust_price_to_tick(avg_price)
+                base_qty = math.floor(unit_amount / avg_buy_price)
+                qty_at_star = math.floor(unit_amount / 2 / star_buy_price)
+                qty_at_avg = max(base_qty - qty_at_star, 0)
 
                 if qty_at_star > 0:
                     orders.append({
@@ -318,9 +320,23 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "comment": "전반전 평단 매수 (절반 매수) — 체결 시 T += 0.5",
                     })
 
+                # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))
+                if base_qty > 0:
+                    for i in range(1, ADDITIONAL_LOC_LEVELS + 1):
+                        add_price = adjust_price_to_tick(unit_amount / (base_qty + i))
+                        if add_price <= 0:
+                            break
+                        orders.append({
+                            "side": "BUY",
+                            "quantity": 1,
+                            "price": add_price,
+                            "order_type": "LOC",
+                            "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                        })
+
             else:
                 # 후반전: 전체 금액을 별지점 LOC 한 곳에
-                qty_at_star = math.floor(unit_amount / last_price)
+                qty_at_star = math.floor(unit_amount / star_buy_price)
 
                 if qty_at_star > 0:
                     orders.append({
@@ -330,6 +346,20 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "order_type": "LOC",
                         "comment": "후반전 별지점 매수 (1회 매수) — 체결 시 T += 1",
                     })
+
+                # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (qty_at_star + i))
+                if qty_at_star > 0:
+                    for i in range(1, ADDITIONAL_LOC_LEVELS + 1):
+                        add_price = adjust_price_to_tick(unit_amount / (qty_at_star + i))
+                        if add_price <= 0:
+                            break
+                        orders.append({
+                            "side": "BUY",
+                            "quantity": 1,
+                            "price": add_price,
+                            "order_type": "LOC",
+                            "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                        })
         else:
             # avg_price가 없는데 T > 0인 경우 (상태 불일치): 별지점 계산 불가
             print(
@@ -360,39 +390,4 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         "take_profit_price": take_profit_price,
         "orders": orders,
     }
-
-
-
-def adjust_price_to_tick(price):
-    """
-    미국 주식 거래소의 호가 단위 규칙에 맞춰 가격을 조정합니다.
-    
-    호가 단위 규칙:
-    - 가격이 $1.00 미만: 소수점 4자리까지 ($0.0001 단위)
-    - 가격이 $1.00 이상: 소수점 2자리까지 ($0.01 단위)
-    
-    모든 가격은 버림(floor) 처리합니다.
-    
-    Parameters:
-        price (float): 조정할 가격
-    
-    Returns:
-        float: 호가 단위에 맞게 조정된 가격
-    
-    Examples:
-        >>> adjust_price_to_tick(0.98769)
-        0.9876
-        >>> adjust_price_to_tick(56.375)
-        56.37
-        >>> adjust_price_to_tick(56.378)
-        56.37
-    """
-    price = float(price)
-    
-    if price < 1.0:
-        # $1.00 미만: 소수점 4자리까지
-        return math.floor(price * 10000) / 10000
-    else:
-        # $1.00 이상: 소수점 2자리까지
-        return math.floor(price * 100) / 100
 

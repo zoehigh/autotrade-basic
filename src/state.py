@@ -241,8 +241,14 @@ def _apply_recent_history(symbol, state, order_history, last_updated):
                 state["cycle_start_date"] = cycle_start
                 print(f"  → 새 사이클 시작일 기록: {cycle_start}")
 
-            T += 1.0
-            print(f"  → 매수 체결 ({ord_dt}): T += 1 → T={T}")
+            # 추가매수 주문(급락 대비 1주씩)은 T값을 증가시키지 않습니다
+            order_odno = order.get("odno", "")
+            additional_loc_odno = state.get("additional_loc_odno", [])
+            if order_odno and order_odno in additional_loc_odno:
+                print(f"  → 매수 체결 ({ord_dt}): 추가매수 주문 제외 → T 변경 없음")
+            else:
+                T += 1.0
+                print(f"  → 매수 체결 ({ord_dt}): T += 1 → T={T}")
 
         elif buy_sell == "매도":
             # 최종매도 감지 및 T 리셋은 trading_bot.py에서 position_qty 기준으로 처리합니다.
