@@ -230,10 +230,16 @@ def run_one_symbol(symbol_config):
 
     state = load_state(symbol)
 
-    # 사이클 시작일 기준으로 주문 이력 조회 기간을 동적으로 계산합니다
-    # 한 사이클이 30일 이상 걸릴 수 있으므로, 충분한 기간을 조회합니다
+    # 주문 이력 조회 기간을 상황에 맞게 계산합니다
     cycle_start_date = state.get("cycle_start_date", "")
-    if cycle_start_date:
+    last_updated = state.get("last_updated", "")
+
+    if not last_updated:
+        # 초기 상태(처음 실행 또는 업그레이드 직후): 이전 이력에서 T를 추정하기 위해 넉넉하게 조회합니다
+        # 5~6페이지 × 20건 = 약 100~120건을 확보합니다
+        history_days = 90
+    elif cycle_start_date:
+        # 사이클 시작일 기준으로 전체 사이클 이력을 조회합니다
         try:
             start_dt = datetime.strptime(cycle_start_date, "%Y-%m-%d")
             days_since_start = (datetime.now() - start_dt).days + 5

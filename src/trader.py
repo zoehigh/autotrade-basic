@@ -3,11 +3,7 @@ import requests
 import certifi
 import time
 from datetime import datetime, time as dtime, timedelta
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    # Python <3.9 fallback (shouldn't be needed on modern runners)
-    from backports.zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 from authentication import get_access_token
 from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN, KIS_MODE
 
