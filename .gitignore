@@ -14,6 +14,9 @@ wheels/
 .env.local
 .env.*.local
 
+# 자동매매 봇 런타임 상태 파일 (GitHub Actions 캐시로 관리)
+.state.json
+
 # IDE settings
 .vscode/
 .idea/

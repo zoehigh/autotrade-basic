@@ -77,6 +77,18 @@ jobs:
       - name: 의존성 설치
         run: uv sync
 
+      - name: state 캐시 복원
+        # 이전 실행에서 저장한 .state.json을 불러옵니다.
+        # T값, 사이클 시작일, 복리 시드 등 KIS API로 복구할 수 없는 정보가 담겨 있습니다.
+        uses: actions/cache/restore@v4
+        with:
+          path: .state.json
+          # run_id를 포함한 키로 이번 실행을 위한 새 캐시 자리를 예약합니다.
+          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-${{ github.run_id }}
+          # 정확히 일치하는 키가 없으면 같은 접두사의 가장 최신 캐시를 사용합니다.
+          restore-keys: |
+            state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-
+
       - name: Resolve and log inputs
         run: |
           echo "Resolved TRADE_MODE=${{ inputs.trade_mode || 'DRY' }}"
@@ -120,3 +132,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: uv run python trading_bot.py
+
+      - name: state 캐시 저장
+        # 봇 실행이 성공하든 실패하든 항상 최신 상태를 저장합니다.
+        # (에러 중단 시에도 T값이 일부 갱신됐을 수 있으므로 always()로 저장)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state.json
+          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-${{ github.run_id }}
