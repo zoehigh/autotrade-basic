@@ -14,7 +14,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from trader import get_overseas_order_history
-from config import SYMBOL, EXCHANGE
+from config import SYMBOLS
+
+
+TEST_SYMBOL = SYMBOLS[0]["symbol"]
+TEST_EXCHANGE = SYMBOLS[0]["exchange"]
 
 
 def format_order_type(sll_buy_dvsn_cd_name):
@@ -34,7 +38,7 @@ def test_overseas_symbol_order_history():
     특정 종목의 해외주식 주문체결내역 조회 API 호출 테스트
     
     테스트 내용:
-    - 환경변수에서 읽은 SYMBOL, EXCHANGE를 사용하여 API 호출
+    - 환경변수 SYMBOLS의 첫 번째 종목을 사용하여 API 호출
     - 최근 30일의 특정 종목 체결내역 조회
     - 매도/매수 여부와 체결수량 표시
     - 최신 내역이 먼저 표시되는지 확인
@@ -42,17 +46,17 @@ def test_overseas_symbol_order_history():
     
     print("=" * 100)
     print("해외주식 주문체결내역 조회 API 테스트 (특정 종목)")
-    print(f"종목 코드: {SYMBOL} | 거래소: {EXCHANGE} | 조회 기간: 최근 30일")
+    print(f"종목 코드: {TEST_SYMBOL} | 거래소: {TEST_EXCHANGE} | 조회 기간: 최근 30일")
     print("=" * 100)
     
     try:
         # API 호출
-        order_history = get_overseas_order_history(symbol=SYMBOL, exchange_code=EXCHANGE, days=30)
+        order_history = get_overseas_order_history(symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE, days=30)
         
         # 결과 검증
         if not order_history:
             print("\n⚠️ 해당 기간에 해당 종목의 체결내역이 없습니다.")
-            print(f"조회한 종목코드: {SYMBOL}")
+            print(f"조회한 종목코드: {TEST_SYMBOL}")
             print("종목 코드를 확인해주세요.")
             return True  # 정상적인 경우 (체결내역이 없음)
         
@@ -88,7 +92,7 @@ def test_overseas_symbol_order_history():
                              for order in order_history 
                              if "매도" in order.get("sll_buy_dvsn_cd_name", ""))
         
-        print(f"  종목 코드: {SYMBOL}")
+        print(f"  종목 코드: {TEST_SYMBOL}")
         print(f"  총 매수 수량: {total_buy_qty} 주")
         print(f"  총 매도 수량: {total_sell_qty} 주")
         print(f"  총 체결 건수: {len(order_history)} 건")

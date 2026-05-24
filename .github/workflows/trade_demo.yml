@@ -28,11 +28,6 @@ jobs:
       kis_mode: demo
       # 데모 전용 기본값(우선순위: 호출자 inputs -> repo vars -> base defaults)
       symbols: ${{ github.event.inputs.symbols || vars.SYMBOLS }}
-      symbol: ${{ vars.SYMBOL }}
-      exchange: ${{ vars.EXCHANGE }}
-      splits: ${{ vars.SPLITS }}
-      take_profit: ${{ vars.TAKE_PROFIT }}
-      big_buy_range: ${{ vars.BIG_BUY_RANGE }}
       quiet_hours: ${{ vars.QUIET_HOURS_DEMO || 'true' }}
       commission_rate: ${{ vars.COMMISSION_RATE_DEMO || '0.0025' }}
       reinvest: ${{ vars.REINVEST_DEMO || 'false' }}

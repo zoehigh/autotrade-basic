@@ -23,23 +23,18 @@ else:
 if not KIS_ACCOUNT_NO:
 	print(f"경고: KIS_MODE={KIS_MODE} 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
 
-# 전략 파라미터 (종목별 기본값으로 사용되므로 _parse_symbols() 호출 전에 정의)
-SPLITS = int(os.getenv("SPLITS") or "40")  # 분할 수
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT") or "0.10")  # 익절률 (예: 0.10 = 10%)
-BIG_BUY_RANGE = float(os.getenv("BIG_BUY_RANGE") or "0.10")  # 큰수 상승률 (예: 0.10 = 10%)
-
 # 종목 정보
 # 여러 종목을 매매하려면 SYMBOLS 환경변수를 사용하세요.
 # 사용법: SYMBOLS=TQQQ:NAS,SOXL:AMS
-# 기존 단일 종목 방식도 계속 호환됩니다: SYMBOL=TQQQ EXCHANGE=NAS
+# 단일 종목 방식(SYMBOL, EXCHANGE)은 더 이상 지원하지 않습니다.
 #
 # 종목별 세부 설정 (환경변수 이름 규칙: {종목코드}_{설정명})
 # 예시:
-#   TQQQ_SPLITS=40        → TQQQ 분할 수 (미설정 시 전역 SPLITS 사용)
-#   TQQQ_TAKE_PROFIT=0.10 → TQQQ 익절률
-#   TQQQ_BIG_BUY_RANGE=0.10 → TQQQ 큰수 상승률
+#   TQQQ_SPLITS=40        → TQQQ 분할 수
+#   TQQQ_SYMBOL_TYPE=TQQQ → 별지점 공식 타입
 #   TQQQ_SEED=10000       → TQQQ에 투입할 시드 (달러, 0이면 계좌 전체 사용)
 #   SOXL_SPLITS=20
+#   SOXL_SYMBOL_TYPE=SOXL
 #   SOXL_SEED=5000
 def _parse_symbols():
 	"""
@@ -49,7 +44,8 @@ def _parse_symbols():
 	  [
 	    {
 	      "symbol": "TQQQ", "exchange": "NAS",
-	      "splits": 40, "take_profit": 0.10, "big_buy_range": 0.10,
+	      "splits": 40,
+	      "symbol_type": "TQQQ",
 	      "seed": 10000  # 0이면 계좌 전체 사용
 	    },
 	    ...
@@ -57,37 +53,44 @@ def _parse_symbols():
 
 	설정 우선순위:
 	  1. SYMBOLS=TQQQ:NAS,SOXL:AMS  (복수 종목)
-	  2. SYMBOL=TQQQ  EXCHANGE=NAS  (기존 단일 종목 방식, 하위 호환)
-	  3. 기본값: TQQQ(나스닥) + SOXL(아멕스)
+	  2. 기본값: TQQQ(나스닥) + SOXL(아멕스)
+
+	왜 이렇게 바꿨나요?
+	  - 단일 변수(SYMBOL, EXCHANGE)와 미사용 변수(TAKE_PROFIT, BIG_BUY_RANGE)를 제거해
+	    설정 혼선을 줄였습니다.
+	  - 이제 종목별 설정만 보고도 실제 동작을 바로 이해할 수 있습니다.
 	"""
 	raw = os.getenv("SYMBOLS", "").strip()
 	pairs = []
 	if raw:
 		for item in raw.split(","):
 			item = item.strip()
-			if ":" in item:
-				sym, exch = item.split(":", 1)
-				pairs.append((sym.strip().upper(), exch.strip().upper()))
+			if not item:
+				continue
+			if ":" not in item:
+				raise ValueError(
+					f"잘못된 SYMBOLS 형식: '{item}'. 예시: SYMBOLS=TQQQ:NAS,SOXL:AMS"
+				)
+			sym, exch = item.split(":", 1)
+			sym = sym.strip().upper()
+			exch = exch.strip().upper()
+			if not sym or not exch:
+				raise ValueError(
+					f"잘못된 SYMBOLS 항목: '{item}'. 종목코드와 거래소코드를 모두 입력하세요."
+				)
+			pairs.append((sym, exch))
 
 	if not pairs:
-		# 기존 단일 종목 방식 (하위 호환)
-		single_symbol = os.getenv("SYMBOL", "").strip().upper()
-		single_exchange = os.getenv("EXCHANGE", "").strip().upper()
-		if single_symbol and single_exchange:
-			pairs = [(single_symbol, single_exchange)]
-		else:
-			# 기본값: TQQQ(나스닥) + SOXL(아멕스)
-			pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
+		# 기본값: TQQQ(나스닥) + SOXL(아멕스)
+		pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
 
 	result = []
 	for sym, exch in pairs:
 		result.append({
 			"symbol": sym,
 			"exchange": exch,
-			# 종목별 설정이 없으면 전역 기본값을 사용합니다
-			"splits": int(os.getenv(f"{sym}_SPLITS") or SPLITS),
-			"take_profit": float(os.getenv(f"{sym}_TAKE_PROFIT") or TAKE_PROFIT),
-			"big_buy_range": float(os.getenv(f"{sym}_BIG_BUY_RANGE") or BIG_BUY_RANGE),
+			# V4는 종목별 분할 수를 직접 사용합니다.
+			"splits": int(os.getenv(f"{sym}_SPLITS") or "40"),
 			# 시드: 이 종목에 투입할 최대 금액 (달러). 0이면 계좌 전체 주문가능금액 사용
 			"seed": float(os.getenv(f"{sym}_SEED") or "0"),
 			# 별지점 공식 선택용 종목 타입: "TQQQ" 또는 "SOXL"
@@ -99,10 +102,6 @@ def _parse_symbols():
 	return result
 
 SYMBOLS = _parse_symbols()
-
-# 하위 호환성을 위해 첫 번째 종목을 SYMBOL/EXCHANGE로도 제공합니다
-SYMBOL = SYMBOLS[0]["symbol"]
-EXCHANGE = SYMBOLS[0]["exchange"]
 
 # 계좌 정보
 ACNT_PRDT_CD = "01"  # 계좌상품코드 (상품코드)

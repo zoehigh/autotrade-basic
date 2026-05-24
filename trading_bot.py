@@ -211,8 +211,7 @@ def run_one_symbol(symbol_config):
             - symbol (str): 종목 코드 (예: "TQQQ")
             - exchange (str): 거래소 코드 (예: "NAS")
             - splits (int): 분할 수
-            - take_profit (float): 익절률
-            - big_buy_range (float): 큰수 상승률
+            - symbol_type (str): 종목 타입 (예: "TQQQ", "SOXL")
             - seed (float): 투입 시드 금액 (0이면 계좌 전체 사용)
     """
     symbol = symbol_config["symbol"]

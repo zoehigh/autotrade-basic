@@ -14,7 +14,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from trader import get_overseas_stock_quotation
-from config import SYMBOL, EXCHANGE
+from config import SYMBOLS
+
+
+TEST_SYMBOL = SYMBOLS[0]["symbol"]
+TEST_EXCHANGE = SYMBOLS[0]["exchange"]
 
 
 def is_order_available(ordy_value):
@@ -45,19 +49,19 @@ def test_overseas_stock_quotation():
     해외주식 현재체결가 API 호출 테스트
     
     테스트 내용:
-    - 환경변수에서 읽은 SYMBOL, EXCHANGE를 사용하여 API 호출
+    - 환경변수 SYMBOLS의 첫 번째 종목을 사용하여 API 호출
     - 매수가능여부(ordy) 정보 확인
     - 모든 응답 필드 출력
     """
     
     print("=" * 80)
     print("해외주식 현재체결가 API 호출 테스트")
-    print(f"종목 코드: {SYMBOL} | 거래소: {EXCHANGE}")
+    print(f"종목 코드: {TEST_SYMBOL} | 거래소: {TEST_EXCHANGE}")
     print("=" * 80)
     
     try:
         # API 호출
-        result = get_overseas_stock_quotation(symbol=SYMBOL, exchange_code=EXCHANGE)
+        result = get_overseas_stock_quotation(symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE)
         
         # 결과 검증
         if not result:

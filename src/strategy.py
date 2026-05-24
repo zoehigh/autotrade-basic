@@ -109,6 +109,13 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
     - 전반전(T < splits/2): 절반은 별지점 LOC, 절반은 평단 LOC로 분산 매수
     - 후반전(T >= splits/2): 전체를 별지점 LOC에 집중 매수
     - 항상 쿼터매도(LOC) + 지정가 최종매도 두 개의 매도 주문을 함께 제출합니다.
+        - 최종 익절가는 symbol_type 기준 고정 배율을 사용합니다.
+            (TQQQ: 평단 x 1.15, SOXL: 평단 x 1.20)
+
+        왜 고정 배율을 쓰나요?
+        - V4 학습용 로직은 종목별 익절 규칙을 단순하게 유지하는 것이 핵심입니다.
+        - 환경변수 후보를 많이 두면 설정 실수로 실제 전략과 다른 기대를 만들 수 있어,
+            전략 내부의 명시값으로 동작을 고정했습니다.
 
     Parameters:
         symbol (str): 종목 코드 (예: "TQQQ")
@@ -220,7 +227,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         star_point = calculate_star_point(avg_price, T, splits, symbol_type)
         star_buy_price = adjust_price_to_tick(star_point - 0.01)
 
-    # 익절가 계산 (TQQQ: 평단×1.15, SOXL: 평단×1.20)
+    # 익절가 계산: V4 고정 규칙 (환경변수 TAKE_PROFIT를 사용하지 않음)
     take_profit_multiplier = 1.15 if symbol_type == "TQQQ" else 1.20
     take_profit_price = None
     if avg_price > 0:

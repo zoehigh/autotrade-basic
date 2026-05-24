@@ -15,26 +15,6 @@ on:
         description: '투자 심볼 (예: TQQQ:NAS,SOXL:AMS)'
         required: false
         type: string
-      symbol:
-        description: '종목 코드'
-        required: false
-        type: string
-      exchange:
-        description: '거래소 코드'
-        required: false
-        type: string
-      splits:
-        description: '분할 수'
-        required: false
-        type: string
-      take_profit:
-        description: '익절률'
-        required: false
-        type: string
-      big_buy_range:
-        description: '큰수 상승률'
-        required: false
-        type: string
       quiet_hours:
         description: '조용한 시간대 기능 (true/false)'
         required: false
@@ -106,22 +86,16 @@ jobs:
           # 런타임 설정: inputs -> repo vars -> 하드코딩 기본값 순으로 폴백
           KIS_MODE: ${{ inputs.kis_mode || vars.KIS_MODE || 'demo' }}
           TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}
-          SYMBOL: ${{ inputs.symbol || vars.SYMBOL || 'TQQQ' }}
-          EXCHANGE: ${{ inputs.exchange || vars.EXCHANGE || 'NAS' }}
-          SPLITS: ${{ inputs.splits || vars.SPLITS || '40' }}
-          TAKE_PROFIT: ${{ inputs.take_profit || vars.TAKE_PROFIT || '0.10' }}
-          BIG_BUY_RANGE: ${{ inputs.big_buy_range || vars.BIG_BUY_RANGE || '0.10' }}
-          # 복수 종목 사용 (inputs.symbols 추가)
+          # 복수 종목 사용
           SYMBOLS: ${{ inputs.symbols || 'TQQQ:NAS,SOXL:AMS' }}
 
-          # 종목별 세부 설정 (미설정 시 전역 값 또는 코드 기본값 사용)
+          # 종목별 세부 설정
           TQQQ_SPLITS: ${{ vars.TQQQ_SPLITS }}
-          TQQQ_TAKE_PROFIT: ${{ vars.TQQQ_TAKE_PROFIT }}
-          TQQQ_BIG_BUY_RANGE: ${{ vars.TQQQ_BIG_BUY_RANGE }}
+          TQQQ_SYMBOL_TYPE: ${{ vars.TQQQ_SYMBOL_TYPE }}
           TQQQ_SEED: ${{ vars.TQQQ_SEED }}
+
           SOXL_SPLITS: ${{ vars.SOXL_SPLITS }}
-          SOXL_TAKE_PROFIT: ${{ vars.SOXL_TAKE_PROFIT }}
-          SOXL_BIG_BUY_RANGE: ${{ vars.SOXL_BIG_BUY_RANGE }}
+          SOXL_SYMBOL_TYPE: ${{ vars.SOXL_SYMBOL_TYPE }}
           SOXL_SEED: ${{ vars.SOXL_SEED }}
 
           QUIET_HOURS: ${{ inputs.quiet_hours }}

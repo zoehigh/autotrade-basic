@@ -11,7 +11,11 @@ import sys
 sys.path.append("src")
 
 from trader import place_overseas_order, get_overseas_stock_price
-from config import SYMBOL, EXCHANGE, TRADE_MODE
+from config import SYMBOLS, TRADE_MODE
+
+
+TEST_SYMBOL = SYMBOLS[0]["symbol"]
+TEST_EXCHANGE = SYMBOLS[0]["exchange"]
 
 
 def test_overseas_order():
@@ -29,13 +33,13 @@ def test_overseas_order():
     
     # 환경변수 확인
     print(f"\n[설정 정보]")
-    print(f"종목 코드: {SYMBOL}")
-    print(f"거래소: {EXCHANGE}")
+    print(f"종목 코드: {TEST_SYMBOL}")
+    print(f"거래소: {TEST_EXCHANGE}")
     print(f"거래 모드: {TRADE_MODE}")
     
     try:
         # Step 1: 현재가 조회
-        print(f"\n[Step 1] {SYMBOL} 현재가 조회 중...")
+        print(f"\n[Step 1] {TEST_SYMBOL} 현재가 조회 중...")
         
         # 거래소 코드 변환: NAS -> NASD
         exchange_map = {
@@ -45,10 +49,10 @@ def test_overseas_order():
         }
         
         # 주문용 거래소 코드
-        order_exchange_code = exchange_map.get(EXCHANGE, EXCHANGE)
+        order_exchange_code = exchange_map.get(TEST_EXCHANGE, TEST_EXCHANGE)
         
         # 현재가 조회용 거래소 코드는 원래 코드 사용
-        price_data = get_overseas_stock_price(SYMBOL, EXCHANGE)
+        price_data = get_overseas_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
         
         current_price = float(price_data.get("last", "0"))
         
@@ -67,7 +71,7 @@ def test_overseas_order():
         
         try:
             result_limit = place_overseas_order(
-                symbol=SYMBOL,
+                symbol=TEST_SYMBOL,
                 exchange_code=order_exchange_code,
                 order_type="LIMIT",
                 quantity=1,
@@ -90,7 +94,7 @@ def test_overseas_order():
         
         try:
             result_loc = place_overseas_order(
-                symbol=SYMBOL,
+                symbol=TEST_SYMBOL,
                 exchange_code=order_exchange_code,
                 order_type="LOC",
                 quantity=1,
