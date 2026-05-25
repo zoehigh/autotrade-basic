@@ -2,10 +2,10 @@ name: 자동매매 실행 (Real)
 
 on:
   schedule:
-    # 프리마켓 진입(ET 04:00) 트리거 - DST 분리
-    - cron: '0 8 * 4-10 1-5'
-    - cron: '0 9 * 11-12 1-5'
-    - cron: '0 9 * 1-3 1-5'
+    # 프리마켓 진입(ET 04:00) 후 얼추 시작되도록 트리거 - DST 분리
+    - cron: '31 7 * 4-10 1-5'
+    - cron: '31 8 * 11-12 1-5'
+    - cron: '31 8 * 1-3 1-5'
   workflow_dispatch:
     inputs:
       trade_mode:
