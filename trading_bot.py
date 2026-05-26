@@ -14,7 +14,7 @@ import time
 
 sys.path.append("src")
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
 from strategy import 무한매수법_V4, adjust_price_to_tick
@@ -225,7 +225,7 @@ def run_one_symbol(symbol_config):
     print(f"{'=' * 60}")
 
     # ── Step 1: T값 로드 및 어제 체결 반영 ──────────────────────
-    print(f"\n[Step 1] T값 로드 중...")
+    print("\n[Step 1] T값 로드 중...")
 
     state = load_state(symbol)
 
@@ -261,7 +261,7 @@ def run_one_symbol(symbol_config):
         print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
 
     # ── Step 2: 전략 실행 ────────────────────────────────────────
-    print(f"\n[Step 2] 전략 실행 중...")
+    print("\n[Step 2] 전략 실행 중...")
 
     strategy_result = 무한매수법_V4(
         symbol=symbol,
@@ -272,7 +272,7 @@ def run_one_symbol(symbol_config):
         T=T,
     )
 
-    print(f"✓ 전략 실행 완료")
+    print("✓ 전략 실행 완료")
     print(f"  현재가: ${strategy_result['last_price']}")
     print(f"  보유 수량: {strategy_result['position_qty']}주")
     print(f"  평단가: ${strategy_result['avg_price']}")
@@ -314,7 +314,7 @@ def run_one_symbol(symbol_config):
         state["cycle_start_date"] = ""
         save_state(symbol, state)
 
-        print(f"  T값 초기화 완료. 다음 실행 시 새 사이클이 시작됩니다.")
+        print("  T값 초기화 완료. 다음 실행 시 새 사이클이 시작됩니다.")
         return
 
     orders = strategy_result["orders"]
@@ -337,7 +337,7 @@ def run_one_symbol(symbol_config):
         else:
             print("  가격: 시장가")
 
-    print(f"\n[Step 4] 주문 실행 중...")
+    print("\n[Step 4] 주문 실행 중...")
     print("-" * 60)
 
     order_exchange_code = convert_exchange_code(exchange)
@@ -360,7 +360,7 @@ def run_one_symbol(symbol_config):
                     if order_price > max_allowed_price:
                         corrected_price = adjust_price_to_tick(max_allowed_price)
                         print(f"  ⚠️ LOC 가격 보정: ${order_price:.2f} → ${corrected_price:.2f} (현재가 ${strategy_last_price:.2f} × 1.19 기준)")
-                        notify(f"⚠️ LOC 가격 보정\n원가격: ${order_price:.2f}\n현재가: ${strategy_last_price:.2f}\n보정가: ${corrected_price:.2f}")
+                        notify(f"{symbol} ⚠️ LOC 가격 보정\n원가격: ${order_price:.2f}\n현재가: ${strategy_last_price:.2f}\n보정가: ${corrected_price:.2f}")
                         order_price = corrected_price
 
             result = place_overseas_order(
@@ -388,7 +388,7 @@ def run_one_symbol(symbol_config):
 
                 print("✓ 주문 성공")
 
-                message = f"""✅ 주문 성공
+                message = f"""✅ 주문 성공 {symbol}
 
 {order['comment']}
 수량: {order['quantity']}주
@@ -426,7 +426,7 @@ def run_one_symbol(symbol_config):
                     )
                     print(f"✓ 예약주문 접수 완료 (주문번호: {resv_result['odno']})")
 
-                    message = f"""📋 예약주문 접수
+                    message = f"""📋 예약주문 접수 {symbol}
 
 {order['comment']}
 수량: {order['quantity']}주
@@ -442,7 +442,7 @@ def run_one_symbol(symbol_config):
                         }
                     )
                     notify(
-                        f"⚠️ 예약주문 실패\n\n{order['comment']}\n에러: {str(reservation_error)}",
+                        f"{symbol} ⚠️ 예약주문 실패\n\n{order['comment']}\n에러: {str(reservation_error)}",
                         urgent=True,
                     )
 
@@ -455,7 +455,7 @@ def run_one_symbol(symbol_config):
                 }
             )
 
-            message = f"""⚠️ 주문 실패
+            message = f"""⚠️ 주문 실패 {symbol}
 
 {order['comment']}
 에러: {str(error)}"""
@@ -518,9 +518,9 @@ def main():
         # ========================================
         # 설정 정보 출력
         # ========================================
-        print(f"\n[설정 정보]")
+        print("\n[설정 정보]")
         print(f"거래 모드: {TRADE_MODE}")
-        print(f"종목 목록:")
+        print("종목 목록:")
         for cfg in SYMBOLS:
             seed_info = f", 시드: ${cfg['seed']:.0f}" if cfg['seed'] > 0 else ""
             print(f"  - {cfg['symbol']}({cfg['exchange']}): "
