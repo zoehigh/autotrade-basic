@@ -169,6 +169,13 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         position_qty = 0
         avg_price = 0.0
 
+    # 보유 수량이 0이고 T==0(새 사이클로 판단)인 경우, 초회 진입을 허용하기 위해
+    # 평단가가 없다면 현재가로 대체합니다. (옵션: 학습용 간편 처리)
+    if position_qty == 0 and avg_price == 0.0 and T == 0:
+        if last_price > 0:
+            print(f"  ※ 보유 없음(초기 사이클) — 평단가가 없어 현재가 ${last_price}로 대체하여 진행합니다")
+            avg_price = last_price
+
     # ========================================
     # 3. 주문가능금액 조회 및 시드 적용
     # ========================================

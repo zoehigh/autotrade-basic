@@ -619,11 +619,11 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
     
-    # Step 2: 날짜 계산 (현지시각 기준 - 한국시간으로 계산)
-    today = datetime.now()
-    start_date = today - timedelta(days=days)
-    
-    ord_end_dt = today.strftime("%Y%m%d")
+    # Step 2: 날짜 계산 (KST 기준으로 API 요청 날짜를 생성)
+    now_kst = _get_kst_now()
+    start_date = now_kst - timedelta(days=days)
+
+    ord_end_dt = now_kst.strftime("%Y%m%d")
     ord_strt_dt = start_date.strftime("%Y%m%d")
     
     # Step 3: 거래소 코드와 통화 코드 변환
@@ -695,9 +695,29 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
             output = response_data.get("output", [])
 
             for item in output:
+                # ord_dt: YYYYMMDD, ord_tmd: HHMMSS (may be empty)
+                ord_dt = item.get("ord_dt", "")
+                ord_tmd_raw = item.get("ord_tmd", "")
+                ord_tmd = ord_tmd_raw.zfill(6) if ord_tmd_raw else ""
+
+                ord_datetime_kst_iso = None
+                ord_datetime_utc_iso = None
+                if ord_dt and ord_tmd:
+                    try:
+                        kst_dt = datetime.strptime(ord_dt + ord_tmd, "%Y%m%d%H%M%S")
+                        kst_dt = kst_dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                        ord_datetime_kst_iso = kst_dt.isoformat()
+                        ord_datetime_utc_iso = kst_dt.astimezone(ZoneInfo("UTC")).isoformat()
+                    except Exception as e:
+                        print(f"[주문이력] {symbol} ord_dt/ord_tmd 파싱 실패: ord_dt={ord_dt}, ord_tmd={ord_tmd_raw} ({e})")
+                        ord_datetime_kst_iso = None
+                        ord_datetime_utc_iso = None
+
                 order_history.append({
-                    "ord_dt": item.get("ord_dt", ""),              # 주문일자
-                    "ord_tmd": item.get("ord_tmd", ""),            # 주문시각
+                    "ord_dt": ord_dt,
+                    "ord_tmd": ord_tmd_raw,
+                    "ord_datetime_kst": ord_datetime_kst_iso,
+                    "ord_datetime_utc": ord_datetime_utc_iso,
                     "prdt_name": item.get("prdt_name", ""),        # 상품명 (종목명)
                     "sll_buy_dvsn_cd_name": item.get("sll_buy_dvsn_cd_name", ""),  # 매도/매수 (핵심)
                     "ft_ord_qty": item.get("ft_ord_qty", "0"),     # 주문수량

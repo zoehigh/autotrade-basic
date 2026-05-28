@@ -250,6 +250,8 @@ def run_one_symbol(symbol_config):
 
     order_history = get_overseas_order_history(symbol, exchange, days=history_days)
     state = update_T_from_history(symbol, state, order_history)
+    # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
+    save_state(symbol, state)
 
     T = state["T"]
     print(f"  현재 T값: {T}")
