@@ -18,11 +18,12 @@ from datetime import datetime
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history
+from state import load_state, save_state, update_T_from_history, compute_position_from_history
 from trader import (
     place_overseas_order,
     place_overseas_reservation_order,
     get_overseas_order_history,
+    get_overseas_balance,
     ReservationOrderRequired,
 )
 from notifier import notify
@@ -248,10 +249,77 @@ def run_one_symbol(symbol_config):
     else:
         history_days = 30
 
-    order_history = get_overseas_order_history(symbol, exchange, days=history_days)
+    # DRY 모드이면 사람이 읽기 쉬운 주문 이력 요약을 로그에 출력합니다.
+    order_history = get_overseas_order_history(
+        symbol,
+        exchange,
+        days=history_days,
+        verbose=(TRADE_MODE == "DRY"),
+        limit=10,
+    )
     state = update_T_from_history(symbol, state, order_history)
     # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
     save_state(symbol, state)
+
+    # ── 상태-잔고 교차검증 (conservative reconciliation) ──
+    try:
+        computed = compute_position_from_history(order_history, cycle_start_date=state.get("cycle_start_date", ""))
+    except Exception as e:
+        print(f"[상태 검증] 이력 기반 포지션 계산 실패: {e}")
+        computed = {"net_qty": 0, "avg_price": 0.0}
+
+    try:
+        live_balance = get_overseas_balance(symbol, exchange)
+        live_qty = int(float(live_balance.get("quantity", "0"))) if live_balance else 0
+        live_avg = float(live_balance.get("avg_price", "0")) if live_balance else 0.0
+    except Exception as e:
+        print(f"[상태 검증] 브로커 잔고 조회 실패: {e}")
+        live_balance = None
+        live_qty = None
+        live_avg = None
+
+    comp_qty = int(computed.get("net_qty", 0))
+    comp_avg = float(computed.get("avg_price", 0.0))
+
+    if live_qty is not None:
+        if live_qty == 0 and comp_qty > 0:
+            msg = (
+                f"[불일치] 이력으로는 보유 {comp_qty}주(평단 ${comp_avg:.2f})로 추정되나, 브로커 잔고는 0입니다. "
+                f"보수적 자동 보정: T=0으로 초기화합니다."
+            )
+            print(msg)
+            notify(msg)
+            state["balance_mismatch"] = {
+                "computed_net_qty": comp_qty,
+                "computed_avg_price": round(comp_avg, 2),
+                "live_qty": live_qty,
+                "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
+                "note": "auto-corrected-to-zero",
+            }
+            state["T"] = 0.0
+            state["cycle_start_date"] = ""
+            save_state(symbol, state)
+
+        elif live_qty != comp_qty:
+            # 불일치지만 자동 보정하지 않음 — 관리자 확인 필요
+            msg = (
+                f"[불일치] 이력 net_qty={comp_qty}, 브로커 잔고={live_qty}. 자동 보정하지 않습니다. 확인 필요."
+            )
+            print(msg)
+            notify(msg)
+            state["balance_mismatch"] = {
+                "computed_net_qty": comp_qty,
+                "computed_avg_price": round(comp_avg, 2),
+                "live_qty": live_qty,
+                "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
+                "note": "requires-attention",
+            }
+            save_state(symbol, state)
+        else:
+            # 일치하는 경우, 기존 불일치 표시 제거
+            if state.get("balance_mismatch"):
+                state.pop("balance_mismatch", None)
+                save_state(symbol, state)
 
     T = state["T"]
     print(f"  현재 T값: {T}")

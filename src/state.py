@@ -28,7 +28,16 @@ def load_state(symbol):
 
     if not os.path.exists(_STATE_FILE):
         print(f"[상태] {symbol} 상태 파일 없음 → T=0으로 시작합니다")
-        return {"T": 0.0, "last_updated": "", "cycle_start_date": "", "effective_seed": 0.0, "last_processed_ordno": ""}
+        return {
+            "T": 0.0,
+            "last_updated": "",
+            "cycle_start_date": "",
+            "effective_seed": 0.0,
+            "last_processed_ordno": "",
+            "additional_loc_odno": [],
+            "balance_mismatch": {},
+            "state_version": "v2",
+        }
 
     try:
         with open(_STATE_FILE, "r", encoding="utf-8") as f:
@@ -39,7 +48,16 @@ def load_state(symbol):
 
     if symbol not in all_states:
         print(f"[상태] {symbol} 상태 기록 없음 → T=0으로 시작합니다")
-        return {"T": 0.0, "last_updated": "", "cycle_start_date": "", "effective_seed": 0.0, "last_processed_ordno": ""}
+        return {
+            "T": 0.0,
+            "last_updated": "",
+            "cycle_start_date": "",
+            "effective_seed": 0.0,
+            "last_processed_ordno": "",
+            "additional_loc_odno": [],
+            "balance_mismatch": {},
+            "state_version": "v2",
+        }
 
     state = all_states[symbol]
     T = float(state.get("T", 0.0))
@@ -47,6 +65,10 @@ def load_state(symbol):
     cycle_start_date = state.get("cycle_start_date", "")
     effective_seed = float(state.get("effective_seed", 0.0))
     last_processed_ordno = state.get("last_processed_ordno", "")
+    additional_loc_odno = state.get("additional_loc_odno", [])
+    balance_mismatch = state.get("balance_mismatch", {})
+    state_version = state.get("state_version", "v1")
+
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
     return {
         "T": T,
@@ -54,6 +76,9 @@ def load_state(symbol):
         "cycle_start_date": cycle_start_date,
         "effective_seed": effective_seed,
         "last_processed_ordno": last_processed_ordno,
+        "additional_loc_odno": additional_loc_odno,
+        "balance_mismatch": balance_mismatch,
+        "state_version": state_version,
     }
 
 
@@ -86,12 +111,16 @@ def save_state(symbol, state_dict):
         # 기본값: 현재 UTC 시각 ISO
         last_updated_val = datetime.now(ZoneInfo("UTC")).isoformat()
 
+    # Allow optional new fields to be persisted for diagnostic purposes
     all_states[symbol] = {
         "T": float(state_dict.get("T", 0.0)),
         "last_updated": last_updated_val,
         "cycle_start_date": state_dict.get("cycle_start_date", ""),
         "effective_seed": float(state_dict.get("effective_seed", 0.0)),
         "last_processed_ordno": state_dict.get("last_processed_ordno", ""),
+        "additional_loc_odno": state_dict.get("additional_loc_odno", []),
+        "balance_mismatch": state_dict.get("balance_mismatch", {}),
+        "state_version": state_dict.get("state_version", "v2"),
     }
 
     with open(_STATE_FILE, "w", encoding="utf-8") as f:
@@ -101,7 +130,9 @@ def save_state(symbol, state_dict):
     effective_seed = all_states[symbol]["effective_seed"]
     last_upd = all_states[symbol].get("last_updated", "")
     last_ordno = all_states[symbol].get("last_processed_ordno", "")
-    print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}, last_updated={last_upd}, last_processed_ordno={last_ordno}")
+    mismatch = all_states[symbol].get("balance_mismatch")
+    mismatch_flag = "YES" if mismatch else "NO"
+    print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}, last_updated={last_upd}, last_processed_ordno={last_ordno}, balance_mismatch={mismatch_flag}")
 
 
 def update_T_from_history(symbol, state, order_history):
@@ -234,6 +265,68 @@ def _infer_T_from_full_history(symbol, state, order_history):
         pass
 
     return state
+
+
+def compute_position_from_history(order_history, cycle_start_date=None):
+    """
+    주문 이력을 시뮬레이션하여 현재 보유 수량과 추정 평단을 계산합니다.
+
+    - order_history: get_overseas_order_history()가 반환한 리스트(최신순이든 상관없음)
+    - cycle_start_date (optional): YYYY-MM-DD 형식으로 주면 그 날짜 이후의 이력만 사용
+
+    Returns: dict {"net_qty": int, "avg_price": float, "buy_count": int, "sell_count": int}
+    """
+    # 필터: 체결수량(>0) 있고 ord_datetime_utc가 있는 항목만 사용
+    filled = [o for o in order_history if int(float(o.get("ft_ccld_qty", "0"))) > 0 and o.get("ord_datetime_utc")]
+    if cycle_start_date:
+        # YYYY-MM-DD -> YYYYMMDD for comparison
+        ymd = cycle_start_date.replace("-", "")
+        filled = [o for o in filled if o.get("ord_dt", "") >= ymd]
+
+    # 정렬: 오래된 순
+    try:
+        filled_sorted = sorted(filled, key=lambda o: (o.get("ord_datetime_utc", ""), o.get("odno", "")))
+    except Exception:
+        filled_sorted = filled
+
+    lots = []  # list of (qty:int, price:float)
+    buy_count = 0
+    sell_count = 0
+
+    for o in filled_sorted:
+        side = o.get("sll_buy_dvsn_cd_name", "")
+        qty = int(float(o.get("ft_ccld_qty", "0")))
+        price = float(o.get("ft_ccld_unpr3", "0") or 0)
+
+        if side == "매수":
+            if qty > 0:
+                lots.append({"qty": qty, "price": price})
+                buy_count += 1
+
+        elif side == "매도":
+            remaining = qty
+            sell_count += 1
+            # FIFO 소거
+            while remaining > 0 and lots:
+                lot = lots[0]
+                if lot["qty"] > remaining:
+                    lot["qty"] -= remaining
+                    remaining = 0
+                else:
+                    remaining -= lot["qty"]
+                    lots.pop(0)
+            # 만약 매도량이 더 큰 경우(이상상태) 그냥 무시: 잔여 마이너스는 처리 안함
+
+    net_qty = sum(l["qty"] for l in lots) if lots else 0
+    avg_price = 0.0
+    if net_qty > 0:
+        total_val = sum(l["qty"] * l["price"] for l in lots)
+        try:
+            avg_price = total_val / net_qty
+        except Exception:
+            avg_price = 0.0
+
+    return {"net_qty": int(net_qty), "avg_price": round(avg_price, 4), "buy_count": buy_count, "sell_count": sell_count}
 
 
 def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno):

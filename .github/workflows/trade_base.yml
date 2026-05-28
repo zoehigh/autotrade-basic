@@ -63,11 +63,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .state.json
-          # run_id를 포함한 키로 이번 실행을 위한 새 캐시 자리를 예약합니다.
-          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-${{ github.run_id }}
-          # 정확히 일치하는 키가 없으면 같은 접두사의 가장 최신 캐시를 사용합니다.
+          # use a fixed key name so different runs/branches can restore the latest saved state
+          key: state-${{ inputs.kis_mode || 'default' }}-latest
+          # allow fallback to the same fixed key
           restore-keys: |
-            state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-
+            state-${{ inputs.kis_mode || 'default' }}-latest
 
       - name: Resolve and log inputs
         run: |
@@ -114,4 +114,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .state.json
-          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: state-${{ inputs.kis_mode || 'default' }}-latest

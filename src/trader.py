@@ -565,7 +565,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
         raise Exception(f"매수가능금액 조회 실패: {str(e)}")
 
 
-def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
+def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=False, limit=10):
     """
     한국투자증권 API를 사용하여 해외주식의 최근 주문체결내역을 조회합니다.
     
@@ -600,6 +600,10 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
               - 기타 필드 참고
         
         []: 체결내역이 없을 경우 빈 배열
+
+    Note:
+        - `verbose` (bool): True이면 사람이 읽기 쉬운 요약(최근 `limit`건)을 로그로 출력합니다.
+        - `limit` (int): `verbose`일 때 출력할 최근 건수(기본 10)
     
     Raises:
         Exception: API 호출 실패 또는 필수 정보 미설정 시 예외 발생
@@ -745,6 +749,52 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
             is_first_call = False
 
         print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
+
+        # Human-friendly summary (optional)
+        if verbose and order_history:
+            try:
+                n = int(limit) if limit and int(limit) > 0 else 10
+            except Exception:
+                n = 10
+            n = min(n, len(order_history))
+
+            print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
+            for item in order_history[:n]:
+                kst_iso = item.get("ord_datetime_kst")
+                if kst_iso:
+                    try:
+                        kst_dt = datetime.fromisoformat(kst_iso)
+                        kst_str = kst_dt.strftime("%Y-%m-%d %H:%M:%S") + " KST"
+                    except Exception:
+                        kst_str = kst_iso
+                else:
+                    ord_dt = item.get("ord_dt", "")
+                    ord_tmd = (item.get("ord_tmd") or "").zfill(6)
+                    if ord_dt and len(ord_dt) == 8 and ord_tmd:
+                        try:
+                            kst_str = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]} {ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]} KST"
+                        except Exception:
+                            kst_str = f"{ord_dt} {ord_tmd}"
+                    else:
+                        kst_str = "(시간없음)"
+
+                odno = item.get("odno", "")
+                side = item.get("sll_buy_dvsn_cd_name", "")
+                qty = item.get("ft_ccld_qty", "0")
+                price = item.get("ft_ccld_unpr3", "0")
+                amt = item.get("ft_ccld_amt3", "0")
+
+                try:
+                    price_s = f"{float(price):.2f}"
+                except Exception:
+                    price_s = price
+                try:
+                    amt_s = f"{float(amt):.2f}"
+                except Exception:
+                    amt_s = amt
+
+                print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+
         return order_history
 
     except requests.exceptions.RequestException as e:
