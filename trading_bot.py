@@ -328,34 +328,13 @@ def run_one_symbol(symbol_config):
     if REINVEST and effective_seed > 0:
         seed = effective_seed
         print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
+    # ── 사이클 종료 사전 감지 (전략 실행 전에) ─────────────────────────
+    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다
+    current_qty = live_qty if live_qty is not None else comp_qty
 
-    # ── Step 2: 전략 실행 ────────────────────────────────────────
-    print("\n[Step 2] 전략 실행 중...")
-
-    strategy_result = 무한매수법_V4(
-        symbol=symbol,
-        exchange_code=exchange,
-        splits=splits,
-        symbol_type=symbol_type,
-        seed=seed,
-        T=T,
-    )
-
-    print("✓ 전략 실행 완료")
-    print(f"  현재가: ${strategy_result['last_price']}")
-    print(f"  보유 수량: {strategy_result['position_qty']}주")
-    print(f"  평단가: ${strategy_result['avg_price']}")
-    print(f"  주문 가능 금액: ${strategy_result['orderable_cash']:.2f}")
-    print(f"  T값: {T} / {splits}")
-    if strategy_result['star_point']:
-        print(f"  별지점: ${strategy_result['star_point']:.2f}")
-
-    # ── 사이클 종료 감지 ─────────────────────────────────────────
-    # T > 0인데 보유 수량이 0이면 최종매도가 체결된 것으로 판단합니다.
-    position_qty = strategy_result["position_qty"]
-    if T > 0 and position_qty == 0:
+    if T > 0 and current_qty == 0:
         print(f"\n{'=' * 60}")
-        print(f"🏁 {symbol} 사이클 종료 감지 (T={T}, 보유수량=0)")
+        print(f"🏁 {symbol} 사이클 종료 감지 (사전) (T={T}, 보유수량={current_qty})")
         print(f"{'=' * 60}")
 
         report = generate_cycle_report(
@@ -385,6 +364,27 @@ def run_one_symbol(symbol_config):
 
         print("  T값 초기화 완료. 다음 실행 시 새 사이클이 시작됩니다.")
         return
+
+    # ── Step 2: 전략 실행 ───────────────────────────────────────
+    print("\n[Step 2] 전략 실행 중...")
+
+    strategy_result = 무한매수법_V4(
+        symbol=symbol,
+        exchange_code=exchange,
+        splits=splits,
+        symbol_type=symbol_type,
+        seed=seed,
+        T=T,
+    )
+
+    print("✓ 전략 실행 완료")
+    print(f"  현재가: ${strategy_result['last_price']}")
+    print(f"  보유 수량: {strategy_result['position_qty']}주")
+    print(f"  평단가: ${strategy_result['avg_price']}")
+    print(f"  주문 가능 금액: ${strategy_result['orderable_cash']:.2f}")
+    print(f"  T값: {T} / {splits}")
+    if strategy_result['star_point']:
+        print(f"  별지점: ${strategy_result['star_point']:.2f}")
 
     orders = strategy_result["orders"]
 
