@@ -51,7 +51,7 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
             try:
                 resp.raise_for_status()
                 return resp
-            except requests.exceptions.HTTPError as he:
+            except requests.exceptions.HTTPError:
                 # 서버가 JSON으로 에러코드를 제공하는 경우 메시지 확인
                 try:
                     data = resp.json()
@@ -352,7 +352,7 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
 
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # Step 1: 접근 토큰 획득
     try:
@@ -565,7 +565,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
         raise Exception(f"매수가능금액 조회 실패: {str(e)}")
 
 
-def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=False, limit=10):
+def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=False, limit=100):
     """
     한국투자증권 API를 사용하여 해외주식의 최근 주문체결내역을 조회합니다.
     
@@ -614,7 +614,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
 
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
     
     # Step 1: 접근 토큰 획득
     try:
@@ -675,6 +675,8 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
     ctx_area_fk200 = ""
     is_first_call = True
 
+    print(f"[주문이력] {symbol} 체결내역 조회 시작: ord_strt_dt={ord_strt_dt}, ord_end_dt={ord_end_dt}")
+
     try:
         while True:
             headers = dict(base_headers)
@@ -686,10 +688,12 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
                 params["CTX_AREA_NK200"] = ctx_area_nk200
                 params["CTX_AREA_FK200"] = ctx_area_fk200
 
+            print(f"[주문이력] {symbol} 체결내역 페이지 조회 시도: ord_strt_dt={ord_strt_dt}, ord_end_dt={ord_end_dt}, tr_cont={headers.get('tr_cont', '첫페이지')}")
             response = _request_with_rate_retry("GET", url, headers=headers, params=params)
             response.raise_for_status()
 
             response_data = response.json()
+            print(f"[주문이력] {symbol} 체결내역 페이지 조회 성공: {len(response_data.get('output', []))}건, tr_cont={response.headers.get('tr_cont', '')}")
 
             if response_data.get("rt_cd") != "0":
                 msg = response_data.get("msg1", "알 수 없는 에러")
@@ -737,9 +741,9 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
                 })
 
             # Step 9: 다음 페이지 여부 확인
-            # tr_cont가 "M"이면 더 가져올 데이터가 있음
+            # tr_cont가 "F" or "M"이면 더 가져올 데이터가 있음
             tr_cont = response.headers.get("tr_cont", "")
-            if tr_cont != "M":
+            if tr_cont != "M" and tr_cont != "F":
                 # "D", "E" 또는 빈 값이면 마지막 페이지
                 break
 
@@ -753,9 +757,9 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
         # Human-friendly summary (optional)
         if verbose and order_history:
             try:
-                n = int(limit) if limit and int(limit) > 0 else 10
+                n = int(limit) if limit and int(limit) > 0 else 100
             except Exception:
-                n = 10
+                n = 100
             n = min(n, len(order_history))
 
             print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
@@ -845,7 +849,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
     
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # 모의투자에서 지원하지 않는 주문 유형을 대체합니다.
     # 한국투자증권 모의투자 API는 LOC(34·장마감지정가) 등 일부 주문 유형을 지원하지 않습니다.
@@ -997,7 +1001,7 @@ def place_overseas_reservation_order(symbol: str, exchange_code: str, quantity: 
     from config import KIS_ACCOUNT_NO, ACNT_PRDT_CD
 
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # TR_ID 결정: 실전/모의 및 매수/매도/아시아 구분
     if KIS_MODE == "real":

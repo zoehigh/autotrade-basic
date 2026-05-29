@@ -3,6 +3,7 @@
 # 프로그램이 종료되어도 T값을 잃지 않도록 JSON 파일에 보관합니다.
 import json
 import os
+from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -190,6 +191,37 @@ def update_T_from_history(symbol, state, order_history):
         return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno)
 
 
+def _compute_net_qty_up_to(order_history, cutoff_dt):
+    """
+    cutoff_dt 이전(포함)의 체결 이력을 기반으로 순보유수량을 계산합니다.
+    매도 체결이 쿼터매도인지 최종매도인지 판별하기 위한 기준 수량 산출에 사용됩니다.
+    """
+    qty = 0
+    for o in order_history:
+        odt_iso = o.get("ord_datetime_utc")
+        if not odt_iso:
+            continue
+        try:
+            o_dt = datetime.fromisoformat(odt_iso)
+            if o_dt.tzinfo is None:
+                o_dt = o_dt.replace(tzinfo=ZoneInfo("UTC"))
+            else:
+                o_dt = o_dt.astimezone(ZoneInfo("UTC"))
+        except Exception:
+            continue
+        if o_dt > cutoff_dt:
+            continue
+        filled = int(float(o.get("ft_ccld_qty", "0")))
+        if filled <= 0:
+            continue
+        side = o.get("sll_buy_dvsn_cd_name", "")
+        if side == "매수":
+            qty += filled
+        elif side == "매도":
+            qty -= filled
+    return max(0, qty)
+
+
 def _infer_T_from_full_history(symbol, state, order_history):
     """
     전체 주문 이력을 처음부터 스캔하여 T값을 추정합니다.
@@ -197,6 +229,11 @@ def _infer_T_from_full_history(symbol, state, order_history):
     무상태 봇에서 4.0으로 업그레이드하거나 state.json이 없는 경우에 사용됩니다.
     순보유수량(net_qty)을 추적하여 전량매도(사이클 종료) 시점을 감지합니다.
     이전 사이클이 여러 번 있었어도 마지막 사이클의 T값만 반영합니다.
+
+    ⚠️ 소액 시드 한계:
+    1회 분할 금액 / 주가 ≤ 1 이면 정상 매수도 qty=1이 되어 추가매수와 구분이 불가합니다.
+    이 경우 T가 실제보다 낮게 추정될 수 있습니다.
+    함수 실행 후 경고가 출력되면 .state.json 의 "T" 값을 직접 확인하고 수정하세요.
     """
     # 체결 완료된 주문만 추출(타임스탬프가 있는 항목 우선)
     filled_orders = [
@@ -217,29 +254,66 @@ def _infer_T_from_full_history(symbol, state, order_history):
     print(f"[상태] {symbol} 초기 상태 감지 → 전체 이력 {len(sorted_orders)}건에서 T 자동 추정 시작")
 
     T = 0.0
-    net_qty = 0          # 순보유수량: 매수 시 +, 매도 시 -
+    net_qty = 0
     cycle_start_ord_dt = ""
+    small_seed_days = 0  # qty=1 매수만 있어서 정상매수/추가매수 구분이 불가능한 날 수
 
+    # 날짜(ord_dt)별로 그룹화하여 처리합니다.
+    # 같은 날 여러 매수 체결이 있어도 qty > 1인 것만 정상 매수로 간주합니다.
+    # qty == 1인 매수는 급락 대비 추가매수(1주씩)로 간주하여 T 계산에서 제외합니다.
+    orders_by_date = defaultdict(list)
     for order in sorted_orders:
-        buy_sell = order.get("sll_buy_dvsn_cd_name", "")
-        qty = int(float(order.get("ft_ccld_qty", "0")))
         ord_dt = order.get("ord_dt", "")
+        if ord_dt:
+            orders_by_date[ord_dt].append(order)
 
-        if buy_sell == "매수":
+    for ord_dt in sorted(orders_by_date.keys()):
+        day_orders = orders_by_date[ord_dt]
+
+        day_sells = [o for o in day_orders if o.get("sll_buy_dvsn_cd_name") == "매도"]
+        day_buys  = [o for o in day_orders if o.get("sll_buy_dvsn_cd_name") == "매수"]
+
+        # 매도 처리: 보유수량 대비 비율로 쿼터매도(T×0.75) / 최종매도(T=0) 구분
+        # 쿼터매도: 보유량의 ~25% 매도 → 비율 < 0.5
+        # 최종매도: 보유량의 ~75% 매도 → 비율 >= 0.5
+        for order in day_sells:
+            sell_qty = int(float(order.get("ft_ccld_qty", "0")))
+            if net_qty > 0:
+                ratio = sell_qty / net_qty
+                if ratio >= 0.5:
+                    T = 0.0
+                    cycle_start_ord_dt = ""
+                else:
+                    T = round(T * 0.75, 4)
+            else:
+                T = round(T * 0.75, 4)
+            net_qty = max(0, net_qty - sell_qty)
+
+        # qty > 1인 매수만 정상 매수로 간주합니다. qty == 1인 매수는 추가매수(급락 대비, 1주씩)로 처리합니다.
+        # ⚠️ 한계: 시드가 적어 1회 분할 금액으로 1주만 살 수 있는 경우,
+        #          정상 매수도 qty=1이 되어 추가매수로 잘못 분류될 수 있습니다.
+        #          이 경우 small_seed_days 카운터가 증가하고, 함수 끝에서 경고가 출력됩니다.
+        normal_buys     = [o for o in day_buys if int(float(o.get("ft_ccld_qty", "0"))) > 1]
+        additional_buys = [o for o in day_buys if int(float(o.get("ft_ccld_qty", "0"))) <= 1]
+
+        # 매수 체결은 있는데 정상 매수(qty>1)가 하나도 없는 날 → 소액 시드 의심
+        if day_buys and not normal_buys:
+            small_seed_days += 1
+
+        for o in additional_buys:
+            net_qty += int(float(o.get("ft_ccld_qty", "0")))
+
+        if normal_buys:
             if T == 0:
                 cycle_start_ord_dt = ord_dt
-            net_qty += qty
-            T += 1.0
-
-        elif buy_sell == "매도":
-            net_qty -= qty
-            T = T * 0.75
-
-            # 순보유수량이 0 이하 = 전량매도 = 사이클 종료
-            if net_qty <= 0:
-                net_qty = 0
-                T = 0.0
-                cycle_start_ord_dt = ""
+            # 하루 정상 매수 건수로 T 증가량 결정:
+            # 2건 이상 → 전반전 분할매수 두 건 모두 체결 → +1.0
+            # 1건     → 전반전 한 건만 체결 또는 후반전 단일 매수 → +0.5
+            buy_count = len(normal_buys)
+            delta_T = 1.0 if buy_count >= 2 else 0.5
+            T = round(T + delta_T, 4)
+            for o in normal_buys:
+                net_qty += int(float(o.get("ft_ccld_qty", "0")))
 
     # 사이클 시작일 설정 (state에 아직 없는 경우만)
     if cycle_start_ord_dt and len(cycle_start_ord_dt) == 8 and not state.get("cycle_start_date"):
@@ -253,6 +327,15 @@ def _infer_T_from_full_history(symbol, state, order_history):
         print("  ※ 자동 추정값입니다. 값이 틀리면 .state.json 파일에서 T를 직접 수정하세요.")
     else:
         print(f"[상태] {symbol} 이력 스캔 결과 현재 보유 없음 → T=0으로 시작합니다")
+
+    # 소액 시드 경고: qty=1 매수만 있는 날이 있으면 T가 실제보다 낮을 수 있습니다
+    if small_seed_days > 0:
+        print("")
+        print(f"[경고] {symbol} qty=1 매수만 체결된 날 {small_seed_days}일 발견됨")
+        print("  → 1회 분할 금액으로 1주만 살 수 있는 소액 시드 환경일 수 있습니다")
+        print("  → 정상 매수(T +0.5)가 추가매수로 잘못 분류되어 T가 낮게 추정되었을 수 있습니다")
+        print(f"  → 현재 추정 T={state['T']} 가 실제보다 낮을 수 있으니 .state.json 에서 직접 확인/수정하세요")
+        print("")
 
     # 초기 추정 시 처리한 가장 최신 주문의 타임스탬프/주문번호를 상태에 기록
     try:
@@ -380,16 +463,66 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     recent_candidates.sort(key=lambda tup: (tup[0], tup[1] or ""))
 
     T = state.get("T", 0.0)
+    additional_loc_odno = state.get("additional_loc_odno", [])
+
+    # 매도 분류를 위해 기준 시점의 순보유수량을 미리 계산합니다
+    net_qty = _compute_net_qty_up_to(order_history, last_updated_dt)
+
     print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 {len(recent_candidates)}건 발견 → T값 업데이트 시작 (현재 T={T})")
 
     last_dt_processed = last_updated_dt
     last_ordno_processed = last_processed_ordno
 
+    # 날짜(ord_dt)별로 그룹화하여 처리합니다
+    orders_by_date = defaultdict(list)
     for o_dt, odno, order in recent_candidates:
-        buy_sell = order.get("sll_buy_dvsn_cd_name", "")
         ord_dt = order.get("ord_dt", "")
+        if ord_dt:
+            orders_by_date[ord_dt].append((o_dt, odno, order))
 
-        if buy_sell == "매수":
+    for ord_dt in sorted(orders_by_date.keys()):
+        day_items = orders_by_date[ord_dt]
+        day_items.sort(key=lambda tup: (tup[0], tup[1] or ""))
+
+        day_sells = [(o_dt, odno, o) for o_dt, odno, o in day_items if o.get("sll_buy_dvsn_cd_name") == "매도"]
+        day_buys  = [(o_dt, odno, o) for o_dt, odno, o in day_items if o.get("sll_buy_dvsn_cd_name") == "매수"]
+
+        # 매도 처리: 보유수량 대비 비율로 쿼터매도(T×0.75) / 최종매도(T=0) 구분
+        for o_dt, odno, order in day_sells:
+            sell_qty = int(float(order.get("ft_ccld_qty", "0")))
+            if net_qty > 0:
+                ratio = sell_qty / net_qty
+                if ratio >= 0.5:
+                    T = 0.0
+                    state["cycle_start_date"] = ""
+                    print(f"  → 매도 체결 ({ord_dt}): 최종매도 감지 (비율={ratio:.2f}) → T=0")
+                else:
+                    T = round(T * 0.75, 4)
+                    print(f"  → 매도 체결 ({ord_dt}): 쿼터매도 (비율={ratio:.2f}) → T={T}")
+            else:
+                T = round(T * 0.75, 4)
+                print(f"  → 매도 체결 ({ord_dt}): 쿼터매도 (보유수량 불명) → T={T}")
+            net_qty = max(0, net_qty - sell_qty)
+            if o_dt > last_dt_processed:
+                last_dt_processed = o_dt
+                last_ordno_processed = odno or last_ordno_processed
+            elif o_dt == last_dt_processed and odno:
+                last_ordno_processed = odno
+
+        # 매수 처리: additional_loc_odno에 있는 건은 추가매수로 제외
+        normal_buys = [(o_dt, odno, o) for o_dt, odno, o in day_buys if odno not in additional_loc_odno]
+        skip_buys   = [(o_dt, odno, o) for o_dt, odno, o in day_buys if odno in additional_loc_odno]
+
+        for o_dt, odno, order in skip_buys:
+            net_qty += int(float(order.get("ft_ccld_qty", "0")))
+            print(f"  → 매수 체결 ({ord_dt}): 추가매수 주문 제외 → T 변경 없음")
+            if o_dt > last_dt_processed:
+                last_dt_processed = o_dt
+                last_ordno_processed = odno or last_ordno_processed
+            elif o_dt == last_dt_processed and odno:
+                last_ordno_processed = odno
+
+        if normal_buys:
             if T == 0 and not state.get("cycle_start_date"):
                 if len(ord_dt) == 8:
                     cycle_start = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}"
@@ -398,27 +531,23 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 state["cycle_start_date"] = cycle_start
                 print(f"  → 새 사이클 시작일 기록: {cycle_start}")
 
-            order_odno = order.get("odno", "")
-            additional_loc_odno = state.get("additional_loc_odno", [])
-            if order_odno and order_odno in additional_loc_odno:
-                print(f"  → 매수 체결 ({ord_dt}): 추가매수 주문 제외 → T 변경 없음")
-            else:
-                T += 1.0
-                print(f"  → 매수 체결 ({ord_dt}): T += 1 → T={T}")
+            # 하루 정상 매수 건수로 T 증가량 결정:
+            # 2건 이상 → 전반전 분할매수 두 건 모두 체결 → +1.0
+            # 1건     → 전반전 한 건만 체결 또는 후반전 단일 매수 → +0.5
+            buy_count = len(normal_buys)
+            delta_T = 1.0 if buy_count >= 2 else 0.5
+            T = round(T + delta_T, 4)
+            print(f"  → 매수 체결 ({ord_dt}): {buy_count}건 → T += {delta_T} → T={T}")
 
-        elif buy_sell == "매도":
-            T = T * 0.75
-            print(f"  → 매도 체결 ({ord_dt}): T = T * 0.75 → T={T}")
-
-        # 최신 처리 시점/주문번호 업데이트
-        if o_dt > last_dt_processed:
-            last_dt_processed = o_dt
-            last_ordno_processed = odno or last_ordno_processed
-        elif o_dt == last_dt_processed and odno:
-            last_ordno_processed = odno
+            for o_dt, odno, order in normal_buys:
+                net_qty += int(float(order.get("ft_ccld_qty", "0")))
+                if o_dt > last_dt_processed:
+                    last_dt_processed = o_dt
+                    last_ordno_processed = odno or last_ordno_processed
+                elif o_dt == last_dt_processed and odno:
+                    last_ordno_processed = odno
 
     state["T"] = round(T, 4)
-    # 처리한 마지막 주문의 UTC ISO와 주문번호를 기록
     try:
         state["last_updated"] = last_dt_processed.isoformat()
         state["last_processed_ordno"] = last_ordno_processed or ""

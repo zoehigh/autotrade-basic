@@ -255,7 +255,6 @@ def run_one_symbol(symbol_config):
         exchange,
         days=history_days,
         verbose=(TRADE_MODE == "DRY"),
-        limit=10,
     )
     state = update_T_from_history(symbol, state, order_history)
     # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
@@ -544,16 +543,16 @@ def run_one_symbol(symbol_config):
         print("\n💡 DRY 모드로 실행되었습니다.")
         print("   실제 주문은 실행되지 않았으며, 주문 정보만 출력되었습니다.")
         print(f"   총 {len(orders)}개 주문이 처리되었습니다.")
-        print("\n   실제 주문을 하려면 .env 파일에서 TRADE_MODE=LIVE로 설정하세요.")
+        print("\n   실제 주문을 하려면 환경변수 또는 .env 파일에서 TRADE_MODE=LIVE 로 설정하세요.")
     else:
         print("\n✓ LIVE 모드로 실행되었습니다.")
         print(f"   총 {len(orders)}개 주문 중:")
-        print(f"   - 체결 성공: {len(executed_orders)}개")
+        print(f"   - 주문 성공: {len(executed_orders)}개")
         print(f"   - 예약 접수: {len(reserved_orders)}개")
         print(f"   - 실패:     {len(failed_orders)}개")
 
     if executed_orders:
-        print("\n[체결 주문]")
+        print("\n[성공한 주문]")
         for order in executed_orders:
             print(f"  ✓ {order['comment']}: 주문번호 {order['odno']} (시각: {order['ord_tmd']})")
 
