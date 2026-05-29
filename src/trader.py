@@ -51,7 +51,7 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
             try:
                 resp.raise_for_status()
                 return resp
-            except requests.exceptions.HTTPError as he:
+            except requests.exceptions.HTTPError:
                 # 서버가 JSON으로 에러코드를 제공하는 경우 메시지 확인
                 try:
                     data = resp.json()
@@ -352,7 +352,7 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
 
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # Step 1: 접근 토큰 획득
     try:
@@ -565,7 +565,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
         raise Exception(f"매수가능금액 조회 실패: {str(e)}")
 
 
-def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
+def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=False, limit=100):
     """
     한국투자증권 API를 사용하여 해외주식의 최근 주문체결내역을 조회합니다.
     
@@ -600,6 +600,10 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
               - 기타 필드 참고
         
         []: 체결내역이 없을 경우 빈 배열
+
+    Note:
+        - `verbose` (bool): True이면 사람이 읽기 쉬운 요약(최근 `limit`건)을 로그로 출력합니다.
+        - `limit` (int): `verbose`일 때 출력할 최근 건수(기본 10)
     
     Raises:
         Exception: API 호출 실패 또는 필수 정보 미설정 시 예외 발생
@@ -610,7 +614,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
 
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
     
     # Step 1: 접근 토큰 획득
     try:
@@ -619,11 +623,11 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
     
-    # Step 2: 날짜 계산 (현지시각 기준 - 한국시간으로 계산)
-    today = datetime.now()
-    start_date = today - timedelta(days=days)
-    
-    ord_end_dt = today.strftime("%Y%m%d")
+    # Step 2: 날짜 계산 (KST 기준으로 API 요청 날짜를 생성)
+    now_kst = _get_kst_now()
+    start_date = now_kst - timedelta(days=days)
+
+    ord_end_dt = now_kst.strftime("%Y%m%d")
     ord_strt_dt = start_date.strftime("%Y%m%d")
     
     # Step 3: 거래소 코드와 통화 코드 변환
@@ -671,6 +675,8 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
     ctx_area_fk200 = ""
     is_first_call = True
 
+    print(f"[주문이력] {symbol} 체결내역 조회 시작: ord_strt_dt={ord_strt_dt}, ord_end_dt={ord_end_dt}")
+
     try:
         while True:
             headers = dict(base_headers)
@@ -682,10 +688,12 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
                 params["CTX_AREA_NK200"] = ctx_area_nk200
                 params["CTX_AREA_FK200"] = ctx_area_fk200
 
+            print(f"[주문이력] {symbol} 체결내역 페이지 조회 시도: ord_strt_dt={ord_strt_dt}, ord_end_dt={ord_end_dt}, tr_cont={headers.get('tr_cont', '첫페이지')}")
             response = _request_with_rate_retry("GET", url, headers=headers, params=params)
             response.raise_for_status()
 
             response_data = response.json()
+            print(f"[주문이력] {symbol} 체결내역 페이지 조회 성공: {len(response_data.get('output', []))}건, tr_cont={response.headers.get('tr_cont', '')}")
 
             if response_data.get("rt_cd") != "0":
                 msg = response_data.get("msg1", "알 수 없는 에러")
@@ -695,9 +703,29 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
             output = response_data.get("output", [])
 
             for item in output:
+                # ord_dt: YYYYMMDD, ord_tmd: HHMMSS (may be empty)
+                ord_dt = item.get("ord_dt", "")
+                ord_tmd_raw = item.get("ord_tmd", "")
+                ord_tmd = ord_tmd_raw.zfill(6) if ord_tmd_raw else ""
+
+                ord_datetime_kst_iso = None
+                ord_datetime_utc_iso = None
+                if ord_dt and ord_tmd:
+                    try:
+                        kst_dt = datetime.strptime(ord_dt + ord_tmd, "%Y%m%d%H%M%S")
+                        kst_dt = kst_dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                        ord_datetime_kst_iso = kst_dt.isoformat()
+                        ord_datetime_utc_iso = kst_dt.astimezone(ZoneInfo("UTC")).isoformat()
+                    except Exception as e:
+                        print(f"[주문이력] {symbol} ord_dt/ord_tmd 파싱 실패: ord_dt={ord_dt}, ord_tmd={ord_tmd_raw} ({e})")
+                        ord_datetime_kst_iso = None
+                        ord_datetime_utc_iso = None
+
                 order_history.append({
-                    "ord_dt": item.get("ord_dt", ""),              # 주문일자
-                    "ord_tmd": item.get("ord_tmd", ""),            # 주문시각
+                    "ord_dt": ord_dt,
+                    "ord_tmd": ord_tmd_raw,
+                    "ord_datetime_kst": ord_datetime_kst_iso,
+                    "ord_datetime_utc": ord_datetime_utc_iso,
                     "prdt_name": item.get("prdt_name", ""),        # 상품명 (종목명)
                     "sll_buy_dvsn_cd_name": item.get("sll_buy_dvsn_cd_name", ""),  # 매도/매수 (핵심)
                     "ft_ord_qty": item.get("ft_ord_qty", "0"),     # 주문수량
@@ -713,9 +741,9 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
                 })
 
             # Step 9: 다음 페이지 여부 확인
-            # tr_cont가 "M"이면 더 가져올 데이터가 있음
+            # tr_cont가 "F" or "M"이면 더 가져올 데이터가 있음
             tr_cont = response.headers.get("tr_cont", "")
-            if tr_cont != "M":
+            if tr_cont != "M" and tr_cont != "F":
                 # "D", "E" 또는 빈 값이면 마지막 페이지
                 break
 
@@ -725,6 +753,52 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30):
             is_first_call = False
 
         print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
+
+        # Human-friendly summary (optional)
+        if verbose and order_history:
+            try:
+                n = int(limit) if limit and int(limit) > 0 else 100
+            except Exception:
+                n = 100
+            n = min(n, len(order_history))
+
+            print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
+            for item in order_history[:n]:
+                kst_iso = item.get("ord_datetime_kst")
+                if kst_iso:
+                    try:
+                        kst_dt = datetime.fromisoformat(kst_iso)
+                        kst_str = kst_dt.strftime("%Y-%m-%d %H:%M:%S") + " KST"
+                    except Exception:
+                        kst_str = kst_iso
+                else:
+                    ord_dt = item.get("ord_dt", "")
+                    ord_tmd = (item.get("ord_tmd") or "").zfill(6)
+                    if ord_dt and len(ord_dt) == 8 and ord_tmd:
+                        try:
+                            kst_str = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]} {ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]} KST"
+                        except Exception:
+                            kst_str = f"{ord_dt} {ord_tmd}"
+                    else:
+                        kst_str = "(시간없음)"
+
+                odno = item.get("odno", "")
+                side = item.get("sll_buy_dvsn_cd_name", "")
+                qty = item.get("ft_ccld_qty", "0")
+                price = item.get("ft_ccld_unpr3", "0")
+                amt = item.get("ft_ccld_amt3", "0")
+
+                try:
+                    price_s = f"{float(price):.2f}"
+                except Exception:
+                    price_s = price
+                try:
+                    amt_s = f"{float(amt):.2f}"
+                except Exception:
+                    amt_s = amt
+
+                print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+
         return order_history
 
     except requests.exceptions.RequestException as e:
@@ -775,7 +849,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
     
     # 필수 설정 검증: KIS_ACCOUNT_NO는 필수입니다
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # 모의투자에서 지원하지 않는 주문 유형을 대체합니다.
     # 한국투자증권 모의투자 API는 LOC(34·장마감지정가) 등 일부 주문 유형을 지원하지 않습니다.
@@ -927,7 +1001,7 @@ def place_overseas_reservation_order(symbol: str, exchange_code: str, quantity: 
     from config import KIS_ACCOUNT_NO, ACNT_PRDT_CD
 
     if not KIS_ACCOUNT_NO:
-        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
+        raise Exception("KIS_ACCOUNT_NO가 설정되어 있지 않습니다. 환경변수 또는 .env 파일에 KIS_ACCOUNT_NO를 추가하세요.")
 
     # TR_ID 결정: 실전/모의 및 매수/매도/아시아 구분
     if KIS_MODE == "real":

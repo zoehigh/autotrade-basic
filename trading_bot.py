@@ -18,11 +18,12 @@ from datetime import datetime
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history
+from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state
 from trader import (
     place_overseas_order,
     place_overseas_reservation_order,
     get_overseas_order_history,
+    get_overseas_balance,
     ReservationOrderRequired,
 )
 from notifier import notify
@@ -248,8 +249,76 @@ def run_one_symbol(symbol_config):
     else:
         history_days = 30
 
-    order_history = get_overseas_order_history(symbol, exchange, days=history_days)
+    # DRY 모드이면 사람이 읽기 쉬운 주문 이력 요약을 로그에 출력합니다.
+    order_history = get_overseas_order_history(
+        symbol,
+        exchange,
+        days=history_days,
+        verbose=(TRADE_MODE == "DRY"),
+    )
     state = update_T_from_history(symbol, state, order_history)
+    # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
+    save_state(symbol, state)
+
+    # ── 상태-잔고 교차검증 (conservative reconciliation) ──
+    try:
+        computed = compute_position_from_history(order_history, cycle_start_date=state.get("cycle_start_date", ""))
+    except Exception as e:
+        print(f"[상태 검증] 이력 기반 포지션 계산 실패: {e}")
+        computed = {"net_qty": 0, "avg_price": 0.0}
+
+    try:
+        live_balance = get_overseas_balance(symbol, exchange)
+        live_qty = int(float(live_balance.get("quantity", "0"))) if live_balance else 0
+        live_avg = float(live_balance.get("avg_price", "0")) if live_balance else 0.0
+    except Exception as e:
+        print(f"[상태 검증] 브로커 잔고 조회 실패: {e}")
+        live_balance = None
+        live_qty = None
+        live_avg = None
+
+    comp_qty = int(computed.get("net_qty", 0))
+    comp_avg = float(computed.get("avg_price", 0.0))
+
+    if live_qty is not None:
+        if live_qty == 0 and comp_qty > 0:
+            msg = (
+                f"[불일치] 이력으로는 보유 {comp_qty}주(평단 ${comp_avg:.2f})로 추정되나, 브로커 잔고는 0입니다. "
+                f"보수적 자동 보정: T=0으로 초기화합니다."
+            )
+            print(msg)
+            notify(msg)
+            state["balance_mismatch"] = {
+                "computed_net_qty": comp_qty,
+                "computed_avg_price": round(comp_avg, 2),
+                "live_qty": live_qty,
+                "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
+                "note": "auto-corrected-to-zero",
+            }
+            state["T"] = 0.0
+            state["cycle_start_date"] = ""
+            save_state(symbol, state)
+
+        elif live_qty != comp_qty:
+            # 불일치지만 자동 보정하지 않음 — 관리자 확인 필요
+            msg = (
+                f"[불일치] 이력 net_qty={comp_qty}, 브로커 잔고={live_qty}. 자동 보정하지 않습니다. 확인 필요."
+            )
+            print(msg)
+            notify(msg)
+            state["balance_mismatch"] = {
+                "computed_net_qty": comp_qty,
+                "computed_avg_price": round(comp_avg, 2),
+                "live_qty": live_qty,
+                "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
+                "note": "requires-attention",
+            }
+            save_state(symbol, state)
+        else:
+            # 일치하는 경우, 기존 불일치 표시 제거
+            if state.get("balance_mismatch"):
+                state.pop("balance_mismatch", None)
+                save_state(symbol, state)
 
     T = state["T"]
     print(f"  현재 T값: {T}")
@@ -382,9 +451,25 @@ def run_one_symbol(symbol_config):
                     }
                 )
 
-                # 추가매수 주문은 T값 증가 대상에서 제외되므로 주문번호를 상태에 기록합니다
-                if "[추가매수]" in order.get("comment", ""):
+                is_additional = "[추가매수]" in order.get("comment", "")
+
+                # 기존: additional_loc_odno 유지 (레거시 호환)
+                if is_additional:
                     state.setdefault("additional_loc_odno", []).append(result["odno"])
+
+                # 신규: orders_meta에 t_target 등록
+                # strategy가 t_target을 제공하면 그대로 사용, 없으면 fallback
+                t_target = order.get("t_target")
+                if t_target is None:
+                    t_target = 0.0 if is_additional else 1.0
+
+                register_order_meta_in_state(state, result["odno"], {
+                    "side": order["side"],
+                    "total_qty": int(order["quantity"]),
+                    "t_target": float(t_target),
+                    "is_additional": bool(is_additional),
+                    "processed_filled_qty": 0,
+                })
 
                 print("✓ 주문 성공")
 
@@ -424,6 +509,22 @@ def run_one_symbol(symbol_config):
                             "rsvn_ord_rcit_dt": resv_result["rsvn_ord_rcit_dt"],
                         }
                     )
+
+                    # 예약주문도 orders_meta에 등록
+                    is_additional_resv = "[추가매수]" in order.get("comment", "")
+                    if is_additional_resv:
+                        state.setdefault("additional_loc_odno", []).append(resv_result["odno"])
+                    t_target_resv = order.get("t_target")
+                    if t_target_resv is None:
+                        t_target_resv = 0.0 if is_additional_resv else 1.0
+                    register_order_meta_in_state(state, resv_result["odno"], {
+                        "side": order["side"],
+                        "total_qty": int(order["quantity"]),
+                        "t_target": float(t_target_resv),
+                        "is_additional": bool(is_additional_resv),
+                        "processed_filled_qty": 0,
+                    })
+
                     print(f"✓ 예약주문 접수 완료 (주문번호: {resv_result['odno']})")
 
                     message = f"""📋 예약주문 접수 {symbol}
@@ -474,16 +575,16 @@ def run_one_symbol(symbol_config):
         print("\n💡 DRY 모드로 실행되었습니다.")
         print("   실제 주문은 실행되지 않았으며, 주문 정보만 출력되었습니다.")
         print(f"   총 {len(orders)}개 주문이 처리되었습니다.")
-        print("\n   실제 주문을 하려면 .env 파일에서 TRADE_MODE=LIVE로 설정하세요.")
+        print("\n   실제 주문을 하려면 환경변수 또는 .env 파일에서 TRADE_MODE=LIVE 로 설정하세요.")
     else:
         print("\n✓ LIVE 모드로 실행되었습니다.")
         print(f"   총 {len(orders)}개 주문 중:")
-        print(f"   - 체결 성공: {len(executed_orders)}개")
+        print(f"   - 주문 성공: {len(executed_orders)}개")
         print(f"   - 예약 접수: {len(reserved_orders)}개")
         print(f"   - 실패:     {len(failed_orders)}개")
 
     if executed_orders:
-        print("\n[체결 주문]")
+        print("\n[성공한 주문]")
         for order in executed_orders:
             print(f"  ✓ {order['comment']}: 주문번호 {order['odno']} (시각: {order['ord_tmd']})")
 

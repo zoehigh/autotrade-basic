@@ -169,6 +169,13 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         position_qty = 0
         avg_price = 0.0
 
+    # 보유 수량이 0이고 T==0(새 사이클로 판단)인 경우, 초회 진입을 허용하기 위해
+    # 평단가가 없다면 현재가로 대체합니다. (옵션: 학습용 간편 처리)
+    if position_qty == 0 and avg_price == 0.0 and T == 0:
+        if last_price > 0:
+            print(f"  ※ 보유 없음(초기 사이클) — 평단가가 없어 현재가 ${last_price}로 대체하여 진행합니다")
+            avg_price = last_price
+
     # ========================================
     # 3. 주문가능금액 조회 및 시드 적용
     # ========================================
@@ -264,6 +271,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
             "price": entry_price,
             "order_type": "LOC",
             "comment": "초기 진입 (1회 매수)",
+            "t_target": 1.0,
         })
 
     else:
@@ -280,6 +288,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                     "price": sell_star_price,
                     "order_type": "LOC",
                     "comment": "쿼터매도 (별지점 LOC) — 체결 시 T = T × 0.75",
+                    "t_target": 0.0,
                 })
 
             if remaining_qty > 0:
@@ -289,6 +298,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                     "price": take_profit_price,
                     "order_type": "LIMIT",
                     "comment": "최종매도 지정가 — 체결 시 T 리셋 후 재진입",
+                    "t_target": 0.0,
                 })
 
         # ── 매수 주문 (전반전 / 후반전 구분) ─────────────────────────
@@ -309,6 +319,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "price": star_buy_price,
                         "order_type": "LOC",
                         "comment": "전반전 별지점 매수 (절반 매수) — 체결 시 T += 0.5",
+                        "t_target": 0.5,
                     })
 
                 if qty_at_avg > 0:
@@ -318,6 +329,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "price": avg_buy_price,
                         "order_type": "LOC",
                         "comment": "전반전 평단 매수 (절반 매수) — 체결 시 T += 0.5",
+                        "t_target": 0.5,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))
@@ -332,6 +344,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                             "price": add_price,
                             "order_type": "LOC",
                             "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                            "t_target": 0.0,
                         })
 
             else:
@@ -345,6 +358,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "price": star_buy_price,
                         "order_type": "LOC",
                         "comment": "후반전 별지점 매수 (1회 매수) — 체결 시 T += 1",
+                        "t_target": 1.0,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (qty_at_star + i))
@@ -359,6 +373,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                             "price": add_price,
                             "order_type": "LOC",
                             "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                            "t_target": 0.0,
                         })
         else:
             # avg_price가 없는데 T > 0인 경우 (상태 불일치): 별지점 계산 불가
