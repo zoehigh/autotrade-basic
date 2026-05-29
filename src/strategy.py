@@ -178,11 +178,11 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
 
     remaining_seed = None
     if seed > 0:
-        current_position_value = position_qty * last_price
-        remaining_seed = max(seed - current_position_value, 0.0)
+        current_use_value = position_qty * avg_price
+        remaining_seed = max(seed - current_use_value, 0.0)
         orderable_cash = min(orderable_cash, remaining_seed)
         print(
-            f"  시드 적용: ${seed:.2f} (보유 평가금액 ${current_position_value:.2f} 차감 후 "
+            f"  시드 적용: ${seed:.2f} (사용한 금액 ${current_use_value:.2f} 차감 후 "
             f"${orderable_cash:.2f} 사용)"
         )
 
