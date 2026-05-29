@@ -18,7 +18,7 @@ from datetime import datetime
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history, compute_position_from_history
+from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state
 from trader import (
     place_overseas_order,
     place_overseas_reservation_order,
@@ -451,9 +451,25 @@ def run_one_symbol(symbol_config):
                     }
                 )
 
-                # 추가매수 주문은 T값 증가 대상에서 제외되므로 주문번호를 상태에 기록합니다
-                if "[추가매수]" in order.get("comment", ""):
+                is_additional = "[추가매수]" in order.get("comment", "")
+
+                # 기존: additional_loc_odno 유지 (레거시 호환)
+                if is_additional:
                     state.setdefault("additional_loc_odno", []).append(result["odno"])
+
+                # 신규: orders_meta에 t_target 등록
+                # strategy가 t_target을 제공하면 그대로 사용, 없으면 fallback
+                t_target = order.get("t_target")
+                if t_target is None:
+                    t_target = 0.0 if is_additional else 1.0
+
+                register_order_meta_in_state(state, result["odno"], {
+                    "side": order["side"],
+                    "total_qty": int(order["quantity"]),
+                    "t_target": float(t_target),
+                    "is_additional": bool(is_additional),
+                    "processed_filled_qty": 0,
+                })
 
                 print("✓ 주문 성공")
 
@@ -493,6 +509,22 @@ def run_one_symbol(symbol_config):
                             "rsvn_ord_rcit_dt": resv_result["rsvn_ord_rcit_dt"],
                         }
                     )
+
+                    # 예약주문도 orders_meta에 등록
+                    is_additional_resv = "[추가매수]" in order.get("comment", "")
+                    if is_additional_resv:
+                        state.setdefault("additional_loc_odno", []).append(resv_result["odno"])
+                    t_target_resv = order.get("t_target")
+                    if t_target_resv is None:
+                        t_target_resv = 0.0 if is_additional_resv else 1.0
+                    register_order_meta_in_state(state, resv_result["odno"], {
+                        "side": order["side"],
+                        "total_qty": int(order["quantity"]),
+                        "t_target": float(t_target_resv),
+                        "is_additional": bool(is_additional_resv),
+                        "processed_filled_qty": 0,
+                    })
+
                     print(f"✓ 예약주문 접수 완료 (주문번호: {resv_result['odno']})")
 
                     message = f"""📋 예약주문 접수 {symbol}

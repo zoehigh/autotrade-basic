@@ -36,6 +36,7 @@ def load_state(symbol):
             "effective_seed": 0.0,
             "last_processed_ordno": "",
             "additional_loc_odno": [],
+            "orders_meta": {},
             "balance_mismatch": {},
             "state_version": "v2",
         }
@@ -56,6 +57,7 @@ def load_state(symbol):
             "effective_seed": 0.0,
             "last_processed_ordno": "",
             "additional_loc_odno": [],
+            "orders_meta": {},
             "balance_mismatch": {},
             "state_version": "v2",
         }
@@ -67,6 +69,7 @@ def load_state(symbol):
     effective_seed = float(state.get("effective_seed", 0.0))
     last_processed_ordno = state.get("last_processed_ordno", "")
     additional_loc_odno = state.get("additional_loc_odno", [])
+    orders_meta = state.get("orders_meta", {})
     balance_mismatch = state.get("balance_mismatch", {})
     state_version = state.get("state_version", "v1")
 
@@ -78,6 +81,7 @@ def load_state(symbol):
         "effective_seed": effective_seed,
         "last_processed_ordno": last_processed_ordno,
         "additional_loc_odno": additional_loc_odno,
+        "orders_meta": orders_meta,
         "balance_mismatch": balance_mismatch,
         "state_version": state_version,
     }
@@ -120,6 +124,7 @@ def save_state(symbol, state_dict):
         "effective_seed": float(state_dict.get("effective_seed", 0.0)),
         "last_processed_ordno": state_dict.get("last_processed_ordno", ""),
         "additional_loc_odno": state_dict.get("additional_loc_odno", []),
+        "orders_meta": state_dict.get("orders_meta", {}),
         "balance_mismatch": state_dict.get("balance_mismatch", {}),
         "state_version": state_dict.get("state_version", "v2"),
     }
@@ -134,6 +139,28 @@ def save_state(symbol, state_dict):
     mismatch = all_states[symbol].get("balance_mismatch")
     mismatch_flag = "YES" if mismatch else "NO"
     print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}, last_updated={last_upd}, last_processed_ordno={last_ordno}, balance_mismatch={mismatch_flag}")
+
+
+def register_order_meta_in_state(state, odno, meta):
+    """
+    주문 메타 정보를 state의 orders_meta에 저장합니다.
+
+    Parameters:
+        state (dict): 현재 상태 딕셔너리
+        odno (str): 주문번호
+        meta (dict): 저장할 메타 정보
+            - side (str): 'BUY' 또는 'SELL'
+            - total_qty (int): 주문 수량
+            - t_target (float): 체결 완료 시 증가할 T 목표값 (0.0, 0.5, 1.0 등)
+            - is_additional (bool): 추가매수 여부 (True면 T 변화 없음)
+            - processed_filled_qty (int): 이미 T에 반영된 체결 수량
+    """
+    state.setdefault("orders_meta", {})[str(odno)] = meta
+
+
+def get_order_meta(state, odno):
+    """state의 orders_meta에서 odno 메타를 반환하거나 None."""
+    return state.get("orders_meta", {}).get(str(odno))
 
 
 def update_T_from_history(symbol, state, order_history):
@@ -293,8 +320,18 @@ def _infer_T_from_full_history(symbol, state, order_history):
         # ⚠️ 한계: 시드가 적어 1회 분할 금액으로 1주만 살 수 있는 경우,
         #          정상 매수도 qty=1이 되어 추가매수로 잘못 분류될 수 있습니다.
         #          이 경우 small_seed_days 카운터가 증가하고, 함수 끝에서 경고가 출력됩니다.
-        normal_buys     = [o for o in day_buys if int(float(o.get("ft_ccld_qty", "0"))) > 1]
-        additional_buys = [o for o in day_buys if int(float(o.get("ft_ccld_qty", "0"))) <= 1]
+        orders_meta = state.get("orders_meta", {})
+
+        def _is_additional_buy(o):
+            odno = str(o.get("odno", ""))
+            if odno and odno in orders_meta:
+                # meta가 있으면 is_additional 필드만 신뢰한다 (qty 무관)
+                return bool(orders_meta[odno].get("is_additional", False))
+            # meta가 없으면 qty로 추론 (레거시 폴백: 1주 = 추가매수)
+            return int(float(o.get("ft_ccld_qty", "0"))) <= 1
+
+        normal_buys     = [o for o in day_buys if not _is_additional_buy(o)]
+        additional_buys = [o for o in day_buys if _is_additional_buy(o)]
 
         # 매수 체결은 있는데 정상 매수(qty>1)가 하나도 없는 날 → 소액 시드 의심
         if day_buys and not normal_buys:
@@ -306,14 +343,26 @@ def _infer_T_from_full_history(symbol, state, order_history):
         if normal_buys:
             if T == 0:
                 cycle_start_ord_dt = ord_dt
-            # 하루 정상 매수 건수로 T 증가량 결정:
-            # 2건 이상 → 전반전 분할매수 두 건 모두 체결 → +1.0
-            # 1건     → 전반전 한 건만 체결 또는 후반전 단일 매수 → +0.5
-            buy_count = len(normal_buys)
-            delta_T = 1.0 if buy_count >= 2 else 0.5
-            T = round(T + delta_T, 4)
-            for o in normal_buys:
-                net_qty += int(float(o.get("ft_ccld_qty", "0")))
+            meta_buys   = [o for o in normal_buys if orders_meta.get(str(o.get("odno", "")))]
+            legacy_buys = [o for o in normal_buys if not orders_meta.get(str(o.get("odno", "")))]
+            for o in meta_buys:
+                odno = str(o.get("odno", ""))
+                meta = orders_meta[odno]
+                qty = int(float(o.get("ft_ccld_qty", "0")))
+                total_qty = int(meta.get("total_qty") or qty)
+                processed = int(meta.get("processed_filled_qty", 0))
+                new_filled = max(0, qty - processed)
+                if new_filled > 0 and total_qty > 0:
+                    delta_T = round((new_filled / total_qty) * float(meta.get("t_target", 1.0)), 4)
+                    T = round(T + delta_T, 4)
+                    meta["processed_filled_qty"] = processed + new_filled
+                net_qty += qty
+            if legacy_buys:
+                buy_count = len(legacy_buys)
+                delta_T = 1.0 if buy_count >= 2 else 0.5
+                T = round(T + delta_T, 4)
+                for o in legacy_buys:
+                    net_qty += int(float(o.get("ft_ccld_qty", "0")))
 
     # 사이클 시작일 설정 (state에 아직 없는 경우만)
     if cycle_start_ord_dt and len(cycle_start_ord_dt) == 8 and not state.get("cycle_start_date"):
@@ -509,13 +558,22 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             elif o_dt == last_dt_processed and odno:
                 last_ordno_processed = odno
 
-        # 매수 처리: additional_loc_odno에 있는 건은 추가매수로 제외
-        normal_buys = [(o_dt, odno, o) for o_dt, odno, o in day_buys if odno not in additional_loc_odno]
-        skip_buys   = [(o_dt, odno, o) for o_dt, odno, o in day_buys if odno in additional_loc_odno]
+        # 매수 처리
+        # 우선순위: orders_meta.is_additional → additional_loc_odno(레거시) → orders_meta.t_target → 건수 폴백
+        orders_meta = state.get("orders_meta", {})
+
+        skip_buys   = [
+            (o_dt, odno, o) for o_dt, odno, o in day_buys
+            if odno in additional_loc_odno or orders_meta.get(odno, {}).get("is_additional")
+        ]
+        normal_buys = [
+            (o_dt, odno, o) for o_dt, odno, o in day_buys
+            if odno not in additional_loc_odno and not orders_meta.get(odno, {}).get("is_additional")
+        ]
 
         for o_dt, odno, order in skip_buys:
             net_qty += int(float(order.get("ft_ccld_qty", "0")))
-            print(f"  → 매수 체결 ({ord_dt}): 추가매수 주문 제외 → T 변경 없음")
+            print(f"  → 매수 체결 ({ord_dt}): 추가매수(odno={odno}) 제외 → T 변경 없음")
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
                 last_ordno_processed = odno or last_ordno_processed
@@ -531,21 +589,41 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 state["cycle_start_date"] = cycle_start
                 print(f"  → 새 사이클 시작일 기록: {cycle_start}")
 
-            # 하루 정상 매수 건수로 T 증가량 결정:
-            # 2건 이상 → 전반전 분할매수 두 건 모두 체결 → +1.0
-            # 1건     → 전반전 한 건만 체결 또는 후반전 단일 매수 → +0.5
-            buy_count = len(normal_buys)
-            delta_T = 1.0 if buy_count >= 2 else 0.5
-            T = round(T + delta_T, 4)
-            print(f"  → 매수 체결 ({ord_dt}): {buy_count}건 → T += {delta_T} → T={T}")
+            # meta가 있는 주문: t_target 기반으로 각각 반영 (부분체결 비례 처리)
+            meta_buys   = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if orders_meta.get(odno)]
+            legacy_buys = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if not orders_meta.get(odno)]
 
-            for o_dt, odno, order in normal_buys:
-                net_qty += int(float(order.get("ft_ccld_qty", "0")))
+            for o_dt, odno, order in meta_buys:
+                meta = orders_meta[odno]
+                qty = int(float(order.get("ft_ccld_qty", "0")))
+                total_qty = int(meta.get("total_qty") or qty)
+                processed = int(meta.get("processed_filled_qty", 0))
+                new_filled = max(0, qty - processed)
+                if new_filled > 0 and total_qty > 0:
+                    delta_T = round((new_filled / total_qty) * float(meta.get("t_target", 1.0)), 4)
+                    T = round(T + delta_T, 4)
+                    meta["processed_filled_qty"] = processed + new_filled
+                    print(f"  → 매수 체결 ({ord_dt}): odno={odno} t_target={meta.get('t_target')} 부분체결({new_filled}/{total_qty}) → ΔT={delta_T} → T={T}")
+                net_qty += qty
                 if o_dt > last_dt_processed:
                     last_dt_processed = o_dt
                     last_ordno_processed = odno or last_ordno_processed
                 elif o_dt == last_dt_processed and odno:
                     last_ordno_processed = odno
+
+            # meta가 없는 주문(레거시): 건수 기반 폴백
+            if legacy_buys:
+                buy_count = len(legacy_buys)
+                delta_T = 1.0 if buy_count >= 2 else 0.5
+                T = round(T + delta_T, 4)
+                print(f"  → 매수 체결 ({ord_dt}): 레거시 {buy_count}건 → T += {delta_T} → T={T}")
+                for o_dt, odno, order in legacy_buys:
+                    net_qty += int(float(order.get("ft_ccld_qty", "0")))
+                    if o_dt > last_dt_processed:
+                        last_dt_processed = o_dt
+                        last_ordno_processed = odno or last_ordno_processed
+                    elif o_dt == last_dt_processed and odno:
+                        last_ordno_processed = odno
 
     state["T"] = round(T, 4)
     try:
