@@ -323,11 +323,6 @@ def run_one_symbol(symbol_config):
     T = state["T"]
     print(f"  현재 T값: {T}")
 
-    # ── 복리 재투자: effective_seed가 있으면 env 시드 대신 사용 ──
-    effective_seed = state.get("effective_seed", 0.0)
-    if REINVEST and effective_seed > 0:
-        seed = effective_seed
-        print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
     # ── 사이클 종료 사전 감지 (전략 실행 전에) ─────────────────────────
     # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다
     current_qty = live_qty if live_qty is not None else comp_qty
@@ -337,11 +332,14 @@ def run_one_symbol(symbol_config):
         print(f"🏁 {symbol} 사이클 종료 감지 (사전) (T={T}, 보유수량={current_qty})")
         print(f"{'=' * 60}")
 
+        _used_seed = state.get("effective_seed", 0.0)
+        if not (REINVEST and _used_seed > 0):
+            _used_seed = seed
         report = generate_cycle_report(
             symbol=symbol,
             order_history=order_history,
             state=state,
-            seed=seed,
+            seed=_used_seed,
             commission_rate=COMMISSION_RATE,
         )
 
@@ -362,8 +360,16 @@ def run_one_symbol(symbol_config):
         state["cycle_start_date"] = ""
         save_state(symbol, state)
 
-        print("  T값 초기화 완료. 다음 실행 시 새 사이클이 시작됩니다.")
-        return
+        print("  T값 초기화 완료. 새 사이클을 즉시 시작합니다.")
+        T = 0.0
+        # ── Step 2로 계속 진행 (새 사이클 즉시 시작) ──
+
+    # ── seed 적용 (복리 재투자) ────────────────────────────────
+    if REINVEST:
+        effective_seed = state.get("effective_seed", 0.0)
+        if effective_seed > 0:
+            seed = effective_seed
+            print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
 
     # ── Step 2: 전략 실행 ───────────────────────────────────────
     print("\n[Step 2] 전략 실행 중...")
