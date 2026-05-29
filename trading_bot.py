@@ -645,7 +645,8 @@ def main():
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]
                 print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
-                notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
+                    notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
 
             if len(SYMBOLS) > 1:
                 time.sleep(1)
