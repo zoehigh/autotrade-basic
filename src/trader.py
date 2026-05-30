@@ -890,7 +890,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
         if not _is_kst_regular_market(now_kst):
             # 예약주문 가능시간이 아닌 경우에는 일반 예외로 중단
             if not _is_kst_reserve_window(now_kst):
-                raise Exception("SIM_MODE: 예약주문 가능시간이 아닙니다 (KST 기준)")
+                raise Exception("모의투자: 예약주문 가능시간이 아닙니다 (KST 기준)")
             # 정규장 외이지만 예약주문 가능시간 → 호출자에게 예약주문 필요 신호를 보냅니다.
             # place_overseas_order는 일반 주문 엔드포인트만 담당하므로
             # 예약주문 엔드포인트 호출은 호출자가 직접 처리합니다.
