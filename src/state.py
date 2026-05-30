@@ -221,7 +221,7 @@ def update_T_from_history(symbol, state, order_history):
 def _compute_net_qty_up_to(order_history, cutoff_dt):
     """
     cutoff_dt 이전(포함)의 체결 이력을 기반으로 순보유수량을 계산합니다.
-    매도 체결이 쿼터매도인지 최종매도인지 판별하기 위한 기준 수량 산출에 사용됩니다.
+    매도 체결이 쿼터매도/목표매도/전량매도인지 판별하기 위한 기준 수량 산출에 사용됩니다.
     """
     qty = 0
     for o in order_history:
@@ -300,16 +300,19 @@ def _infer_T_from_full_history(symbol, state, order_history):
         day_sells = [o for o in day_orders if o.get("sll_buy_dvsn_cd_name") == "매도"]
         day_buys  = [o for o in day_orders if o.get("sll_buy_dvsn_cd_name") == "매수"]
 
-        # 매도 처리: 보유수량 대비 비율로 쿼터매도(T×0.75) / 최종매도(T=0) 구분
-        # 쿼터매도: 보유량의 ~25% 매도 → 비율 < 0.5
-        # 최종매도: 보유량의 ~75% 매도 → 비율 >= 0.5
+        # 매도 처리: 보유수량 대비 비율로 쿼터매도 / 목표매도 / 전량매도 구분
+        # 쿼터매도: 보유량의 ~25% 매도 → 비율 < 0.5 → T × 0.75
+        # 목표매도: 보유량의 ~75% 매도 → 0.5 <= 비율 < 1.0 → T × 0.25
+        # 전량매도: 보유량 100% → 비율 >= 1.0 → T = 0 (사이클 종료)
         for order in day_sells:
             sell_qty = int(float(order.get("ft_ccld_qty", "0")))
             if net_qty > 0:
                 ratio = sell_qty / net_qty
-                if ratio >= 0.5:
+                if ratio >= 1.0:
                     T = 0.0
                     cycle_start_ord_dt = ""
+                elif ratio >= 0.5:
+                    T = round(T * 0.25, 4)
                 else:
                     T = round(T * 0.75, 4)
             else:
@@ -536,15 +539,21 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         day_sells = [(o_dt, odno, o) for o_dt, odno, o in day_items if o.get("sll_buy_dvsn_cd_name") == "매도"]
         day_buys  = [(o_dt, odno, o) for o_dt, odno, o in day_items if o.get("sll_buy_dvsn_cd_name") == "매수"]
 
-        # 매도 처리: 보유수량 대비 비율로 쿼터매도(T×0.75) / 최종매도(T=0) 구분
+        # 매도 처리: 보유수량 대비 비율로 쿼터매도 / 목표매도 / 전량매도 구분
+        # 쿼터매도: 보유량의 ~25% → 비율 < 0.5 → T × 0.75
+        # 목표매도: 보유량의 ~75% → 0.5 <= 비율 < 1.0 → T × 0.25
+        # 전량매도: 보유량 100% → 비율 >= 1.0 → T = 0 (사이클 종료)
         for o_dt, odno, order in day_sells:
             sell_qty = int(float(order.get("ft_ccld_qty", "0")))
             if net_qty > 0:
                 ratio = sell_qty / net_qty
-                if ratio >= 0.5:
+                if ratio >= 1.0:
                     T = 0.0
                     state["cycle_start_date"] = ""
-                    print(f"  → 매도 체결 ({ord_dt}): 최종매도 감지 (비율={ratio:.2f}) → T=0")
+                    print(f"  → 매도 체결 ({ord_dt}): 전량매도 (비율={ratio:.2f}) → T=0")
+                elif ratio >= 0.5:
+                    T = round(T * 0.25, 4)
+                    print(f"  → 매도 체결 ({ord_dt}): 목표매도 (비율={ratio:.2f}) → T={T}")
                 else:
                     T = round(T * 0.75, 4)
                     print(f"  → 매도 체결 ({ord_dt}): 쿼터매도 (비율={ratio:.2f}) → T={T}")
@@ -689,7 +698,8 @@ def _apply_recent_history(symbol, state, order_history, last_updated):
                 print(f"  → 매수 체결 ({ord_dt}): T += 1 → T={T}")
 
         elif buy_sell == "매도":
-            # 최종매도 감지 및 T 리셋은 trading_bot.py에서 position_qty 기준으로 처리합니다.
+            # 모든 매도는 보수적으로 T × 0.75 처리합니다.
+            # 정확한 T 반영은 _apply_recent_history_dt()의 비율 기반 로직이 수행합니다.
             T = T * 0.75
             print(f"  → 매도 체결 ({ord_dt}): T = T * 0.75 → T={T}")
 

@@ -110,8 +110,8 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
     - T값(누적 매수 횟수)에 따라 별지점이 자동으로 조정됩니다.
     - 전반전(T < splits/2): 절반은 별지점 LOC, 절반은 평단 LOC로 분산 매수
     - 후반전(T >= splits/2): 전체를 별지점 LOC에 집중 매수
-    - 항상 쿼터매도(LOC) + 지정가 최종매도 두 개의 매도 주문을 함께 제출합니다.
-        - 최종 익절가는 symbol_type 기준 고정 배율을 사용합니다.
+    - 항상 쿼터매도(LOC) + 지정가 목표매도 두 개의 매도 주문을 함께 제출합니다.
+        - 목표 익절가는 symbol_type 기준 고정 배율을 사용합니다.
             (TQQQ: 평단 x 1.15, SOXL: 평단 x 1.20)
 
         왜 고정 배율을 쓰나요?
@@ -138,7 +138,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
             - unit_qty: 1회 매수 수량 (unit_amount / last_price)
             - star_point: 별지점 가격
             - star_buy_price: 매수점 (별지점 - 0.01)
-            - take_profit_price: 최종 익절가 (TQQQ: 평단×1.15, SOXL: 평단×1.20)
+            - take_profit_price: 목표 익절가 (TQQQ: 평단×1.15, SOXL: 평단×1.20)
             - orders: 예상 주문 목록
 
     Raises:
@@ -297,7 +297,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                     "quantity": remaining_qty,
                     "price": take_profit_price,
                     "order_type": "LIMIT",
-                    "comment": "최종매도 지정가 — 체결 시 T 리셋 후 재진입",
+                    "comment": "목표매도 지정가 — 체결 시 T × 0.25 (보유수량 0이면 사이클 종료)",
                     "t_target": 0.0,
                 })
 
