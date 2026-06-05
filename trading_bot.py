@@ -220,6 +220,7 @@ def run_one_symbol(symbol_config):
     splits = symbol_config["splits"]
     symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
+    additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
 
     print(f"\n{'=' * 60}")
     print(f"종목 처리 시작: {symbol} ({exchange})")
@@ -381,6 +382,7 @@ def run_one_symbol(symbol_config):
         symbol_type=symbol_type,
         seed=seed,
         T=T,
+        additional_loc_levels=additional_loc_levels,
     )
 
     print("✓ 전략 실행 완료")

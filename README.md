@@ -1,58 +1,149 @@
 # autotrade-basic — 자동매매 봇
 
 KIS(한국투자증권) Open API를 사용한 미국 주식 자동매매 학습용 프로젝트입니다.  
-무상태 무한매수법 전략을 기반으로 동작하며, GitHub Actions에서 자동 실행됩니다.
+**무한매수법 V4** 전략을 기반으로 동작하며, GitHub Actions에서 `repository_dispatch`로 트리거됩니다.
 
 ---
 
 ## 프로젝트 구조
 
 ```
-trading_bot.py        # 메인 실행 파일 (주문 루프 · 결과 요약)
+trading_bot.py        # 전체 파이프라인 실행 (state → 전략 → 주문실행 → 저장)
+tests/
+  test_dryrun.py      # 전략 미리보기 CLI (상태/주문 비접촉, what-if 검증용)
+  test_state_t_updates.py  # T값 업데이트 유닛 테스트
+  ...
 src/
-  strategy.py         # 무상태 무한매수법 전략 로직
+  strategy.py         # 무한매수법 V4 전략 로직
   trader.py           # KIS API 호출 래퍼 (주문 · 예약주문 · 잔고 · 시세)
-  authentication.py   # 액세스 토큰 발급
+  state.py            # 상태 관리 (state.json 로드/저장, T값 추적)
   config.py           # 환경변수 로드
+  authentication.py   # 액세스 토큰 발급
   notifier.py         # 알림 헬퍼
   telegram.py         # 텔레그램 전송
 .github/workflows/
   trade_base.yml      # 재사용 가능한 공통 실행 베이스
-  trade_real.yml      # 실전 계좌 워크플로우 (기본 TRADE_MODE=LIVE)
-  trade_demo.yml      # 모의 계좌 워크플로우 (기본 TRADE_MODE=DRY)
+  trade_real.yml      # 실전 계좌
+  trade_demo.yml      # 모의 계좌
+.state.json           # 상태 파일 (자동 생성, .gitignore 권장)
 ```
 
 ---
 
-## 전략 개요 — 무상태 무한매수법
+## 전략 개요 — 무한매수법 V4
 
-1. **포지션 없음**: 현재가로 초기 진입 (2 × 단위수량, LIMIT 주문)
-2. **포지션 있음 — 익절 조건 충족**: 전량 매도 (LIMIT 주문)
-3. **포지션 있음 — 추가 매수**:
-   - 평단가에 LOC 매수 (단위수량)
-   - 큰수 기준가에 LOC 매수 (단위수량)
+V4는 **T값(누적 매수 횟수)** 기반으로 매수/매도가 자동 조정되는 전략입니다.
 
-> 전략은 `trading_bot.py`에서 주문 목록만 생성하고, 실제 API 호출은 `trader.py`가 담당합니다.
+### 핵심 개념
 
----
-
-## 주문 흐름
-
-```
-place_overseas_order()         # /trading/order (일반 주문)
-  └─ 모의 + 정규장 외 시간
-       └─ ReservationOrderRequired 예외 발생
-            └─ place_overseas_reservation_order()  # /trading/order-resv (예약주문)
-```
-
-실행 후 주문은 4가지로 집계됩니다:
-
-| 구분 | 설명 |
+| 용어 | 설명 |
 |------|------|
-| 체결 성공 | `/trading/order` 정상 접수 |
-| 예약 접수 | `/trading/order-resv` 예약 완료 (다음 정규장 시작 시 체결) |
-| 실패 | 일반/예약 주문 모두 실패 |
-| 건너뜀 | 매도 주문 (현재 미지원) |
+| **분할 (splits)** | 전체 시드를 나눌 횟수 (20 또는 40) |
+| **T값** | 현재까지 소진한 분할 횟수 (매수 시 증가, 매도 시 감소) |
+| **1회 매수금 (unit_amount)** | `남은자금 / (splits - T)` |
+| **별지점 (star point)** | `평단 × (1 + 별%)` — T가 높을수록 평단에 가까워짐 |
+| **추가매수 LOC** | 급락 대비 1주씩 N단계 LOC (T 변화 없음) |
+
+### 별지점 공식
+
+| 종목 | 20분할 | 40분할 |
+|------|--------|--------|
+| TQQQ | 별% = (15 - 1.5×T)% | 별% = (15 - 0.75×T)% |
+| SOXL | 별% = (20 - 2×T)% | 별% = (20 - T)% |
+
+### 매수 전략
+
+- **전반전** (T < splits/2): 절반은 별지점 LOC, 절반은 평단 LOC — 각각 체결 시 T += 0.5
+- **후반전** (T >= splits/2): 전액 별지점 LOC에 집중 — 체결 시 T += 1.0
+- **추가매수 LOC**: 라오어 공식 `unit_amount / (기준수량 + i)`로 N단계 가격 설정, 1주씩 LOC
+
+### 매도 전략 (항상 두 개를 동시 제출)
+
+| 주문 | 수량 | 가격 | 유형 | 체결 시 T |
+|------|------|------|------|----------|
+| **쿼터매도** | 보유량의 ≈25% | 별지점가 | LOC | T × 0.75 |
+| **목표매도** | 잔량 | 익절가 (TQQQ: 평단×1.15, SOXL: 평단×1.20) | LIMIT | T × 0.25 |
+
+### 초기 진입 (T=0, 포지션 없음)
+
+- 현재가 기준 별% 위 가격에 LOC 1회 매수 (t_target=1.0)
+- 추가매수 LOC N단계 동시 제출
+
+### 사이클 종료
+
+- 매도 체결로 보유수량 = 0 → `T = 0` 초기화 → 새 사이클 자동 시작
+- 종료 시 `generate_cycle_report()`로 수익률 리포트 생성
+
+### 소진
+
+- `T >= splits` 시 모든 분할을 소진한 것으로 판단, 더 이상 주문을 생성하지 않음
+
+---
+
+## 실행 방법
+
+### 1. 전략 미리보기 — `tests/test_dryrun.py`
+
+**상태나 API 주문을 전혀 건드리지 않고** `무한매수법_V4()` 전략의 결과만 출력합니다.
+파라미터를 조정해 what-if 시나리오를 검증할 때 사용합니다.
+
+```bash
+# 기본 설정 (SYMBOLS 첫 번째 종목, 실제 API 잔고 기반)
+uv run python tests/test_dryrun.py
+
+# What-if: T=5, 시드 $10,000, 20분할로 테스트
+TEST_T=5 TEST_SEED=10000 TEST_SPLITS=20 uv run python tests/test_dryrun.py
+```
+
+### 2. 전체 파이프라인 실행 — `trading_bot.py`
+
+실제 운영 파이프라인을 실행합니다:
+
+```bash
+# DRY 모드: 주문을 생성만 하고 실행하지 않음
+TRADE_MODE=DRY uv run python trading_bot.py
+
+# LIVE 모드: 실제 주문 실행
+TRADE_MODE=LIVE uv run python trading_bot.py
+```
+
+### 두 실행 방식 비교
+
+| 항목 | `tests/test_dryrun.py` | `trading_bot.py` |
+|------|------------------------|------------------|
+| 상태 로드/저장 (`state.json`) | ❌ | ✅ |
+| 체결 이력 반영 (T 갱신) | ❌ | ✅ |
+| 잔고 교차검증 | ❌ | ✅ |
+| 사이클 종료 감지 | ❌ | ✅ |
+| 실제 주문 실행 | ❌ | ✅ (LIVE) / 출력만 (DRY) |
+| Telegram 알림 | ❌ | ✅ |
+| 대상 종목 | 1개 (TEST_SYMBOL 또는 SYMBOLS[0]) | SYMBOLS 전체 |
+| 목적 | **전략 what-if 검증** | **운영 자동매매** |
+
+---
+
+## 상태 관리
+
+각 종목의 상태는 `.state.json` 파일에 저장됩니다.
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `T` | float | 누적 매수 횟수 |
+| `last_updated` | str (ISO) | 마지막으로 T에 반영된 체결 시각 (UTC) |
+| `cycle_start_date` | str | 현재 사이클 시작일 (YYYY-MM-DD) |
+| `effective_seed` | float | 복리 재투자 적용 시드 (REINVEST 활성 시) |
+| `orders_meta` | dict | 주문별 메타 (t_target, is_additional, 부분체결 추적) |
+| `last_processed_ordno` | str | 마지막 처리 주문번호 |
+| `balance_mismatch` | dict | 잔고 불일치 진단 정보 |
+
+`update_T_from_history()`가 체결 이력을 기반으로 T값을 자동 갱신하며, 브로커 잔고와 이력 기반 포지션을 교차검증해 불일치를 감지합니다.
+
+---
+
+## 복리 재투자
+
+`REINVEST=true` 환경변수로 활성화합니다. 사이클 종료 시 순수익(손실 포함)을 `effective_seed`에 합산하여 다음 사이클 시드로 사용합니다.  
+미설정 시 매 사이클 동일한 시드로 운용됩니다.
 
 ---
 
@@ -60,8 +151,8 @@ place_overseas_order()         # /trading/order (일반 주문)
 
 | 변수 | 값 | 역할 |
 |------|----|------|
-| `KIS_MODE` | `real` / `demo` | KIS Open API 환경 선택(실전/모의). 기본값은 `demo`입니다. `real` 선택 시 실계좌(`KIS_ACCOUNT_NO`)를 사용하고 API 도메인은 `https://openapi.koreainvestment.com:9443`로 설정됩니다. `demo`는 모의 도메인 `https://openapivts.koreainvestment.com:29443`과 `KIS_ACCOUNT_NO_DEMO`를 사용합니다. |
-| `TRADE_MODE` | `LIVE` / `DRY` | 실제 주문 실행 여부. `DRY`는 주문 정보만 출력합니다. 입력값이 유효하지 않으면 경고를 출력하고 기본값 `DRY`로 동작합니다. |
+| `KIS_MODE` | `real` / `demo` | KIS Open API 환경 선택(실전/모의). 기본값은 `demo`. |
+| `TRADE_MODE` | `LIVE` / `DRY` | 실제 주문 실행 여부. `DRY`는 주문 정보만 출력합니다. |
 
 ---
 
@@ -75,22 +166,25 @@ KIS_APP_SECRET=your_app_secret
 KIS_ACCOUNT_NO=12345678        # 실계좌 번호
 KIS_ACCOUNT_NO_DEMO=87654321   # 모의계좌 번호
 KIS_MODE=demo                  # demo 또는 real (기본: demo)
-TRADE_MODE=DRY                 # DRY 또는 LIVE (잘못된 값은 DRY로 대체됨)
+TRADE_MODE=DRY                 # DRY 또는 LIVE
 SYMBOLS=TQQQ:NAS,SOXL:AMS
 TQQQ_SPLITS=40
 TQQQ_SYMBOL_TYPE=TQQQ
 TQQQ_SEED=10000
+TQQQ_ADDITIONAL_LOC_LEVELS=3
 SOXL_SPLITS=20
 SOXL_SYMBOL_TYPE=SOXL
 SOXL_SEED=5000
+SOXL_ADDITIONAL_LOC_LEVELS=3
+ADDITIONAL_LOC_LEVELS=3        # 모든 종목 공통 기본값 (종목별 설정 우선)
 ```
 
 환경 변수 관련 주요 동작 요약:
 
 - **다중 종목 중심**: `SYMBOLS`에 `TQQQ:NAS,SOXL:AMS` 형태로 종목을 지정합니다. 미설정 시 기본값은 `TQQQ:NAS,SOXL:AMS`입니다.
-- **종목별 설정**: `{SYMBOL}_SPLITS`, `{SYMBOL}_SYMBOL_TYPE`, `{SYMBOL}_SEED`를 사용합니다.
-- **정리된 항목**: 기존 단일 종목 변수(`SYMBOL`, `EXCHANGE`)와 V4에서 사용하지 않는 변수(`TAKE_PROFIT`, `BIG_BUY_RANGE`, `{SYMBOL}_TAKE_PROFIT`, `{SYMBOL}_BIG_BUY_RANGE`)는 제거했습니다.
-- **왜 바꿨나요?**: 실제 전략에서 쓰지 않는 설정을 제거해, 설정 파일을 보는 것만으로 현재 동작을 이해할 수 있게 만들었습니다.
+- **종목별 설정**: `{SYMBOL}_SPLITS`, `{SYMBOL}_SYMBOL_TYPE`, `{SYMBOL}_SEED`, `{SYMBOL}_ADDITIONAL_LOC_LEVELS`를 사용합니다.
+  - `{SYMBOL}_ADDITIONAL_LOC_LEVELS` 미설정 시 글로벌 `ADDITIONAL_LOC_LEVELS`를 사용하며, 이것도 없으면 기본값 3이 적용됩니다.
+- **복리 재투자**: `REINVEST=true` 설정 시 사이클 종료 후 순수익을 다음 시드에 합산합니다.
 
 ```bash
 uv run python trading_bot.py
@@ -99,6 +193,8 @@ uv run python trading_bot.py
 ---
 
 ## GitHub Actions 설정
+
+워크플로우는 `repository_dispatch`(외부 트리거)와 `workflow_dispatch`(수동 실행)로 실행됩니다.
 
 ### Secrets (`Settings > Secrets and variables > Actions > Secrets`)
 
@@ -133,9 +229,7 @@ secrets:
   KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO_DEMO }}
 ```
 
-이렇게 하면 동일한 재사용 워크플로우(`.github/workflows/trade_base.yml`)를 사용하더라도, 데모 실행 시 데모 전용 키/계좌가 전달되어 실계좌 사용 실수를 방지할 수 있습니다.
-
-`trade_real.yml`은 실전 키(`KIS_APP_KEY`, `KIS_APP_SECRET`)를 사용하도록 설정되어 있으니, 실전 배포 전 키 설정을 반드시 확인하세요.
+`trade_real.yml`은 실전 키(`KIS_APP_KEY`, `KIS_APP_SECRET`)를 사용하도록 설정되어 있습니다.
 
 ### Repository Variables (`Settings > Secrets and variables > Actions > Variables`)
 
@@ -147,30 +241,14 @@ secrets:
 | `TQQQ_SPLITS` | `40` | TQQQ 분할 수 |
 | `TQQQ_SYMBOL_TYPE` | `TQQQ` | TQQQ 별지점 공식 타입 |
 | `TQQQ_SEED` | `10000` | TQQQ 시드 금액 |
+| `TQQQ_ADDITIONAL_LOC_LEVELS` | `3` | TQQQ 급락 대비 추가 LOC 단계 수 |
 | `SOXL_SPLITS` | `20` | SOXL 분할 수 |
 | `SOXL_SYMBOL_TYPE` | `SOXL` | SOXL 별지점 공식 타입 |
 | `SOXL_SEED` | `5000` | SOXL 시드 금액 |
-
----
-
-## 워크플로우 스케줄
-
-### `trade_real.yml` — 실전 계좌
-
-ET(미국 동부시간) 기준 프리마켓 오전 4시 경에 자동 실행됩니다.
-
-| 기간 | UTC cron | 설명 |
-|------|----------|------|
-| 4월~10월 (EDT) | `0 8 * 4-10 1-5` | ET+4 = UTC 08:00 |
-| 11월~3월 (EST) | `0 9 * 11-3 1-5` | ET+5 = UTC 09:00 |
-
-기본 `TRADE_MODE=LIVE` — 수동 실행 시 DRY 선택 가능.
-
-### `trade_demo.yml` — 모의 계좌
-
-ET 기준 오전 14시 00분(장중)경 에 자동 실행됩니다. 예약주문 검증에 활용합니다.
-
-기본 `TRADE_MODE=DRY` — `Variables`의 `SYMBOLS`, `TQQQ_*`, `SOXL_*`를 자동으로 적용합니다.
+| `SOXL_ADDITIONAL_LOC_LEVELS` | `3` | SOXL 급락 대비 추가 LOC 단계 수 |
+| `ADDITIONAL_LOC_LEVELS` | `3` | 모든 종목 공통 기본값 |
+| `TRADE_MODE_DEMO` | `DRY` | 데모 워크플로우 기본 거래 모드 |
+| `REINVEST_REAL` / `REINVEST_DEMO` | `false` | 복리 재투자 여부 |
 
 ---
 

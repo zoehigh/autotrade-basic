@@ -7,9 +7,6 @@ from trader import (
     get_overseas_purchase_amount,
 )
 
-ADDITIONAL_LOC_LEVELS = 10  # 급락 대비 추가 LOC 주문 단계 수
-
-
 def adjust_price_to_tick(price):
     """
     미국 주식 거래소의 호가 단위 규칙에 맞춰 가격을 조정합니다.
@@ -102,7 +99,7 @@ def calculate_unit_amount(remaining_cash, T, splits):
     return remaining_cash / remaining_slots
 
 
-def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0):
+def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -126,6 +123,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         symbol_type (str): 종목 타입 ("TQQQ" 또는 "SOXL") — 별지점 공식 결정용
         seed (float): 이 종목에 투입할 최대 금액 (달러). 0이면 계좌 전체 사용
         T (float): 현재까지의 누적 매수 횟수 (state.py에서 로드)
+        additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 3)
 
     Returns:
         dict: 전략 결과
@@ -274,6 +272,20 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
             "t_target": 1.0,
         })
 
+        # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (entry_qty + i))
+        for i in range(1, additional_loc_levels + 1):
+            add_price = adjust_price_to_tick(unit_amount / (entry_qty + i))
+            if add_price <= 0:
+                break
+            orders.append({
+                "side": "BUY",
+                "quantity": 1,
+                "price": add_price,
+                "order_type": "LOC",
+                "comment": f"초기진입 추가매수 {i}단계 (급락 대비) [추가매수]",
+                "t_target": 0.0,
+            })
+
     else:
         # ── 포지션 있음: 매도 주문 ──────────────────────────────────
         if position_qty > 0 and star_point and take_profit_price:
@@ -334,7 +346,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))
                 if base_qty > 0:
-                    for i in range(1, ADDITIONAL_LOC_LEVELS + 1):
+                    for i in range(1, additional_loc_levels + 1):
                         add_price = adjust_price_to_tick(unit_amount / (base_qty + i))
                         if add_price <= 0:
                             break
@@ -363,7 +375,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (qty_at_star + i))
                 if qty_at_star > 0:
-                    for i in range(1, ADDITIONAL_LOC_LEVELS + 1):
+                    for i in range(1, additional_loc_levels + 1):
                         add_price = adjust_price_to_tick(unit_amount / (qty_at_star + i))
                         if add_price <= 0:
                             break

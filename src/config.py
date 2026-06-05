@@ -33,9 +33,11 @@ if not KIS_ACCOUNT_NO:
 #   TQQQ_SPLITS=40        → TQQQ 분할 수
 #   TQQQ_SYMBOL_TYPE=TQQQ → 별지점 공식 타입
 #   TQQQ_SEED=10000       → TQQQ에 투입할 시드 (달러, 0이면 계좌 전체 사용)
+#   TQQQ_ADDITIONAL_LOC_LEVELS=3  → TQQQ 급락 대비 추가 LOC 단계 수
 #   SOXL_SPLITS=20
 #   SOXL_SYMBOL_TYPE=SOXL
 #   SOXL_SEED=5000
+#   SOXL_ADDITIONAL_LOC_LEVELS=3
 def _parse_symbols():
 	"""
 	환경변수에서 종목 목록을 읽어 종목별 설정 dict 리스트로 반환합니다.
@@ -98,6 +100,13 @@ def _parse_symbols():
 			# - SOXL: 20분할 별% = (20-2T)%, 40분할 별% = (20-T)%
 			# 미설정 시 종목코드를 그대로 사용 (TQQQ → "TQQQ", SOXL → "SOXL")
 			"symbol_type": os.getenv(f"{sym}_SYMBOL_TYPE", sym).strip().upper(),
+			# 급락 대비 추가 LOC 주문 단계 수
+			# 종목별 설정({SYMBOL}_ADDITIONAL_LOC_LEVELS) → 글로벌(ADDITIONAL_LOC_LEVELS) → 기본값 3
+			"additional_loc_levels": int(
+				os.getenv(f"{sym}_ADDITIONAL_LOC_LEVELS")
+				or os.getenv("ADDITIONAL_LOC_LEVELS")
+				or "3"
+			),
 		})
 	return result
 
