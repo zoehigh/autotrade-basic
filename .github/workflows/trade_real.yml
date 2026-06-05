@@ -6,6 +6,8 @@ on:
 #    - cron: '31 7 * 4-10 1-5'
 #    - cron: '31 8 * 11-12 1-5'
 #    - cron: '31 8 * 1-3 1-5'
+  repository_dispatch:
+    types: [trigger_trade]
   workflow_dispatch:
     inputs:
       trade_mode:
@@ -24,10 +26,10 @@ jobs:
   trade:
     uses: ./.github/workflows/trade_base.yml
     with:
-      trade_mode: ${{ github.event.inputs.trade_mode || vars.TRADE_MODE }}
+      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || vars.TRADE_MODE }}
       kis_mode: real
       # 복수 종목 사용 (우선순위: input.symbols -> vars.SYMBOLS -> base 기본값)
-      symbols: ${{ github.event.inputs.symbols || vars.SYMBOLS }}
+      symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || vars.SYMBOLS }}
       quiet_hours: ${{ vars.QUIET_HOURS_REAL || 'false' }}
       commission_rate: ${{ vars.COMMISSION_RATE_REAL || '0.0025' }}
       reinvest: ${{ vars.REINVEST_REAL || 'false' }}
