@@ -1,4 +1,4 @@
-name: Reusable 자동매매 베이스
+name: Reusable 무한매수법 베이스
 
 on:
   workflow_call:
