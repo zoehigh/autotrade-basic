@@ -324,14 +324,19 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                 qty_at_star = math.floor(unit_amount / 2 / star_buy_price)
                 qty_at_avg = max(base_qty - qty_at_star, 0)
 
+                # 소액 시드로 1주만 가능하면 그 1주가 1회분 전액 → t_target=1.0
+                active_round_orders = (1 if qty_at_star > 0 else 0) + (1 if qty_at_avg > 0 else 0)
+                t_target_each = 1.0 if active_round_orders == 1 else 0.5
+                t_target_label = "1.0" if active_round_orders == 1 else "0.5"
+
                 if qty_at_star > 0:
                     orders.append({
                         "side": "BUY",
                         "quantity": qty_at_star,
                         "price": star_buy_price,
                         "order_type": "LOC",
-                        "comment": "전반전 별지점 매수 (절반 매수) — 체결 시 T += 0.5",
-                        "t_target": 0.5,
+                        "comment": f"전반전 별지점 매수 — 체결 시 T += {t_target_label}",
+                        "t_target": t_target_each,
                     })
 
                 if qty_at_avg > 0:
@@ -340,8 +345,8 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
                         "quantity": qty_at_avg,
                         "price": avg_buy_price,
                         "order_type": "LOC",
-                        "comment": "전반전 평단 매수 (절반 매수) — 체결 시 T += 0.5",
-                        "t_target": 0.5,
+                        "comment": f"전반전 평단 매수 — 체결 시 T += {t_target_label}",
+                        "t_target": t_target_each,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))

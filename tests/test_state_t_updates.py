@@ -151,6 +151,46 @@ class TestApplyRecentHistory:
         result = update_T_from_history("TQQQ", state, orders)
         assert result["T"] == 1.5, f"T={result['T']} (expected 1.5)"
 
+    def test_전반전_별지점만_소액시드_t1(self):
+        """소액 시드: 별지점만 있고 평단 없음 → t_target=1.0 (1회분 전액)"""
+        state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
+        register_order_meta_in_state(state, "ORD020", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        orders = [_make_buy_order("ORD020", "20260528", qty=1)]
+        result = update_T_from_history("TQQQ", state, orders)
+        assert result["T"] == 2.0, f"T={result['T']} (expected 2.0)"
+
+    def test_전반전_평단만_소액시드_t1(self):
+        """소액 시드: 평단만 있고 별지점 없음 → t_target=1.0 (1회분 전액)"""
+        state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
+        register_order_meta_in_state(state, "ORD021", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        orders = [_make_buy_order("ORD021", "20260528", qty=1)]
+        result = update_T_from_history("TQQQ", state, orders)
+        assert result["T"] == 2.0, f"T={result['T']} (expected 2.0)"
+
+    def test_전반전_소액시드_추가매수_함께_t1(self):
+        """소액 시드: 평단 1주(T+1.0) + 추가매수(T+0.0) → T += 1.0"""
+        state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
+        register_order_meta_in_state(state, "ORD022", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        register_order_meta_in_state(state, "ORD023", {
+            "side": "BUY", "total_qty": 1, "t_target": 0.0,
+            "is_additional": True, "processed_filled_qty": 0,
+        })
+        orders = [
+            _make_buy_order("ORD022", "20260528", qty=1, utc_dt="2026-05-28T10:00:00+00:00"),
+            _make_buy_order("ORD023", "20260528", qty=1, utc_dt="2026-05-28T10:01:00+00:00"),
+        ]
+        result = update_T_from_history("TQQQ", state, orders)
+        assert result["T"] == 2.0, f"T={result['T']} (expected 2.0)"
+
     def test_부분체결_비례_반영(self):
         """주문 total_qty=4, 체결 qty=2 (50%) → ΔT = 0.5 * 1.0 = 0.5"""
         state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
@@ -251,6 +291,17 @@ class TestInferTFromFullHistory:
             _make_buy_order("ORD105", "20260528", qty=2, utc_dt="2026-05-28T10:00:00+00:00"),
             _make_buy_order("ORD106", "20260528", qty=1, utc_dt="2026-05-28T10:01:00+00:00"),
         ]
+        result = update_T_from_history("TQQQ", state, orders)
+        assert result["T"] == 1.0, f"T={result['T']} (expected 1.0)"
+
+    def test_전반전_소액시드_1건_meta_t1_초기모드(self):
+        """초기 모드: 소액 시드 전반전 1건 t_target=1.0 → T=1.0"""
+        state = _make_state(T=0.0, last_updated="")
+        register_order_meta_in_state(state, "ORD107", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        orders = [_make_buy_order("ORD107", "20260528", qty=1)]
         result = update_T_from_history("TQQQ", state, orders)
         assert result["T"] == 1.0, f"T={result['T']} (expected 1.0)"
 
