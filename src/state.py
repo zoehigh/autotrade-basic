@@ -263,10 +263,22 @@ def _infer_T_from_full_history(symbol, state, order_history):
     함수 실행 후 경고가 출력되면 .state.json 의 "T" 값을 직접 확인하고 수정하세요.
     """
     # 체결 완료된 주문만 추출(타임스탬프가 있는 항목 우선)
-    filled_orders = [
-        o for o in order_history
-        if int(float(o.get("ft_ccld_qty", "0"))) > 0 and o.get("ord_datetime_utc")
-    ]
+    filled_orders = []
+    for o in order_history:
+        qty = int(float(o.get("ft_ccld_qty", "0")))
+        dt_utc = o.get("ord_datetime_utc")
+        if qty > 0 and dt_utc:
+            filled_orders.append(o)
+        else:
+            reasons = []
+            if qty <= 0:
+                reasons.append(f"체결수량={o.get('ft_ccld_qty','0')}")
+            if not dt_utc:
+                reasons.append("ord_datetime_utc 없음")
+            print(f"  [디버그] 초기모드 주문 제외: odno={o.get('odno','')}, "
+                  f"ord_dt={o.get('ord_dt','')}, ord_tmd={o.get('ord_tmd','')}, "
+                  f"side={o.get('sll_buy_dvsn_cd_name','')}, "
+                  f"qty={o.get('ft_ccld_qty','0')}, 사유={'/'.join(reasons)}")
 
     if not filled_orders:
         print(f"[상태] {symbol} 초기 상태 - 이력 없음 → T=0으로 시작합니다")
@@ -378,7 +390,10 @@ def _infer_T_from_full_history(symbol, state, order_history):
         print(f"[상태] {symbol} T 추정 완료 → T={state['T']} (사이클 시작: {state.get('cycle_start_date', '알 수 없음')})")
         print("  ※ 자동 추정값입니다. 값이 틀리면 .state.json 파일에서 T를 직접 수정하세요.")
     else:
-        print(f"[상태] {symbol} 이력 스캔 결과 현재 보유 없음 → T=0으로 시작합니다")
+        if net_qty > 0:
+            print(f"[상태] {symbol} 이력 스캔 결과 net_qty={net_qty}주이나 T=0입니다 (소액 시드로 인한 오추정 가능성)")
+        else:
+            print(f"[상태] {symbol} 이력 스캔 결과 현재 보유 없음 → T=0으로 시작합니다")
 
     # 소액 시드 경고: qty=1 매수만 있는 날이 있으면 T가 실제보다 낮을 수 있습니다
     if small_seed_days > 0:
@@ -475,6 +490,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     for o in order_history:
         odt_iso = o.get("ord_datetime_utc")
         if not odt_iso:
+            print(f"  [디버그] 최근모드 주문 제외(타임스탬프없음): "
+                  f"odno={o.get('odno','')}, ord_dt={o.get('ord_dt','')}, "
+                  f"ord_tmd={o.get('ord_tmd','')}, "
+                  f"qty={o.get('ft_ccld_qty','0')}, "
+                  f"side={o.get('sll_buy_dvsn_cd_name','')}")
             continue
         try:
             o_dt = datetime.fromisoformat(odt_iso)
@@ -483,10 +503,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             else:
                 o_dt = o_dt.astimezone(ZoneInfo("UTC"))
         except Exception:
+            print(f"  [디버그] 최근모드 주문 제외(파싱실패): "
+                  f"odno={o.get('odno','')}, odt_iso={odt_iso}")
             continue
 
         # 체결수량 없는 항목은 무시
         if int(float(o.get("ft_ccld_qty", "0"))) <= 0:
+            print(f"  [디버그] 최근모드 주문 제외(체결수량0): "
+                  f"odno={o.get('odno','')}, dt={odt_iso}, "
+                  f"qty={o.get('ft_ccld_qty','0')}")
             continue
 
         odno = o.get("odno", "")
@@ -505,6 +530,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
         if include:
             recent_candidates.append((o_dt, odno, o))
+        else:
+            print(f"  [디버그] 최근모드 주문 제외(기간외): "
+                  f"odno={o.get('odno','')}, o_dt={o_dt}, "
+                  f"last_updated_dt={last_updated_dt}, "
+                  f"odno={odno}, last_processed_ordno={last_processed_ordno}, "
+                  f"qty={o.get('ft_ccld_qty','0')}, "
+                  f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
     if not recent_candidates:
         # 출력은 기존처럼 날짜(문자열)로 간단 표시

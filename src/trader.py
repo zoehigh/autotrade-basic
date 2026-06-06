@@ -697,6 +697,14 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
 
             if response_data.get("rt_cd") != "0":
                 msg = response_data.get("msg1", "알 수 없는 에러")
+                print(f"[주문이력] {symbol} API 오류 상세:")
+                print(f"  rt_cd={response_data.get('rt_cd')}")
+                print(f"  msg1={msg}")
+                print(f"  tr_id={headers.get('tr_id', '')}")
+                print(f"  KIS_MODE={KIS_MODE}")
+                print(f"  CANO={params.get('CANO', '')}")
+                print(f"  OVRS_EXCG_CD={params.get('OVRS_EXCG_CD', '')}")
+                print(f"  ORD_STRT_DT={params.get('ORD_STRT_DT', '')}~{params.get('ORD_END_DT', '')}")
                 raise Exception(f"API 호출 실패: {msg}")
 
             # Step 8: 이번 페이지 체결내역 추출

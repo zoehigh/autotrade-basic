@@ -315,6 +315,24 @@ def run_one_symbol(symbol_config):
                 "note": "requires-attention",
             }
             save_state(symbol, state)
+
+        elif state["T"] == 0 and live_qty > 0:
+            # T=0인데 실제 보유가 있음: T 오추정 (소액 시드로 인한 추가매수 오분류)
+            msg = (
+                f"[경고] {symbol} T=0이지만 브로커 잔고에 {live_qty}주 보유 중입니다. "
+                f"T가 실제보다 낮게 추정되었을 수 있습니다. .state.json 에서 직접 확인/수정하세요."
+            )
+            print(msg)
+            notify(msg)
+            state["balance_mismatch"] = {
+                "computed_net_qty": comp_qty,
+                "computed_avg_price": round(comp_avg, 2),
+                "live_qty": live_qty,
+                "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
+                "note": "T-estimation-suspected-low",
+            }
+            save_state(symbol, state)
+
         else:
             # 일치하는 경우, 기존 불일치 표시 제거
             if state.get("balance_mismatch"):
