@@ -83,7 +83,7 @@ def main():
         if result['avg_price'] > 0:
             print(f"평단가: ${result['avg_price']:.2f}")
         else:
-            print(f"평단가: None (포지션 없음)")
+            print("평단가: None (포지션 없음)")
         print()
 
         print(f"주문가능금액: ${result['orderable_cash']:.2f}")
