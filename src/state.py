@@ -213,9 +213,16 @@ def update_T_from_history(symbol, state, order_history):
     if last_updated_dt is None:
         # 초기 모드: 전체 이력에서 T를 처음부터 재계산합니다
         return _infer_T_from_full_history(symbol, state, order_history)
-    else:
-        # 일반 모드: last_updated_dt 이후의 이력만 T에 반영합니다
-        return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno)
+
+    # Safety net: T 오추정 상태에서 orders_meta가 있으면 full 재추정
+    mismatch_note = state.get("balance_mismatch", {}).get("note")
+    if mismatch_note == "T-estimation-suspected-low" and state.get("orders_meta"):
+        print(f"[상태] {symbol} T 오추정 감지 → orders_meta({len(state['orders_meta'])}건) 활용 재추정")
+        state.pop("balance_mismatch", None)
+        return _infer_T_from_full_history(symbol, state, order_history)
+
+    # 일반 모드: last_updated_dt 이후의 이력만 T에 반영합니다
+    return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno)
 
 
 def _compute_net_qty_up_to(order_history, cutoff_dt):
@@ -296,10 +303,9 @@ def _infer_T_from_full_history(symbol, state, order_history):
     net_qty = 0
     cycle_start_ord_dt = ""
     small_seed_days = 0  # qty=1 매수만 있어서 정상매수/추가매수 구분이 불가능한 날 수
+    current_avg_price = 0.0  # running 평균단가 (가격 기반 추가매수 분류용)
 
     # 날짜(ord_dt)별로 그룹화하여 처리합니다.
-    # 같은 날 여러 매수 체결이 있어도 qty > 1인 것만 정상 매수로 간주합니다.
-    # qty == 1인 매수는 급락 대비 추가매수(1주씩)로 간주하여 T 계산에서 제외합니다.
     orders_by_date = defaultdict(list)
     for order in sorted_orders:
         ord_dt = order.get("ord_dt", "")
@@ -331,29 +337,44 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 T = round(T * 0.75, 4)
             net_qty = max(0, net_qty - sell_qty)
 
-        # qty > 1인 매수만 정상 매수로 간주합니다. qty == 1인 매수는 추가매수(급락 대비, 1주씩)로 처리합니다.
-        # ⚠️ 한계: 시드가 적어 1회 분할 금액으로 1주만 살 수 있는 경우,
-        #          정상 매수도 qty=1이 되어 추가매수로 잘못 분류될 수 있습니다.
-        #          이 경우 small_seed_days 카운터가 증가하고, 함수 끝에서 경고가 출력됩니다.
         orders_meta = state.get("orders_meta", {})
 
-        def _is_additional_buy(o):
+        def _is_additional_buy(o, avg_price):
             odno = str(o.get("odno", ""))
             if odno and odno in orders_meta:
-                # meta가 있으면 is_additional 필드만 신뢰한다 (qty 무관)
                 return bool(orders_meta[odno].get("is_additional", False))
-            # meta가 없으면 qty로 추론 (레거시 폴백: 1주 = 추가매수)
-            return int(float(o.get("ft_ccld_qty", "0"))) <= 1
 
-        normal_buys     = [o for o in day_buys if not _is_additional_buy(o)]
-        additional_buys = [o for o in day_buys if _is_additional_buy(o)]
+            qty = int(float(o.get("ft_ccld_qty", "0")))
+            if qty > 1:
+                return False
+
+            if avg_price <= 0:
+                return False
+
+            fill_price = float(o.get("ft_ccld_unpr3", "0"))
+            if fill_price > 0:
+                fill_ratio = fill_price / avg_price
+                if fill_ratio >= 0.95:
+                    return False
+
+            return True
+
+        normal_buys     = [o for o in day_buys if not _is_additional_buy(o, current_avg_price)]
+        additional_buys = [o for o in day_buys if _is_additional_buy(o, current_avg_price)]
 
         # 매수 체결은 있는데 정상 매수(qty>1)가 하나도 없는 날 → 소액 시드 의심
         if day_buys and not normal_buys:
             small_seed_days += 1
 
         for o in additional_buys:
-            net_qty += int(float(o.get("ft_ccld_qty", "0")))
+            qty = int(float(o.get("ft_ccld_qty", "0")))
+            fill_price = float(o.get("ft_ccld_unpr3", "0"))
+            prev_net = net_qty
+            net_qty += qty
+            if fill_price > 0 and prev_net > 0:
+                current_avg_price = (current_avg_price * prev_net + fill_price * qty) / net_qty
+            elif fill_price > 0:
+                current_avg_price = fill_price
 
         if normal_buys:
             if T == 0:
@@ -371,13 +392,26 @@ def _infer_T_from_full_history(symbol, state, order_history):
                     delta_T = round((new_filled / total_qty) * float(meta.get("t_target", 1.0)), 4)
                     T = round(T + delta_T, 4)
                     meta["processed_filled_qty"] = processed + new_filled
+                fill_price = float(o.get("ft_ccld_unpr3", "0"))
+                prev_net = net_qty
                 net_qty += qty
+                if fill_price > 0 and prev_net > 0:
+                    current_avg_price = (current_avg_price * prev_net + fill_price * qty) / net_qty
+                elif fill_price > 0:
+                    current_avg_price = fill_price
             if legacy_buys:
                 buy_count = len(legacy_buys)
                 delta_T = 1.0 if buy_count >= 2 else 0.5
                 T = round(T + delta_T, 4)
                 for o in legacy_buys:
-                    net_qty += int(float(o.get("ft_ccld_qty", "0")))
+                    qty = int(float(o.get("ft_ccld_qty", "0")))
+                    fill_price = float(o.get("ft_ccld_unpr3", "0"))
+                    prev_net = net_qty
+                    net_qty += qty
+                    if fill_price > 0 and prev_net > 0:
+                        current_avg_price = (current_avg_price * prev_net + fill_price * qty) / net_qty
+                    elif fill_price > 0:
+                        current_avg_price = fill_price
 
     # 사이클 시작일 설정 (state에 아직 없는 경우만)
     if cycle_start_ord_dt and len(cycle_start_ord_dt) == 8 and not state.get("cycle_start_date"):
