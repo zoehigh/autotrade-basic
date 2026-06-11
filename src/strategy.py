@@ -1,5 +1,6 @@
 # 매수/매도 여부를 판단하는 전략 로직 — 무한매수법 V4.0
 import math
+from config import TRADE_MODE
 from trader import (
     get_overseas_stock_price,
     get_overseas_stock_quotation,
@@ -258,10 +259,53 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
         entry_qty = math.floor(unit_amount / last_price)
 
         if entry_qty == 0:
-            raise Exception(
+            msg = (
                 f"잔고 부족: 주문 가능 금액이 부족합니다. "
                 f"현재 잔고: ${orderable_cash:.2f}, 현재가: ${last_price:.2f}"
             )
+            if TRADE_MODE == "DRY":
+                sim_cash = remaining_seed if remaining_seed is not None else seed
+                if sim_cash > 0 and last_price > 0:
+                    sim_unit_amount = calculate_unit_amount(sim_cash, T, splits)
+                    sim_qty = math.floor(sim_unit_amount / last_price)
+                    if sim_qty > 0:
+                        print(f"  [DRY 시뮬레이션] {msg}")
+                        print(f"    시드 ${sim_cash:.0f} 기준으로 시뮬레이션합니다: "
+                              f"unit_amount ${unit_amount:.2f} → ${sim_unit_amount:.2f}, "
+                              f"수량 {entry_qty}주 → {sim_qty}주")
+                        orderable_cash = sim_cash
+                        unit_amount = sim_unit_amount
+                        unit_qty = sim_qty
+                        entry_qty = sim_qty
+                    else:
+                        print(f"  [주의] {msg}")
+                        print(f"  시드 ${sim_cash:.0f}(으)로는 1주도 매수할 수 없습니다. 시드를 늘려주세요.")
+                        return {
+                            "symbol": symbol, "exchange": exchange_code,
+                            "tradable": tradable, "open_price": open_price,
+                            "last_price": last_price, "position_qty": position_qty,
+                            "avg_price": avg_price, "orderable_cash": orderable_cash,
+                            "seed": seed, "remaining_seed": remaining_seed,
+                            "T": T, "unit_amount": unit_amount, "unit_qty": unit_qty,
+                            "star_point": star_point, "star_buy_price": star_buy_price,
+                            "take_profit_price": take_profit_price, "orders": [],
+                        }
+                else:
+                    print(f"  [주의] {msg}")
+                    if seed == 0:
+                        print("  시드(seed)가 설정되어 있지 않아 시뮬레이션할 수 없습니다.")
+                    return {
+                        "symbol": symbol, "exchange": exchange_code,
+                        "tradable": tradable, "open_price": open_price,
+                        "last_price": last_price, "position_qty": position_qty,
+                        "avg_price": avg_price, "orderable_cash": orderable_cash,
+                        "seed": seed, "remaining_seed": remaining_seed,
+                        "T": T, "unit_amount": unit_amount, "unit_qty": unit_qty,
+                        "star_point": star_point, "star_buy_price": star_buy_price,
+                        "take_profit_price": take_profit_price, "orders": [],
+                    }
+            else:
+                raise Exception(msg)
 
         orders.append({
             "side": "BUY",
