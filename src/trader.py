@@ -36,6 +36,7 @@ def _mask_account_no(acct):
 def _request_with_rate_retry(method, url, headers=None, params=None, json=None, max_retries=5):
     """
     requests.request 래퍼. EGW00201(초당 호출 초과) 발생 시 KIS_MODE에 따라 고정 대기 후 재시도합니다.
+    타임아웃(ConnectTimeout, ReadTimeout) 발생 시 지수 백오프 후 재시도합니다.
 
     - demo: 초당 2회 -> 대기 0.5s
     - real: 초당 5회 -> 대기 0.2s
@@ -44,6 +45,9 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
     wait_sec = 1.0 / allowed_per_sec
 
     attempt = 0
+    network_retry_count = 0
+    network_max_retries = 3
+
     while True:
         attempt += 1
         try:
@@ -52,7 +56,6 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
                 resp.raise_for_status()
                 return resp
             except requests.exceptions.HTTPError:
-                # 서버가 JSON으로 에러코드를 제공하는 경우 메시지 확인
                 try:
                     data = resp.json()
                     msg_cd = data.get("msg_cd") or data.get("message") or ""
@@ -65,10 +68,17 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
                 if is_rate_limit and attempt <= max_retries:
                     time.sleep(wait_sec)
                     continue
-                # 재시도 조건이 아니면 원래 예외를 올립니다
                 raise
+        except requests.exceptions.Timeout as e:
+            network_retry_count += 1
+            if network_retry_count <= network_max_retries:
+                wait = 2 ** network_retry_count
+                print(f"⏳ 타임아웃 오류 발생: {str(e)[:60]}...")
+                print(f"   {wait}초 후 재시도합니다... ({network_retry_count}/{network_max_retries})")
+                time.sleep(wait)
+                continue
+            raise
         except requests.exceptions.RequestException:
-            # 네트워크 계열 예외는 그대로 재전파
             raise
 
 

@@ -23,7 +23,8 @@ def get_access_token():
     
     자동 재시도:
     - EGW00133 오류(1분당 1회 제한) 발생 시 1분 대기 후 자동으로 재시도합니다
-    - 최대 3회까지 자동 재시도하며, 프로그램은 중단되지 않습니다
+    - 타임아웃 오류(ConnectTimeout, ReadTimeout) 발생 시 2초→4초→8초 지수 백오프 후 재시도합니다
+    - 각 오류 유형별 최대 3회까지 자동 재시도하며, 프로그램은 중단되지 않습니다
     
     Returns:
         dict: access token과 관련 정보를 포함한 딕셔너리
@@ -68,55 +69,48 @@ def get_access_token():
         "appsecret": KIS_APP_SECRET
     }
     
-    # 자동 재시도 로직
-    # EGW00133 오류(1분당 1회 제한)가 발생하면 대기 후 재시도합니다
-    max_retries = 3  # 최대 3회까지 재시도
+    max_retries = 3
     retry_count = 0
-    
-    while retry_count < max_retries:
+    network_max_retries = 3
+    network_retry_count = 0
+
+    while True:
         try:
             response = requests.post(url, json=body, headers=headers, verify=certifi.where())
-            
-            # 응답 데이터 추출
             response_data = response.json()
-            
-            # API 응답에 error_code가 있는지 확인합니다
-            # 성공하면 access_token이 포함되어 있습니다
+
             if "error_code" in response_data:
-                # API에서 오류를 반환한 경우
                 error_code = response_data.get("error_code")
                 error_description = response_data.get("error_description", "알 수 없는 오류")
-                
-                # EGW00133 오류인지 확인합니다
-                # 이 오류는 1분당 1회 토큰 발급 제한으로 인한 오류입니다
+
                 if error_code == "EGW00133":
                     retry_count += 1
-                    
+
                     if retry_count < max_retries:
-                        # 1분 대기 후 재시도합니다
-                        print(f"⏳ 토큰 발급 제한 감지 (EGW00133)")
+                        print("⏳ 토큰 발급 제한 감지 (EGW00133)")
                         print(f"   사유: {error_description}")
                         print(f"   1분 대기 후 재시도합니다... ({retry_count}/{max_retries})")
-                        time.sleep(60)  # 60초 대기
+                        time.sleep(60)
                         continue
                     else:
-                        # 최대 재시도 횟수를 초과했습니다
                         raise Exception(
                             f"토큰 발급 실패: 최대 재시도 횟수({max_retries}회) 초과. "
                             f"1분 후 다시 시도해주세요."
                         )
                 else:
-                    # 다른 API 오류입니다
                     raise Exception(f"토큰 발급 실패: [{error_code}] {error_description}")
             else:
-                # 정상 응답 - access_token 포함
-                # 토큰을 캐시에 저장합니다
-                # 이후 get_access_token() 호출 시 캐시된 토큰을 반환합니다
                 _cached_token = response_data
-                
                 return response_data
-        
-        except requests.exceptions.RequestException as e:
-            # HTTP 통신 오류입니다
-            error_msg = str(e)
-            raise Exception(f"토큰 발급 실패: {error_msg}")
+
+        except requests.exceptions.Timeout as e:
+            network_retry_count += 1
+            if network_retry_count <= network_max_retries:
+                wait = 2 ** network_retry_count
+                print(f"⏳ 타임아웃 오류 발생: {str(e)[:60]}...")
+                print(f"   {wait}초 후 재시도합니다... ({network_retry_count}/{network_max_retries})")
+                time.sleep(wait)
+                continue
+            else:
+                error_msg = str(e)
+                raise Exception(f"토큰 발급 실패: {error_msg}")
