@@ -339,7 +339,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
 
         orders_meta = state.get("orders_meta", {})
 
-        def _is_additional_buy(o, avg_price):
+        def _is_additional_buy(o, avg_price, net_qty_before=0):
+            """return True if this buy is an additional (extra) buy that should NOT increment T"""
             odno = str(o.get("odno", ""))
             if odno and odno in orders_meta:
                 return bool(orders_meta[odno].get("is_additional", False))
@@ -348,6 +349,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
             if qty > 1:
                 return False
 
+            # net_qty가 0인 상태에서의 첫 매수는 항상 정상매수 (사이클 시작)
+            # (avg_price도 0이므로 가격 기반 분류가 불가능)
             if avg_price <= 0:
                 return False
 
@@ -359,8 +362,25 @@ def _infer_T_from_full_history(symbol, state, order_history):
 
             return True
 
-        normal_buys     = [o for o in day_buys if not _is_additional_buy(o, current_avg_price)]
-        additional_buys = [o for o in day_buys if _is_additional_buy(o, current_avg_price)]
+        normal_buys     = []
+        additional_buys = []
+        for o in day_buys:
+            is_add = _is_additional_buy(o, current_avg_price, net_qty)
+            qty = int(float(o.get("ft_ccld_qty", "0")))
+            fill_price = float(o.get("ft_ccld_unpr3", "0"))
+            fill_ratio = (fill_price / current_avg_price) if current_avg_price > 0 and fill_price > 0 else 0.0
+            odno = str(o.get("odno", ""))
+            has_meta = "있음" if odno and odno in orders_meta else "없음"
+            print(f"  [디버그] 매수 분류({ord_dt}): odno={odno}, "
+                  f"qty={qty}, fill_price=${fill_price:.2f}, "
+                  f"avg_price=${current_avg_price:.2f}, "
+                  f"fill_ratio={fill_ratio:.4f}, "
+                  f"orders_meta={has_meta}, "
+                  f"분류={'추가매수' if is_add else '정상매수'}")
+            if is_add:
+                additional_buys.append(o)
+            else:
+                normal_buys.append(o)
 
         # 매수 체결은 있는데 정상 매수(qty>1)가 하나도 없는 날 → 소액 시드 의심
         if day_buys and not normal_buys:
@@ -431,12 +451,22 @@ def _infer_T_from_full_history(symbol, state, order_history):
 
     # 소액 시드 경고: qty=1 매수만 있는 날이 있으면 T가 실제보다 낮을 수 있습니다
     if small_seed_days > 0:
+        # 만약 이 날들을 정상매수로 재분류한다면 T에 최소 0.5씩 추가
+        min_additional_T = small_seed_days * 0.5
         print("")
         print(f"[경고] {symbol} qty=1 매수만 체결된 날 {small_seed_days}일 발견됨")
         print("  → 1회 분할 금액으로 1주만 살 수 있는 소액 시드 환경일 수 있습니다")
         print("  → 정상 매수(T +0.5)가 추가매수로 잘못 분류되어 T가 낮게 추정되었을 수 있습니다")
-        print(f"  → 현재 추정 T={state['T']} 가 실제보다 낮을 수 있으니 .state.json 에서 직접 확인/수정하세요")
+        print(f"  → 현재 추정 T={state['T']}, 추정 범위: T={state['T']} ~ T={state['T'] + min_additional_T}")
+        print(f"  → 위를 T 바로잡기 추정값으로 사용하려면 .state.json 에서 T를 {state['T'] + min_additional_T} 로 수정하세요")
+        print("  ※ (위 값은 qty=1 매수만 발생한 모든 날을 정상매수로 가정한 최대 추정치입니다)")
         print("")
+        state["_inference_diagnostic"] = {
+            "small_seed_days": small_seed_days,
+            "estimated_T": state["T"],
+            "max_corrected_T": state["T"] + min_additional_T,
+            "note": "small-seed detected; actual T may be between estimated_T and max_corrected_T",
+        }
 
     # 초기 추정 시 처리한 가장 최신 주문의 타임스탬프/주문번호를 상태에 기록
     try:

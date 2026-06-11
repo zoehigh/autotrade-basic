@@ -263,11 +263,11 @@ class TestInferTFromFullHistory:
         assert result["T"] == 0.0, f"T={result['T']} (expected 0.0)"
 
     def test_레거시_폴백_qty1_initial_mode(self):
-        """초기 모드 레거시: qty=1 매수는 추가매수로 분류 → T=0"""
+        """초기 모드 레거시: qty=1 첫 매수(avg_price=0) → 정상매수 → T+=0.5"""
         state = _make_state(T=0.0, last_updated="")
         orders = [_make_buy_order("ORD103", "20260528", qty=1)]
         result = update_T_from_history("TQQQ", state, orders)
-        assert result["T"] == 0.0, f"T={result['T']} (expected 0.0)"
+        assert result["T"] == 0.5, f"T={result['T']} (expected 0.5)"
 
     def test_레거시_폴백_qty2_초기모드_plus05(self):
         """초기 모드 레거시: qty=2 단일 매수 → +0.5"""
