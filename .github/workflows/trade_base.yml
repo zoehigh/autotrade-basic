@@ -57,16 +57,23 @@ jobs:
       - name: 의존성 설치
         run: uv sync
 
-      - name: state 캐시 복원/저장
+      - name: state 캐시 복원
         # 이전 실행에서 저장한 .state.json을 불러옵니다.
         # T값, 사이클 시작일, 복리 시드 등 KIS API로 복구할 수 없는 정보가 담겨 있습니다.
-        # 봇 실행 후 save-always:true 로 항상 최신 상태를 저장합니다.
-        uses: actions/cache@v4
+        id: state-cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: .state.json
-          # use a fixed key name so different runs/branches can restore the latest saved state
-          key: state-${{ inputs.kis_mode || 'default' }}-latest
-          save-always: true
+          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ inputs.kis_mode || 'default' }}-
+
+      - name: state 캐시 저장
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .state.json
+          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
 
       - name: Resolve and log inputs
         run: |
