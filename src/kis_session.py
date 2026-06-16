@@ -17,5 +17,8 @@ class KISSession:
         url = f"{KIS_DOMAIN}{path}"
         return self.session.request(method, url, **kwargs)
 
+    def post(self, url, **kwargs):
+        return self.session.post(url, **kwargs)
+
     def close(self):
         self.session.close()
