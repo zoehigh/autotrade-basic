@@ -68,13 +68,6 @@ jobs:
           restore-keys: |
             state-${{ inputs.kis_mode || 'default' }}-
 
-      - name: state 캐시 저장
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: .state.json
-          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
-
       - name: Resolve and log inputs
         run: |
           echo "Resolved TRADE_MODE=${{ inputs.trade_mode || 'DRY' }}"
@@ -112,5 +105,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: uv run python trading_bot.py
+
+      - name: state 캐시 저장
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .state.json
+          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
 
 
