@@ -12,6 +12,7 @@ sys.path.append("src")
 
 from trader import place_overseas_order, get_overseas_stock_price
 from config import SYMBOLS, TRADE_MODE
+from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -52,7 +53,8 @@ def test_overseas_order():
         order_exchange_code = exchange_map.get(TEST_EXCHANGE, TEST_EXCHANGE)
         
         # 현재가 조회용 거래소 코드는 원래 코드 사용
-        price_data = get_overseas_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
+        session = KISSession()
+        price_data = get_overseas_stock_price(session, TEST_SYMBOL, TEST_EXCHANGE)
         
         current_price = float(price_data.get("last", "0"))
         
@@ -71,6 +73,7 @@ def test_overseas_order():
         
         try:
             result_limit = place_overseas_order(
+                session,
                 symbol=TEST_SYMBOL,
                 exchange_code=order_exchange_code,
                 order_type="LIMIT",
@@ -94,6 +97,7 @@ def test_overseas_order():
         
         try:
             result_loc = place_overseas_order(
+                session,
                 symbol=TEST_SYMBOL,
                 exchange_code=order_exchange_code,
                 order_type="LOC",

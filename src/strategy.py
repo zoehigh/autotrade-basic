@@ -100,7 +100,7 @@ def calculate_unit_amount(remaining_cash, T, splits):
     return remaining_cash / remaining_slots
 
 
-def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3):
+def 무한매수법_V4(session, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -148,10 +148,10 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
     # 1. 시장 정보 조회
     # ========================================
 
-    quotation = get_overseas_stock_quotation(symbol, exchange_code)
+    quotation = get_overseas_stock_quotation(session, symbol, exchange_code)
     tradable = quotation.get("ordy", "N") == "Y"
 
-    price_detail = get_overseas_stock_price(symbol, exchange_code)
+    price_detail = get_overseas_stock_price(session, symbol, exchange_code)
     open_price = float(price_detail.get("open", "0"))
     last_price = float(price_detail.get("last", "0"))
 
@@ -159,7 +159,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
     # 2. 보유 정보 조회
     # ========================================
 
-    balance = get_overseas_balance(symbol, exchange_code)
+    balance = get_overseas_balance(session, symbol, exchange_code)
 
     if balance:
         position_qty = int(float(balance.get("quantity", "0")))
@@ -179,7 +179,7 @@ def 무한매수법_V4(symbol, exchange_code, splits, symbol_type, seed=0, T=0.0
     # 3. 주문가능금액 조회 및 시드 적용
     # ========================================
 
-    psamount = get_overseas_purchase_amount(symbol, exchange_code)
+    psamount = get_overseas_purchase_amount(session, symbol, exchange_code)
     orderable_cash = float(psamount.get("ord_psbl_frcr_amt", "0"))
 
     remaining_seed = None

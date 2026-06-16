@@ -9,7 +9,7 @@ from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN
 _cached_token = None
 
 
-def get_access_token():
+def get_access_token(session=None):
     """
     한국투자증권 API에서 access token을 발급받습니다.
     
@@ -76,7 +76,8 @@ def get_access_token():
 
     while True:
         try:
-            response = requests.post(url, json=body, headers=headers, verify=certifi.where())
+            http = session.post if session else requests.post
+            response = http(url, json=body, headers=headers, verify=certifi.where())
             response_data = response.json()
 
             if "error_code" in response_data:

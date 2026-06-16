@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 # .env 파일에서 환경변수 읽기
 load_dotenv()
 
+# 텔레그램 API용 세션 (connection pooling)
+_TELEGRAM_SESSION = requests.Session()
+
 
 def send_telegram(message: str) -> bool:
     """
@@ -43,7 +46,7 @@ def send_telegram(message: str) -> bool:
     
     try:
         # 메시지 전송
-        response = requests.post(url, data=data, timeout=10)
+        response = _TELEGRAM_SESSION.post(url, data=data, timeout=10)
         
         # 응답 확인
         if response.status_code == 200:

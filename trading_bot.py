@@ -17,6 +17,7 @@ sys.path.append("src")
 from datetime import datetime
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
+from kis_session import KISSession
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state
 from trader import (
@@ -203,7 +204,7 @@ def convert_exchange_code(exchange_code):
     return exchange_map.get(exchange_code, exchange_code)
 
 
-def run_one_symbol(symbol_config):
+def run_one_symbol(session, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
 
@@ -252,6 +253,7 @@ def run_one_symbol(symbol_config):
 
     # DRY 모드이면 사람이 읽기 쉬운 주문 이력 요약을 로그에 출력합니다.
     order_history = get_overseas_order_history(
+        session,
         symbol,
         exchange,
         days=history_days,
@@ -269,7 +271,7 @@ def run_one_symbol(symbol_config):
         computed = {"net_qty": 0, "avg_price": 0.0}
 
     try:
-        live_balance = get_overseas_balance(symbol, exchange)
+        live_balance = get_overseas_balance(session, symbol, exchange)
         live_qty = int(float(live_balance.get("quantity", "0"))) if live_balance else 0
         live_avg = float(live_balance.get("avg_price", "0")) if live_balance else 0.0
     except Exception as e:
@@ -394,6 +396,7 @@ def run_one_symbol(symbol_config):
     print("\n[Step 2] 전략 실행 중...")
 
     strategy_result = 무한매수법_V4(
+        session,
         symbol=symbol,
         exchange_code=exchange,
         splits=splits,
@@ -459,6 +462,7 @@ def run_one_symbol(symbol_config):
                         order_price = corrected_price
 
             result = place_overseas_order(
+                session,
                 symbol=symbol,
                 exchange_code=order_exchange_code,
                 order_type=order["order_type"],
@@ -522,6 +526,7 @@ def run_one_symbol(symbol_config):
             else:
                 try:
                     resv_result = place_overseas_reservation_order(
+                        session,
                         symbol=symbol,
                         exchange_code=order_exchange_code,
                         quantity=order["quantity"],
@@ -635,6 +640,7 @@ def main():
     SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
     한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
     """
+    kis_session = KISSession()
     try:
         print("\n" + "=" * 60)
         print("자동매매 봇 시작")
@@ -660,7 +666,7 @@ def main():
         # ========================================
         for symbol_config in SYMBOLS:
             try:
-                run_one_symbol(symbol_config)
+                run_one_symbol(kis_session, symbol_config)
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]
@@ -691,6 +697,8 @@ def main():
 
         print("\n프로그램을 에러와 함께 종료합니다.")
         sys.exit(1)
+    finally:
+        kis_session.close()
 
 
 if __name__ == "__main__":

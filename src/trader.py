@@ -1,11 +1,10 @@
 # 실제 주문을 실행하는 코드
 import requests
-import certifi
 import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from authentication import get_access_token
-from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN, KIS_MODE
+from config import KIS_MODE
 
 
 class ReservationOrderRequired(Exception):
@@ -33,7 +32,7 @@ def _mask_account_no(acct):
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
 
 
-def _request_with_rate_retry(method, url, headers=None, params=None, json=None, max_retries=5):
+def _request_with_rate_retry(session, method, path, headers=None, params=None, json=None, max_retries=5):
     """
     requests.request 래퍼. EGW00201(초당 호출 초과) 발생 시 KIS_MODE에 따라 고정 대기 후 재시도합니다.
     타임아웃(ConnectTimeout, ReadTimeout) 발생 시 지수 백오프 후 재시도합니다.
@@ -51,7 +50,7 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
     while True:
         attempt += 1
         try:
-            resp = requests.request(method, url, headers=headers, params=params, json=json, verify=certifi.where())
+            resp = session.request(method, path, headers=headers, params=params, json=json)
             try:
                 resp.raise_for_status()
                 return resp
@@ -82,7 +81,7 @@ def _request_with_rate_retry(method, url, headers=None, params=None, json=None, 
             raise
 
 
-def get_overseas_stock_price(symbol, exchange_code="NAS"):
+def get_overseas_stock_price(session, symbol, exchange_code="NAS"):
     """
     한국투자증권 API를 사용하여 해외주식의 현재가를 조회합니다.
     
@@ -123,21 +122,19 @@ def get_overseas_stock_price(symbol, exchange_code="NAS"):
     # Step 1: 접근 토큰 획득
     # 한 번 발급한 토큰은 캐싱되어 재사용됩니다
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
     
-    # Step 2: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-price/v1/quotations/price-detail"
+    # Step 2: 요청 경로 설정
+    path = "/uapi/overseas-price/v1/quotations/price-detail"
     
     # Step 3: 요청 헤더 설정
     # authorization 헤더에 "Bearer" 접두사를 붙여야 합니다
+    # appkey, appsecret, content-type은 KISSession에서 공통 관리
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": "HHDFS76200200"  # 해외주식 현재가상세 조회 API의 거래 ID
     }
     
@@ -151,7 +148,7 @@ def get_overseas_stock_price(symbol, exchange_code="NAS"):
     
     # Step 5: API 호출
     try:
-        response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+        response = _request_with_rate_retry(session, "GET", path, headers=headers, params=params)
         response.raise_for_status()  # HTTP 에러 발생 시 예외 던지기
         
         # Step 6: 응답 데이터 추출
@@ -169,7 +166,7 @@ def get_overseas_stock_price(symbol, exchange_code="NAS"):
         raise Exception(f"현재가 조회 실패: {str(e)}")
 
 
-def get_overseas_stock_quotation(symbol, exchange_code="NAS"):
+def get_overseas_stock_quotation(session, symbol, exchange_code="NAS"):
     """
     한국투자증권 API를 사용하여 해외주식의 현재체결가를 조회합니다.
     
@@ -209,20 +206,17 @@ def get_overseas_stock_quotation(symbol, exchange_code="NAS"):
     
     # Step 1: 접근 토큰 획득
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
     
-    # Step 2: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-price/v1/quotations/price"
+    # Step 2: 요청 경로 설정
+    path = "/uapi/overseas-price/v1/quotations/price"
     
     # Step 3: 요청 헤더 설정
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": "HHDFS00000300"  # 해외주식 현재체결가 조회 API의 거래 ID
     }
     
@@ -235,7 +229,7 @@ def get_overseas_stock_quotation(symbol, exchange_code="NAS"):
     
     # Step 5: API 호출
     try:
-        response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+        response = _request_with_rate_retry(session, "GET", path, headers=headers, params=params)
         response.raise_for_status()
         
         # Step 6: 응답 데이터 추출
@@ -326,7 +320,7 @@ def _is_kst_reserve_window(now_kst: datetime) -> bool:
     return (t >= start) and (t <= end)
 
 
-def get_overseas_balance(symbol, exchange_code="NAS"):
+def get_overseas_balance(session, symbol, exchange_code="NAS"):
     """
     한국투자증권 API를 사용하여 해외주식의 보유 잔고를 조회합니다.
     
@@ -366,7 +360,7 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
 
     # Step 1: 접근 토큰 획득
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
@@ -377,17 +371,14 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
     except Exception as e:
         raise Exception(f"거래소 코드 변환 실패: {str(e)}")
     
-    # Step 3: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-balance"
+    # Step 3: 요청 경로 설정
+    path = "/uapi/overseas-stock/v1/trading/inquire-balance"
     
     # Step 4: 요청 헤더 설정
     # TR_ID는 실전/모의에 따라 다릅니다
     balance_tr_id = "TTTS3012R" if KIS_MODE == "real" else "VTTS3012R"
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": balance_tr_id
     }
     
@@ -403,7 +394,7 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
     
     # Step 6: API 호출
     try:
-        response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+        response = _request_with_rate_retry(session, "GET", path, headers=headers, params=params)
         response.raise_for_status()
         
         # Step 7: 응답 데이터 추출
@@ -456,7 +447,7 @@ def get_overseas_balance(symbol, exchange_code="NAS"):
         raise Exception(f"잔고 조회 실패: {str(e)}{resp_info}")
 
 
-def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
+def get_overseas_purchase_amount(session, symbol, exchange_code="NAS"):
     """
     한국투자증권 API를 사용하여 해외주식의 매수가능금액을 조회합니다.
     
@@ -494,7 +485,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
     
     # Step 1: 접근 토큰 획득
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
@@ -502,7 +493,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
     # Step 2: 현재가 조회 (단가 정보 필요)
     # 먼저 현재 가격을 조회하여 OVRS_ORD_UNPR (주문단가)로 사용
     try:
-        quotation = get_overseas_stock_quotation(symbol=symbol, exchange_code=exchange_code)
+        quotation = get_overseas_stock_quotation(session, symbol=symbol, exchange_code=exchange_code)
         current_price = quotation.get("last", "0")
         
         if not current_price or current_price == "0":
@@ -516,16 +507,13 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
     except Exception as e:
         raise Exception(f"거래소 코드 변환 실패: {str(e)}")
     
-    # Step 4: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-psamount"
+    # Step 4: 요청 경로 설정
+    path = "/uapi/overseas-stock/v1/trading/inquire-psamount"
     
     # Step 5: 요청 헤더 설정
     psamount_tr_id = "TTTS3007R" if KIS_MODE == "real" else "VTTS3007R"
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": psamount_tr_id
     }
     
@@ -540,7 +528,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
     
     # Step 7: API 호출
     try:
-        response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+        response = _request_with_rate_retry(session, "GET", path, headers=headers, params=params)
         response.raise_for_status()
         
         # Step 8: 응답 데이터 추출
@@ -575,7 +563,7 @@ def get_overseas_purchase_amount(symbol, exchange_code="NAS"):
         raise Exception(f"매수가능금액 조회 실패: {str(e)}")
 
 
-def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=False, limit=100):
+def get_overseas_order_history(session, symbol, exchange_code="NAS", days=30, verbose=False, limit=100):
     """
     한국투자증권 API를 사용하여 해외주식의 최근 주문체결내역을 조회합니다.
     
@@ -628,7 +616,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
     
     # Step 1: 접근 토큰 획득
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
@@ -646,16 +634,13 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
     except Exception as e:
         raise Exception(f"거래소 코드 변환 실패: {str(e)}")
     
-    # Step 4: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+    # Step 4: 요청 경로 설정
+    path = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
     
     # Step 5: 요청 헤더 설정
     order_history_tr_id = "TTTS3035R" if KIS_MODE == "real" else "VTTS3035R"
     base_headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": order_history_tr_id
     }
     
@@ -699,7 +684,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
                 params["CTX_AREA_FK200"] = ctx_area_fk200
 
             print(f"[주문이력] {symbol} 체결내역 페이지 조회 시도: ord_strt_dt={ord_strt_dt}, ord_end_dt={ord_end_dt}, tr_cont={headers.get('tr_cont', '첫페이지')}")
-            response = _request_with_rate_retry("GET", url, headers=headers, params=params)
+            response = _request_with_rate_retry(session, "GET", path, headers=headers, params=params)
             response.raise_for_status()
 
             response_data = response.json()
@@ -823,7 +808,7 @@ def get_overseas_order_history(symbol, exchange_code="NAS", days=30, verbose=Fal
         raise Exception(f"주문체결내역 조회 실패: {str(e)}")
 
 
-def place_overseas_order(symbol, exchange_code, order_type, quantity, price, side="BUY", trade_mode="DRY"):
+def place_overseas_order(session, symbol, exchange_code, order_type, quantity, price, side="BUY", trade_mode="DRY"):
     """
     해외주식 주문을 실행합니다.
     
@@ -937,13 +922,13 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
     # LIVE 모드일 때만 실제 주문 실행
     # Step 1: 접근 토큰 획득
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
     
-    # Step 2: API 호출 URL 구성
-    url = f"{KIS_DOMAIN}/uapi/overseas-stock/v1/trading/order"
+    # Step 2: 요청 경로 설정
+    path = "/uapi/overseas-stock/v1/trading/order"
     
     # Step 3: TR_ID 결정 (실전/모의 및 매수/매도에 따라 다름)
     # 매수: TTTT1002U (실전) / VTTT1002U (모의)
@@ -955,10 +940,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
     
     # Step 4: 요청 헤더 설정
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": tr_id
     }
     
@@ -976,7 +958,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
     
     # Step 6: API 호출
     try:
-        response = _request_with_rate_retry("POST", url, headers=headers, json=body)
+        response = _request_with_rate_retry(session, "POST", path, headers=headers, json=body)
         response.raise_for_status()
         
         # Step 7: 응답 데이터 추출
@@ -1009,7 +991,7 @@ def place_overseas_order(symbol, exchange_code, order_type, quantity, price, sid
         raise Exception(f"주문 실행 실패: {str(e)}")
 
 
-def place_overseas_reservation_order(symbol: str, exchange_code: str, quantity: int, price: float, ord_dv: str = "usBuy"):
+def place_overseas_reservation_order(session, symbol: str, exchange_code: str, quantity: int, price: float, ord_dv: str = "usBuy"):
     """
     해외주식 예약주문 접수 API를 호출합니다.
 
@@ -1044,20 +1026,17 @@ def place_overseas_reservation_order(symbol: str, exchange_code: str, quantity: 
         else:
             raise Exception("ord_dv can only be 'usBuy', 'usSell' or 'asia'")
 
-    url = f"{KIS_DOMAIN}/uapi/overseas-stock/v1/trading/order-resv"
+    path = "/uapi/overseas-stock/v1/trading/order-resv"
 
     # access token
     try:
-        token_data = get_access_token()
+        token_data = get_access_token(session=session)
         access_token = token_data["access_token"]
     except Exception as e:
         raise Exception(f"토큰 획득 실패: {str(e)}")
 
     headers = {
-        "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {access_token}",
-        "appkey": KIS_APP_KEY,
-        "appsecret": KIS_APP_SECRET,
         "tr_id": tr_id
     }
 
@@ -1072,7 +1051,7 @@ def place_overseas_reservation_order(symbol: str, exchange_code: str, quantity: 
     }
 
     try:
-        response = _request_with_rate_retry("POST", url, headers=headers, json=body)
+        response = _request_with_rate_retry(session, "POST", path, headers=headers, json=body)
         response.raise_for_status()
         response_data = response.json()
 

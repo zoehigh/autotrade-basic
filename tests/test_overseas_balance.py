@@ -15,6 +15,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from trader import get_overseas_balance
 from config import SYMBOLS
+from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -38,7 +39,8 @@ def test_overseas_balance():
     
     try:
         # API 호출
-        result = get_overseas_balance(symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE)
+        session = KISSession()
+        result = get_overseas_balance(session, symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE)
         
         # 결과 검증
         if result is None:

@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from trader import get_overseas_stock_price
+from kis_session import KISSession
 
 
 def test_tqqq_price_inquiry():
@@ -26,7 +27,8 @@ def test_tqqq_price_inquiry():
     try:
         # Step 1: 현재가 조회
         print("\n[Step 1] API에서 TQQQ 현재가 조회 중...")
-        price_data = get_overseas_stock_price(symbol="TQQQ", exchange_code="NAS")
+        session = KISSession()
+        price_data = get_overseas_stock_price(session, symbol="TQQQ", exchange_code="NAS")
         
         # Step 2: 응답 데이터 검증
         print("[Step 2] 응답 데이터 검증 중...")
