@@ -327,6 +327,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
             if net_qty > 0:
                 ratio = sell_qty / net_qty
                 if ratio >= 1.0:
+                    if cycle_start_ord_dt and T > 0:
+                        state["_completed_cycle_start"] = f"{cycle_start_ord_dt[:4]}-{cycle_start_ord_dt[4:6]}-{cycle_start_ord_dt[6:8]}"
                     T = 0.0
                     cycle_start_ord_dt = ""
                 elif ratio >= 0.5:

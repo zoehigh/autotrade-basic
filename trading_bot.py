@@ -260,6 +260,37 @@ def run_one_symbol(session, symbol_config):
         verbose=(TRADE_MODE == "DRY"),
     )
     state = update_T_from_history(symbol, state, order_history)
+
+    # ── 사이클 종료 감지 (전체 재추정 경로) ──
+    # _infer_T_from_full_history가 전량매도를 감지해 T=0으로 리셋한 경우,
+    # 일반 경로(T > 0 조건)는 작동하지 않으므로 여기서 따로 처리합니다.
+    completed_cycle_start = state.pop("_completed_cycle_start", None)
+    if completed_cycle_start:
+        print(f"\n{'=' * 60}")
+        print(f"[사이클 종료] {symbol} — {completed_cycle_start} ~ 완료")
+        print(f"{'=' * 60}")
+        _used_seed = state.get("effective_seed", 0.0)
+        if not (REINVEST and _used_seed > 0):
+            _used_seed = seed
+        state["cycle_start_date"] = completed_cycle_start
+        report = generate_cycle_report(
+            symbol=symbol,
+            order_history=order_history,
+            state=state,
+            seed=_used_seed,
+            commission_rate=COMMISSION_RATE,
+        )
+        report_message = format_cycle_report_message(report)
+        print(f"\n{report_message}")
+        notify(report_message)
+        if REINVEST and report["next_cycle_seed"] is not None:
+            state["effective_seed"] = round(report["next_cycle_seed"], 2)
+            print(f"  복리 재투자: 다음 사이클 시드 = ${state['effective_seed']:.2f}")
+        else:
+            state["effective_seed"] = 0.0
+        state["T"] = 0.0
+        state["cycle_start_date"] = ""
+
     # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
     save_state(symbol, state)
 
