@@ -23,6 +23,14 @@ else:
 if not KIS_ACCOUNT_NO:
 	print(f"경고: KIS_MODE={KIS_MODE} 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
 
+# HTTP 타임아웃 설정 (초)
+# connect_timeout: 연결 시도 제한 시간
+# read_timeout: 응답 수신 제한 시간
+# .env 예: KIS_CONNECT_TIMEOUT=5, KIS_READ_TIMEOUT=30
+KIS_CONNECT_TIMEOUT = int(os.getenv("KIS_CONNECT_TIMEOUT") or "10")
+KIS_READ_TIMEOUT = int(os.getenv("KIS_READ_TIMEOUT") or "30")
+KIS_TIMEOUT = (KIS_CONNECT_TIMEOUT, KIS_READ_TIMEOUT)
+
 # 종목 정보
 # 여러 종목을 매매하려면 SYMBOLS 환경변수를 사용하세요.
 # 사용법: SYMBOLS=TQQQ:NAS,SOXL:AMS

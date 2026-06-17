@@ -1,8 +1,9 @@
 # 한국투자증권 API 인증을 담당하는 파일
+import random
 import requests
 import time
 import certifi
-from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN
+from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN, KIS_MODE, KIS_TIMEOUT
 
 # 발급받은 토큰을 캐시하는 전역 변수
 # 프로그램 실행 중 한 번 발급한 토큰을 재사용하여 불필요한 API 호출을 줄입니다
@@ -22,9 +23,10 @@ def get_access_token(session=None):
     - 프로그램 실행 중 동일한 토큰을 반복 호출하면 API 요청 없이 캐시된 토큰을 반환합니다
     
     자동 재시도:
-    - EGW00133 오류(1분당 1회 제한) 발생 시 1분 대기 후 자동으로 재시도합니다
-    - 타임아웃 오류(ConnectTimeout, ReadTimeout) 발생 시 2초→4초→8초 지수 백오프 후 재시도합니다
-    - 각 오류 유형별 최대 3회까지 자동 재시도하며, 프로그램은 중단되지 않습니다
+    - EGW00133(토큰 발급 과다): 1분 대기 후 재시도 (최대 3회)
+    - EGW00201/EGW00215(초당 호출 과다): fixed-wait 후 재시도 (실전=0.05s, 모의=1.0s, 최대 3회)
+    - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
+    - 각 오류 유형은 독립적인 카운터로 관리되어 서로 영향을 주지 않습니다
     
     Returns:
         dict: access token과 관련 정보를 포함한 딕셔너리
@@ -69,15 +71,18 @@ def get_access_token(session=None):
         "appsecret": KIS_APP_SECRET
     }
     
-    max_retries = 3
-    retry_count = 0
-    network_max_retries = 3
-    network_retry_count = 0
+    MAX_RETRIES = 3
+    retry_count = 0               # EGW00133 (토큰 발급 과다)
+    network_retry_count = 0       # Timeout (네트워크 장애)
+    rate_limit_retry_count = 0    # EGW00201/EGW00215 (초당 호출 과다)
+
+    rate_limit_wait = 0.05 if KIS_MODE == "real" else 1.0
 
     while True:
         try:
             http = session.post if session else requests.post
-            response = http(url, json=body, headers=headers, verify=certifi.where())
+            response = http(url, json=body, headers=headers, verify=certifi.where(),
+                            timeout=KIS_TIMEOUT)
             response_data = response.json()
 
             if "error_code" in response_data:
@@ -86,18 +91,27 @@ def get_access_token(session=None):
 
                 if error_code == "EGW00133":
                     retry_count += 1
-
-                    if retry_count < max_retries:
+                    if retry_count <= MAX_RETRIES:
                         print("⏳ 토큰 발급 제한 감지 (EGW00133)")
                         print(f"   사유: {error_description}")
-                        print(f"   1분 대기 후 재시도합니다... ({retry_count}/{max_retries})")
+                        print(f"   1분 대기 후 재시도합니다... ({retry_count}/{MAX_RETRIES})")
                         time.sleep(60)
                         continue
-                    else:
-                        raise Exception(
-                            f"토큰 발급 실패: 최대 재시도 횟수({max_retries}회) 초과. "
-                            f"1분 후 다시 시도해주세요."
-                        )
+                    raise Exception(
+                        f"토큰 발급 실패: 최대 재시도 횟수({MAX_RETRIES}회) 초과. "
+                        f"1분 후 다시 시도해주세요."
+                    )
+                elif error_code in ("EGW00201", "EGW00215"):
+                    rate_limit_retry_count += 1
+                    if rate_limit_retry_count <= MAX_RETRIES:
+                        print(f"⏳ 초당 호출 제한 감지 ({error_code})")
+                        print(f"   {rate_limit_wait}초 후 재시도합니다... ({rate_limit_retry_count}/{MAX_RETRIES})")
+                        time.sleep(rate_limit_wait)
+                        continue
+                    raise Exception(
+                        f"토큰 발급 실패: 초당 호출 제한 재시도 초과 "
+                        f"[{error_code}] {error_description}"
+                    )
                 else:
                     raise Exception(f"토큰 발급 실패: [{error_code}] {error_description}")
             else:
@@ -106,12 +120,10 @@ def get_access_token(session=None):
 
         except requests.exceptions.Timeout as e:
             network_retry_count += 1
-            if network_retry_count <= network_max_retries:
-                wait = 2 ** network_retry_count
+            if network_retry_count <= MAX_RETRIES:
+                wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
                 print(f"⏳ 타임아웃 오류 발생: {str(e)[:60]}...")
-                print(f"   {wait}초 후 재시도합니다... ({network_retry_count}/{network_max_retries})")
+                print(f"   {wait:.1f}초 후 재시도합니다... ({network_retry_count}/{MAX_RETRIES})")
                 time.sleep(wait)
                 continue
-            else:
-                error_msg = str(e)
-                raise Exception(f"토큰 발급 실패: {error_msg}")
+            raise Exception(f"토큰 발급 실패: {str(e)}")

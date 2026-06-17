@@ -1,4 +1,5 @@
 # 실제 주문을 실행하는 코드
+import random
 import requests
 import time
 from datetime import datetime, time as dtime, timedelta
@@ -32,52 +33,58 @@ def _mask_account_no(acct):
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
 
 
-def _request_with_rate_retry(session, method, path, headers=None, params=None, json=None, max_retries=5):
+def _request_with_rate_retry(session, method, path, headers=None, params=None, json=None):
     """
-    requests.request 래퍼. EGW00201(초당 호출 초과) 발생 시 KIS_MODE에 따라 고정 대기 후 재시도합니다.
-    타임아웃(ConnectTimeout, ReadTimeout) 발생 시 지수 백오프 후 재시도합니다.
+    requests.request 래퍼.
+    - rate-limit(EGW00201/EGW00215, 초당 거래건수 초과): fixed-wait 후 재시도 (최대 3회)
+    - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
+    - rate-limit과 타임아웃 재시도는 독립적인 카운터로 관리됩니다
 
-    - demo: 초당 2회 -> 대기 0.5s
-    - real: 초당 5회 -> 대기 0.2s
+    실전(real): 초당 20회 → 대기 0.05s
+    모의(demo): 초당 1회 → 대기 1.0s
     """
-    allowed_per_sec = 5 if KIS_MODE == "real" else 2
-    wait_sec = 1.0 / allowed_per_sec
-
-    attempt = 0
+    rate_limit_wait = 0.05 if KIS_MODE == "real" else 1.0
+    MAX_RETRIES = 3
     network_retry_count = 0
-    network_max_retries = 3
 
-    while True:
-        attempt += 1
+    while network_retry_count <= MAX_RETRIES:
         try:
-            resp = session.request(method, path, headers=headers, params=params, json=json)
-            try:
-                resp.raise_for_status()
-                return resp
-            except requests.exceptions.HTTPError:
+            for _ in range(MAX_RETRIES + 1):
+                resp = session.request(method, path, headers=headers, params=params, json=json)
                 try:
-                    data = resp.json()
-                    msg_cd = data.get("msg_cd") or data.get("message") or ""
-                    msg1 = data.get("msg1", "")
-                except Exception:
-                    msg_cd = ""
-                    msg1 = ""
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError:
+                    try:
+                        data = resp.json()
+                        msg_cd = data.get("msg_cd") or data.get("message") or ""
+                        msg1 = data.get("msg1", "")
+                    except Exception:
+                        msg_cd = ""
+                        msg1 = ""
 
-                is_rate_limit = ("EGW00201" in str(msg_cd)) or ("초당" in str(msg1)) or ("초당" in resp.text)
-                if is_rate_limit and attempt <= max_retries:
-                    time.sleep(wait_sec)
-                    continue
-                raise
+                    is_rate_limit = (
+                        msg_cd in ("EGW00201", "EGW00215") or
+                        "초당 거래건수" in msg1 or
+                        "초당 거래건수" in resp.text
+                    )
+
+                    if is_rate_limit:
+                        time.sleep(rate_limit_wait)
+                        continue
+                    raise
+
+                return resp
+
+            raise Exception("API 호출 실패: 초당 호출 제한 재시도 초과")
+
         except requests.exceptions.Timeout as e:
             network_retry_count += 1
-            if network_retry_count <= network_max_retries:
-                wait = 2 ** network_retry_count
+            if network_retry_count <= MAX_RETRIES:
+                wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
                 print(f"⏳ 타임아웃 오류 발생: {str(e)[:60]}...")
-                print(f"   {wait}초 후 재시도합니다... ({network_retry_count}/{network_max_retries})")
+                print(f"   {wait:.1f}초 후 재시도합니다... ({network_retry_count}/{MAX_RETRIES})")
                 time.sleep(wait)
                 continue
-            raise
-        except requests.exceptions.RequestException:
             raise
 
 
