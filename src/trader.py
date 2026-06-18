@@ -77,7 +77,7 @@ def _request_with_rate_retry(session, method, path, headers=None, params=None, j
 
             raise Exception("API 호출 실패: 초당 호출 제한 재시도 초과")
 
-        except requests.exceptions.Timeout as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             network_retry_count += 1
             if network_retry_count <= MAX_RETRIES:
                 wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)

@@ -118,7 +118,7 @@ def get_access_token(session=None):
                 _cached_token = response_data
                 return response_data
 
-        except requests.exceptions.Timeout as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             network_retry_count += 1
             if network_retry_count <= MAX_RETRIES:
                 wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
