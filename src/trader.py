@@ -4,6 +4,9 @@ import requests
 import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
+
+import exchange_calendars as xcals
+
 from authentication import get_access_token
 from config import KIS_MODE
 
@@ -325,6 +328,26 @@ def _is_kst_reserve_window(now_kst: datetime) -> bool:
     start = dtime(10, 0)
     end = dtime(22, 20) if is_dst else dtime(23, 20)
     return (t >= start) and (t <= end)
+
+
+_XNYS_CALENDAR = None
+
+
+def is_us_trading_day() -> bool:
+    """오늘이 미국 증시 영업일인지 확인합니다 (NYSE 기준).
+
+    exchange_calendars 라이브러리의 XNYS(뉴욕증권거래소) 캘린더를 사용하여
+    오늘 날짜가 정규 세션일인지 판단합니다.
+
+    Returns:
+        True: 오늘은 영업일 (정규장이 열리는 날)
+        False: 오늘은 휴장일 (주말 또는 공휴일)
+    """
+    global _XNYS_CALENDAR
+    if _XNYS_CALENDAR is None:
+        _XNYS_CALENDAR = xcals.get_calendar("XNYS")
+    now_kst = _get_kst_now()
+    return _XNYS_CALENDAR.is_session(now_kst.strftime("%Y-%m-%d"))
 
 
 def get_overseas_balance(session, symbol, exchange_code="NAS"):
