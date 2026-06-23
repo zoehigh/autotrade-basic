@@ -646,6 +646,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if net_qty > 0:
                 ratio = sell_qty / net_qty
                 if ratio >= 1.0:
+                    completed_start = state.get("cycle_start_date", "")
+                    if T > 0 and completed_start:
+                        state["_completed_cycle_start"] = completed_start
                     T = 0.0
                     state["cycle_start_date"] = ""
                     print(f"  → 매도 체결 ({ord_dt}): 전량매도 (비율={ratio:.2f}) → T=0")
@@ -671,11 +674,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
         skip_buys   = [
             (o_dt, odno, o) for o_dt, odno, o in day_buys
-            if odno in additional_loc_odno or orders_meta.get(odno, {}).get("is_additional")
+            if str(odno) in additional_loc_odno or orders_meta.get(str(odno), {}).get("is_additional")
         ]
         normal_buys = [
             (o_dt, odno, o) for o_dt, odno, o in day_buys
-            if odno not in additional_loc_odno and not orders_meta.get(odno, {}).get("is_additional")
+            if str(odno) not in additional_loc_odno and not orders_meta.get(str(odno), {}).get("is_additional")
         ]
 
         for o_dt, odno, order in skip_buys:
@@ -697,11 +700,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 print(f"  → 새 사이클 시작일 기록: {cycle_start}")
 
             # meta가 있는 주문: t_target 기반으로 각각 반영 (부분체결 비례 처리)
-            meta_buys   = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if orders_meta.get(odno)]
-            legacy_buys = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if not orders_meta.get(odno)]
+            meta_buys   = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if orders_meta.get(str(odno))]
+            legacy_buys = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if not orders_meta.get(str(odno))]
 
             for o_dt, odno, order in meta_buys:
-                meta = orders_meta[odno]
+                meta = orders_meta[str(odno)]
                 qty = int(float(order.get("ft_ccld_qty", "0")))
                 total_qty = int(meta.get("total_qty") or qty)
                 processed = int(meta.get("processed_filled_qty", 0))
@@ -741,5 +744,4 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
     print(f"[상태] {symbol} T값 업데이트 완료 → T={state['T']}")
     return state
-
 

@@ -232,6 +232,31 @@ class TestApplyRecentHistory:
         result = update_T_from_history("TQQQ", state, orders)
         assert result["T"] == 1.0, f"T={result['T']} (expected 1.0)"
 
+    def test_odno_int_타입_메타_t1_정상반영(self):
+        """int odno로 API 응답이 와도 str() 변환으로 orders_meta 조회 성공 → T=1.0"""
+        state = _make_state(T=0.0, last_updated="2026-06-15T00:00:00+00:00")
+        register_order_meta_in_state(state, "36267", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        # odno를 int 36267로 전달 (KIS API가 int로 반환하는 상황 시뮬레이션)
+        orders = [_make_buy_order(36267, "20260616", qty=1)]
+        result = update_T_from_history("SOXL", state, orders)
+        assert result["T"] == 1.0, f"T={result['T']} (expected 1.0, not 0.5)"
+
+    def test_전량매도_완료_사이클_플래그_설정(self):
+        """일반 모드: 전량매도 시 _completed_cycle_start 플래그가 설정되어야 함"""
+        state = _make_state(T=4.0, last_updated="2026-06-02T00:00:00+00:00")
+        state["cycle_start_date"] = "2026-06-03"
+        # 06-01 매수 8주 + 06-14 전량매도 8주
+        orders = [
+            _make_buy_order("ORD1", "20260601", qty=8, utc_dt="2026-06-01T10:00:00+00:00"),
+            _make_sell_order("ORD2", "20260614", qty=8, utc_dt="2026-06-14T15:00:00+00:00"),
+        ]
+        result = update_T_from_history("SOXL", state, orders)
+        assert result.get("_completed_cycle_start") == "2026-06-03", f"got {result.get('_completed_cycle_start')}"
+        assert result["T"] == 0.0, f"T={result['T']} (expected 0.0)"
+
 
 # ─────────────────────────────────────────────────────────
 # 테스트: _infer_T_from_full_history (초기 모드 — last_updated 없음)
@@ -310,6 +335,18 @@ class TestInferTFromFullHistory:
         state = _make_state(T=0.0, last_updated="")
         result = update_T_from_history("TQQQ", state, [])
         assert result["T"] == 0.0
+
+    def test_전량매도_초기모드_사이클_플래그(self):
+        """초기 모드: _infer_T_from_full_history가 전량매도 시 _completed_cycle_start 설정"""
+        state = _make_state(T=0.0, last_updated="")
+        # qty>1 매수로 첫 매수(T += 0.5) 후 전량매도
+        orders = [
+            _make_buy_order("ORD1", "20260604", qty=3, utc_dt="2026-06-04T10:00:00+00:00"),
+            _make_sell_order("ORD2", "20260614", qty=3, utc_dt="2026-06-14T15:00:00+00:00"),
+        ]
+        result = update_T_from_history("SOXL", state, orders)
+        assert result.get("_completed_cycle_start") == "2026-06-04", f"got {result.get('_completed_cycle_start')}"
+        assert result["T"] == 0.0, f"T={result['T']} (expected 0.0)"
 
 
 # ─────────────────────────────────────────────────────────
