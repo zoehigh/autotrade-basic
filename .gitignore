@@ -29,3 +29,7 @@ wheels/
 Thumbs.db
 
 *.log
+!.omo/
+.omo/*
+!.omo/plans/
+!.omo/evidence/
