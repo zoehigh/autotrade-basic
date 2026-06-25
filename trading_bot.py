@@ -16,7 +16,7 @@ sys.path.append("src")
 
 from datetime import datetime
 
-from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, KIS_MODE
 from kis_session import KISSession
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state
@@ -27,6 +27,8 @@ from trader import (
     get_overseas_balance,
     is_us_trading_day,
     ReservationOrderRequired,
+    _get_kst_now,
+    _is_us_dst,
 )
 from notifier import notify
 
@@ -475,6 +477,17 @@ def run_one_symbol(session, symbol_config):
 
     print("\n[Step 4] 주문 실행 중...")
     print("-" * 60)
+
+    # Real+LIVE: 프리장 오픈 전이면 KST 기준으로 대기
+    if KIS_MODE == "real" and TRADE_MODE == "LIVE":
+        now_kst = _get_kst_now()
+        is_dst = _is_us_dst()
+        pre_market_open_hour = 17 if is_dst else 18
+        if now_kst.hour < pre_market_open_hour:
+            target = now_kst.replace(hour=pre_market_open_hour, minute=0, second=0, microsecond=0)
+            wait_seconds = (target - now_kst).total_seconds()
+            print(f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → {target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)")
+            time.sleep(wait_seconds)
 
     order_exchange_code = convert_exchange_code(exchange)
 
