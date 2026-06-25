@@ -1,0 +1,26 @@
+Task 1 Verification: Fix bugs in _apply_recent_history_dt()
+=========================================================
+Date: 2026-06-23
+
+[Automated Verification]
+- `uv run python -m pytest tests/test_state_t_updates.py -v` → 24 passed (기존 + 영향 없음)
+
+[Code Review - Bug A: odno str() 변환]
+- Line 677: str(odno) in additional_loc_odno or orders_meta.get(str(odno), ...) ✅
+- Line 681: str(odno) not in additional_loc_odno and not orders_meta.get(str(odno), ...) ✅
+- Line 703: orders_meta.get(str(odno)) ✅
+- Line 704: not orders_meta.get(str(odno)) ✅
+- Line 707: orders_meta[str(odno)] ✅
+Total: 5개 라인 모두 str() 변환 적용 완료
+
+[Code Review - Bug B: _completed_cycle_start 플래그]
+- Line 649-651: completed_start = state.get("cycle_start_date", "")
+                   if T > 0 and completed_start:
+                       state["_completed_cycle_start"] = completed_start ✅
+- `_completed_cycle_start` 2개 라인 확인 (line 331 기존 + line 651 신규)
+
+[Scope Creep Check]
+- git diff: Only src/state.py modified (8 insertions, 6 deletions)
+- No changes to _infer_T_from_full_history, trading_bot.py, or other files
+
+[Status] ✅ PASS - All verifications complete
