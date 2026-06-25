@@ -680,6 +680,10 @@ def main():
     """
     kis_session = KISSession()
     try:
+        # stdout 버퍼링 해제: GitHub Actions 또는 로컬에서 출력이 한꺼번에 나오지 않고
+        # 줄 단위로 실시간 표시되도록 합니다. (PYTHONUNBUFFERED 환경변수와 동일한 효과)
+        sys.stdout.reconfigure(line_buffering=True)
+
         print("\n" + "=" * 60)
         print("자동매매 봇 시작")
         print("=" * 60)
