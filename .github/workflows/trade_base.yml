@@ -104,6 +104,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
+          # KIS API 연결 타임아웃 (초 단위, 기본값 10초 → 30초로 증가)
+          KIS_CONNECT_TIMEOUT: 30
+
           # GitHub Actions에서 Python 출력이 line-by-line으로 표시되도록 버퍼링 해제
           PYTHONUNBUFFERED: 1
 
