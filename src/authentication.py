@@ -25,7 +25,7 @@ def get_access_token(session=None):
     자동 재시도:
     - EGW00133(토큰 발급 과다): 1분 대기 후 재시도 (최대 3회)
     - EGW00201/EGW00215(초당 호출 과다): fixed-wait 후 재시도 (실전=0.05s, 모의=1.0s, 최대 3회)
-    - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
+    - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 20회)
     - 각 오류 유형은 독립적인 카운터로 관리되어 서로 영향을 주지 않습니다
     
     Returns:
@@ -72,6 +72,7 @@ def get_access_token(session=None):
     }
     
     MAX_RETRIES = 3
+    NETWORK_MAX_RETRIES = 20
     retry_count = 0               # EGW00133 (토큰 발급 과다)
     network_retry_count = 0       # Timeout (네트워크 장애)
     rate_limit_retry_count = 0    # EGW00201/EGW00215 (초당 호출 과다)
@@ -120,10 +121,10 @@ def get_access_token(session=None):
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             network_retry_count += 1
-            if network_retry_count <= MAX_RETRIES:
-                wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
+            if network_retry_count <= NETWORK_MAX_RETRIES:
+                wait = min(60, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
                 print(f"⏳ 타임아웃 오류 발생: {str(e)[:60]}...")
-                print(f"   {wait:.1f}초 후 재시도합니다... ({network_retry_count}/{MAX_RETRIES})")
+                print(f"   {wait:.1f}초 후 재시도합니다... ({network_retry_count}/{NETWORK_MAX_RETRIES})")
                 time.sleep(wait)
                 continue
             raise Exception(f"토큰 발급 실패: {str(e)}")
