@@ -27,7 +27,7 @@ jobs:
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || vars.SYMBOLS }}
       quiet_hours: ${{ vars.QUIET_HOURS_DEMO || 'true' }}
       commission_rate: ${{ vars.COMMISSION_RATE_DEMO || '0.0025' }}
-      reinvest: ${{ vars.REINVEST_DEMO || 'false' }}
+      reinvest: ${{ vars.REINVEST_DEMO || 'true' }}
     secrets:
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY_DEMO }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET_DEMO }}

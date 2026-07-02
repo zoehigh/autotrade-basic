@@ -140,8 +140,8 @@ else:
 COMMISSION_RATE = float(os.getenv("COMMISSION_RATE") or "0.0025")
 
 # 사이클 수익 복리 재투자 여부
-# true: 사이클 종료 후 순수익을 다음 사이클 시드에 자동으로 합산합니다
-# false (기본값): 매 사이클 동일한 시드로 운용합니다
-# .env 예: REINVEST=true
-_reinvest_raw = os.getenv("REINVEST", "false").strip().lower()
+# true (기본값): 사이클 종료 후 순수익을 다음 사이클 시드에 자동으로 합산합니다
+# 설정 해제 시 false: 매 사이클 동일한 시드로 운용
+# .env 예: REINVEST=false
+_reinvest_raw = os.getenv("REINVEST", "true").strip().lower()
 REINVEST = _reinvest_raw == "true"

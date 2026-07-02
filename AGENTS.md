@@ -86,4 +86,4 @@ uv run pytest tests/ -v
 - GitHub Actions: `repository_dispatch`로만 트리거 (cron 없음)
 - 기본 거래소: TQQQ(NAS), SOXL(AMS)
 - KIS 모의투자는 초당 1회, 실전은 초당 20회 rate-limit
-- 복리 재투자: `REINVEST=true` 환경변수로 활성화
+- 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
