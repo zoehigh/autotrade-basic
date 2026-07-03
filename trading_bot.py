@@ -15,6 +15,7 @@ import time
 sys.path.append("src")
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, KIS_MODE
 from kis_session import KISSession
@@ -232,7 +233,7 @@ def run_one_symbol(session, symbol_config):
 
     # ── 휴장일 체크 ───────────────────────────────────────────
     if not is_us_trading_day():
-        today_str = datetime.now().strftime("%Y-%m-%d %A")
+        today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
         print(f"  📅 오늘({today_str})은 미국 증시 휴장일입니다. 이 종목을 건너<skip>니다.")
         return
 
@@ -707,7 +708,7 @@ def main():
         # 휴장일 체크 — 조기종료
         # ========================================
         if not is_us_trading_day():
-            today_str = datetime.now().strftime("%Y-%m-%d %A")
+            today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
             print(f"\n📅 오늘({today_str})은 미국 증시 휴장일입니다. 프로그램을 종료합니다.")
             notify("📅 오늘은 미국 증시 휴장일입니다. 자동매매를 실행하지 않습니다.")
             return

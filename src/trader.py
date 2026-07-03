@@ -346,8 +346,8 @@ def is_us_trading_day() -> bool:
     global _XNYS_CALENDAR
     if _XNYS_CALENDAR is None:
         _XNYS_CALENDAR = xcals.get_calendar("XNYS")
-    now_kst = _get_kst_now()
-    return _XNYS_CALENDAR.is_session(now_kst.strftime("%Y-%m-%d"))
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    return _XNYS_CALENDAR.is_session(now_et.strftime("%Y-%m-%d"))
 
 
 def get_overseas_balance(session, symbol, exchange_code="NAS"):
