@@ -1,0 +1,547 @@
+"""
+KiwoomBroker — 키움증권 Broker 구현체.
+
+키움증권 미국주식 REST API를 Broker 인터페이스로 구현합니다.
+- 모든 TR은 POST 방식 (tr_registry.py 참고)
+- 인증: Authorization Bearer 헤더 + api-id 헤더
+- 응답 검증: return_code == 0 (정수)
+- 숫자 필드는 문자열로 반환되므로 float()/int() 변환 필요
+- 모의투자(demo)도 지원 (2026.07.02부터 미국주식 모의 지원)
+
+사용법:
+    broker = KiwoomBroker()
+    price = broker.get_stock_price("TQQQ", "NAS")
+    result = broker.place_order("TQQQ", "NAS", "BUY", 10, 50.0, "LOC")
+
+DRY 모드는 DryBroker 래퍼로 처리 — KiwoomBroker 자체는 항상 LIVE로 동작.
+"""
+import random
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import Optional
+
+import requests
+
+from broker.base import (
+    Broker,
+    StockPrice,
+    StockQuotation,
+    Balance,
+    PurchaseAmount,
+    OrderResult,
+    BrokerError,
+    OrderError,
+)
+from broker.market_utils import get_kst_now, is_us_trading_day
+from broker.kiwoom.session import KiwoomSession
+from broker.kiwoom.auth import get_access_token
+from broker.kiwoom.exchange import get_api_exchange_code
+from broker.kiwoom.tr_registry import (
+    TR_PRICE,
+    TR_ORDERBOOK,
+    TR_BALANCE,
+    TR_HISTORY,
+    TR_DEPOSIT,
+    TR_BUY,
+    TR_SELL,
+)
+
+
+# ── 키움증권 주문 유형 코드 매핑 ─────────────────────────────────────
+# TODO: 실전 응답 확인 후 코드값 보정 필요
+_KIWOOM_ORDER_TYPE_MAP = {
+    "LIMIT": "00",  # 지정가
+    "LOC":   "34",  # 장마감지정가
+    "LOO":   "32",  # 장개시지정가
+    "MOO":   "31",  # 장개시시장가
+    "MOC":   "33",  # 장마감시장가
+}
+
+# 모의투자에서 지원하지 않는 주문 유형 — LIMIT으로 자동 변환
+_DEMO_UNSUPPORTED_ORDER_TYPES = {"LOC", "LOO", "MOO", "MOC"}
+
+
+class KiwoomBroker(Broker):
+    """
+    키움증권 미국주식 REST API Broker 구현체.
+
+    config.py의 BROKER_CONFIG["kiwoom"]에서 설정을 읽습니다.
+    BROKER_MODE에 따라 실전(real) / 모의(demo) 도메인이 결정됩니다.
+    """
+
+    def __init__(self):
+        from config import BROKER_CONFIG, BROKER_MODE, HTTP_TIMEOUT
+
+        self._mode = BROKER_MODE  # "real" or "demo"
+        self._domain = BROKER_CONFIG["domain"]
+        self._app_key = BROKER_CONFIG["app_key"]
+        self._app_secret = BROKER_CONFIG["app_secret"]
+        self._account_no = BROKER_CONFIG["account_no"]
+        self._session = KiwoomSession(self._domain, timeout=HTTP_TIMEOUT)
+
+        # rate limit: 실전 10회/초, 모의 1회/초
+        self._rate_limit_wait = 0.1 if self._mode == "real" else 1.0
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 속성
+    # ═══════════════════════════════════════════════════════════════════
+
+    @property
+    def name(self) -> str:
+        """증권사 식별자"""
+        return "kiwoom"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 내부 유틸리티
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _get_token(self) -> str:
+        """접근 토큰을 획득합니다 (auth.get_access_token 캐싱 포함)."""
+        try:
+            return get_access_token(
+                domain=self._domain,
+                app_key=self._app_key,
+                app_secret=self._app_secret,
+                timeout=self._session.timeout,
+            )
+        except Exception as e:
+            raise BrokerError(f"키움 토큰 획득 실패: {str(e)}")
+
+    def _check_account(self):
+        """계좌번호 설정 여부를 검증합니다."""
+        if not self._account_no:
+            raise BrokerError(
+                "KIWOOM_ACCOUNT_NO가 설정되어 있지 않습니다. "
+                "환경변수 또는 .env 파일에 KIWOOM_ACCOUNT_NO를 추가하세요."
+            )
+
+    def _check_response(self, resp: requests.Response) -> dict:
+        """
+        키움 공통 응답 검증: return_code == 0.
+
+        Raises:
+            BrokerError: return_code가 0이 아니거나 HTTP 오류인 경우
+        """
+        resp.raise_for_status()
+        body = resp.json()
+
+        return_code = body.get("return_code")
+        if return_code is None or return_code != 0:
+            msg = body.get("return_msg", "알 수 없는 오류")
+            raise BrokerError(f"키움 API 오류 (return_code={return_code}): {msg}")
+
+        return body
+
+    def _request_with_rate_retry(self, tr_id: str, body: dict, token: str) -> dict:
+        """
+        키움 API 요청 래퍼 — rate-limit/타임아웃 재시도 포함.
+
+        - rate-limit(HTTP 429 또는 return_code != 0): fixed-wait 후 재시도 (최대 3회)
+        - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
+
+        항상 dict(파싱된 JSON)를 반환하거나 예외를 발생시킵니다.
+        """
+        MAX_RETRIES = 3
+        network_retry_count = 0
+
+        while network_retry_count <= MAX_RETRIES:
+            try:
+                for _ in range(MAX_RETRIES + 1):
+                    resp = self._session.request_with_tr(tr_id, body, token)
+                    try:
+                        resp.raise_for_status()
+                    except requests.exceptions.HTTPError:
+                        # rate-limit 감지 (HTTP 429 또는 응답 내 오류코드)
+                        try:
+                            data = resp.json()
+                            return_code = data.get("return_code")
+                            return_msg = data.get("return_msg", "")
+                        except Exception:
+                            return_code = None
+                            return_msg = ""
+
+                        is_rate_limit = (
+                            resp.status_code == 429
+                            or (return_code is not None and return_code != 0
+                                and "초당" in return_msg)
+                        )
+
+                        if is_rate_limit:
+                            time.sleep(self._rate_limit_wait)
+                            continue
+                        raise
+
+                    return self._check_response(resp)
+
+                raise BrokerError("API 호출 실패: 초당 호출 제한 재시도 초과")
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                network_retry_count += 1
+                if network_retry_count <= MAX_RETRIES:
+                    wait = min(30, 2 ** network_retry_count) * random.uniform(0.75, 1.25)
+                    print(f"⏳ 타임아웃/연결 오류 발생: {str(e)[:60]}...")
+                    print(f"   {wait:.1f}초 후 재시도합니다... ({network_retry_count}/{MAX_RETRIES})")
+                    time.sleep(wait)
+                    continue
+                raise
+
+        # 도달 불가능 — 루프는 항상 return 또는 raise로 종료
+        raise BrokerError("API 호출 실패: 재시도 한도 초과")
+
+    def _normalize_order_item(self, raw: dict) -> dict:
+        """
+        키움 응답 필드를 state.py가 기대하는 표준 필드명으로 변환.
+
+        TODO: 실전 응답 확인 후 키움의 실제 응답 필드명으로 매핑 보정 필요.
+        현재는 KIS와 동일한 필드명을 가정 (한국 증권사 API는 유사한 필드명 사용).
+        """
+        ord_dt = raw.get("ord_dt", "")
+        ord_tmd_raw = raw.get("ord_tmd", "")
+        ord_tmd = ord_tmd_raw.zfill(6) if ord_tmd_raw else ""
+
+        ord_datetime_kst_iso = None
+        ord_datetime_utc_iso = None
+        if ord_dt and ord_tmd:
+            try:
+                kst_dt = datetime.strptime(ord_dt + ord_tmd, "%Y%m%d%H%M%S")
+                kst_dt = kst_dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                ord_datetime_kst_iso = kst_dt.isoformat()
+                ord_datetime_utc_iso = kst_dt.astimezone(ZoneInfo("UTC")).isoformat()
+            except Exception:
+                pass
+
+        return {
+            "ord_dt": ord_dt,
+            "ord_tmd": ord_tmd_raw,
+            "ord_datetime_kst": ord_datetime_kst_iso,
+            "ord_datetime_utc": ord_datetime_utc_iso,
+            "prdt_name": raw.get("prdt_name", ""),
+            "sll_buy_dvsn_cd_name": raw.get("sll_buy_dvsn_cd_name", ""),
+            "ft_ord_qty": raw.get("ft_ord_qty", "0"),
+            "ft_ccld_qty": raw.get("ft_ccld_qty", "0"),
+            "ft_ccld_unpr3": raw.get("ft_ccld_unpr3", "0"),
+            "ft_ccld_amt3": raw.get("ft_ccld_amt3", "0"),
+            "nccs_qty": raw.get("nccs_qty", "0"),
+            "prcs_stat_name": raw.get("prcs_stat_name", ""),
+            "tr_mket_name": raw.get("tr_mket_name", ""),
+            "tr_crcy_cd": raw.get("tr_crcy_cd", "USD"),
+            "odno": raw.get("odno", ""),
+            "ovrs_excg_cd": raw.get("ovrs_excg_cd", ""),
+        }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 시장 정보
+    # ═══════════════════════════════════════════════════════════════════
+
+    def is_trading_day(self) -> bool:
+        """오늘이 미국 증시 영업일인지 확인합니다 (NYSE 기준)."""
+        return is_us_trading_day()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 조회 API
+    # ═══════════════════════════════════════════════════════════════════
+
+    def get_stock_price(self, symbol: str, exchange: str) -> StockPrice:
+        """
+        해외주식 현재가를 조회합니다 → StockPrice(open, last).
+
+        TR: usa20100 (현재가)
+        키움은 숫자를 문자열로 반환하므로 float() 변환합니다.
+        """
+        token = self._get_token()
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "stk_cd": symbol.upper(),
+            "excg_cd": api_exch,
+        }
+
+        try:
+            data = self._request_with_rate_retry(TR_PRICE, body, token)
+            output = data.get("output", {})
+            return StockPrice(
+                open=float(output.get("open", "0")),
+                last=float(output.get("last", "0")),
+            )
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"현재가 조회 실패: {str(e)}")
+
+    def get_stock_quotation(self, symbol: str, exchange: str) -> StockQuotation:
+        """
+        주문 가능 여부 + 현재가 → StockQuotation(tradable, last).
+
+        TR: usa20101 (10호가)
+        - ordy: "Y"면 주문 가능
+        - last: 현재가
+        """
+        token = self._get_token()
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "stk_cd": symbol.upper(),
+            "excg_cd": api_exch,
+        }
+
+        try:
+            data = self._request_with_rate_retry(TR_ORDERBOOK, body, token)
+            output = data.get("output", {})
+            return StockQuotation(
+                tradable=output.get("ordy", "N") == "Y",
+                last=float(output.get("last", "0")),
+            )
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"호가 조회 실패: {str(e)}")
+
+    def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
+        """
+        해외주식 보유 잔고를 조회합니다 → Balance(quantity, avg_price).
+
+        TR: ust21070 (잔고)
+        해당 종목의 잔고가 없으면 None을 반환합니다.
+        """
+        self._check_account()
+        token = self._get_token()
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "acnt_no": self._account_no,
+            "excg_cd": api_exch,
+        }
+
+        try:
+            data = self._request_with_rate_retry(TR_BALANCE, body, token)
+            output = data.get("output", [])
+            if not output:
+                return None
+
+            # 종목 코드로 해당 항목 찾기
+            for item in output:
+                stk_cd = item.get("stk_cd", "").upper()
+                if symbol.upper() in stk_cd:
+                    return Balance(
+                        quantity=int(float(item.get("hold_qty", "0"))),
+                        avg_price=float(item.get("avg_price", "0")),
+                    )
+
+            return None
+
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"잔고 조회 실패: {str(e)}")
+
+    def get_purchase_amount(self, symbol: str, exchange: str) -> PurchaseAmount:
+        """
+        주문 가능 금액을 조회합니다 → PurchaseAmount(orderable_cash).
+
+        TR: ust21110 (예수금)
+        계좌의 주문가능 현금을 반환합니다.
+        """
+        self._check_account()
+        token = self._get_token()
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "acnt_no": self._account_no,
+            "excg_cd": api_exch,
+        }
+
+        try:
+            data = self._request_with_rate_retry(TR_DEPOSIT, body, token)
+            output = data.get("output", {})
+            if not output:
+                raise BrokerError("예수금 정보를 조회할 수 없습니다")
+
+            return PurchaseAmount(
+                orderable_cash=float(output.get("ord_psbl_cash", "0")),
+            )
+
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
+
+    def get_order_history(
+        self,
+        symbol: str,
+        exchange: str,
+        days: int = 30,
+        verbose: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        해외주식 주문 체결 내역을 조회합니다 → list[dict].
+
+        TR: ust21100 (거래내역)
+        각 dict는 state.py가 기대하는 표준 필드를 포함합니다:
+            ord_dt, ord_tmd, ord_datetime_kst, ord_datetime_utc,
+            prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
+            ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
+            tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
+
+        TODO: 키움의 연속조회(페이지네이션) 지원 필요 시 추가 구현.
+        """
+        self._check_account()
+        token = self._get_token()
+
+        # 날짜 계산 (KST 기준)
+        now_kst = get_kst_now()
+        start_date = now_kst - timedelta(days=days)
+        ord_end_dt = now_kst.strftime("%Y%m%d")
+        ord_strt_dt = start_date.strftime("%Y%m%d")
+
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "acnt_no": self._account_no,
+            "stk_cd": symbol.upper(),
+            "excg_cd": api_exch,
+            "ord_strt_dt": ord_strt_dt,
+            "ord_end_dt": ord_end_dt,
+        }
+
+        print(f"[주문이력] {symbol} 체결내역 조회 시작: {ord_strt_dt}~{ord_end_dt}")
+
+        try:
+            data = self._request_with_rate_retry(TR_HISTORY, body, token)
+            raw_items = data.get("output", [])
+
+            order_history = []
+            for item in raw_items:
+                normalized = self._normalize_order_item(item)
+                order_history.append(normalized)
+
+            print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
+
+            # Human-friendly summary (optional)
+            if verbose and order_history:
+                try:
+                    n = int(limit) if limit and int(limit) > 0 else 100
+                except Exception:
+                    n = 100
+                n = min(n, len(order_history))
+
+                print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
+                for item in order_history[:n]:
+                    kst_iso = item.get("ord_datetime_kst")
+                    if kst_iso:
+                        try:
+                            kst_dt = datetime.fromisoformat(kst_iso)
+                            kst_str = kst_dt.strftime("%Y-%m-%d %H:%M:%S") + " KST"
+                        except Exception:
+                            kst_str = kst_iso
+                    else:
+                        ord_dt = item.get("ord_dt", "")
+                        ord_tmd = (item.get("ord_tmd") or "").zfill(6)
+                        if ord_dt and len(ord_dt) == 8 and ord_tmd:
+                            try:
+                                kst_str = (
+                                    f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]} "
+                                    f"{ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]} KST"
+                                )
+                            except Exception:
+                                kst_str = f"{ord_dt} {ord_tmd}"
+                        else:
+                            kst_str = "(시간없음)"
+
+                    odno = item.get("odno", "")
+                    side = item.get("sll_buy_dvsn_cd_name", "")
+                    qty = item.get("ft_ccld_qty", "0")
+                    price = item.get("ft_ccld_unpr3", "0")
+                    amt = item.get("ft_ccld_amt3", "0")
+
+                    try:
+                        price_s = f"{float(price):.2f}"
+                    except Exception:
+                        price_s = price
+                    try:
+                        amt_s = f"{float(amt):.2f}"
+                    except Exception:
+                        amt_s = amt
+
+                    print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+
+            return order_history
+
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"주문체결내역 조회 실패: {str(e)}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 주문 API
+    # ═══════════════════════════════════════════════════════════════════
+
+    def place_order(
+        self,
+        symbol: str,
+        exchange: str,
+        side: str,
+        quantity: int,
+        price: float,
+        order_type: str,
+    ) -> Optional[OrderResult]:
+        """
+        해외주식 주문을 실행합니다 → Optional[OrderResult].
+
+        TR: ust20000 (매수) / ust20001 (매도)
+
+        - 모의투자 미지원 주문 유형(LOC 등)은 LIMIT으로 자동 변환합니다.
+        - DRY 모드는 DryBroker가 처리하므로, 이 메서드는 항상 LIVE로 동작합니다.
+
+        Returns:
+            OrderResult: 주문 성공 시 (주문번호, 시각, 예약여부)
+        """
+        self._check_account()
+        token = self._get_token()
+
+        # 모의투자 미지원 주문 유형 자동 변환
+        if self._mode != "real" and order_type in _DEMO_UNSUPPORTED_ORDER_TYPES:
+            print(f"⚠️  모의투자 미지원 주문 유형: {order_type} → LIMIT(지정가)으로 자동 변환합니다.")
+            order_type = "LIMIT"
+
+        ord_dvsn_cd = _KIWOOM_ORDER_TYPE_MAP.get(order_type)
+        if ord_dvsn_cd is None:
+            raise OrderError(f"지원하지 않는 주문 유형입니다: {order_type}")
+
+        tr_id = TR_BUY if side == "BUY" else TR_SELL
+        api_exch = get_api_exchange_code(exchange)
+
+        body = {
+            "acnt_no": self._account_no,
+            "stk_cd": symbol.upper(),
+            "excg_cd": api_exch,
+            "ord_qty": str(quantity),
+            "ord_unpr": str(price),
+            "ord_dvsn_cd": ord_dvsn_cd,
+        }
+
+        try:
+            data = self._request_with_rate_retry(tr_id, body, token)
+            output = data.get("output", {})
+
+            print("\n========== [LIVE 모드] 주문 성공 ==========")
+            print(f"종목 코드: {symbol}")
+            print(f"주문번호: {output.get('ODNO', '')}")
+            print(f"주문시각: {output.get('ORD_TMD', '')}")
+            print(f"주문수량: {quantity}주")
+            print(f"주문가격: ${price}")
+            print("==========================================\n")
+
+            return OrderResult(
+                order_id=output.get("ODNO", ""),
+                order_time=output.get("ORD_TMD", ""),
+                is_reservation=False,
+            )
+
+        except BrokerError as e:
+            raise OrderError(str(e)) from e
+        except requests.exceptions.RequestException as e:
+            raise OrderError(f"주문 실행 실패: {str(e)}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 유틸리티
+    # ═══════════════════════════════════════════════════════════════════
+
+    def exchange_code(self, user_code: str) -> str:
+        """사용자 거래소 코드 → API 거래소 코드 변환 (예: 'NAS' → 'ND')."""
+        return get_api_exchange_code(user_code)
+
+    def close(self):
+        """HTTP 세션을 종료합니다."""
+        self._session.close()

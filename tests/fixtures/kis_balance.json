@@ -1,0 +1,28 @@
+{
+  "rt_cd": "0",
+  "msg_cd": "MCA00000",
+  "msg1": "",
+  "output1": [
+    {
+      "ovrs_pdno": "TQQQ",
+      "ovrs_cblc_qty": "10",
+      "pchs_avg_pric": "48.50",
+      "prdt_name": "TQQQ",
+      "frcr_pchs_amt1": "485.00",
+      "ovrs_cblc_amt": "520.00",
+      "evlu_erng_rt": "7.22",
+      "now_pric2": "52.00",
+      "tr_mket_name": "NASDAQ",
+      "ovrs_excg_cd": "NASD"
+    }
+  ],
+  "output2": [
+    {
+      "tot_evlu_amt": "520.00",
+      "tot_pchs_amt": "485.00",
+      "tot_evlu_pfls_amt": "35.00",
+      "tot_evlu_pfls_rt": "7.22",
+      "natv_tot_evlu_amt": "520.00"
+    }
+  ]
+}

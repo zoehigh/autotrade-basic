@@ -11,23 +11,47 @@ load_dotenv()
 # .env 예: BROKER=kis
 BROKER = os.getenv("BROKER", "kis").strip().lower()
 
-# 한국투자증권 API 설정
-KIS_APP_KEY = os.getenv("KIS_APP_KEY", "")
-KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
-# 계좌번호는 KIS_ACCOUNT_NO 하나로 관리합니다.
-KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")
+# 브로커 모드 (demo/real)
+# 환경변수 BROKER_MODE (우선) 또는 KIS_MODE(하위호환)를 읽습니다.
+# 기본값은 demo(모의)입니다. .env 예: BROKER_MODE=real
+BROKER_MODE = os.getenv("BROKER_MODE") or os.getenv("KIS_MODE", "demo")
+BROKER_MODE = BROKER_MODE.strip().lower()
 
-# 한국투자증권 API 엔드포인트
-# 환경변수 `KIS_MODE`로 demo(모의) 또는 real(실전) 환경을 선택합니다.
-# 기본값은 demo(모의)입니다. .env 예: KIS_MODE=real
-KIS_MODE = os.getenv("KIS_MODE", "demo").strip().lower()
-if KIS_MODE == "real":
-	KIS_DOMAIN = "https://openapi.koreainvestment.com:9443"
-else:
-	KIS_DOMAIN = "https://openapivts.koreainvestment.com:29443"
 
-if BROKER == "kis" and not KIS_ACCOUNT_NO:
-	print(f"경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
+def _get_broker_config(broker_name: str) -> dict:
+    """브로커별 설정을 반환합니다."""
+    configs = {
+        "kis": {
+            "app_key": os.getenv("KIS_APP_KEY", ""),
+            "app_secret": os.getenv("KIS_APP_SECRET", ""),
+            "account_no": os.getenv("KIS_ACCOUNT_NO", ""),
+            "domain": (
+                "https://openapi.koreainvestment.com:9443"
+                if BROKER_MODE == "real"
+                else "https://openapivts.koreainvestment.com:29443"
+            ),
+            "acnt_prdt_cd": "01",
+        },
+        "kiwoom": {
+            "app_key": os.getenv("KIWOOM_APP_KEY", ""),
+            "app_secret": os.getenv("KIWOOM_APP_SECRET", ""),
+            "account_no": os.getenv("KIWOOM_ACCOUNT_NO", ""),
+            "domain": (
+                "https://api.kiwoom.com"
+                if BROKER_MODE == "real"
+                else "https://mockapi.kiwoom.com"
+            ),
+            "acnt_prdt_cd": "",
+        },
+    }
+    return configs.get(broker_name, {})
+
+
+BROKER_CONFIG = _get_broker_config(BROKER)
+
+# 계좌번호 확인
+if BROKER == "kis" and not BROKER_CONFIG.get("account_no", ""):
+    print(f"경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
 
 # ── 키움증권 API 설정 (향후 지원) ──
 KIWOOM_APP_KEY = os.getenv("KIWOOM_APP_KEY", "")
@@ -47,10 +71,10 @@ TOSS_ACCOUNT_NO = os.getenv("TOSS_ACCOUNT_NO", "")
 # HTTP 타임아웃 설정 (초)
 # connect_timeout: 연결 시도 제한 시간
 # read_timeout: 응답 수신 제한 시간
-# .env 예: KIS_CONNECT_TIMEOUT=5, KIS_READ_TIMEOUT=30
-KIS_CONNECT_TIMEOUT = int(os.getenv("KIS_CONNECT_TIMEOUT") or "10")
-KIS_READ_TIMEOUT = int(os.getenv("KIS_READ_TIMEOUT") or "30")
-KIS_TIMEOUT = (KIS_CONNECT_TIMEOUT, KIS_READ_TIMEOUT)
+# .env 예: CONNECT_TIMEOUT=5, READ_TIMEOUT=30
+CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT") or os.getenv("KIS_CONNECT_TIMEOUT") or "10")
+READ_TIMEOUT = int(os.getenv("READ_TIMEOUT") or os.getenv("KIS_READ_TIMEOUT") or "30")
+HTTP_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
 # 종목 정보
 # 여러 종목을 매매하려면 SYMBOLS 환경변수를 사용하세요.
@@ -142,7 +166,7 @@ def _parse_symbols():
 SYMBOLS = _parse_symbols()
 
 # 계좌 정보
-ACNT_PRDT_CD = "01"  # 계좌상품코드 (상품코드)
+ACNT_PRDT_CD = BROKER_CONFIG.get("acnt_prdt_cd", "01")  # 계좌상품코드 (상품코드)
 
 # 거래 모드
 # 환경변수에서 값을 읽어 대문자로 정규화하고 유효성 검사 수행
@@ -166,3 +190,13 @@ COMMISSION_RATE = float(os.getenv("COMMISSION_RATE") or "0.0025")
 # .env 예: REINVEST=false
 _reinvest_raw = os.getenv("REINVEST", "true").strip().lower()
 REINVEST = _reinvest_raw == "true"
+
+# ── 하위호환 alias (기존 import 경로 유지) ──
+KIS_MODE = BROKER_MODE
+KIS_DOMAIN = BROKER_CONFIG.get("domain", "")
+KIS_APP_KEY = BROKER_CONFIG.get("app_key", "")
+KIS_APP_SECRET = BROKER_CONFIG.get("app_secret", "")
+KIS_ACCOUNT_NO = BROKER_CONFIG.get("account_no", "")
+KIS_TIMEOUT = HTTP_TIMEOUT
+KIS_CONNECT_TIMEOUT = CONNECT_TIMEOUT
+KIS_READ_TIMEOUT = READ_TIMEOUT

@@ -21,16 +21,12 @@ jobs:
   trade:
     uses: ./.github/workflows/trade_base.yml
     with:
-      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || vars.TRADE_MODE }}
-      kis_mode: real
+      broker: ${{ vars.BROKER || 'kis' }}
+      broker_mode: real
+      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || vars.TRADE_MODE || 'LIVE' }}
       # 복수 종목 사용 (우선순위: input.symbols -> vars.SYMBOLS -> base 기본값)
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || vars.SYMBOLS }}
       quiet_hours: ${{ vars.QUIET_HOURS_REAL || 'false' }}
       commission_rate: ${{ vars.COMMISSION_RATE_REAL || '0.0025' }}
       reinvest: ${{ vars.REINVEST_REAL || 'true' }}
-    secrets:
-      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-      KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_REAL }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID_REAL }}
+    secrets: inherit

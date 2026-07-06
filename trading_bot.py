@@ -17,7 +17,7 @@ sys.path.append("src")
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, KIS_MODE
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER_MODE
 from broker import create_broker
 from broker.base import Broker, OrderResult
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
@@ -445,7 +445,7 @@ def run_one_symbol(broker: Broker, symbol_config):
     print("-" * 60)
 
     # Real+LIVE: 프리장 오픈 전이면 KST 기준으로 대기
-    if KIS_MODE == "real" and TRADE_MODE == "LIVE":
+    if BROKER_MODE == "real" and TRADE_MODE == "LIVE":
         now_kst = get_kst_now()
         is_dst = is_us_dst()
         pre_market_open_hour = 17 if is_dst else 18
