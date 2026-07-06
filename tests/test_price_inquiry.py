@@ -5,8 +5,7 @@ from pathlib import Path
 # 부모 디렉토리(src)를 Python 경로에 추가하여 모듈을 import 가능하게 함
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from trader import get_overseas_stock_price
-from kis_session import KISSession
+from broker.kis.adapter import KISBroker
 
 
 def test_tqqq_price_inquiry():
@@ -27,39 +26,19 @@ def test_tqqq_price_inquiry():
     try:
         # Step 1: 현재가 조회
         print("\n[Step 1] API에서 TQQQ 현재가 조회 중...")
-        session = KISSession()
-        price_data = get_overseas_stock_price(session, symbol="TQQQ", exchange_code="NAS")
+        broker = KISBroker()
+        price_data = broker.get_stock_price("TQQQ", "NAS")
         
         # Step 2: 응답 데이터 검증
         print("[Step 2] 응답 데이터 검증 중...")
-        
-        required_fields = ["rsym", "last", "open", "high", "low", "base", "tvol"]
-        missing_fields = [field for field in required_fields if field not in price_data]
-        
-        if missing_fields:
-            print(f"❌ 응답에 필수 필드가 부족합니다: {missing_fields}")
-            return False
+        assert price_data.last > 0, "현재가(last)가 0입니다"
+        assert price_data.open > 0, "시가(open)가 0입니다"
         
         # Step 3: 현재가 정보 출력
         print("\n✅ 현재가 조회 성공!")
         print("\n[TQQQ 시세 정보]")
-        print(f"- 종목코드: {price_data.get('rsym', 'N/A')}")
-        print(f"- 현재가: ${price_data.get('last', 'N/A')}")
-        print(f"- 시가: ${price_data.get('open', 'N/A')}")
-        print(f"- 고가: ${price_data.get('high', 'N/A')}")
-        print(f"- 저가: ${price_data.get('low', 'N/A')}")
-        print(f"- 전일 종가: ${price_data.get('base', 'N/A')}")
-        print(f"- 거래량: {price_data.get('tvol', 'N/A')} 주")
-        print(f"- 거래대금: ${price_data.get('tamt', 'N/A')}")
-        
-        # Step 4: 추가 정보 출력 (있을 경우)
-        print("\n[추가 정보]")
-        if price_data.get('perx'):
-            print(f"- PER: {price_data.get('perx')}")
-        if price_data.get('epsx'):
-            print(f"- EPS: ${price_data.get('epsx')}")
-        if price_data.get('t_xprc'):
-            print(f"- 원환산 당일 가격: ₩{price_data.get('t_xprc')}")
+        print(f"- 현재가: ${price_data.last:.2f}")
+        print(f"- 시가: ${price_data.open:.2f}")
         
         print("\n" + "=" * 70)
         print("✅ 모든 테스트를 통과했습니다!")

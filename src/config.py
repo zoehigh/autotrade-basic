@@ -5,6 +5,12 @@ from dotenv import load_dotenv
 # .env 파일에서 환경변수 읽기
 load_dotenv()
 
+# 증권사 선택
+# 환경변수 BROKER로 사용할 증권사를 선택합니다.
+# 지원: kis(기본값), kiwoom, ls, toss(예정)
+# .env 예: BROKER=kis
+BROKER = os.getenv("BROKER", "kis").strip().lower()
+
 # 한국투자증권 API 설정
 KIS_APP_KEY = os.getenv("KIS_APP_KEY", "")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
@@ -20,8 +26,23 @@ if KIS_MODE == "real":
 else:
 	KIS_DOMAIN = "https://openapivts.koreainvestment.com:29443"
 
-if not KIS_ACCOUNT_NO:
-	print(f"경고: KIS_MODE={KIS_MODE} 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
+if BROKER == "kis" and not KIS_ACCOUNT_NO:
+	print(f"경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
+
+# ── 키움증권 API 설정 (향후 지원) ──
+KIWOOM_APP_KEY = os.getenv("KIWOOM_APP_KEY", "")
+KIWOOM_APP_SECRET = os.getenv("KIWOOM_APP_SECRET", "")
+KIWOOM_ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
+
+# ── LS증권 API 설정 (향후 지원) ──
+LS_APP_KEY = os.getenv("LS_APP_KEY", "")
+LS_APP_SECRET = os.getenv("LS_APP_SECRET", "")
+LS_ACCOUNT_NO = os.getenv("LS_ACCOUNT_NO", "")
+
+# ── 토스증권 API 설정 (향후 지원) ──
+TOSS_APP_KEY = os.getenv("TOSS_APP_KEY", "")
+TOSS_APP_SECRET = os.getenv("TOSS_APP_SECRET", "")
+TOSS_ACCOUNT_NO = os.getenv("TOSS_ACCOUNT_NO", "")
 
 # HTTP 타임아웃 설정 (초)
 # connect_timeout: 연결 시도 제한 시간

@@ -1,12 +1,7 @@
 # 매수/매도 여부를 판단하는 전략 로직 — 무한매수법 V4.0
 import math
 from config import TRADE_MODE
-from trader import (
-    get_overseas_stock_price,
-    get_overseas_stock_quotation,
-    get_overseas_balance,
-    get_overseas_purchase_amount,
-)
+from broker.base import Broker
 
 def adjust_price_to_tick(price):
     """
@@ -100,7 +95,7 @@ def calculate_unit_amount(remaining_cash, T, splits):
     return remaining_cash / remaining_slots
 
 
-def 무한매수법_V4(session, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3):
+def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -148,22 +143,22 @@ def 무한매수법_V4(session, symbol, exchange_code, splits, symbol_type, seed
     # 1. 시장 정보 조회
     # ========================================
 
-    quotation = get_overseas_stock_quotation(session, symbol, exchange_code)
-    tradable = quotation.get("ordy", "N") == "Y"
+    quotation = broker.get_stock_quotation(symbol, exchange_code)
+    tradable = quotation.tradable
 
-    price_detail = get_overseas_stock_price(session, symbol, exchange_code)
-    open_price = float(price_detail.get("open", "0"))
-    last_price = float(price_detail.get("last", "0"))
+    price_detail = broker.get_stock_price(symbol, exchange_code)
+    open_price = price_detail.open
+    last_price = price_detail.last
 
     # ========================================
     # 2. 보유 정보 조회
     # ========================================
 
-    balance = get_overseas_balance(session, symbol, exchange_code)
+    balance = broker.get_balance(symbol, exchange_code)
 
     if balance:
-        position_qty = int(float(balance.get("quantity", "0")))
-        avg_price = float(balance.get("avg_price", "0"))
+        position_qty = balance.quantity
+        avg_price = balance.avg_price
     else:
         position_qty = 0
         avg_price = 0.0
@@ -179,8 +174,8 @@ def 무한매수법_V4(session, symbol, exchange_code, splits, symbol_type, seed
     # 3. 주문가능금액 조회 및 시드 적용
     # ========================================
 
-    psamount = get_overseas_purchase_amount(session, symbol, exchange_code)
-    orderable_cash = float(psamount.get("ord_psbl_frcr_amt", "0"))
+    psamount = broker.get_purchase_amount(symbol, exchange_code)
+    orderable_cash = psamount.orderable_cash
 
     remaining_seed = None
     if seed > 0:

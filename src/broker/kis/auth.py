@@ -1,4 +1,8 @@
-# 한국투자증권 API 인증을 담당하는 파일
+"""
+KIS OAuth2 인증 — 접근 토큰 발급/캐싱/재시도.
+
+기존 src/authentication.py에서 이관. KISBroker가 내부적으로 사용합니다.
+"""
 import random
 import requests
 import time
@@ -13,21 +17,21 @@ _cached_token = None
 def get_access_token(session=None):
     """
     한국투자증권 API에서 access token을 발급받습니다.
-    
+
     이 함수는 한국투자증권의 OAuth2 Client Credentials 절차를 따릅니다.
     - token은 발급 후 24시간 동안 유효합니다
     - 6시간 이내에 재발급 요청하면 이전 token을 반환합니다
-    
+
     토큰 캐싱:
     - 한 번 발급받은 토큰은 전역 변수(_cached_token)에 저장되어 재사용됩니다
     - 프로그램 실행 중 동일한 토큰을 반복 호출하면 API 요청 없이 캐시된 토큰을 반환합니다
-    
+
     자동 재시도:
     - EGW00133(토큰 발급 과다): 1분 대기 후 재시도 (최대 3회)
     - EGW00201/EGW00215(초당 호출 과다): fixed-wait 후 재시도 (실전=0.05s, 모의=1.0s, 최대 3회)
     - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 20회)
     - 각 오류 유형은 독립적인 카운터로 관리되어 서로 영향을 주지 않습니다
-    
+
     Returns:
         dict: access token과 관련 정보를 포함한 딕셔너리
               {
@@ -36,33 +40,32 @@ def get_access_token(session=None):
                   'expires_in': 초 단위 유효기간,
                   'access_token_token_expired': '2024-01-01 00:00:00' 형식의 유효기간
               }
-    
+
     Raises:
         Exception: API 호출 실패 또는 필수 환경변수 미설정 시 예외 발생
     """
-    
+
     global _cached_token
-    
+
     # 캐시된 토큰이 있으면 즉시 반환합니다
-    # 이렇게 하면 같은 토큰을 여러 번 요청할 때 API 호출을 하지 않아 효율적입니다
     if _cached_token is not None:
         return _cached_token
-    
+
     # 환경변수가 설정되어 있는지 확인
     if not KIS_APP_KEY or not KIS_APP_SECRET:
         raise Exception(
-            "환경변수 KIS_APP_KEY와 KIS_APP_SECRET이 설정되어야 합니다. "
+            "환경변수 KIS_APP_KEY과 KIS_APP_SECRET이 설정되어야 합니다. "
             ".env 파일을 확인해주세요."
         )
-    
+
     # API 호출에 필요한 정보 준비
     url = f"{KIS_DOMAIN}/oauth2/tokenP"
-    
+
     # 요청 헤더 설정
     headers = {
         "Content-Type": "application/json; charset=UTF-8"
     }
-    
+
     # 요청 바디 설정
     # grant_type은 항상 "client_credentials"로 고정됩니다
     body = {
@@ -70,7 +73,7 @@ def get_access_token(session=None):
         "appkey": KIS_APP_KEY,
         "appsecret": KIS_APP_SECRET
     }
-    
+
     MAX_RETRIES = 3
     NETWORK_MAX_RETRIES = 20
     retry_count = 0               # EGW00133 (토큰 발급 과다)
