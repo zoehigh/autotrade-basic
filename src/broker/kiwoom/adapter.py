@@ -63,6 +63,30 @@ _KIWOOM_ORDER_TYPE_MAP = {
 _DEMO_UNSUPPORTED_ORDER_TYPES = {"LOC", "LOO", "MOO", "MOC"}
 
 
+def _parse_price(value, default: float = 0.0) -> float:
+    """
+    키움 가격 문자열을 float로 안전 변환합니다.
+
+    키움 API는 가격 필드를 '부호 포함 문자열'로 반환합니다:
+      - "-73.78" → 실제 가격 73.78 (앞 부호는 전일대비 등락 방향, 실제값은 절대값)
+      - "+90800" → 90800
+      - "" / None → 장외 시간 등 미가용 → default
+    레거시 OpenAPI+의 2중 부호("--4500")도 lstrip으로 방어합니다.
+    """
+    if value is None:
+        return default
+    s = str(value).strip().replace(",", "")
+    if s == "":
+        return default
+    s = s.lstrip("+-")
+    if s == "":
+        return default
+    try:
+        return abs(float(s))
+    except ValueError:
+        return default
+
+
 class KiwoomBroker(Broker):
     """
     키움증권 미국주식 REST API Broker 구현체.
@@ -221,8 +245,9 @@ class KiwoomBroker(Broker):
             "sll_buy_dvsn_cd_name": raw.get("sll_buy_dvsn_cd_name", ""),
             "ft_ord_qty": raw.get("ft_ord_qty", "0"),
             "ft_ccld_qty": raw.get("ft_ccld_qty", "0"),
-            "ft_ccld_unpr3": raw.get("ft_ccld_unpr3", "0"),
-            "ft_ccld_amt3": raw.get("ft_ccld_amt3", "0"),
+            # 키움 가격/금액 필드는 부호 포함 문자열 → 절대값 문자열로 정규화
+            "ft_ccld_unpr3": str(_parse_price(raw.get("ft_ccld_unpr3"))),
+            "ft_ccld_amt3": str(_parse_price(raw.get("ft_ccld_amt3"))),
             "nccs_qty": raw.get("nccs_qty", "0"),
             "prcs_stat_name": raw.get("prcs_stat_name", ""),
             "tr_mket_name": raw.get("tr_mket_name", ""),
@@ -258,12 +283,10 @@ class KiwoomBroker(Broker):
                 pass
 
         # 체결금액 계산 (cntr_amt가 응답에 없으므로 cntr_qty × cntr_uv로 계산)
-        cntr_qty = raw.get("cntr_qty", "0")
-        cntr_uv = raw.get("cntr_uv", "0")
-        try:
-            ft_ccld_amt3 = str(float(cntr_qty) * float(cntr_uv))
-        except Exception:
-            ft_ccld_amt3 = "0"
+        # 키움 가격 필드는 부호 포함 문자열이므로 _parse_price()로 절대값 변환.
+        cntr_qty = int(_parse_price(raw.get("cntr_qty")))
+        cntr_uv = _parse_price(raw.get("cntr_uv"))
+        ft_ccld_amt3 = str(cntr_qty * cntr_uv)
 
         return {
             "ord_dt": ord_dt,
@@ -273,8 +296,8 @@ class KiwoomBroker(Broker):
             "prdt_name": raw.get("frgn_stk_nm", ""),
             "sll_buy_dvsn_cd_name": raw.get("slby_tp_nm", ""),
             "ft_ord_qty": raw.get("ord_qty", "0"),
-            "ft_ccld_qty": cntr_qty,
-            "ft_ccld_unpr3": cntr_uv,
+            "ft_ccld_qty": str(cntr_qty),
+            "ft_ccld_unpr3": str(cntr_uv),
             "ft_ccld_amt3": ft_ccld_amt3,
             "nccs_qty": raw.get("ord_remnq", "0"),
             "prcs_stat_name": raw.get("ord_stat_nm", ""),
@@ -301,7 +324,8 @@ class KiwoomBroker(Broker):
         해외주식 현재가를 조회합니다 → StockPrice(open, last).
 
         TR: usa20100 (현재가)
-        키움은 숫자를 문자열로 반환하므로 float() 변환합니다.
+        키움은 가격을 '부호 포함 문자열'로 반환하므로 _parse_price()로 변환합니다.
+        장외 시간에는 open_pric이 빈 문자열로 올 수 있습니다.
         """
         token = self._get_token()
         api_exch = get_api_exchange_code(exchange)
@@ -317,8 +341,8 @@ class KiwoomBroker(Broker):
             # output 키가 있으면 그 값을, 없으면 data 자체를 사용.
             output = data.get("output", data)
             return StockPrice(
-                open=float(output.get("open_pric", "0")),
-                last=float(output.get("cur_prc", "0")),
+                open=_parse_price(output.get("open_pric")),
+                last=_parse_price(output.get("cur_prc")),
             )
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"현재가 조회 실패: {str(e)}")
@@ -328,7 +352,7 @@ class KiwoomBroker(Broker):
         현재가 조회 + 주문 가능 여부 → StockQuotation(tradable, last).
 
         TR: usa20101 (10호가)
-        - cur_prc: 현재가 (부호 포함 문자열, float()로 정상 변환)
+        - cur_prc: 현재가 (부호 포함 문자열 → _parse_price()로 절대값 변환)
 
         참고: usa20101 응답에는 주문가능여부 전용 필드가 없음 (trd_susp_tp는 usa20100에만 존재).
         tradable은 현재 주문 결정을 제어하지 않으므로 안전 기본값 True 사용.
@@ -349,7 +373,7 @@ class KiwoomBroker(Broker):
             output = data.get("output", data)
             return StockQuotation(
                 tradable=True,
-                last=float(output.get("cur_prc", "0")),
+                last=_parse_price(output.get("cur_prc")),
             )
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"호가 조회 실패: {str(e)}")
@@ -382,8 +406,8 @@ class KiwoomBroker(Broker):
                 stk_cd = item.get("stk_cd", "").upper()
                 if symbol.upper() in stk_cd:
                     return Balance(
-                        quantity=int(float(item.get("poss_qty", "0"))),
-                        avg_price=float(item.get("frgn_stk_book_uv", "0")),
+                        quantity=int(_parse_price(item.get("poss_qty"))),
+                        avg_price=_parse_price(item.get("frgn_stk_book_uv")),
                     )
 
             return None
@@ -418,7 +442,7 @@ class KiwoomBroker(Broker):
             # 모의투자 응답으로 검증 완료: result_list[0].fc_ord_alowa (USD 주문가능금액).
             item = result_list[0] if isinstance(result_list, list) else result_list
             return PurchaseAmount(
-                orderable_cash=float(item.get("fc_ord_alowa", "0")),
+                orderable_cash=_parse_price(item.get("fc_ord_alowa")),
             )
 
         except requests.exceptions.RequestException as e:
@@ -561,11 +585,11 @@ class KiwoomBroker(Broker):
                 amt = item.get("ft_ccld_amt3", "0")
 
                 try:
-                    price_s = f"{float(price):.2f}"
+                    price_s = f"{_parse_price(price):.2f}"
                 except Exception:
                     price_s = price
                 try:
-                    amt_s = f"{float(amt):.2f}"
+                    amt_s = f"{_parse_price(amt):.2f}"
                 except Exception:
                     amt_s = amt
 

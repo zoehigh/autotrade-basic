@@ -170,10 +170,12 @@ class TestKiwoomMockIntegration:
         assert price.last > 0, (
             f"현재가가 0입니다 (모의투자 서버 문제 또는 장 마감): last={price.last}"
         )
-        assert price.open > 0, (
-            f"시가가 0입니다 (모의투자 서버 문제): open={price.open}"
+        # 시가(open)는 장 오픈 전(장시작전)에는 아직 없어 0.0일 수 있음 → 음수만 차단
+        assert price.open >= 0, (
+            f"시가가 음수입니다 (파싱 오류): open={price.open}"
         )
-        print(f"  TQQQ 현재가: ${price.last:.2f} (시가: ${price.open:.2f})")
+        open_note = "" if price.open > 0 else " (시가 미가용: 장 오픈 전)"
+        print(f"  TQQQ 현재가: ${price.last:.2f} (시가: ${price.open:.2f}{open_note})")
 
     def test_03_get_stock_quotation(self, kiwoom_broker):
         """TQQQ 호가를 조회하고 StockQuotation dataclass를 반환하는지 확인합니다."""
@@ -255,7 +257,7 @@ class TestKiwoomMockIntegration:
         """TQQQ 1주 LIMIT 매수를 실행합니다 — 현재가로 지정가 주문.
 
         주의: 미국 장 시간(ET 09:30~16:00)에만 주문 가능.
-        장 마감 시 RC4058 오류로 자동 skip.
+        장 오픈 전 RC4057(장시작전), 장 마감 후 RC4058(장종료) 오류로 자동 skip.
         """
         # 현재가 조회
         price = kiwoom_broker.get_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
@@ -275,12 +277,19 @@ class TestKiwoomMockIntegration:
                 "LIMIT",
             )
         except OrderError as e:
-            # 장 마감 오류(RC4058 등)는 skip, 그 외 오류는 re-raise
+            # 장 시간 외 오류(RC4057 장시작전 / RC4058 장종료)는 skip, 그 외는 re-raise
             err_msg = str(e)
-            if "RC4058" in err_msg or "장종료" in err_msg or "장 마감" in err_msg:
+            market_closed = (
+                "RC4057" in err_msg
+                or "RC4058" in err_msg
+                or "장시작전" in err_msg
+                or "장종료" in err_msg
+                or "장 마감" in err_msg
+            )
+            if market_closed:
                 pytest.skip(
-                    f"미국 장 마감 상태로 주문이 거부되었습니다. "
-                    f"장 시간(ET 09:30~16:00)에 재실행하세요. 오류: {err_msg[:80]}"
+                    f"미국 장 시간 외(ET 09:30~16:00)로 주문이 거부되었습니다. "
+                    f"장 시간에 재실행하세요. 오류: {err_msg[:80]}"
                 )
             raise
 
