@@ -289,6 +289,9 @@ def _infer_T_from_full_history(symbol, state, order_history):
 
     if not filled_orders:
         print(f"[상태] {symbol} 초기 상태 - 이력 없음 → T=0으로 시작합니다")
+        state["T"] = 0.0
+        state["last_updated"] = ""
+        state["last_processed_ordno"] = ""
         return state
 
     # ord_datetime_utc로 정렬 (오래된 순)
@@ -605,8 +608,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
     if not recent_candidates:
-        # 출력은 기존처럼 날짜(문자열)로 간단 표시
-        print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → T값 변경 없음 (T={state['T']})")
+        # 최근 이력이 없으면 전체 이력 기반 재추정으로 fallback.
+        # 이력이 전혀 없으면 _infer_T_from_full_history가 T=0으로 리셋
+        # (state.json이 잘못된 상태의 자동 복구).
+        if state.get("T", 0) > 0:
+            print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → 전체 이력 재추정 시도 (T={state['T']})")
+            return _infer_T_from_full_history(symbol, state, order_history)
+        print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → T=0 유지")
         return state
 
     # 시간순, 주문번호순 정렬
