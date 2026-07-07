@@ -51,7 +51,7 @@ BROKER_CONFIG = _get_broker_config(BROKER)
 
 # 계좌번호 확인
 if BROKER == "kis" and not BROKER_CONFIG.get("account_no", ""):
-    print(f"경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
+    print("경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
 
 # ── 키움증권 API 설정 (향후 지원) ──
 KIWOOM_APP_KEY = os.getenv("KIWOOM_APP_KEY", "")

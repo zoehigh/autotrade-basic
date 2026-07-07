@@ -42,6 +42,7 @@ from broker.kiwoom.tr_registry import (
     TR_ORDERBOOK,
     TR_BALANCE,
     TR_HISTORY,
+    TR_HISTORY_DEMO,
     TR_DEPOSIT,
     TR_BUY,
     TR_SELL,
@@ -52,7 +53,7 @@ from broker.kiwoom.tr_registry import (
 # TODO: 실전 응답 확인 후 코드값 보정 필요
 _KIWOOM_ORDER_TYPE_MAP = {
     "LIMIT": "00",  # 지정가
-    "LOC":   "34",  # 장마감지정가
+    "LOC":   "30",  # 장마감지정가
     "LOO":   "32",  # 장개시지정가
     "MOO":   "31",  # 장개시시장가
     "MOC":   "33",  # 장마감시장가
@@ -230,6 +231,59 @@ class KiwoomBroker(Broker):
             "ovrs_excg_cd": raw.get("ovrs_excg_cd", ""),
         }
 
+    def _normalize_ust21150_item(self, raw: dict, ord_dt: str = "") -> dict:
+        """
+        ust21150(일별 주문체결내역) 응답을 state.py 표준 필드로 변환.
+
+        ust21150은 모의투자(mockapi)에서 ust21100(거래내역) 미지원을 대체하기 위한 TR.
+        ust21150 응답에는 ord_dt가 없으므로 요청 파라미터에서 주입받아 사용.
+
+        참고: state.py는 ft_ccld_qty > 0으로 체결 여부 판단 (prcs_stat_name 사용 안 함).
+        """
+        # ord_dt는 요청에서 주입 (응답에 없음)
+        ord_dt = ord_dt or raw.get("ord_dt", "")
+        ord_time_raw = raw.get("ord_time", "")  # HH:mm:ss
+        # HHMMSS로 변환 (콜론 제거)
+        ord_tmd = ord_time_raw.replace(":", "") if ord_time_raw else ""
+
+        ord_datetime_kst_iso = None
+        ord_datetime_utc_iso = None
+        if ord_dt and ord_tmd:
+            try:
+                kst_dt = datetime.strptime(ord_dt + ord_tmd, "%Y%m%d%H%M%S")
+                kst_dt = kst_dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                ord_datetime_kst_iso = kst_dt.isoformat()
+                ord_datetime_utc_iso = kst_dt.astimezone(ZoneInfo("UTC")).isoformat()
+            except Exception:
+                pass
+
+        # 체결금액 계산 (cntr_amt가 응답에 없으므로 cntr_qty × cntr_uv로 계산)
+        cntr_qty = raw.get("cntr_qty", "0")
+        cntr_uv = raw.get("cntr_uv", "0")
+        try:
+            ft_ccld_amt3 = str(float(cntr_qty) * float(cntr_uv))
+        except Exception:
+            ft_ccld_amt3 = "0"
+
+        return {
+            "ord_dt": ord_dt,
+            "ord_tmd": ord_tmd,
+            "ord_datetime_kst": ord_datetime_kst_iso,
+            "ord_datetime_utc": ord_datetime_utc_iso,
+            "prdt_name": raw.get("frgn_stk_nm", ""),
+            "sll_buy_dvsn_cd_name": raw.get("slby_tp_nm", ""),
+            "ft_ord_qty": raw.get("ord_qty", "0"),
+            "ft_ccld_qty": cntr_qty,
+            "ft_ccld_unpr3": cntr_uv,
+            "ft_ccld_amt3": ft_ccld_amt3,
+            "nccs_qty": raw.get("ord_remnq", "0"),
+            "prcs_stat_name": raw.get("ord_stat_nm", ""),
+            "tr_mket_name": raw.get("stex_nm", ""),
+            "tr_crcy_cd": raw.get("crnc_code", "USD"),
+            "odno": raw.get("ord_no", ""),
+            "ovrs_excg_cd": "",  # ust21150에 없음
+        }
+
     # ═══════════════════════════════════════════════════════════════════
     # 시장 정보
     # ═══════════════════════════════════════════════════════════════════
@@ -254,41 +308,48 @@ class KiwoomBroker(Broker):
 
         body = {
             "stk_cd": symbol.upper(),
-            "excg_cd": api_exch,
+            "stex_tp": api_exch,
         }
 
         try:
             data = self._request_with_rate_retry(TR_PRICE, body, token)
-            output = data.get("output", {})
+            # 키움 응답은 flat 구조(output 중첩 없이 최상위에 필드)이므로,
+            # output 키가 있으면 그 값을, 없으면 data 자체를 사용.
+            output = data.get("output", data)
             return StockPrice(
-                open=float(output.get("open", "0")),
-                last=float(output.get("last", "0")),
+                open=float(output.get("open_pric", "0")),
+                last=float(output.get("cur_prc", "0")),
             )
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"현재가 조회 실패: {str(e)}")
 
     def get_stock_quotation(self, symbol: str, exchange: str) -> StockQuotation:
         """
-        주문 가능 여부 + 현재가 → StockQuotation(tradable, last).
+        현재가 조회 + 주문 가능 여부 → StockQuotation(tradable, last).
 
         TR: usa20101 (10호가)
-        - ordy: "Y"면 주문 가능
-        - last: 현재가
+        - cur_prc: 현재가 (부호 포함 문자열, float()로 정상 변환)
+
+        참고: usa20101 응답에는 주문가능여부 전용 필드가 없음 (trd_susp_tp는 usa20100에만 존재).
+        tradable은 현재 주문 결정을 제어하지 않으므로 안전 기본값 True 사용.
+        주문 시도 시 API가 거부하면 그때 처리.
         """
         token = self._get_token()
         api_exch = get_api_exchange_code(exchange)
 
         body = {
             "stk_cd": symbol.upper(),
-            "excg_cd": api_exch,
+            "stex_tp": api_exch,
         }
 
         try:
             data = self._request_with_rate_retry(TR_ORDERBOOK, body, token)
-            output = data.get("output", {})
+            # 키움 응답은 flat 구조(output 중첩 없이 최상위에 필드)이므로,
+            # output 키가 있으면 그 값을, 없으면 data 자체를 사용.
+            output = data.get("output", data)
             return StockQuotation(
-                tradable=output.get("ordy", "N") == "Y",
-                last=float(output.get("last", "0")),
+                tradable=True,
+                last=float(output.get("cur_prc", "0")),
             )
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"호가 조회 실패: {str(e)}")
@@ -305,13 +366,14 @@ class KiwoomBroker(Broker):
         api_exch = get_api_exchange_code(exchange)
 
         body = {
-            "acnt_no": self._account_no,
-            "excg_cd": api_exch,
+            "stex_tp": api_exch,
+            "stk_cd": symbol.upper(),
         }
 
         try:
             data = self._request_with_rate_retry(TR_BALANCE, body, token)
-            output = data.get("output", [])
+            # 키움 응답은 result_list 사용 (output이 아님). result_list가 없으면 output fallback.
+            output = data.get("result_list", data.get("output", []))
             if not output:
                 return None
 
@@ -320,8 +382,8 @@ class KiwoomBroker(Broker):
                 stk_cd = item.get("stk_cd", "").upper()
                 if symbol.upper() in stk_cd:
                     return Balance(
-                        quantity=int(float(item.get("hold_qty", "0"))),
-                        avg_price=float(item.get("avg_price", "0")),
+                        quantity=int(float(item.get("poss_qty", "0"))),
+                        avg_price=float(item.get("frgn_stk_book_uv", "0")),
                     )
 
             return None
@@ -334,25 +396,29 @@ class KiwoomBroker(Broker):
         주문 가능 금액을 조회합니다 → PurchaseAmount(orderable_cash).
 
         TR: ust21110 (예수금)
-        계좌의 주문가능 현금을 반환합니다.
+        계좌의 외화(USD) 주문가능금액을 반환합니다.
+        응답 result_list[].fc_ord_alowa 필드 사용 (모의투자 검증 완료).
+        모의투자에서 외화 예수금이 없으면 빈 result_list → 0.0 반환.
         """
         self._check_account()
         token = self._get_token()
-        api_exch = get_api_exchange_code(exchange)
 
-        body = {
-            "acnt_no": self._account_no,
-            "excg_cd": api_exch,
-        }
+        body = {}
 
         try:
             data = self._request_with_rate_retry(TR_DEPOSIT, body, token)
-            output = data.get("output", {})
-            if not output:
-                raise BrokerError("예수금 정보를 조회할 수 없습니다")
+            # 키움 예수금 TR 응답: result_list (output이 아님).
+            # 모의투자에서는 result_list가 빈 리스트일 수 있음 (해당조회내역 없음).
+            result_list = data.get("result_list", [])
+            if not result_list:
+                # 모의투자 등에서 외화 예수금 데이터가 없는 경우 0 반환
+                return PurchaseAmount(orderable_cash=0.0)
 
+            # result_list에서 외화 주문가능금액 추출.
+            # 모의투자 응답으로 검증 완료: result_list[0].fc_ord_alowa (USD 주문가능금액).
+            item = result_list[0] if isinstance(result_list, list) else result_list
             return PurchaseAmount(
-                orderable_cash=float(output.get("ord_psbl_cash", "0")),
+                orderable_cash=float(item.get("fc_ord_alowa", "0")),
             )
 
         except requests.exceptions.RequestException as e:
@@ -369,7 +435,10 @@ class KiwoomBroker(Broker):
         """
         해외주식 주문 체결 내역을 조회합니다 → list[dict].
 
-        TR: ust21100 (거래내역)
+        TR:
+        - 실전: ust21100 (거래내역)
+        - 모의: ust21150 (일별 주문체결내역 — ust21100/ust21180 미지원 대안)
+
         각 dict는 state.py가 기대하는 표준 필드를 포함합니다:
             ord_dt, ord_tmd, ord_datetime_kst, ord_datetime_utc,
             prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
@@ -377,6 +446,10 @@ class KiwoomBroker(Broker):
             tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
 
         TODO: 키움의 연속조회(페이지네이션) 지원 필요 시 추가 구현.
+        # 참고: 모의투자(mockapi.kiwoom.com)에서는 거래내역 TR(ust21100)과
+        # 기간별 주문내역 TR(ust21180)이 "해당업무가 제공되지 않습니다" 오류로 지원되지 않음.
+        # 실전(api.kiwoom.com)에서만 동작.
+        # 모의투자에서는 ust21150(일별 주문체결내역)을 사용.
         """
         self._check_account()
         token = self._get_token()
@@ -389,79 +462,116 @@ class KiwoomBroker(Broker):
 
         api_exch = get_api_exchange_code(exchange)
 
-        body = {
-            "acnt_no": self._account_no,
-            "stk_cd": symbol.upper(),
-            "excg_cd": api_exch,
-            "ord_strt_dt": ord_strt_dt,
-            "ord_end_dt": ord_end_dt,
-        }
+        is_demo = (self._mode == "demo")
 
-        print(f"[주문이력] {symbol} 체결내역 조회 시작: {ord_strt_dt}~{ord_end_dt}")
+        order_history = []
 
-        try:
-            data = self._request_with_rate_retry(TR_HISTORY, body, token)
-            raw_items = data.get("output", [])
+        if is_demo:
+            # 모의투자: ust21150(일별 주문체결내역) — ust21100/ust21180 미지원 대안
+            # ust21150는 일별 조회이므로 days 범위를 순회하며 각 날짜별로 조회 후 합침
+            tr_id = TR_HISTORY_DEMO
+            from datetime import timedelta as _td
+            date_list = []
+            cur = start_date
+            while cur <= now_kst:
+                date_list.append(cur.strftime("%Y%m%d"))
+                cur = cur + _td(days=1)
 
-            order_history = []
-            for item in raw_items:
-                normalized = self._normalize_order_item(item)
-                order_history.append(normalized)
+            print(f"[주문이력] {symbol} 체결내역 조회(ust21150, 모의투자): {ord_strt_dt}~{ord_end_dt} ({len(date_list)}일)")
+
+            for dt in date_list:
+                body = {
+                    "ord_dt": dt,
+                    "query_tp": "1",   # 주문순
+                    "slby_tp": "0",    # 전체 (매도+매수)
+                    "stk_cd": symbol.upper(),
+                    "stex_tp": api_exch,
+                }
+                try:
+                    data = self._request_with_rate_retry(tr_id, body, token)
+                    raw_items = data.get("result_list", [])
+                    for item in raw_items:
+                        normalized = self._normalize_ust21150_item(item, ord_dt=dt)
+                        order_history.append(normalized)
+                except BrokerError as e:
+                    # 단일 날짜 실패는 무시하고 계속 (rate-limit 등)
+                    print(f"[주문이력] {dt} 조회 실패: {str(e)[:80]}")
+                time.sleep(self._rate_limit_wait)  # 모의투자 1회/초 rate-limit
+
+            print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
+        else:
+            # 실전: ust21100(거래내역)
+            tr_id = TR_HISTORY
+            body = {
+                "stk_cd": symbol.upper(),
+                "stex_tp": api_exch,
+                "strt_dt": ord_strt_dt,
+                "end_dt": ord_end_dt,
+            }
+            print(f"[주문이력] {symbol} 체결내역 조회(ust21100, 실전): {ord_strt_dt}~{ord_end_dt}")
+
+            try:
+                data = self._request_with_rate_retry(tr_id, body, token)
+                raw_items = data.get("result_list", data.get("output", []))
+
+                for item in raw_items:
+                    normalized = self._normalize_order_item(item)
+                    order_history.append(normalized)
+
+            except requests.exceptions.RequestException as e:
+                raise BrokerError(f"주문체결내역 조회 실패: {str(e)}")
 
             print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
 
-            # Human-friendly summary (optional)
-            if verbose and order_history:
-                try:
-                    n = int(limit) if limit and int(limit) > 0 else 100
-                except Exception:
-                    n = 100
-                n = min(n, len(order_history))
+        # Human-friendly summary (optional) — 공통 처리 (모의/실전 모두)
+        if verbose and order_history:
+            try:
+                n = int(limit) if limit and int(limit) > 0 else 100
+            except Exception:
+                n = 100
+            n = min(n, len(order_history))
 
-                print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
-                for item in order_history[:n]:
-                    kst_iso = item.get("ord_datetime_kst")
-                    if kst_iso:
+            print(f"[주문이력 요약] {symbol} 최근 {n}건 (간단 요약)")
+            for item in order_history[:n]:
+                kst_iso = item.get("ord_datetime_kst")
+                if kst_iso:
+                    try:
+                        kst_dt = datetime.fromisoformat(kst_iso)
+                        kst_str = kst_dt.strftime("%Y-%m-%d %H:%M:%S") + " KST"
+                    except Exception:
+                        kst_str = kst_iso
+                else:
+                    ord_dt = item.get("ord_dt", "")
+                    ord_tmd = (item.get("ord_tmd") or "").zfill(6)
+                    if ord_dt and len(ord_dt) == 8 and ord_tmd:
                         try:
-                            kst_dt = datetime.fromisoformat(kst_iso)
-                            kst_str = kst_dt.strftime("%Y-%m-%d %H:%M:%S") + " KST"
+                            kst_str = (
+                                f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]} "
+                                f"{ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]} KST"
+                            )
                         except Exception:
-                            kst_str = kst_iso
+                            kst_str = f"{ord_dt} {ord_tmd}"
                     else:
-                        ord_dt = item.get("ord_dt", "")
-                        ord_tmd = (item.get("ord_tmd") or "").zfill(6)
-                        if ord_dt and len(ord_dt) == 8 and ord_tmd:
-                            try:
-                                kst_str = (
-                                    f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]} "
-                                    f"{ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]} KST"
-                                )
-                            except Exception:
-                                kst_str = f"{ord_dt} {ord_tmd}"
-                        else:
-                            kst_str = "(시간없음)"
+                        kst_str = "(시간없음)"
 
-                    odno = item.get("odno", "")
-                    side = item.get("sll_buy_dvsn_cd_name", "")
-                    qty = item.get("ft_ccld_qty", "0")
-                    price = item.get("ft_ccld_unpr3", "0")
-                    amt = item.get("ft_ccld_amt3", "0")
+                odno = item.get("odno", "")
+                side = item.get("sll_buy_dvsn_cd_name", "")
+                qty = item.get("ft_ccld_qty", "0")
+                price = item.get("ft_ccld_unpr3", "0")
+                amt = item.get("ft_ccld_amt3", "0")
 
-                    try:
-                        price_s = f"{float(price):.2f}"
-                    except Exception:
-                        price_s = price
-                    try:
-                        amt_s = f"{float(amt):.2f}"
-                    except Exception:
-                        amt_s = amt
+                try:
+                    price_s = f"{float(price):.2f}"
+                except Exception:
+                    price_s = price
+                try:
+                    amt_s = f"{float(amt):.2f}"
+                except Exception:
+                    amt_s = amt
 
-                    print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+                print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
 
-            return order_history
-
-        except requests.exceptions.RequestException as e:
-            raise BrokerError(f"주문체결내역 조회 실패: {str(e)}")
+        return order_history
 
     # ═══════════════════════════════════════════════════════════════════
     # 주문 API
@@ -483,9 +593,14 @@ class KiwoomBroker(Broker):
 
         - 모의투자 미지원 주문 유형(LOC 등)은 LIMIT으로 자동 변환합니다.
         - DRY 모드는 DryBroker가 처리하므로, 이 메서드는 항상 LIVE로 동작합니다.
+        - 키움 REST API는 예약 주문을 지원하지 않습니다 (ust20000/ust20001 body에
+          예약 주문 파라미터가 없고, 예약 주문 전용 TR도 없음).
+          따라서 OrderResult.is_reservation은 항상 False입니다.
+          예약 주문은 영웅문 HTS/모바일앱에서만 가능합니다.
+        - 장 마감 후(미국 장 시간 외, ET 09:30~16:00 외) 주문 시 RC4058 오류 발생.
 
         Returns:
-            OrderResult: 주문 성공 시 (주문번호, 시각, 예약여부)
+            OrderResult: 주문 성공 시 (주문번호, 시각, 예약여부=False)
         """
         self._check_account()
         token = self._get_token()
@@ -503,12 +618,11 @@ class KiwoomBroker(Broker):
         api_exch = get_api_exchange_code(exchange)
 
         body = {
-            "acnt_no": self._account_no,
             "stk_cd": symbol.upper(),
-            "excg_cd": api_exch,
+            "stex_tp": api_exch,
             "ord_qty": str(quantity),
-            "ord_unpr": str(price),
-            "ord_dvsn_cd": ord_dvsn_cd,
+            "ord_uv": str(price),
+            "trde_tp": ord_dvsn_cd,
         }
 
         try:

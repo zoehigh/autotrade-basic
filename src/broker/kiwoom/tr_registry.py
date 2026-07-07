@@ -1,11 +1,12 @@
 """
 키움증권 TR 레지스트리 — TR ID별 (method, path) 매핑.
 
-엔드포인트 그룹 (정정된 구조):
+미국주식 엔드포인트 그룹 (/api/us/*):
   /api/us/ordr     — 주문 (매수/매도/정정/취소)
   /api/us/acnt     — 계좌 (잔고/거래내역/예수금)
   /api/us/mrkcond  — 시세 (현재가/호가)
 
+참고: /api/dostk/* 는 국내주식(KRX) 전용이며 미국주식 TR(usa*/ust*)은 /api/us/* 사용.
 환전(/api/us/exchange)은 현재 프로젝트에서 불필요하므로 제외.
 """
 from dataclasses import dataclass
@@ -27,7 +28,8 @@ _REGISTRY: dict[str, TrEndpoint] = {
 
     # 계좌 — /api/us/acnt
     "ust21070": TrEndpoint("POST", "/api/us/acnt"),   # 잔고
-    "ust21100": TrEndpoint("POST", "/api/us/acnt"),   # 거래내역
+    "ust21100": TrEndpoint("POST", "/api/us/acnt"),   # 거래내역 (실전용)
+    "ust21150": TrEndpoint("POST", "/api/us/acnt"),   # 일별 주문체결내역 (모의투자용 — ust21100 미지원 대안)
     "ust21110": TrEndpoint("POST", "/api/us/acnt"),   # 예수금
 
     # 시세 — /api/us/mrkcond
@@ -49,8 +51,9 @@ TR_BUY       = "ust20000"
 TR_SELL      = "ust20001"
 TR_CORRECT   = "ust20002"
 TR_CANCEL    = "ust20003"
-TR_BALANCE   = "ust21070"
-TR_HISTORY   = "ust21100"
-TR_DEPOSIT   = "ust21110"
+TR_BALANCE       = "ust21070"
+TR_HISTORY       = "ust21100"   # 거래내역 (실전용)
+TR_HISTORY_DEMO  = "ust21150"   # 일별 주문체결내역 (모의투자용 — ust21100 미지원 대안)
+TR_DEPOSIT       = "ust21110"
 TR_PRICE     = "usa20100"
 TR_ORDERBOOK = "usa20101"

@@ -554,11 +554,11 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         def _side_effect(tr_id, body, token):
             if tr_id == TR_PRICE:  # usa20100 — 현재가
                 return _make_response({
-                    "return_code": 0, "output": {"open": "50.00", "last": "52.00"},
+                    "return_code": 0, "output": {"open_pric": "50.00", "cur_prc": "52.00"},
                 })
             elif tr_id == TR_ORDERBOOK:  # usa20101 — 10호가
                 return _make_response({
-                    "return_code": 0, "output": {"ordy": "Y", "last": "52.00"},
+                    "return_code": 0, "output": {"cur_prc": "52.00"},
                 })
             elif tr_id == TR_BALANCE:  # ust21070 — 잔고
                 return _make_response({
@@ -599,7 +599,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         """반환된 StockPrice의 open/last 값이 응답과 일치해야 합니다."""
         self._set_mock_response({
             "return_code": 0,
-            "output": {"open": "50.00", "last": "52.50"},
+            "output": {"open_pric": "50.00", "cur_prc": "52.50"},
         })
         broker = self._create_broker()
         result = broker.get_stock_price("TQQQ", "NAS")
@@ -617,25 +617,15 @@ class TestKiwoomBrokerContract(BrokerContractTest):
             broker.get_stock_price("TQQQ", "NAS")
 
     def test_get_stock_quotation_returns_tradable(self):
-        """ordy=Y 응답에서 tradable=True가 반환되어야 합니다."""
+        """tradable은 항상 True(안전 기본값)가 반환되어야 합니다."""
         self._set_mock_response({
             "return_code": 0,
-            "output": {"ordy": "Y", "last": "52.00"},
+            "output": {"cur_prc": "52.00"},
         })
         broker = self._create_broker()
         result = broker.get_stock_quotation("TQQQ", "NAS")
         assert result.tradable is True
         assert result.last == 52.0
-
-    def test_get_stock_quotation_not_tradable(self):
-        """ordy=N 응답에서 tradable=False가 반환되어야 합니다."""
-        self._set_mock_response({
-            "return_code": 0,
-            "output": {"ordy": "N", "last": "0"},
-        })
-        broker = self._create_broker()
-        result = broker.get_stock_quotation("TQQQ", "NAS")
-        assert result.tradable is False
 
     def test_get_balance_returns_none_when_no_position(self):
         """잔고가 없으면 None을 반환해야 합니다."""
@@ -654,8 +644,8 @@ class TestKiwoomBrokerContract(BrokerContractTest):
             "output": [
                 {
                     "stk_cd": "TQQQ",
-                    "hold_qty": "10",
-                    "avg_price": "48.50",
+                    "poss_qty": "10",
+                    "frgn_stk_book_uv": "48.50",
                 }
             ],
         })
@@ -669,7 +659,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         """매수가능금액이 PurchaseAmount로 반환되어야 합니다."""
         self._set_mock_response({
             "return_code": 0,
-            "output": {"ord_psbl_cash": "5000.00"},
+            "result_list": [{"fc_ord_alowa": "5000.00"}],
         })
         broker = self._create_broker()
         result = broker.get_purchase_amount("TQQQ", "NAS")

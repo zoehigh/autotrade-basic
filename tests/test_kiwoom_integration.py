@@ -33,6 +33,12 @@ import time
 import importlib
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# .env 파일을 명시적으로 로드 — 모듈 레벨 skip 조건이 다른 테스트의
+# config.py 임포트 순서에 의존하지 않도록 테스트 격리를 보장합니다.
+load_dotenv()
+
 # src 디렉터리를 Python 경로에 추가 (conftest.py가 처리하지만 명시적으로 추가)
 _src_path = str(Path(__file__).resolve().parent.parent / "src")
 if _src_path not in sys.path:
@@ -45,6 +51,7 @@ from broker.base import (
     Balance,
     PurchaseAmount,
     OrderResult,
+    OrderError,
 )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -83,10 +90,18 @@ def kiwoom_broker():
     키움 모의투자 broker 인스턴스 (모듈 전체에서 재사용).
 
     config.py가 모듈 로드 시점에 환경변수를 읽으므로,
-    BROKER / BROKER_MODE를 먼저 설정한 뒤 config를 리로드합니다.
+    BROKER / BROKER_MODE / TRADE_MODE를 먼저 설정한 뒤 config를 리로드합니다.
+
+    TRADE_MODE=LIVE 필수 — 통합 테스트는 실제 모의투자 API를 호출해야 하므로
+    create_broker()가 DryBroker로 래핑하지 않도록 합니다.
     """
+    # 기존 환경변수 백업 (다른 테스트에 영향을 주지 않도록 격리)
+    _env_keys = ("BROKER", "BROKER_MODE", "TRADE_MODE")
+    saved = {key: os.environ.get(key) for key in _env_keys}
+
     os.environ["BROKER"] = "kiwoom"
     os.environ["BROKER_MODE"] = "demo"
+    os.environ["TRADE_MODE"] = "LIVE"  # DryBroker 래핑 방지
 
     # config 모듈 리로드 — env var 변경 반영
     import config
@@ -99,6 +114,14 @@ def kiwoom_broker():
     print(f"  account_no={broker._account_no[0:4]}****")
     yield broker
     broker.close()
+
+    # 환경변수 복원 — 후속 테스트에 영향을 주지 않도록
+    for key, val in saved.items():
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+    importlib.reload(config)
 
 
 @pytest.fixture(scope="module")
@@ -181,6 +204,8 @@ class TestKiwoomMockIntegration:
 
     def test_05_get_purchase_amount(self, kiwoom_broker):
         """주문가능금액을 조회하고 PurchaseAmount dataclass를 반환하는지 확인합니다."""
+        # 모의투자에서는 외화 예수금이 없으면 result_list가 빈 리스트 → 0.0 반환 (정상).
+        # 실전에서는 result_list[].fc_ord_alowa 값 반환.
         amount = kiwoom_broker.get_purchase_amount(TEST_SYMBOL, TEST_EXCHANGE)
         assert isinstance(amount, PurchaseAmount), (
             f"get_purchase_amount()가 PurchaseAmount를 반환해야 합니다: {type(amount)}"
@@ -193,6 +218,9 @@ class TestKiwoomMockIntegration:
 
     def test_06_get_order_history(self, kiwoom_broker):
         """체결내역을 조회하고 list를 반환하는지 확인합니다 (최근 7일)."""
+        # 모의투자: ust21150(일별 주문체결내역) 사용 — ust21100/ust21180 미지원 대안.
+        # 실전: ust21100(거래내역) 사용.
+        # 거래내역이 없으면 빈 리스트 반환 (정상).
         history = kiwoom_broker.get_order_history(
             TEST_SYMBOL, TEST_EXCHANGE, days=7, verbose=True,
         )
@@ -224,7 +252,11 @@ class TestKiwoomMockIntegration:
     # ── 주문 API (매수 → 확인 → 매도 → 확인) ─────────────────────────
 
     def test_07_place_buy_order(self, kiwoom_broker, context):
-        """TQQQ 1주 LIMIT 매수를 실행합니다 — 현재가로 지정가 주문."""
+        """TQQQ 1주 LIMIT 매수를 실행합니다 — 현재가로 지정가 주문.
+
+        주의: 미국 장 시간(ET 09:30~16:00)에만 주문 가능.
+        장 마감 시 RC4058 오류로 자동 skip.
+        """
         # 현재가 조회
         price = kiwoom_broker.get_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
         if price.last <= 0:
@@ -233,14 +265,24 @@ class TestKiwoomMockIntegration:
         buy_price = round(price.last, 2)
         print(f"  매수 시도: {TEST_SYMBOL} 1주 @ ${buy_price:.2f} (LIMIT)")
 
-        result = kiwoom_broker.place_order(
-            TEST_SYMBOL,
-            TEST_EXCHANGE,
-            "BUY",
-            1,
-            buy_price,
-            "LIMIT",
-        )
+        try:
+            result = kiwoom_broker.place_order(
+                TEST_SYMBOL,
+                TEST_EXCHANGE,
+                "BUY",
+                1,
+                buy_price,
+                "LIMIT",
+            )
+        except OrderError as e:
+            # 장 마감 오류(RC4058 등)는 skip, 그 외 오류는 re-raise
+            err_msg = str(e)
+            if "RC4058" in err_msg or "장종료" in err_msg or "장 마감" in err_msg:
+                pytest.skip(
+                    f"미국 장 마감 상태로 주문이 거부되었습니다. "
+                    f"장 시간(ET 09:30~16:00)에 재실행하세요. 오류: {err_msg[:80]}"
+                )
+            raise
 
         if result is None:
             pytest.skip("매수 주문 결과가 None입니다 (DRY 모드 또는 미실행).")
