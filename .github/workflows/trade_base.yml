@@ -3,12 +3,18 @@ name: Reusable 무한매수법 베이스
 on:
   workflow_call:
     inputs:
-      trade_mode:
-        description: '거래 모드 (DRY or LIVE)'
+      broker:
+        description: '증권사 (kis, kiwoom, ls, toss)'
         required: false
         type: string
-      kis_mode:
-        description: 'KIS 모드 (demo or real)'
+        default: kis
+      broker_mode:
+        description: '브로커 모드 (demo or real)'
+        required: false
+        type: string
+        default: demo
+      trade_mode:
+        description: '거래 모드 (DRY or LIVE)'
         required: false
         type: string
       symbols:
@@ -28,12 +34,21 @@ on:
         required: false
         type: string
     secrets:
+      # KIS secrets (broker=kis 일 때만 사용됨)
       KIS_APP_KEY:
-        required: true
+        required: false
       KIS_APP_SECRET:
-        required: true
+        required: false
       KIS_ACCOUNT_NO:
         required: false
+      # 키움 secrets (broker=kiwoom 일 때만 사용됨)
+      KIWOOM_APP_KEY:
+        required: false
+      KIWOOM_APP_SECRET:
+        required: false
+      KIWOOM_ACCOUNT_NO:
+        required: false
+      # 공통 secrets
       TELEGRAM_BOT_TOKEN:
         required: false
       TELEGRAM_CHAT_ID:
@@ -59,31 +74,39 @@ jobs:
 
       - name: state 캐시 복원
         # 이전 실행에서 저장한 .state.json을 불러옵니다.
-        # T값, 사이클 시작일, 복리 시드 등 KIS API로 복구할 수 없는 정보가 담겨 있습니다.
+        # T값, 사이클 시작일, 복리 시드 등 API로 복구할 수 없는 정보가 담겨 있습니다.
         id: state-cache-restore
         uses: actions/cache/restore@v4
         with:
           path: .state.json
-          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
+          key: state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-${{ github.run_id }}
           restore-keys: |
-            state-${{ inputs.kis_mode || 'default' }}-
+            state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-
 
       - name: Resolve and log inputs
         run: |
+          echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
+          echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
           echo "Resolved TRADE_MODE=${{ inputs.trade_mode || 'DRY' }}"
-          echo "Resolved KIS_MODE=${{ inputs.kis_mode || 'demo' }}"
           echo "Resolved SYMBOLS=${{ inputs.symbols || 'TQQQ:NAS,SOXL:AMS' }}"
 
       - name: 자동매매 봇 실행
         env:
-          # KIS 인증정보 (reusable workflow는 호출자에서 secrets을 주입받습니다)
+          # 브로커 설정 (일반화)
+          BROKER: ${{ inputs.broker || 'kis' }}
+          BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+
+          # KIS 인증정보 (broker=kis 일 때만 사용됨)
           KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-          # 계좌 정보는 호출자에서 주입받은 값을 사용합니다.
           KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
 
+          # 키움 인증정보 (broker=kiwoom 일 때만 사용됨)
+          KIWOOM_APP_KEY: ${{ secrets.KIWOOM_APP_KEY }}
+          KIWOOM_APP_SECRET: ${{ secrets.KIWOOM_APP_SECRET }}
+          KIWOOM_ACCOUNT_NO: ${{ secrets.KIWOOM_ACCOUNT_NO }}
+
           # 런타임 설정: inputs -> repo vars -> 하드코딩 기본값 순으로 폴백
-          KIS_MODE: ${{ inputs.kis_mode || vars.KIS_MODE || 'demo' }}
           TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}
           # 복수 종목 사용
           SYMBOLS: ${{ inputs.symbols || 'TQQQ:NAS,SOXL:AMS' }}
@@ -104,8 +127,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # KIS API 연결 타임아웃 (초 단위, 기본값 10초 → 30초로 증가)
-          KIS_CONNECT_TIMEOUT: 30
+          # API 연결 타임아웃 (초 단위, 기본값 30초)
+          CONNECT_TIMEOUT: 30
 
           # GitHub Actions에서 Python 출력이 line-by-line으로 표시되도록 버퍼링 해제
           PYTHONUNBUFFERED: 1
@@ -117,6 +140,4 @@ jobs:
         if: always()
         with:
           path: .state.json
-          key: state-${{ inputs.kis_mode || 'default' }}-${{ github.run_id }}
-
-
+          key: state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-${{ github.run_id }}

@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from strategy import 무한매수법_V4
 from config import SYMBOLS
-from kis_session import KISSession
+from broker import create_broker
 
 
 # 기본값: 설정 파일의 첫 번째 종목
@@ -61,9 +61,9 @@ def main():
     print("=" * 60 + "\n")
 
     try:
-        session = KISSession()
+        broker = create_broker()
         result = 무한매수법_V4(
-            session,
+            broker,
             symbol=symbol,
             exchange_code=exchange_code,
             splits=splits,

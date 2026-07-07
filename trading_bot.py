@@ -17,20 +17,12 @@ sys.path.append("src")
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, KIS_MODE
-from kis_session import KISSession
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER_MODE
+from broker import create_broker
+from broker.base import Broker, OrderResult
+from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state
-from trader import (
-    place_overseas_order,
-    place_overseas_reservation_order,
-    get_overseas_order_history,
-    get_overseas_balance,
-    is_us_trading_day,
-    ReservationOrderRequired,
-    _get_kst_now,
-    _is_us_dst,
-)
 from notifier import notify
 
 
@@ -182,33 +174,7 @@ def format_cycle_report_message(report):
     return "\n".join(lines)
 
 
-def convert_exchange_code(exchange_code):
-    """
-    거래소 코드를 주문 API용 코드로 변환합니다.
-
-    조회용 거래소 코드와 주문용 거래소 코드가 다릅니다.
-    예: NAS (조회용) -> NASD (주문용)
-
-    Parameters:
-        exchange_code (str): 조회용 거래소 코드 (예: "NAS", "NYS")
-
-    Returns:
-        str: 주문용 거래소 코드 (예: "NASD", "NYSE")
-    """
-    exchange_map = {
-        "NAS": "NASD",  # 나스닥
-        "NYS": "NYSE",  # 뉴욕
-        "AMS": "AMEX",  # 아멕스
-        "HKS": "SEHK",  # 홍콩
-        "TSE": "TKSE",  # 도쿄
-        "SHS": "SHAA",  # 상해
-        "SZS": "SZAA",  # 심천
-    }
-
-    return exchange_map.get(exchange_code, exchange_code)
-
-
-def run_one_symbol(session, symbol_config):
+def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
 
@@ -232,7 +198,7 @@ def run_one_symbol(session, symbol_config):
     print(f"{'=' * 60}")
 
     # ── 휴장일 체크 ───────────────────────────────────────────
-    if not is_us_trading_day():
+    if not broker.is_trading_day():
         today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
         print(f"  📅 오늘({today_str})은 미국 증시 휴장일입니다. 이 종목을 건너<skip>니다.")
         return
@@ -262,8 +228,7 @@ def run_one_symbol(session, symbol_config):
         history_days = 30
 
     # DRY 모드이면 사람이 읽기 쉬운 주문 이력 요약을 로그에 출력합니다.
-    order_history = get_overseas_order_history(
-        session,
+    order_history = broker.get_order_history(
         symbol,
         exchange,
         days=history_days,
@@ -312,9 +277,9 @@ def run_one_symbol(session, symbol_config):
         computed = {"net_qty": 0, "avg_price": 0.0}
 
     try:
-        live_balance = get_overseas_balance(session, symbol, exchange)
-        live_qty = int(float(live_balance.get("quantity", "0"))) if live_balance else 0
-        live_avg = float(live_balance.get("avg_price", "0")) if live_balance else 0.0
+        live_balance = broker.get_balance(symbol, exchange)
+        live_qty = live_balance.quantity if live_balance else 0
+        live_avg = live_balance.avg_price if live_balance else 0.0
     except Exception as e:
         print(f"[상태 검증] 브로커 잔고 조회 실패: {e}")
         live_balance = None
@@ -386,10 +351,37 @@ def run_one_symbol(session, symbol_config):
     print(f"  현재 T값: {T}")
 
     # ── 사이클 종료 사전 감지 (전략 실행 전에) ─────────────────────────
-    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다
+    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다.
+    # 단, 잔고 조회 실패(None) 또는 매도 체결 이력이 없는 잔고 0은
+    # 사이클 종료로 오판할 위험이 있어 보호합니다 (브로커 전환/수동처리 등).
     current_qty = live_qty if live_qty is not None else comp_qty
 
-    if T > 0 and current_qty == 0:
+    # 매도 체결 이력 존재 여부 — 잔고 0이 정당하려면 매도 이력이 있어야 합니다.
+    has_sell_fill = any(
+        o for o in order_history
+        if o.get("sll_buy_dvsn_cd_name") == "매도"
+        and int(float(o.get("ft_ccld_qty", 0))) > 0
+    )
+
+    # 사이클 종료 감지 가능 여부 — 세 가지 보호 조건
+    # 1) live_qty is None: 잔고 조회 자체가 실패 → 종료 감지 불가 (SOXL 케이스)
+    # 2) 매도 체결 이력 없음 + 잔고 0: 데이터 불일치 → 종료 감지 보류 (TQQQ 케이스)
+    can_detect_cycle_end = (live_qty is not None) and (has_sell_fill or comp_qty > 0)
+
+    if T > 0 and current_qty == 0 and not can_detect_cycle_end:
+        # 보호: 잔고는 0이지만 종료 감지 조건 불충분 → T 유지
+        if live_qty is None:
+            reason = "브로커 잔고 조회 실패"
+            print(f"\n[경고] {symbol} 사이클 종료 감지 보류 — {reason} (T={T} 유지, 보유수량 알 수 없음)")
+            notify(f"[경고] {symbol} 잔고 조회 실패로 사이클 종료 감지 보류. T={T} 유지. 확인 필요.")
+        else:
+            reason = "잔고 0이나 매도 체결 이력 없음 (브로커 전환/수동처리 의심)"
+            print(f"\n[경고] {symbol} 사이클 종료 감지 보류 — {reason} (T={T} 유지)")
+            notify(f"[경고] {symbol} 잔고 0이나 매도 이력 없음. T={T} 유지. 브로커 전환/수동처리 확인 필요.")
+        # T 유지, 사이클 종료 처리 생략
+
+    elif T > 0 and current_qty == 0:
+        # 정상: 잔고 0 + 매도 이력(또는 이력 기반 보유) 확인됨 → 사이클 종료
         print(f"\n{'=' * 60}")
         print(f"🏁 {symbol} 사이클 종료 감지 (사전) (T={T}, 보유수량={current_qty})")
         print(f"{'=' * 60}")
@@ -437,7 +429,7 @@ def run_one_symbol(session, symbol_config):
     print("\n[Step 2] 전략 실행 중...")
 
     strategy_result = 무한매수법_V4(
-        session,
+        broker,
         symbol=symbol,
         exchange_code=exchange,
         splits=splits,
@@ -480,9 +472,9 @@ def run_one_symbol(session, symbol_config):
     print("-" * 60)
 
     # Real+LIVE: 프리장 오픈 전이면 KST 기준으로 대기
-    if KIS_MODE == "real" and TRADE_MODE == "LIVE":
-        now_kst = _get_kst_now()
-        is_dst = _is_us_dst()
+    if BROKER_MODE == "real" and TRADE_MODE == "LIVE":
+        now_kst = get_kst_now()
+        is_dst = is_us_dst()
         pre_market_open_hour = 17 if is_dst else 18
         if now_kst.hour < pre_market_open_hour:
             target = now_kst.replace(hour=pre_market_open_hour, minute=0, second=0, microsecond=0)
@@ -490,7 +482,7 @@ def run_one_symbol(session, symbol_config):
             print(f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → {target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)")
             time.sleep(wait_seconds)
 
-    order_exchange_code = convert_exchange_code(exchange)
+    order_exchange_code = broker.exchange_code(exchange)
 
     executed_orders = []
     reserved_orders = []
@@ -513,31 +505,21 @@ def run_one_symbol(session, symbol_config):
                         notify(f"{symbol} ⚠️ LOC 가격 보정\n원가격: ${order_price:.2f}\n현재가: ${strategy_last_price:.2f}\n보정가: ${corrected_price:.2f}")
                         order_price = corrected_price
 
-            result = place_overseas_order(
-                session,
-                symbol=symbol,
-                exchange_code=order_exchange_code,
-                order_type=order["order_type"],
-                quantity=order["quantity"],
-                price=order_price,
-                side=order["side"],
-                trade_mode=TRADE_MODE,
+            result = broker.place_order(
+                symbol,
+                order_exchange_code,
+                order["side"],
+                order["quantity"],
+                order_price,
+                order["order_type"],
             )
 
             if result:
-                executed_orders.append(
-                    {
-                        "comment": order["comment"],
-                        "odno": result["odno"],
-                        "ord_tmd": result["ord_tmd"],
-                    }
-                )
-
                 is_additional = "[추가매수]" in order.get("comment", "")
 
                 # 기존: additional_loc_odno 유지 (레거시 호환)
                 if is_additional:
-                    state.setdefault("additional_loc_odno", []).append(result["odno"])
+                    state.setdefault("additional_loc_odno", []).append(result.order_id)
 
                 # 신규: orders_meta에 t_target 등록
                 # strategy가 t_target을 제공하면 그대로 사용, 없으면 fallback
@@ -545,7 +527,7 @@ def run_one_symbol(session, symbol_config):
                 if t_target is None:
                     t_target = 0.0 if is_additional else 1.0
 
-                register_order_meta_in_state(state, result["odno"], {
+                register_order_meta_in_state(state, result.order_id, {
                     "side": order["side"],
                     "total_qty": int(order["quantity"]),
                     "t_target": float(t_target),
@@ -553,82 +535,36 @@ def run_one_symbol(session, symbol_config):
                     "processed_filled_qty": 0,
                 })
 
-                print("✓ 주문 성공")
-
-                message = f"""✅ 주문 성공 {symbol}
-
-{order['comment']}
-수량: {order['quantity']}주
-주문번호: {result['odno']}
-시각: {result['ord_tmd']}"""
-                notify(message)
-            else:
-                print("✓ 주문 정보 출력 완료")
-
-        except ReservationOrderRequired:
-            print("ℹ️  정규장 외 시간 — 예약주문으로 접수합니다. (/trading/order-resv)")
-
-            ord_dv = "usSell" if order["side"] == "SELL" else "usBuy"
-
-            if TRADE_MODE == "DRY":
-                print(
-                    f"[DRY] 예약주문 정보: {symbol}, {order_exchange_code}, "
-                    f"side={order['side']}, qty={order['quantity']}, price={order_price}"
-                )
-            else:
-                try:
-                    resv_result = place_overseas_reservation_order(
-                        session,
-                        symbol=symbol,
-                        exchange_code=order_exchange_code,
-                        quantity=order["quantity"],
-                        price=order_price,
-                        ord_dv=ord_dv,
-                    )
-                    reserved_orders.append(
-                        {
-                            "comment": order["comment"],
-                            "odno": resv_result["odno"],
-                            "rsvn_ord_rcit_dt": resv_result["rsvn_ord_rcit_dt"],
-                        }
-                    )
-
-                    # 예약주문도 orders_meta에 등록
-                    is_additional_resv = "[추가매수]" in order.get("comment", "")
-                    if is_additional_resv:
-                        state.setdefault("additional_loc_odno", []).append(resv_result["odno"])
-                    t_target_resv = order.get("t_target")
-                    if t_target_resv is None:
-                        t_target_resv = 0.0 if is_additional_resv else 1.0
-                    register_order_meta_in_state(state, resv_result["odno"], {
-                        "side": order["side"],
-                        "total_qty": int(order["quantity"]),
-                        "t_target": float(t_target_resv),
-                        "is_additional": bool(is_additional_resv),
-                        "processed_filled_qty": 0,
+                if result.is_reservation:
+                    reserved_orders.append({
+                        "comment": order["comment"],
+                        "order_id": result.order_id,
+                        "order_time": result.order_time,
                     })
-
-                    print(f"✓ 예약주문 접수 완료 (주문번호: {resv_result['odno']})")
-
+                    print(f"✓ 예약주문 접수 완료 (주문번호: {result.order_id})")
                     message = f"""📋 예약주문 접수 {symbol}
 
 {order['comment']}
 수량: {order['quantity']}주
-예약주문번호: {resv_result['odno']}
-접수일자: {resv_result['rsvn_ord_rcit_dt']}"""
+예약주문번호: {result.order_id}
+접수일자: {result.order_time}"""
                     notify(message)
-                except Exception as reservation_error:
-                    print(f"✗ 예약주문 실패: {str(reservation_error)}")
-                    failed_orders.append(
-                        {
-                            "comment": order["comment"],
-                            "error": f"예약주문 실패: {str(reservation_error)}",
-                        }
-                    )
-                    notify(
-                        f"{symbol} ⚠️ 예약주문 실패\n\n{order['comment']}\n에러: {str(reservation_error)}",
-                        urgent=True,
-                    )
+                else:
+                    executed_orders.append({
+                        "comment": order["comment"],
+                        "order_id": result.order_id,
+                        "order_time": result.order_time,
+                    })
+                    print("✓ 주문 성공")
+                    message = f"""✅ 주문 성공 {symbol}
+
+{order['comment']}
+수량: {order['quantity']}주
+주문번호: {result.order_id}
+시각: {result.order_time}"""
+                    notify(message)
+            else:
+                print("✓ 주문 정보 출력 완료")
 
         except Exception as error:
             print(f"✗ 주문 실패: {str(error)}")
@@ -651,7 +587,7 @@ def run_one_symbol(session, symbol_config):
     print("=" * 60)
 
     # ── Step 4: T값 저장 (LIVE 주문이 하나라도 성공한 경우에만) ──
-    if TRADE_MODE == "LIVE" and len(executed_orders) > 0:
+    if TRADE_MODE == "LIVE" and (len(executed_orders) > 0 or len(reserved_orders) > 0):
         save_state(symbol, state)
 
     if TRADE_MODE == "DRY":
@@ -669,14 +605,14 @@ def run_one_symbol(session, symbol_config):
     if executed_orders:
         print("\n[성공한 주문]")
         for order in executed_orders:
-            print(f"  ✓ {order['comment']}: 주문번호 {order['odno']} (시각: {order['ord_tmd']})")
+            print(f"  ✓ {order['comment']}: 주문번호 {order['order_id']} (시각: {order['order_time']})")
 
     if reserved_orders:
         print("\n[예약 주문] - 다음 정규장 시작 시 체결됩니다")
         for order in reserved_orders:
             print(
-                f"  📋 {order['comment']}: 예약번호 {order['odno']} "
-                f"(접수일자: {order['rsvn_ord_rcit_dt']})"
+                f"  📋 {order['comment']}: 예약번호 {order['order_id']} "
+                f"(접수일자: {order['order_time']})"
             )
 
     if failed_orders:
@@ -692,7 +628,7 @@ def main():
     SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
     한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
     """
-    kis_session = KISSession()
+    broker = create_broker()
     try:
         # stdout 버퍼링 해제: GitHub Actions 또는 로컬에서 출력이 한꺼번에 나오지 않고
         # 줄 단위로 실시간 표시되도록 합니다. (PYTHONUNBUFFERED 환경변수와 동일한 효과)
@@ -707,7 +643,7 @@ def main():
         # ========================================
         # 휴장일 체크 — 조기종료
         # ========================================
-        if not is_us_trading_day():
+        if not broker.is_trading_day():
             today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
             print(f"\n📅 오늘({today_str})은 미국 증시 휴장일입니다. 프로그램을 종료합니다.")
             notify("📅 오늘은 미국 증시 휴장일입니다. 자동매매를 실행하지 않습니다.")
@@ -731,7 +667,7 @@ def main():
         # ========================================
         for symbol_config in SYMBOLS:
             try:
-                run_one_symbol(kis_session, symbol_config)
+                run_one_symbol(broker, symbol_config)
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]
@@ -763,7 +699,7 @@ def main():
         print("\n프로그램을 에러와 함께 종료합니다.")
         sys.exit(1)
     finally:
-        kis_session.close()
+        broker.close()
 
 
 if __name__ == "__main__":

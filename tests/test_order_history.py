@@ -13,9 +13,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from trader import get_overseas_order_history
+from broker.kis.adapter import KISBroker
 from config import SYMBOLS
-from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -52,8 +51,8 @@ def test_overseas_symbol_order_history():
     
     try:
         # API 호출
-        session = KISSession()
-        order_history = get_overseas_order_history(session, symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE, days=30)
+        broker = KISBroker()
+        order_history = broker.get_order_history(TEST_SYMBOL, TEST_EXCHANGE, days=30)
         
         # 결과 검증
         if not order_history:

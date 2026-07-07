@@ -13,7 +13,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from config import KIS_ACCOUNT_NO, ACNT_PRDT_CD, KIS_APP_KEY, KIS_APP_SECRET, KIS_DOMAIN
-from authentication import get_access_token
+from broker.kis.auth import get_access_token
 import requests
 from datetime import datetime, timedelta
 

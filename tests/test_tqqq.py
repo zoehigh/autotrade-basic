@@ -10,8 +10,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from trader import get_overseas_order_history
-from kis_session import KISSession
+from broker.kis.adapter import KISBroker
 
 
 def test_tqqq_order_history():
@@ -25,8 +24,8 @@ def test_tqqq_order_history():
     
     try:
         # TQQQ/NAS로 조회
-        session = KISSession()
-        order_history = get_overseas_order_history(session, symbol="TQQQ", exchange_code="NAS", days=30)
+        broker = KISBroker()
+        order_history = broker.get_order_history("TQQQ", "NAS", days=30)
         
         if not order_history:
             print("\n⚠️ TQQQ 종목의 체결내역이 없습니다.")

@@ -13,9 +13,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from trader import get_overseas_balance
+from broker.kis.adapter import KISBroker
 from config import SYMBOLS
-from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -39,58 +38,22 @@ def test_overseas_balance():
     
     try:
         # API 호출
-        session = KISSession()
-        result = get_overseas_balance(session, symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE)
+        broker = KISBroker()
+        result = broker.get_balance(TEST_SYMBOL, TEST_EXCHANGE)
         
         # 결과 검증
         if result is None:
             print("\n⚠️ 해당 종목의 보유 잔고가 없습니다.")
             print("종목 코드 또는 거래소 코드를 확인해주세요.")
-            return True  # 이는 API 호출이 성공했지만 잔고가 없는 정상적인 경우
+            return True
         
         print("\n✅ API 호출 성공!\n")
         
         # 핵심 정보 출력
-        print("🔍 핵심 정보:")
+        print("📊 보유 정보:")
         print("-" * 80)
-        print(f"  종목 코드 (symbol):          {result.get('symbol', 'N/A')}")
-        print(f"  종목명 (item_name):         {result.get('item_name', 'N/A')}")
-        
-        # 보유 수량과 평단가 (가장 중요한 정보)
-        print("\n📊 보유 정보:")
-        print("-" * 80)
-        quantity = result.get("quantity", "0")
-        avg_price = result.get("avg_price", "0")
-        
-        print(f"  보유 수량 (quantity):        {quantity} 주")
-        print(f"  평단가 (avg_price):          {avg_price}")
-        
-        # 평가 정보
-        print("\n💰 평가 정보:")
-        print("-" * 80)
-        current_price = result.get("current_price", "0")
-        eval_rate = result.get("eval_rate", "0")
-        eval_amount = result.get("eval_amount", "0")
-        
-        print(f"  현재가 (current_price):     {current_price}")
-        print(f"  평가손익율 (eval_rate):     {eval_rate}%")
-        print(f"  평가금액 (eval_amount):     {eval_amount}")
-        
-        # 거래 정보
-        print("\n🌍 거래 정보:")
-        print("-" * 80)
-        currency = result.get("currency", "")
-        exchange = result.get("exchange", "")
-        
-        print(f"  거래통화 (currency):        {currency}")
-        print(f"  거래소 (exchange):          {exchange}")
-        
-        # 전체 응답 데이터
-        print("\n" + "=" * 80)
-        print("📋 전체 응답 데이터:")
-        print("=" * 80)
-        for key, value in sorted(result.items()):
-            print(f"  {key:25s}: {value}")
+        print(f"  보유 수량 (quantity):        {result.quantity} 주")
+        print(f"  평단가 (avg_price):          ${result.avg_price:.2f}")
         
         print("\n" + "=" * 80)
         print("✅ 테스트 완료")

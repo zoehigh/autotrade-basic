@@ -13,9 +13,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from trader import get_overseas_stock_price
+from broker.kis.adapter import KISBroker
 from config import SYMBOLS
-from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -39,40 +38,24 @@ def test_get_overseas_stock_price():
     
     try:
         # API 호출
-        session = KISSession()
-        result = get_overseas_stock_price(session, symbol=TEST_SYMBOL, exchange_code=TEST_EXCHANGE)
+        broker = KISBroker()
+        result = broker.get_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
         
         # 결과 검증
-        if not result:
-            print("❌ 테스트 실패: API 응답이 비어있습니다.")
-            return False
-        
-        # 필수 필드 확인
-        required_fields = ["open", "last"]
-        missing_fields = [field for field in required_fields if field not in result]
-        
-        if missing_fields:
-            print(f"❌ 테스트 실패: 필수 필드가 누락되었습니다: {missing_fields}")
-            print(f"응답에 포함된 필드: {list(result.keys())}")
-            return False
+        assert result.last > 0, "현재가(last)가 0입니다"
+        assert result.open > 0, "시가(open)가 0입니다"
         
         # 결과 출력
         print("\n✅ 테스트 성공!")
         print("\n📊 조회 결과:")
-        print(f"  - 종목 코드: {result.get('rsym', 'N/A')}")
-        print(f"  - 시가 (open): {result.get('open', 'N/A')}")
-        print(f"  - 현재가 (last): {result.get('last', 'N/A')}")
-        print(f"  - 고가 (high): {result.get('high', 'N/A')}")
-        print(f"  - 저가 (low): {result.get('low', 'N/A')}")
-        print(f"  - 전일 종가 (base): {result.get('base', 'N/A')}")
-        print(f"  - 거래량 (tvol): {result.get('tvol', 'N/A')}")
-        print(f"  - 원환산 당일 가격 (t_xprc): {result.get('t_xprc', 'N/A')}")
+        print(f"  - 시가 (open): ${result.open:.2f}")
+        print(f"  - 현재가 (last): ${result.last:.2f}")
         
         print("\n" + "=" * 60)
         print("전체 응답 데이터:")
         print("=" * 60)
-        for key, value in result.items():
-            print(f"{key}: {value}")
+        print(f"open: ${result.open:.2f}")
+        print(f"last: ${result.last:.2f}")
         
         return True
     

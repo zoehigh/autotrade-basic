@@ -1,0 +1,15 @@
+name: Kiwoom Demo Trade
+
+on:
+  repository_dispatch:
+    types: [trade_kiwoom_demo]
+  workflow_dispatch:
+
+jobs:
+  demo-trade:
+    uses: ./.github/workflows/trade_base.yml
+    with:
+      broker: kiwoom
+      broker_mode: demo
+      trade_mode: DRY
+    secrets: inherit

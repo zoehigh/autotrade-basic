@@ -10,9 +10,8 @@
 import sys
 sys.path.append("src")
 
-from trader import place_overseas_order, get_overseas_stock_price
+from broker import create_broker
 from config import SYMBOLS, TRADE_MODE
-from kis_session import KISSession
 
 
 TEST_SYMBOL = SYMBOLS[0]["symbol"]
@@ -42,49 +41,36 @@ def test_overseas_order():
         # Step 1: 현재가 조회
         print(f"\n[Step 1] {TEST_SYMBOL} 현재가 조회 중...")
         
-        # 거래소 코드 변환: NAS -> NASD
-        exchange_map = {
-            "NAS": "NASD",  # 나스닥
-            "NYS": "NYSE",  # 뉴욕
-            "AMS": "AMEX"   # 아멕스
-        }
+        broker = create_broker()
+        order_exchange_code = broker.exchange_code(TEST_EXCHANGE)
         
-        # 주문용 거래소 코드
-        order_exchange_code = exchange_map.get(TEST_EXCHANGE, TEST_EXCHANGE)
-        
-        # 현재가 조회용 거래소 코드는 원래 코드 사용
-        session = KISSession()
-        price_data = get_overseas_stock_price(session, TEST_SYMBOL, TEST_EXCHANGE)
-        
-        current_price = float(price_data.get("last", "0"))
+        price_data = broker.get_stock_price(TEST_SYMBOL, TEST_EXCHANGE)
+        current_price = price_data.last
         
         if current_price == 0:
             print("현재가 조회에 실패했습니다.")
             return
         
-        print(f"✓ 현재가: ${current_price}")
-        print(f"  시가: ${price_data.get('open', 'N/A')}")
-        print(f"  고가: ${price_data.get('high', 'N/A')}")
-        print(f"  저가: ${price_data.get('low', 'N/A')}")
+        print(f"✓ 현재가: ${current_price:.2f}")
+        print(f"  시가: ${price_data.open:.2f}")
         
         # Step 2: LIMIT 주문 테스트
         print(f"\n[Step 2] LIMIT 주문 (지정가) 테스트")
         print("-" * 60)
         
         try:
-            result_limit = place_overseas_order(
-                session,
-                symbol=TEST_SYMBOL,
-                exchange_code=order_exchange_code,
-                order_type="LIMIT",
-                quantity=1,
-                price=current_price,
-                trade_mode=TRADE_MODE
+            result_limit = broker.place_order(
+                TEST_SYMBOL,
+                order_exchange_code,
+                "BUY",
+                1,
+                current_price,
+                "LIMIT",
             )
             
             if result_limit:
                 print(f"✓ LIMIT 주문 성공")
-                print(f"  주문번호: {result_limit.get('odno', 'N/A')}")
+                print(f"  주문번호: {result_limit.order_id}")
             else:
                 print(f"✓ LIMIT 주문 정보 출력 완료 (DRY 모드)")
                 
@@ -96,19 +82,18 @@ def test_overseas_order():
         print("-" * 60)
         
         try:
-            result_loc = place_overseas_order(
-                session,
-                symbol=TEST_SYMBOL,
-                exchange_code=order_exchange_code,
-                order_type="LOC",
-                quantity=1,
-                price=current_price,
-                trade_mode=TRADE_MODE
+            result_loc = broker.place_order(
+                TEST_SYMBOL,
+                order_exchange_code,
+                "BUY",
+                1,
+                current_price,
+                "LOC",
             )
             
             if result_loc:
                 print(f"✓ LOC 주문 성공")
-                print(f"  주문번호: {result_loc.get('odno', 'N/A')}")
+                print(f"  주문번호: {result_loc.order_id}")
             else:
                 print(f"✓ LOC 주문 정보 출력 완료 (DRY 모드)")
                 

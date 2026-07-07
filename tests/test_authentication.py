@@ -5,7 +5,7 @@ from pathlib import Path
 # 부모 디렉토리(src)를 Python 경로에 추가하여 config, authentication을 import 가능하게 함
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from authentication import get_access_token
+from broker.kis.auth import get_access_token
 
 
 def test_authentication():
