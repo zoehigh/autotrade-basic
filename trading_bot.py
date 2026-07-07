@@ -351,10 +351,37 @@ def run_one_symbol(broker: Broker, symbol_config):
     print(f"  현재 T값: {T}")
 
     # ── 사이클 종료 사전 감지 (전략 실행 전에) ─────────────────────────
-    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다
+    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다.
+    # 단, 잔고 조회 실패(None) 또는 매도 체결 이력이 없는 잔고 0은
+    # 사이클 종료로 오판할 위험이 있어 보호합니다 (브로커 전환/수동처리 등).
     current_qty = live_qty if live_qty is not None else comp_qty
 
-    if T > 0 and current_qty == 0:
+    # 매도 체결 이력 존재 여부 — 잔고 0이 정당하려면 매도 이력이 있어야 합니다.
+    has_sell_fill = any(
+        o for o in order_history
+        if o.get("sll_buy_dvsn_cd_name") == "매도"
+        and int(float(o.get("ft_ccld_qty", 0))) > 0
+    )
+
+    # 사이클 종료 감지 가능 여부 — 세 가지 보호 조건
+    # 1) live_qty is None: 잔고 조회 자체가 실패 → 종료 감지 불가 (SOXL 케이스)
+    # 2) 매도 체결 이력 없음 + 잔고 0: 데이터 불일치 → 종료 감지 보류 (TQQQ 케이스)
+    can_detect_cycle_end = (live_qty is not None) and (has_sell_fill or comp_qty > 0)
+
+    if T > 0 and current_qty == 0 and not can_detect_cycle_end:
+        # 보호: 잔고는 0이지만 종료 감지 조건 불충분 → T 유지
+        if live_qty is None:
+            reason = "브로커 잔고 조회 실패"
+            print(f"\n[경고] {symbol} 사이클 종료 감지 보류 — {reason} (T={T} 유지, 보유수량 알 수 없음)")
+            notify(f"[경고] {symbol} 잔고 조회 실패로 사이클 종료 감지 보류. T={T} 유지. 확인 필요.")
+        else:
+            reason = "잔고 0이나 매도 체결 이력 없음 (브로커 전환/수동처리 의심)"
+            print(f"\n[경고] {symbol} 사이클 종료 감지 보류 — {reason} (T={T} 유지)")
+            notify(f"[경고] {symbol} 잔고 0이나 매도 이력 없음. T={T} 유지. 브로커 전환/수동처리 확인 필요.")
+        # T 유지, 사이클 종료 처리 생략
+
+    elif T > 0 and current_qty == 0:
+        # 정상: 잔고 0 + 매도 이력(또는 이력 기반 보유) 확인됨 → 사이클 종료
         print(f"\n{'=' * 60}")
         print(f"🏁 {symbol} 사이클 종료 감지 (사전) (T={T}, 보유수량={current_qty})")
         print(f"{'=' * 60}")
