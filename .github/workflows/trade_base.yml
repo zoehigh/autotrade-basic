@@ -71,7 +71,7 @@ on:
 jobs:
   run-trade:
     # 키움 real은 접근 IP 제약으로 self-hosted runner 사용, 나머지는 ubuntu-latest
-    runs-on: ${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'self-hosted' || 'ubuntu-latest' }}
+    runs-on: ${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'kiwoom-real' || 'ubuntu-latest' }}
     # GitHub Environments: broker-mode 조합별 secrets/variables 분리
     # 환경 예: kis-demo, kis-real, kiwoom-demo, kiwoom-real, ls-demo, ls-real, toss-real
     environment: ${{ inputs.broker }}-${{ inputs.broker_mode }}
@@ -127,9 +127,9 @@ jobs:
           echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
           echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
           echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
-          echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || 'TQQQ:NAS,SOXL:AMS' }}"
+          echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}"
           echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
-          echo "Runner=${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'self-hosted' || 'ubuntu-latest' }}"
+          echo "Runner=${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'kiwoom-real' || 'ubuntu-latest' }}"
 
       - name: 자동매매 봇 실행
         env:
