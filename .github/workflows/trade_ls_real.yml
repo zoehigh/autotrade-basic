@@ -1,0 +1,38 @@
+name: 무한매수법 실행 (LS Real)
+
+# LS증권 실전 계좌 실행
+# GitHub Environment: ls-real (secrets/variables 분리)
+# 캐시 키: state-ls-real-*
+# 주의: LS증권 브로커는 아직 구현되지 않았습니다. 실행 시 NotImplementedError로 실패합니다.
+#       브로커 구현 완료 후 바로 실행 가능하도록 워크플로우 구조만 미리 생성해둡니다.
+
+on:
+  repository_dispatch:
+    types:
+      - trigger_trade_ls_real
+  workflow_dispatch:
+    inputs:
+      trade_mode:
+        description: '거래 모드 선택 (기본: LIVE)'
+        required: false
+        type: choice
+        options:
+          - DRY
+          - LIVE
+      symbols:
+        description: '거래 심볼 — 비워두면 환경 변수 SYMBOLS 사용'
+        required: false
+        type: string
+
+jobs:
+  trade_ls_real:
+    uses: ./.github/workflows/trade_base.yml
+    with:
+      broker: ls
+      broker_mode: real
+      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
+      symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
+      quiet_hours: ${{ '' }}
+      commission_rate: ${{ '' }}
+      reinvest: ${{ '' }}
+    secrets: inherit

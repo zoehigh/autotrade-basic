@@ -14,23 +14,23 @@ on:
         type: string
         default: demo
       trade_mode:
-        description: '거래 모드 (DRY or LIVE)'
+        description: '거래 모드 (DRY or LIVE) — 비워두면 환경 변수 TRADE_MODE 사용'
         required: false
         type: string
       symbols:
-        description: '투자 심볼 (예: TQQQ:NAS,SOXL:AMS)'
+        description: '투자 심볼 (예: TQQQ:NAS,SOXL:AMS) — 비워두면 환경 변수 SYMBOLS 사용'
         required: false
         type: string
       quiet_hours:
-        description: '조용한 시간대 기능 (true/false)'
+        description: '조용한 시간대 기능 (true/false) — 비워두면 환경 변수 QUIET_HOURS 사용'
         required: false
         type: string
       commission_rate:
-        description: '수수료율 (예: 0.0025)'
+        description: '수수료율 (예: 0.0025) — 비워두면 환경 변수 COMMISSION_RATE 사용'
         required: false
         type: string
       reinvest:
-        description: '복리 재투자 활성화 (true/false)'
+        description: '복리 재투자 활성화 (true/false) — 비워두면 환경 변수 REINVEST 사용'
         required: false
         type: string
     secrets:
@@ -48,6 +48,20 @@ on:
         required: false
       KIWOOM_ACCOUNT_NO:
         required: false
+      # LS secrets (broker=ls 일 때만 사용됨)
+      LS_APP_KEY:
+        required: false
+      LS_APP_SECRET:
+        required: false
+      LS_ACCOUNT_NO:
+        required: false
+      # 토스 secrets (broker=toss 일 때만 사용됨)
+      TOSS_APP_KEY:
+        required: false
+      TOSS_APP_SECRET:
+        required: false
+      TOSS_ACCOUNT_NO:
+        required: false
       # 공통 secrets
       TELEGRAM_BOT_TOKEN:
         required: false
@@ -56,10 +70,31 @@ on:
 
 jobs:
   run-trade:
-    runs-on: ubuntu-latest
+    # 키움 real은 접근 IP 제약으로 self-hosted runner 사용, 나머지는 ubuntu-latest
+    runs-on: ${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'self-hosted' || 'ubuntu-latest' }}
+    # GitHub Environments: broker-mode 조합별 secrets/variables 분리
+    # 환경 예: kis-demo, kis-real, kiwoom-demo, kiwoom-real, ls-demo, ls-real, toss-real
+    environment: ${{ inputs.broker }}-${{ inputs.broker_mode }}
+    # 동일 broker-mode 조합의 동시 실행 방지 — .state.json 동시 쓰기 충돌 방지
+    concurrency:
+      group: trade-${{ inputs.broker }}-${{ inputs.broker_mode }}
+      cancel-in-progress: false
     steps:
       - name: 코드 체크아웃
         uses: actions/checkout@v4
+
+      - name: 브로커 구현 여부 사전 검증
+        # LS/Toss는 브로커가 아직 구현되지 않았습니다.
+        # 전체 의존성 설치 후 Python 에러로 실패하는 것보다 빠르게 실패하는 것이 낫습니다.
+        run: |
+          BROKER="${{ inputs.broker }}"
+          case "$BROKER" in
+            ls|toss)
+              echo "::error::$BROKER 증권사 브로커는 아직 구현되지 않았습니다."
+              echo "::error::src/broker/$BROKER/adapter.py 구현 후 실행하세요."
+              exit 1
+              ;;
+          esac
 
       - name: uv 설치
         uses: astral-sh/setup-uv@v5
@@ -75,20 +110,26 @@ jobs:
       - name: state 캐시 복원
         # 이전 실행에서 저장한 .state.json을 불러옵니다.
         # T값, 사이클 시작일, 복리 시드 등 API로 복구할 수 없는 정보가 담겨 있습니다.
+        # 캐시 키: state-{broker}-{mode}-{run_id}
+        # 하위호환: KIS 브로커에 한해 기존 state-{mode}-* 캐시도 복원 (KIS 단일 브로커 시절)
+        # 주의: 비-KIS 브로커는 KIS state를 물려받지 않도록 KIS 전용 폴백 사용
         id: state-cache-restore
         uses: actions/cache/restore@v4
         with:
           path: .state.json
-          key: state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-${{ github.run_id }}
+          key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
           restore-keys: |
-            state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-
+            state-${{ inputs.broker }}-${{ inputs.broker_mode }}-
+            ${{ inputs.broker == 'kis' && format('state-{0}-', inputs.broker_mode) || '_no-legacy_' }}
 
       - name: Resolve and log inputs
         run: |
           echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
           echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
-          echo "Resolved TRADE_MODE=${{ inputs.trade_mode || 'DRY' }}"
-          echo "Resolved SYMBOLS=${{ inputs.symbols || 'TQQQ:NAS,SOXL:AMS' }}"
+          echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}"
+          echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || 'TQQQ:NAS,SOXL:AMS' }}"
+          echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
+          echo "Runner=${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'self-hosted' || 'ubuntu-latest' }}"
 
       - name: 자동매매 봇 실행
         env:
@@ -96,34 +137,51 @@ jobs:
           BROKER: ${{ inputs.broker || 'kis' }}
           BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
 
-          # KIS 인증정보 (broker=kis 일 때만 사용됨)
+          # KIS 인증정보 (environment에서 주입 — broker=kis 일 때만 값이 있음)
           KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
 
-          # 키움 인증정보 (broker=kiwoom 일 때만 사용됨)
+          # 키움 인증정보 (environment에서 주입 — broker=kiwoom 일 때만 값이 있음)
           KIWOOM_APP_KEY: ${{ secrets.KIWOOM_APP_KEY }}
           KIWOOM_APP_SECRET: ${{ secrets.KIWOOM_APP_SECRET }}
           KIWOOM_ACCOUNT_NO: ${{ secrets.KIWOOM_ACCOUNT_NO }}
 
-          # 런타임 설정: inputs -> repo vars -> 하드코딩 기본값 순으로 폴백
-          TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}
-          # 복수 종목 사용
-          SYMBOLS: ${{ inputs.symbols || 'TQQQ:NAS,SOXL:AMS' }}
+          # LS 인증정보 (environment에서 주입 — broker=ls 일 때만 값이 있음)
+          LS_APP_KEY: ${{ secrets.LS_APP_KEY }}
+          LS_APP_SECRET: ${{ secrets.LS_APP_SECRET }}
+          LS_ACCOUNT_NO: ${{ secrets.LS_ACCOUNT_NO }}
 
-          # 종목별 세부 설정
+          # 토스 인증정보 (environment에서 주입 — broker=toss 일 때만 값이 있음)
+          TOSS_APP_KEY: ${{ secrets.TOSS_APP_KEY }}
+          TOSS_APP_SECRET: ${{ secrets.TOSS_APP_SECRET }}
+          TOSS_ACCOUNT_NO: ${{ secrets.TOSS_ACCOUNT_NO }}
+
+          # 런타임 설정: inputs -> environment vars -> 코드 기본값 순으로 폴백
+          TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}
+          # 복수 종목: inputs -> environment vars -> config.py 기본값
+          SYMBOLS: ${{ inputs.symbols || vars.SYMBOLS }}
+
+          # 종목별 세부 설정 (environment vars에서 주입)
           TQQQ_SPLITS: ${{ vars.TQQQ_SPLITS }}
           TQQQ_SYMBOL_TYPE: ${{ vars.TQQQ_SYMBOL_TYPE }}
           TQQQ_SEED: ${{ vars.TQQQ_SEED }}
+          TQQQ_ADDITIONAL_LOC_LEVELS: ${{ vars.TQQQ_ADDITIONAL_LOC_LEVELS }}
 
           SOXL_SPLITS: ${{ vars.SOXL_SPLITS }}
           SOXL_SYMBOL_TYPE: ${{ vars.SOXL_SYMBOL_TYPE }}
           SOXL_SEED: ${{ vars.SOXL_SEED }}
+          SOXL_ADDITIONAL_LOC_LEVELS: ${{ vars.SOXL_ADDITIONAL_LOC_LEVELS }}
 
-          QUIET_HOURS: ${{ inputs.quiet_hours }}
-          COMMISSION_RATE: ${{ inputs.commission_rate }}
-          REINVEST: ${{ inputs.reinvest }}
+          # 글로벌 추가 LOC 단계 (종목별 설정이 없을 때 폴백)
+          ADDITIONAL_LOC_LEVELS: ${{ vars.ADDITIONAL_LOC_LEVELS }}
 
+          # 런타임 옵션: inputs -> environment vars -> 코드 기본값
+          QUIET_HOURS: ${{ inputs.quiet_hours || vars.QUIET_HOURS }}
+          COMMISSION_RATE: ${{ inputs.commission_rate || vars.COMMISSION_RATE }}
+          REINVEST: ${{ inputs.reinvest || vars.REINVEST }}
+
+          # 텔레그램 (environment에서 주입 — 브로커+모드별로 다른 채널 가능)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -140,4 +198,4 @@ jobs:
         if: always()
         with:
           path: .state.json
-          key: state-${{ inputs.broker || 'kis' }}-${{ inputs.broker_mode || 'demo' }}-${{ github.run_id }}
+          key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}

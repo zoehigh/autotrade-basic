@@ -136,8 +136,22 @@ def _parse_symbols():
 			pairs.append((sym, exch))
 
 	if not pairs:
-		# 기본값: TQQQ(나스닥) + SOXL(아멕스)
-		pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
+		# 기본값: TQQQ(나스닥) + SOXL
+		# SOXL 상장 거래소 분류가 브로커마다 다릅니다:
+		#   - KIS: AMEX (AMS)
+		#   - Kiwoom: NYSE (NYS)
+		# LS/Toss 등 미구현 브로커는 거래소 코드 체계가 정해지지 않았으므로
+		# 명시적으로 SYMBOLS 환경변수를 설정해야 합니다.
+		if BROKER == "kiwoom":
+			pairs = [("TQQQ", "NAS"), ("SOXL", "NYS")]
+		else:
+			if BROKER != "kis":
+				print(
+					f"경고: BROKER={BROKER}인데 SYMBOLS가 설정되지 않아 "
+					f"KIS 기본값(TQQQ:NAS,SOXL:AMS)을 사용합니다. "
+					f"브로커별 거래소 코드가 다를 수 있으니 SYMBOLS를 명시적으로 설정하세요."
+				)
+			pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
 
 	result = []
 	for sym, exch in pairs:
@@ -152,7 +166,7 @@ def _parse_symbols():
 			# - TQQQ: 20분할 별% = (15-1.5T)%, 40분할 별% = (15-0.75T)%
 			# - SOXL: 20분할 별% = (20-2T)%, 40분할 별% = (20-T)%
 			# 미설정 시 종목코드를 그대로 사용 (TQQQ → "TQQQ", SOXL → "SOXL")
-			"symbol_type": os.getenv(f"{sym}_SYMBOL_TYPE", sym).strip().upper(),
+			"symbol_type": (os.getenv(f"{sym}_SYMBOL_TYPE") or sym).strip().upper(),
 			# 급락 대비 추가 LOC 주문 단계 수
 			# 종목별 설정({SYMBOL}_ADDITIONAL_LOC_LEVELS) → 글로벌(ADDITIONAL_LOC_LEVELS) → 기본값 3
 			"additional_loc_levels": int(

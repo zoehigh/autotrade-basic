@@ -1,18 +1,19 @@
-name: 무한매수법 실행 (Kiwoom Demo)
+name: 무한매수법 실행 (Kiwoom Real)
 
-# 키움증권 모의투자 계좌 실행
-# GitHub Environment: kiwoom-demo (secrets/variables 분리)
-# 캐시 키: state-kiwoom-demo-*
+# 키움증권 실전 계좌 실행
+# GitHub Environment: kiwoom-real (secrets/variables 분리)
+# 캐시 키: state-kiwoom-real-*
+# Runner: self-hosted (키움 real API 접근 IP 제약 — 사전 등록된 IP에서만 호출 가능)
 # 주의: SOXL은 키움에서 NYSE 상장 → SYMBOLS=TQQQ:NAS,SOXL:NYS (AMS 아님)
 
 on:
   repository_dispatch:
     types:
-      - trigger_trade_kiwoom_demo
+      - trigger_trade_kiwoom_real
   workflow_dispatch:
     inputs:
       trade_mode:
-        description: '거래 모드 선택 (기본: DRY)'
+        description: '거래 모드 선택 (기본: LIVE)'
         required: false
         type: choice
         options:
@@ -24,11 +25,11 @@ on:
         type: string
 
 jobs:
-  trade_kiwoom_demo:
+  trade_kiwoom_real:
     uses: ./.github/workflows/trade_base.yml
     with:
       broker: kiwoom
-      broker_mode: demo
+      broker_mode: real
       trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
       quiet_hours: ${{ '' }}

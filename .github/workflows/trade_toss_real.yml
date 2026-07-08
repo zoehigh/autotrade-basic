@@ -1,0 +1,39 @@
+name: 무한매수법 실행 (Toss Real)
+
+# 토스증권 실전 계좌 실행 (real만 지원)
+# GitHub Environment: toss-real (secrets/variables 분리)
+# 캐시 키: state-toss-real-*
+# 주의: 토스증권 브로커는 아직 구현되지 않았습니다. 실행 시 NotImplementedError로 실패합니다.
+#       브로커 구현 완료 후 바로 실행 가능하도록 워크플로우 구조만 미리 생성해둡니다.
+#       토스는 demo(모의)를 지원하지 않으므로 real 워크플로우만 있습니다.
+
+on:
+  repository_dispatch:
+    types:
+      - trigger_trade_toss_real
+  workflow_dispatch:
+    inputs:
+      trade_mode:
+        description: '거래 모드 선택 (기본: LIVE)'
+        required: false
+        type: choice
+        options:
+          - DRY
+          - LIVE
+      symbols:
+        description: '거래 심볼 — 비워두면 환경 변수 SYMBOLS 사용'
+        required: false
+        type: string
+
+jobs:
+  trade_toss_real:
+    uses: ./.github/workflows/trade_base.yml
+    with:
+      broker: toss
+      broker_mode: real
+      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
+      symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
+      quiet_hours: ${{ '' }}
+      commission_rate: ${{ '' }}
+      reinvest: ${{ '' }}
+    secrets: inherit
