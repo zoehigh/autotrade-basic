@@ -126,7 +126,7 @@ jobs:
         run: |
           echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
           echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
-          echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}"
+          echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
           echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || 'TQQQ:NAS,SOXL:AMS' }}"
           echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
           echo "Runner=${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'self-hosted' || 'ubuntu-latest' }}"
@@ -157,8 +157,10 @@ jobs:
           TOSS_APP_SECRET: ${{ secrets.TOSS_APP_SECRET }}
           TOSS_ACCOUNT_NO: ${{ secrets.TOSS_ACCOUNT_NO }}
 
-          # 런타임 설정: inputs -> environment vars -> 코드 기본값 순으로 폴백
-          TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || 'DRY' }}
+          # 런타임 설정: inputs -> environment vars -> 모드별 기본값 순으로 폴백
+          # real 환경은 기본 DRY (fail-safe: 명시적으로 LIVE 선택해야 실전 주문)
+          # demo 환경은 기본 LIVE (모의 계좌에서 실제 주문 흐름 테스트)
+          TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}
           # 복수 종목: inputs -> environment vars -> config.py 기본값
           SYMBOLS: ${{ inputs.symbols || vars.SYMBOLS }}
 

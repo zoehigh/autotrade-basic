@@ -82,6 +82,14 @@ TRADE_MODE=LIVE uv run python trading_bot.py
 uv run pytest tests/ -v
 ```
 
+## COMMUNICATION RULES
+
+- **질문과 수정 요청 구분**: 사용자가 물음표(?)로 끝내면 "질문"으로 간주한다.
+  - 질문에는 **분석/답변만** 하고, 코드 수정을 하지 않는다.
+  - 수정이 필요하면 사용자가 명시적으로 "수정해줘", "진행해줘", "적용해줘" 등으로 요청해야 한다.
+  - 답변 중 수정이 필요하다고 판단되면 "수정할까요?"라고 먼저 물어본다.
+- **검증 요청은 수정 아님**: "확인해줘", "맞는지 봐줘" 등은 검증만 수행하고 결과만 보고한다.
+
 ## NOTES
 - GitHub Actions: `repository_dispatch`로만 트리거 (cron 없음)
 - 기본 거래소: TQQQ(NAS), SOXL(AMS)

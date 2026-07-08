@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       trade_mode:
-        description: '거래 모드 선택 (기본: LIVE)'
+        description: '거래 모드 선택 (기본: DRY)'
         required: false
         type: choice
         options:
