@@ -528,6 +528,7 @@ class KiwoomBroker(Broker):
             tr_id = TR_HISTORY
             body = {
                 "tp": "3",                   # 구분: 매매 (ust21100 필수 — 공식 문서는 선택이나 실서버 강제)
+                "krw_repl_skip_yn": "Y",  # 원화대용입출금제외여부: KRW 대체거래 제외 (미국주식은 KRW 대체거래 없음, ust21100 필수 — 공식 문서는 선택이나 실서버 강제)
                 "stk_cd": symbol.upper(),
                 "stex_tp": api_exch,
                 "strt_dt": ord_strt_dt,
