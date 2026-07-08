@@ -518,8 +518,12 @@ class KiwoomBroker(Broker):
                         normalized = self._normalize_ust21150_item(item, ord_dt=dt)
                         order_history.append(normalized)
                 except BrokerError as e:
-                    # 단일 날짜 실패는 무시하고 계속 (rate-limit 등)
-                    print(f"[주문이력] {dt} 조회 실패: {str(e)[:80]}")
+                    # 빈 결과(501724)는 정상이므로 조용히 건너뛰고, 그 외 실패만 로깅.
+                    msg = str(e)
+                    if "501724" in msg or "관련자료가 없습니다" in msg:
+                        pass  # 해당 날짜 체결내역 없음 — 정상
+                    else:
+                        print(f"[주문이력] {dt} 조회 실패: {msg[:80]}")
                 time.sleep(self._rate_limit_wait)  # 모의투자 1회/초 rate-limit
 
             print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
@@ -544,6 +548,15 @@ class KiwoomBroker(Broker):
                     normalized = self._normalize_order_item(item)
                     order_history.append(normalized)
 
+            except BrokerError as e:
+                # 키움은 빈 결과를 return_code=20 + 501724(관련자료가 없습니다)로 반환.
+                # 빈 결과는 정상(체결 이력 없음)이므로 빈 리스트로 처리하고 T=0 유지.
+                msg = str(e)
+                if "501724" in msg or "관련자료가 없습니다" in msg:
+                    print(f"[주문이력] {symbol} 체결내역 없음 (빈 결과)")
+                    order_history = []
+                else:
+                    raise
             except requests.exceptions.RequestException as e:
                 raise BrokerError(f"주문체결내역 조회 실패: {str(e)}")
 
