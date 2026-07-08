@@ -527,6 +527,7 @@ class KiwoomBroker(Broker):
             # 실전: ust21100(거래내역)
             tr_id = TR_HISTORY
             body = {
+                "tp": "3",                   # 구분: 매매 (ust21100 필수 — 공식 문서는 선택이나 실서버 강제)
                 "stk_cd": symbol.upper(),
                 "stex_tp": api_exch,
                 "strt_dt": ord_strt_dt,
