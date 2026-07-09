@@ -5,14 +5,13 @@
 다음 환경변수가 설정되어 있어야 실행됩니다:
   KIWOOM_APP_KEY=모의투자_앱키
   KIWOOM_APP_SECRET=모의투자_앱시크릿
-  KIWOOM_ACCOUNT_NO=모의투자_계좌번호
   BROKER=kiwoom
   BROKER_MODE=demo
 
 환경변수가 없으면 자동으로 skip됩니다.
 
 실행:
-  BROKER=kiwoom BROKER_MODE=demo KIWOOM_APP_KEY=... KIWOOM_APP_SECRET=... KIWOOM_ACCOUNT_NO=... \\
+  BROKER=kiwoom BROKER_MODE=demo KIWOOM_APP_KEY=... KIWOOM_APP_SECRET=... \\
     uv run pytest tests/test_kiwoom_integration.py -v
 
 테스트 시나리오:

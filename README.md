@@ -259,10 +259,8 @@ demo/real × 브로커별로 **7개의 Environment**를 생성합니다. 각 Env
 | `KIWOOM_APP_SECRET` | | ✅ | | | 키움 앱 시크릿 |
 | `LS_APP_KEY` | | | ✅ | | LS 앱 키 |
 | `LS_APP_SECRET` | | | ✅ | | LS 앱 시크릿 |
-| `LS_ACCOUNT_NO` | | | ✅ | | LS 계좌번호 |
 | `TOSS_APP_KEY` | | | | ✅ | 토스 앱 키 |
 | `TOSS_APP_SECRET` | | | | ✅ | 토스 앱 시크릿 |
-| `TOSS_ACCOUNT_NO` | | | | ✅ | 토스 계좌번호 |
 | `TELEGRAM_BOT_TOKEN` | ✅ | ✅ | ✅ | ✅ | 텔레그램 봇 토큰 (환경별 채널 분리 가능) |
 | `TELEGRAM_CHAT_ID` | ✅ | ✅ | ✅ | ✅ | 텔레그램 채팅 ID |
 

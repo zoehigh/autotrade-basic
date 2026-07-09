@@ -51,14 +51,10 @@ on:
         required: false
       LS_APP_SECRET:
         required: false
-      LS_ACCOUNT_NO:
-        required: false
       # 토스 secrets (broker=toss 일 때만 사용됨)
       TOSS_APP_KEY:
         required: false
       TOSS_APP_SECRET:
-        required: false
-      TOSS_ACCOUNT_NO:
         required: false
       # 공통 secrets
       TELEGRAM_BOT_TOKEN:
@@ -146,12 +142,10 @@ jobs:
           # LS 인증정보 (environment에서 주입 — broker=ls 일 때만 값이 있음)
           LS_APP_KEY: ${{ secrets.LS_APP_KEY }}
           LS_APP_SECRET: ${{ secrets.LS_APP_SECRET }}
-          LS_ACCOUNT_NO: ${{ secrets.LS_ACCOUNT_NO }}
 
           # 토스 인증정보 (environment에서 주입 — broker=toss 일 때만 값이 있음)
           TOSS_APP_KEY: ${{ secrets.TOSS_APP_KEY }}
           TOSS_APP_SECRET: ${{ secrets.TOSS_APP_SECRET }}
-          TOSS_ACCOUNT_NO: ${{ secrets.TOSS_ACCOUNT_NO }}
 
           # 런타임 설정: inputs -> environment vars -> 모드별 기본값 순으로 폴백
           # real 환경은 기본 DRY (fail-safe: 명시적으로 LIVE 선택해야 실전 주문)

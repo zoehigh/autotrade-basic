@@ -14,14 +14,14 @@ import certifi
 import requests
 
 from config import (
-    LS_APP_KEY,
-    LS_APP_SECRET,
     BROKER_CONFIG,
     HTTP_TIMEOUT,
 )
 
 # Base URL (실전/모의 동일, AppKey로 환경 구분)
 BASE_URL = BROKER_CONFIG.get("domain", "https://openapi.ls-sec.co.kr:8080")
+LS_APP_KEY = BROKER_CONFIG.get("app_key", "")
+LS_APP_SECRET = BROKER_CONFIG.get("app_secret", "")
 
 # 발급받은 토큰을 캐시하는 전역 변수
 _cached_token = None

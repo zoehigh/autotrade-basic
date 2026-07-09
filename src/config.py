@@ -35,7 +35,6 @@ def _get_broker_config(broker_name: str) -> dict:
         "kiwoom": {
             "app_key": os.getenv("KIWOOM_APP_KEY", ""),
             "app_secret": os.getenv("KIWOOM_APP_SECRET", ""),
-            "account_no": os.getenv("KIWOOM_ACCOUNT_NO", ""),
             "domain": (
                 "https://api.kiwoom.com"
                 if BROKER_MODE == "real"
@@ -46,7 +45,6 @@ def _get_broker_config(broker_name: str) -> dict:
         "ls": {
             "app_key": os.getenv("LS_APP_KEY", ""),
             "app_secret": os.getenv("LS_APP_SECRET", ""),
-            "account_no": os.getenv("LS_ACCOUNT_NO", ""),
             "domain": "https://openapi.ls-sec.co.kr:8080",
             "acnt_prdt_cd": "",
         },
@@ -60,17 +58,7 @@ BROKER_CONFIG = _get_broker_config(BROKER)
 if BROKER == "kis" and not BROKER_CONFIG.get("account_no", ""):
     print("경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
 
-# ── 키움증권 API 설정 (향후 지원) ──
-KIWOOM_APP_KEY = os.getenv("KIWOOM_APP_KEY", "")
-KIWOOM_APP_SECRET = os.getenv("KIWOOM_APP_SECRET", "")
-
-# ── LS증권 API 설정 (향후 지원) ──
-LS_APP_KEY = os.getenv("LS_APP_KEY", "")
-LS_APP_SECRET = os.getenv("LS_APP_SECRET", "")
-
-# ── 토스증권 API 설정 (향후 지원) ──
-TOSS_APP_KEY = os.getenv("TOSS_APP_KEY", "")
-TOSS_APP_SECRET = os.getenv("TOSS_APP_SECRET", "")
+# ── 키움/LS/토스 증권 API 설정 (BROKER_CONFIG에서 관리) ──
 
 # HTTP 타임아웃 설정 (초)
 # connect_timeout: 연결 시도 제한 시간
