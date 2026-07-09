@@ -234,7 +234,22 @@ def run_one_symbol(broker: Broker, symbol_config):
         days=history_days,
         verbose=(TRADE_MODE == "DRY"),
     )
-    state = update_T_from_history(symbol, state, order_history)
+
+    # 잔고를 미리 조회하여 update_T_from_history의 잔고 교차 검증에 사용합니다.
+    # 이력이 비었을 때 T 리셋 여부를 잔고로 판별 — 보유 중이면 리셋 보류, 잔고 0이면
+    # 잘못된 state 복구를 위해 리셋 fallback, 조회 실패(None)면 보수적 보류.
+    # 이 결과(live_qty 등)는 아래 상태-잔고 교차검증에서도 그대로 재사용합니다.
+    try:
+        live_balance = broker.get_balance(symbol, exchange)
+        live_qty = live_balance.quantity if live_balance else 0
+        live_avg = live_balance.avg_price if live_balance else 0.0
+    except Exception as e:
+        print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용): {e}")
+        live_balance = None
+        live_qty = None
+        live_avg = None
+
+    state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
 
     # ── 사이클 종료 감지 (전체 재추정 경로) ──
     # _infer_T_from_full_history가 전량매도를 감지해 T=0으로 리셋한 경우,
@@ -275,16 +290,6 @@ def run_one_symbol(broker: Broker, symbol_config):
     except Exception as e:
         print(f"[상태 검증] 이력 기반 포지션 계산 실패: {e}")
         computed = {"net_qty": 0, "avg_price": 0.0}
-
-    try:
-        live_balance = broker.get_balance(symbol, exchange)
-        live_qty = live_balance.quantity if live_balance else 0
-        live_avg = live_balance.avg_price if live_balance else 0.0
-    except Exception as e:
-        print(f"[상태 검증] 브로커 잔고 조회 실패: {e}")
-        live_balance = None
-        live_qty = None
-        live_avg = None
 
     comp_qty = int(computed.get("net_qty", 0))
     comp_avg = float(computed.get("avg_price", 0.0))

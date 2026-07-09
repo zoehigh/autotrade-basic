@@ -270,7 +270,7 @@ class TestKiwoomMockIntegration:
         try:
             result = kiwoom_broker.place_order(
                 TEST_SYMBOL,
-                TEST_EXCHANGE,
+                kiwoom_broker.exchange_code(TEST_EXCHANGE),
                 "BUY",
                 1,
                 buy_price,
@@ -360,7 +360,7 @@ class TestKiwoomMockIntegration:
 
         result = kiwoom_broker.place_order(
             TEST_SYMBOL,
-            TEST_EXCHANGE,
+            kiwoom_broker.exchange_code(TEST_EXCHANGE),
             "SELL",
             1,
             sell_price,

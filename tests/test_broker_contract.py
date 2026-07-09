@@ -726,7 +726,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
             "output": {"ODNO": "202606150001", "ORD_TMD": "103000"},
         })
         broker = self._create_broker()
-        result = broker.place_order("TQQQ", "NAS", "BUY", 1, 50.0, "LIMIT")
+        result = broker.place_order("TQQQ", "ND", "BUY", 1, 50.0, "LIMIT")
 
         assert result is not None
         assert isinstance(result, OrderResult)
@@ -735,12 +735,13 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         assert result.is_reservation is False
 
     # ── Base 계약 테스트 오버라이드 ────────────────────────────────────
-    # KiwoomBroker.place_order는 exchange 인자로 사용자 코드(NAS/NYS/AMS)를 받고
-    # 내부에서 get_api_exchange_code()로 변환하므로 "NASD" 대신 "NAS"를 사용합니다.
+    # KiwoomBroker.place_order는 KIS place_order와 동일하게 변환된 API 거래소 코드를
+    # 받습니다 (호출 측에서 broker.exchange_code()로 변환). 따라서 "NASD"가 아닌
+    # 키움 API 코드 "ND"를 사용합니다.
 
     def test_place_order_returns_orderresult_or_none(self):
         broker = self._create_broker()
-        result = broker.place_order("TQQQ", "NAS", "BUY", 1, 50.0, "LIMIT")
+        result = broker.place_order("TQQQ", "ND", "BUY", 1, 50.0, "LIMIT")
         if result is not None:
             assert isinstance(result, OrderResult)
             assert isinstance(result.order_id, str)

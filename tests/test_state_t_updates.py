@@ -215,9 +215,21 @@ class TestApplyRecentHistory:
         assert result["T"] == 1.5, f"T={result['T']} (expected 1.5)"
 
     def test_이력_없으면_T_변화없음(self):
-        """매수 이력이 없으면 T는 그대로."""
+        """이력이 없는데 보유 중이면 T는 그대로 (조회 누락/정지 복귀 보호)."""
         state = _make_state(T=3.0, last_updated="2026-05-27 00:00:00")
-        result = update_T_from_history("TQQQ", state, [])
+        result = update_T_from_history("TQQQ", state, [], balance_qty=10)
+        assert result["T"] == 3.0
+
+    def test_이력_없음_잔고0이면_T_리셋(self):
+        """이력 없음 + 잔고 0 + T>0 → 잘못된 state 복구를 위해 T=0 리셋 (Case B)."""
+        state = _make_state(T=3.0, last_updated="2026-05-27 00:00:00")
+        result = update_T_from_history("TQQQ", state, [], balance_qty=0)
+        assert result["T"] == 0.0
+
+    def test_이력_없음_잔고_미확인이면_T_유지(self):
+        """이력 없음 + 잔고 조회 실패(None) → 보수적으로 T 유지 (사고 방지)."""
+        state = _make_state(T=3.0, last_updated="2026-05-27 00:00:00")
+        result = update_T_from_history("TQQQ", state, [], balance_qty=None)
         assert result["T"] == 3.0
 
     def test_last_updated_이전_이력_무시(self):

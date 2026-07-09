@@ -638,6 +638,13 @@ class KiwoomBroker(Broker):
           예약 주문은 영웅문 HTS/모바일앱에서만 가능합니다.
         - 장 마감 후(미국 장 시간 외, ET 09:30~16:00 외) 주문 시 RC4058 오류 발생.
 
+        exchange 규약 (KIS place_order와 동일):
+          - place_order는 호출 측에서 broker.exchange_code()로 변환된 API 거래소
+            코드(ND/NY/NA)를 받습니다. 여기서는 추가 변환 없이 그대로 사용합니다.
+          - get_stock_price/get_balance 등 조회 API는 원본 사용자 코드(NAS/NYS/AMS)를
+            받아 내부에서 변환하지만, place_order는 trading_bot/test에서 변환된 코드를
+            넘기므로 중복 변환하면 "지원하지 않는 거래소 코드: ND" 에러가 발생합니다.
+
         Returns:
             OrderResult: 주문 성공 시 (주문번호, 시각, 예약여부=False)
         """
@@ -654,7 +661,10 @@ class KiwoomBroker(Broker):
             raise OrderError(f"지원하지 않는 주문 유형입니다: {order_type}")
 
         tr_id = TR_BUY if side == "BUY" else TR_SELL
-        api_exch = get_api_exchange_code(exchange)
+        # exchange는 이미 broker.exchange_code()로 변환된 API 코드(ND/NY/NA)이므로
+        # 그대로 사용합니다. 여기서 get_api_exchange_code()를 다시 호출하면 이중 변환으로
+        # ValueError가 발생합니다.
+        api_exch = exchange
 
         body = {
             "stk_cd": symbol.upper(),

@@ -163,7 +163,7 @@ def get_order_meta(state, odno):
     return state.get("orders_meta", {}).get(str(odno))
 
 
-def update_T_from_history(symbol, state, order_history):
+def update_T_from_history(symbol, state, order_history, balance_qty=None):
     """
     주문 이력을 바탕으로 T값을 업데이트합니다.
 
@@ -177,11 +177,18 @@ def update_T_from_history(symbol, state, order_history):
     [일반 모드] last_updated가 있을 때
       - last_updated 날짜 이후의 체결 이력만 T값에 누적합니다.
       - 월요일(어제=일요일), 공휴일 다음날 등 어떤 경우에도 올바르게 동작합니다.
+      - 최근 이력이 비고 T>0일 때 잔고 교차 검증(balance_qty)으로 리셋 여부를 판단:
+          * 보유 중(balance_qty > 0): 이력 조회 누락/정지 복귀로 보고 T 유지 + 경고
+          * 잔고 0 또는 미확인: 잘못된 state 복구를 위해 전체 이력 재추정 fallback
 
     Parameters:
         symbol (str): 종목 코드
         state (dict): 현재 상태 (T 포함) — 이 딕셔너리가 직접 수정됩니다
         order_history (list): get_overseas_order_history()의 반환값
+        balance_qty (int|None): 브로커 get_balance()의 보유 수량.
+            None(조회 실패/미확인)이면 보수적으로 리셋을 보류하고, 0이면 잔고 없음으로
+            리셋 fallback을 허용하며, 0 초과면 보유 중으로 보아 리셋을 보류합니다.
+            초기 모드(경로 1)에는 적용되지 않습니다.
 
     Returns:
         dict: 업데이트된 state (입력과 동일한 객체)
@@ -222,7 +229,7 @@ def update_T_from_history(symbol, state, order_history):
         return _infer_T_from_full_history(symbol, state, order_history)
 
     # 일반 모드: last_updated_dt 이후의 이력만 T에 반영합니다
-    return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno)
+    return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty)
 
 
 def _compute_net_qty_up_to(order_history, cutoff_dt):
@@ -548,7 +555,7 @@ def compute_position_from_history(order_history, cycle_start_date=None):
     return {"net_qty": int(net_qty), "avg_price": round(avg_price, 4), "buy_count": buy_count, "sell_count": sell_count}
 
 
-def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno):
+def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty=None):
     """
     tz-aware한 최근 체결 반영 로직
     - order_history의 각 항목 `ord_datetime_utc`(ISO)를 파싱하여 UTC datetime으로 비교
@@ -608,11 +615,24 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
     if not recent_candidates:
-        # 최근 이력이 없으면 전체 이력 기반 재추정으로 fallback.
-        # 이력이 전혀 없으면 _infer_T_from_full_history가 T=0으로 리셋
-        # (state.json이 잘못된 상태의 자동 복구).
+        # 최근 이력이 없을 때의 처리.
         if state.get("T", 0) > 0:
-            print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → 전체 이력 재추정 시도 (T={state['T']})")
+            # 잔고 교차 검증으로 리셋 여부를 판별.
+            # (조회 실패, 모의투자 체결 지연, 31일+ 정지 후 복귀 등에서 이력이 빈 리스트로
+            #  반환될 수 있는데, 이때 T를 임의 리셋하면 대량 매수 사고로 이어진다.)
+            if balance_qty is None:
+                # 잔고 조회 실패/미확인 → 보수적으로 리셋 보류 (사고 방지 우선).
+                print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 잔고 미확인 → T={state['T']} 유지 (보수적 보류)")
+                print(f"[경고] {symbol} 이력이 없는데 잔고를 확인할 수 없어 T 리셋을 보류합니다. state.json과 잔고를 확인하세요.")
+                return state
+            if balance_qty > 0:
+                # 보유 중 → 이력 조회 누락/정지 복귀로 보고 T 보존.
+                print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (이력 조회 누락/정지 복귀 가능)")
+                print(f"[경고] {symbol} 이력이 없는데 보유 중입니다. state.json과 잔고를 확인하세요.")
+                return state
+            # 잔고 0 → 잘못된 state.json(T>0, 잔고0, 이력0) 복구를 위해 전체 재추정.
+            # 전체 이력도 비면 _infer_T_from_full_history가 T=0으로 리셋합니다.
+            print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 잔고 0 → 전체 이력 재추정 시도 (T={state['T']})")
             return _infer_T_from_full_history(symbol, state, order_history)
         print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → T=0 유지")
         return state
