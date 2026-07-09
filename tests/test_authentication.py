@@ -66,7 +66,7 @@ def test_authentication():
         return True
     
     except Exception as e:
-        print(f"\n❌ 테스트 실패")
+        print("\n❌ 테스트 실패")
         print(f"오류: {str(e)}")
         print("\n[해결 방법]")
         print("1. .env 파일이 프로젝트 루트에 존재하는지 확인")
