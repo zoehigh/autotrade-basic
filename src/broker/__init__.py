@@ -47,9 +47,8 @@ def create_broker() -> Broker:
         from broker.kiwoom.adapter import KiwoomBroker
         broker = KiwoomBroker()
     elif BROKER == "ls":
-        # from broker.ls.adapter import LSBroker
-        # broker = LSBroker()
-        raise NotImplementedError("LS증권 브로커는 아직 구현되지 않았습니다.")
+        from broker.ls.adapter import LSBroker
+        broker = LSBroker()
     elif BROKER == "toss":
         # from broker.toss.adapter import TossBroker
         # broker = TossBroker()

@@ -43,6 +43,13 @@ def _get_broker_config(broker_name: str) -> dict:
             ),
             "acnt_prdt_cd": "",
         },
+        "ls": {
+            "app_key": os.getenv("LS_APP_KEY", ""),
+            "app_secret": os.getenv("LS_APP_SECRET", ""),
+            "account_no": os.getenv("LS_ACCOUNT_NO", ""),
+            "domain": "https://openapi.ls-sec.co.kr:8080",
+            "acnt_prdt_cd": "",
+        },
     }
     return configs.get(broker_name, {})
 
@@ -214,3 +221,9 @@ KIS_ACCOUNT_NO = BROKER_CONFIG.get("account_no", "")
 KIS_TIMEOUT = HTTP_TIMEOUT
 KIS_CONNECT_TIMEOUT = CONNECT_TIMEOUT
 KIS_READ_TIMEOUT = READ_TIMEOUT
+
+# ── LS증권 하위호환 alias ──
+LS_DOMAIN = BROKER_CONFIG.get("domain", "")
+LS_APP_KEY = BROKER_CONFIG.get("app_key", "")
+LS_APP_SECRET = BROKER_CONFIG.get("app_secret", "")
+LS_ACCOUNT_NO = BROKER_CONFIG.get("account_no", "")
