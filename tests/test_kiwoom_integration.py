@@ -61,13 +61,12 @@ from broker.base import (
 KIWOOM_CREDENTIALS_AVAILABLE = all([
     os.getenv("KIWOOM_APP_KEY"),
     os.getenv("KIWOOM_APP_SECRET"),
-    os.getenv("KIWOOM_ACCOUNT_NO"),
 ])
 
 pytestmark = pytest.mark.skipif(
     not KIWOOM_CREDENTIALS_AVAILABLE,
     reason=(
-        "KIWOOM_APP_KEY / KIWOOM_APP_SECRET / KIWOOM_ACCOUNT_NO "
+        "KIWOOM_APP_KEY / KIWOOM_APP_SECRET "
         "환경변수가 설정되지 않았습니다."
     ),
 )
@@ -111,7 +110,6 @@ def kiwoom_broker():
     broker = create_broker()
     print(f"[키움 통합테스트] broker={broker.name}, mode={broker._mode}")
     print(f"  domain={broker._domain}")
-    print(f"  account_no={broker._account_no[0:4]}****")
     yield broker
     broker.close()
 

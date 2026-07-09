@@ -63,17 +63,14 @@ if BROKER == "kis" and not BROKER_CONFIG.get("account_no", ""):
 # ── 키움증권 API 설정 (향후 지원) ──
 KIWOOM_APP_KEY = os.getenv("KIWOOM_APP_KEY", "")
 KIWOOM_APP_SECRET = os.getenv("KIWOOM_APP_SECRET", "")
-KIWOOM_ACCOUNT_NO = os.getenv("KIWOOM_ACCOUNT_NO", "")
 
 # ── LS증권 API 설정 (향후 지원) ──
 LS_APP_KEY = os.getenv("LS_APP_KEY", "")
 LS_APP_SECRET = os.getenv("LS_APP_SECRET", "")
-LS_ACCOUNT_NO = os.getenv("LS_ACCOUNT_NO", "")
 
 # ── 토스증권 API 설정 (향후 지원) ──
 TOSS_APP_KEY = os.getenv("TOSS_APP_KEY", "")
 TOSS_APP_SECRET = os.getenv("TOSS_APP_SECRET", "")
-TOSS_ACCOUNT_NO = os.getenv("TOSS_ACCOUNT_NO", "")
 
 # HTTP 타임아웃 설정 (초)
 # connect_timeout: 연결 시도 제한 시간
@@ -222,8 +219,4 @@ KIS_TIMEOUT = HTTP_TIMEOUT
 KIS_CONNECT_TIMEOUT = CONNECT_TIMEOUT
 KIS_READ_TIMEOUT = READ_TIMEOUT
 
-# ── LS증권 하위호환 alias ──
-LS_DOMAIN = BROKER_CONFIG.get("domain", "")
-LS_APP_KEY = BROKER_CONFIG.get("app_key", "")
-LS_APP_SECRET = BROKER_CONFIG.get("app_secret", "")
-LS_ACCOUNT_NO = BROKER_CONFIG.get("account_no", "")
+

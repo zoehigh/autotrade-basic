@@ -257,7 +257,6 @@ demo/real × 브로커별로 **7개의 Environment**를 생성합니다. 각 Env
 | `KIS_ACCOUNT_NO` | ✅ | | | | KIS 계좌번호 |
 | `KIWOOM_APP_KEY` | | ✅ | | | 키움 앱 키 |
 | `KIWOOM_APP_SECRET` | | ✅ | | | 키움 앱 시크릿 |
-| `KIWOOM_ACCOUNT_NO` | | ✅ | | | 키움 계좌번호 |
 | `LS_APP_KEY` | | | ✅ | | LS 앱 키 |
 | `LS_APP_SECRET` | | | ✅ | | LS 앱 시크릿 |
 | `LS_ACCOUNT_NO` | | | ✅ | | LS 계좌번호 |

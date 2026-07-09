@@ -46,8 +46,6 @@ on:
         required: false
       KIWOOM_APP_SECRET:
         required: false
-      KIWOOM_ACCOUNT_NO:
-        required: false
       # LS secrets (broker=ls 일 때만 사용됨)
       LS_APP_KEY:
         required: false
@@ -145,8 +143,6 @@ jobs:
           # 키움 인증정보 (environment에서 주입 — broker=kiwoom 일 때만 값이 있음)
           KIWOOM_APP_KEY: ${{ secrets.KIWOOM_APP_KEY }}
           KIWOOM_APP_SECRET: ${{ secrets.KIWOOM_APP_SECRET }}
-          KIWOOM_ACCOUNT_NO: ${{ secrets.KIWOOM_ACCOUNT_NO }}
-
           # LS 인증정보 (environment에서 주입 — broker=ls 일 때만 값이 있음)
           LS_APP_KEY: ${{ secrets.LS_APP_KEY }}
           LS_APP_SECRET: ${{ secrets.LS_APP_SECRET }}

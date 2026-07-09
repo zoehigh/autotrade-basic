@@ -102,7 +102,6 @@ class KiwoomBroker(Broker):
         self._domain = BROKER_CONFIG["domain"]
         self._app_key = BROKER_CONFIG["app_key"]
         self._app_secret = BROKER_CONFIG["app_secret"]
-        self._account_no = BROKER_CONFIG["account_no"]
         self._session = KiwoomSession(self._domain, timeout=HTTP_TIMEOUT)
 
         # rate limit: 실전 10회/초, 모의 1회/초
@@ -132,14 +131,6 @@ class KiwoomBroker(Broker):
             )
         except Exception as e:
             raise BrokerError(f"키움 토큰 획득 실패: {str(e)}")
-
-    def _check_account(self):
-        """계좌번호 설정 여부를 검증합니다."""
-        if not self._account_no:
-            raise BrokerError(
-                "KIWOOM_ACCOUNT_NO가 설정되어 있지 않습니다. "
-                "환경변수 또는 .env 파일에 KIWOOM_ACCOUNT_NO를 추가하세요."
-            )
 
     def _check_response(self, resp: requests.Response) -> dict:
         """
@@ -398,7 +389,6 @@ class KiwoomBroker(Broker):
         TR: ust21070 (잔고)
         해당 종목의 잔고가 없으면 None을 반환합니다.
         """
-        self._check_account()
         token = self._get_token()
         api_exch = get_api_exchange_code(exchange)
 
@@ -437,7 +427,6 @@ class KiwoomBroker(Broker):
         응답 result_list[].fc_ord_alowa 필드 사용 (모의투자 검증 완료).
         모의투자에서 외화 예수금이 없으면 빈 result_list → 0.0 반환.
         """
-        self._check_account()
         token = self._get_token()
 
         body = {}
@@ -488,7 +477,6 @@ class KiwoomBroker(Broker):
         # 실전(api.kiwoom.com)에서만 동작.
         # 모의투자에서는 ust21150(일별 주문체결내역)을 사용.
         """
-        self._check_account()
         token = self._get_token()
 
         # 날짜 계산 (KST 기준)
@@ -695,7 +683,6 @@ class KiwoomBroker(Broker):
         Returns:
             OrderResult: 주문 성공 시 (주문번호, 시각, 예약여부=False)
         """
-        self._check_account()
         token = self._get_token()
 
         # 모의투자 미지원 주문 유형 자동 변환
