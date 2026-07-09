@@ -32,7 +32,5 @@ jobs:
       broker_mode: demo
       trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
-      quiet_hours: ${{ '' }}
-      commission_rate: ${{ '' }}
-      reinvest: ${{ '' }}
+
     secrets: inherit

@@ -179,9 +179,9 @@ jobs:
           ADDITIONAL_LOC_LEVELS: ${{ vars.ADDITIONAL_LOC_LEVELS }}
 
           # 런타임 옵션: inputs -> environment vars -> 코드 기본값
-          QUIET_HOURS: ${{ inputs.quiet_hours || vars.QUIET_HOURS }}
-          COMMISSION_RATE: ${{ inputs.commission_rate || vars.COMMISSION_RATE }}
-          REINVEST: ${{ inputs.reinvest || vars.REINVEST }}
+          QUIET_HOURS: ${{ inputs.quiet_hours || vars.QUIET_HOURS || (inputs.broker_mode == 'demo' && 'true') || 'false' }}
+          COMMISSION_RATE: ${{ inputs.commission_rate || vars.COMMISSION_RATE || '0.0025' }}
+          REINVEST: ${{ inputs.reinvest || vars.REINVEST || 'true' }}
 
           # 텔레그램 (environment에서 주입 — 브로커+모드별로 다른 채널 가능)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
