@@ -3,8 +3,8 @@ name: 무한매수법 실행 (LS Real)
 # LS증권 실전 계좌 실행
 # GitHub Environment: ls-real (secrets/variables 분리)
 # 캐시 키: state-ls-real-*
-# 주의: LS증권 브로커는 아직 구현되지 않았습니다. 실행 시 NotImplementedError로 실패합니다.
-#       브로커 구현 완료 후 바로 실행 가능하도록 워크플로우 구조만 미리 생성해둡니다.
+# 참고: 실전 AppKey/Secret 발급 후 Secrets 등록 필요
+#       최초 실행은 반드시 DRY 모드로 검증 후 LIVE 전환
 
 on:
   repository_dispatch:
