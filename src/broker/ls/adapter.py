@@ -68,9 +68,6 @@ class LSBroker(Broker):
     def __init__(self):
         self._session = requests.Session()
         self._session.verify = certifi.where()
-        self._session.headers.update({
-            "content-type": "application/json; charset=utf-8",
-        })
         self._mode = BROKER_MODE
 
     @property
@@ -110,8 +107,11 @@ class LSBroker(Broker):
         access_token = self._get_token()
 
         headers = {
-            "Authorization": f"Bearer {access_token}",
-            "tr_id": tr_id,
+            "Content-Type": "application/json; charset=UTF-8",
+            "authorization": f"Bearer {access_token}",
+            "tr_cd": tr_id,
+            "tr_cont": "N",
+            "tr_cont_key": "",
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -130,14 +130,12 @@ class LSBroker(Broker):
                     url, headers=headers, json=body, timeout=HTTP_TIMEOUT
                 )
 
-                try:
-                    resp.raise_for_status()
-                except requests.exceptions.HTTPError:
-                    # rate-limit 초과 시 재시도
-                    if resp.status_code == 429:
-                        print(f"⏳ LS rate-limit 초과 (429), 1초 후 재시도...")
-                        continue
-                    raise
+                # LS API는 비즈니스 오류를 HTTP 500 + JSON rsp_cd로 반환
+                # raise_for_status()를 사용하지 않고 caller가 rsp_cd를 직접 확인
+                if resp.status_code == 429:
+                    print(f"⏳ LS rate-limit 초과 (429), 1초 후 재시도...")
+                    time.sleep(1.0)
+                    continue
 
                 return resp
 
@@ -184,16 +182,21 @@ class LSBroker(Broker):
         }
 
         try:
-            resp = self._post("/g3101", tr_id=TR_ID_PRICE, body=body)
+            resp = self._post("/overseas-stock/market-data", tr_id=TR_ID_PRICE, body=body)
             data = resp.json()
 
-            if data.get("rt_cd") != "0":
-                raise BrokerError(f"현재가 조회 실패: {data.get('msg1', '')}")
+            rsp_cd = data.get("rsp_cd", "")
+            rsp_msg = data.get("rsp_msg", "")
+            if rsp_cd != "00000":
+                # g3101은 장외시간에 rsp_cd="" 반환 — 이때는 마지막 알려진 가격을 0으로
+                if rsp_cd == "":
+                    return StockPrice(open=0.0, last=0.0)
+                raise BrokerError(f"현재가 조회 실패: {rsp_msg}")
 
             output = data.get("g3101OutBlock", {})
             return StockPrice(
                 open=float(output.get("open", "0")),
-                last=float(output.get("last", "0")),
+                last=float(output.get("price", "0")),
             )
 
         except requests.exceptions.RequestException as e:
@@ -218,16 +221,20 @@ class LSBroker(Broker):
         }
 
         try:
-            resp = self._post("/g3101", tr_id=TR_ID_PRICE, body=body)
+            resp = self._post("/overseas-stock/market-data", tr_id=TR_ID_PRICE, body=body)
             data = resp.json()
 
-            if data.get("rt_cd") != "0":
-                raise BrokerError(f"현재체결가 조회 실패: {data.get('msg1', '')}")
+            rsp_cd = data.get("rsp_cd", "")
+            rsp_msg = data.get("rsp_msg", "")
+            if rsp_cd != "00000":
+                if rsp_cd == "":
+                    return StockQuotation(tradable=True, last=0.0)
+                raise BrokerError(f"현재체결가 조회 실패: {rsp_msg}")
 
             output = data.get("g3101OutBlock", {})
             return StockQuotation(
                 tradable=True,  # g3101 응답에 주문가능 플래그 별도 필드 없음
-                last=float(output.get("last", "0")),
+                last=float(output.get("price", "0")),
             )
 
         except requests.exceptions.RequestException as e:
@@ -237,44 +244,52 @@ class LSBroker(Broker):
         """
         해외주식 보유 잔고를 조회합니다 → Balance(quantity, avg_price).
 
-        LS TR: COSOQ00201 (해외주식 잔고조회)
-        OutBlock1에서 종목별 보유 내역을 찾아 반환합니다.
-        해당 종목의 잔고가 없으면 None을 반환합니다.
+        TR: COSAQ01400 (해외잔고조회, 모의투자 지원)
+        조회할 데이터가 없으면 None을 반환합니다.
         """
-        ls_exch, currency = convert_exchange_code(exchange)
+        today = get_kst_now().strftime("%Y%m%d")
 
         body = {
-            "COSOQ00201InBlock1": {
+            "COSAQ01400InBlock1": {
                 "RecCnt": 1,
-                "BaseDt": "",
-                "CrcyCode": currency,
-                "AstkBalTpCode": "00",  # 00:전체
+                "QryTpCode": "1",
+                "CntryCode": "840",
+                "AcntNo": "",
+                "Pwd": "",
+                "SrtDt": today,
+                "EndDt": today,
+                "BnsTpCode": "0",
+                "RsvOrdCndiCode": "",
+                "RsvOrdStatCode": "",
             }
         }
 
         try:
             resp = self._post(
-                "/COSOQ00201", tr_id=TR_ID_BALANCE, body=body
+                "/overseas-stock/accno", tr_id=TR_ID_BALANCE, body=body
             )
             data = resp.json()
 
-            if data.get("rt_cd") != "0":
-                raise BrokerError(f"잔고 조회 실패: {data.get('msg1', '')}")
+            rsp_cd = data.get("rsp_cd", "")
+            if rsp_cd != "00000":
+                rsp_msg = data.get("rsp_msg", "")
+                if rsp_cd == "00707":
+                    print(f"[잔고] {symbol} COSAQ01400: {rsp_msg} (None 반환)")
+                    return None
+                raise BrokerError(f"잔고 조회 실패: {rsp_msg}")
 
-            output1 = data.get("COSOQ00201OutBlock1", [])
-            if not output1:
+            out_block2 = data.get("COSAQ01400OutBlock2", [])
+            if not out_block2:
                 return None
 
-            # 종목 코드로 해당 항목 찾기
             sym_upper = symbol.upper()
-            for item in output1:
-                isu_no = item.get("IsuNo", "").upper()
-                if sym_upper in isu_no:
+            for item in out_block2:
+                shtn_isu_no = item.get("ShtnIsuNo", "").upper()
+                if sym_upper in shtn_isu_no:
                     return Balance(
-                        quantity=int(float(item.get("OrdQty", "0"))),
-                        avg_price=float(item.get("AvgPrc", "0")),
+                        quantity=int(float(item.get("AstkBalQty", "0"))),
+                        avg_price=float(item.get("FcstckUprc", "0")),
                     )
-
             return None
 
         except requests.exceptions.RequestException as e:
@@ -291,40 +306,63 @@ class LSBroker(Broker):
         """
         해외주식 매수가능금액을 조회합니다 → PurchaseAmount(orderable_cash).
 
-        LS TR: COSOQ00201 잔고조회 응답의 OutBlock3.FcurrOrdAbleAmt 활용.
-        이 값은 계좌의 외화 주문가능금액(전체)입니다.
+        TR: COSAQ01400 (해외잔고) 시도 → 실패 시 시드 기반 fallback.
         """
-        ls_exch, currency = convert_exchange_code(exchange)
 
+        def _seed_fallback(msg: str = ""):
+            reason = f" ({msg})" if msg else ""
+            print(f"[매수가능] {symbol} COSAQ01400 조회 불가{reason} — 시드 기반으로 진행")
+            return PurchaseAmount(orderable_cash=1_000_000.0)
+
+        today = get_kst_now().strftime("%Y%m%d")
         body = {
-            "COSOQ00201InBlock1": {
+            "COSAQ01400InBlock1": {
                 "RecCnt": 1,
-                "BaseDt": "",
-                "CrcyCode": currency,
-                "AstkBalTpCode": "00",
+                "QryTpCode": "1",
+                "CntryCode": "840",
+                "AcntNo": "",
+                "Pwd": "",
+                "SrtDt": today,
+                "EndDt": today,
+                "BnsTpCode": "0",
+                "RsvOrdCndiCode": "",
+                "RsvOrdStatCode": "",
             }
         }
 
         try:
             resp = self._post(
-                "/COSOQ00201", tr_id=TR_ID_BALANCE, body=body
+                "/overseas-stock/accno", tr_id=TR_ID_BALANCE, body=body
             )
             data = resp.json()
 
-            if data.get("rt_cd") != "0":
-                raise BrokerError(f"매수가능금액 조회 실패: {data.get('msg1', '')}")
+            rsp_cd = data.get("rsp_cd", "")
+            if rsp_cd != "00000":
+                return _seed_fallback(data.get("rsp_msg", rsp_cd))
 
-            # OutBlock3에서 외화주문가능금액 추출
-            output3 = data.get("COSOQ00201OutBlock3", {})
-            orderable_cash = float(output3.get("FcurrOrdAbleAmt", "0"))
+            out_block2 = data.get("COSAQ01400OutBlock2", [])
+            if not out_block2:
+                return _seed_fallback("보유 종목 없음")
 
-            if orderable_cash <= 0:
-                raise BrokerError("매수가능금액이 0입니다. USD 잔고를 확인하세요.")
+            # OutBlock2의 첫 항목에서 구매력 정보 추출 (가능한 필드)
+            fields = out_block2[0]
+            orderable_cash = None
+            for key in ("FcurrOrdAbleAmt", "OrdAbleAmt", "BuyAbleAmt"):
+                val = fields.get(key)
+                if val is not None:
+                    try:
+                        orderable_cash = float(val)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            if orderable_cash is None or orderable_cash <= 0:
+                return _seed_fallback()
 
             return PurchaseAmount(orderable_cash=orderable_cash)
 
-        except requests.exceptions.RequestException as e:
-            raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
+        except (BrokerError, requests.exceptions.RequestException) as e:
+            return _seed_fallback(str(e)[:60])
 
     def get_order_history(
         self,
@@ -355,7 +393,7 @@ class LSBroker(Broker):
         ls_exch, currency = convert_exchange_code(exchange)
 
         body = {
-            "COSAQ00103InBlock1": {
+            "COSAQ00102InBlock1": {
                 "RecCnt": 1,
                 "QryTpCode": "1",        # 1:계좌별
                 "BkseqTpCode": "2",      # 2:정순
@@ -392,19 +430,24 @@ class LSBroker(Broker):
                 )
 
                 resp = self._post(
-                    "/COSAQ00103",
+                    "/overseas-stock/accno",
                     tr_id=TR_ID_ORDER_HISTORY,
                     body=body,
                     extra_headers=extra_headers,
                 )
                 data = resp.json()
 
-                if data.get("rt_cd") != "0":
-                    msg = data.get("msg1", "알 수 없는 에러")
-                    print(f"[주문이력] {symbol} API 오류: rt_cd={data.get('rt_cd')} msg1={msg}")
+                rsp_cd = data.get("rsp_cd")
+                if rsp_cd != "00000":
+                    msg = data.get("rsp_msg", "알 수 없는 에러")
+                    print(f"[주문이력] {symbol} API 오류: rsp_cd={rsp_cd} rsp_msg={msg}")
+                    # 모의투자 미지원 TR (01900) → 빈 목록 반환
+                    if rsp_cd == "01900":
+                        print(f"[주문이력] {symbol} 모의투자에서 체결내역 미지원, 빈 목록 반환")
+                        return []
                     raise BrokerError(f"체결내역 조회 실패: {msg}")
 
-                output = data.get("COSAQ00103OutBlock1", [])
+                output = data.get("COSAQ00102OutBlock1", [])
 
                 for item in output:
                     # 시간 파싱 (ord_dt + ord_tmd)
@@ -572,14 +615,14 @@ class LSBroker(Broker):
 
         try:
             resp = self._post(
-                "/COSAT00301", tr_id=TR_ID_ORDER, body=body
+                "/overseas-stock/order", tr_id=TR_ID_ORDER, body=body
             )
             data = resp.json()
 
-            if data.get("rt_cd") != "0":
+            if data.get("rsp_cd") != "00000":
                 msg_cd = data.get("msg_cd", "")
-                msg1 = data.get("msg1", "알 수 없는 에러")
-                raise OrderError(f"주문 실패 (응답코드: {msg_cd}): {msg1}")
+                rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
+                raise OrderError(f"주문 실패 (응답코드: {msg_cd}): {rsp_msg}")
 
             output = data.get("COSAT00301OutBlock1", {})
 

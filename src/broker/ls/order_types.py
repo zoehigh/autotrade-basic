@@ -62,8 +62,9 @@ def get_ord_dvsn(order_type: str, side: str = "BUY") -> str:
 # LS증권은 실전/모두 동일한 TR_ID 사용 (AppKey로 환경 구분)
 
 TR_ID_PRICE = "g3101"                # 해외주식 현재가 조회
-TR_ID_BALANCE = "COSOQ00201"         # 해외주식 잔고조회
-TR_ID_ORDER_HISTORY = "COSAQ00103"   # 해외주식 체결내역조회
+TR_ID_BALANCE = "COSAQ01400"         # 해외주식 잔고조회 (COSOQ00201 서버 버그 대체)
+TR_ID_BALANCE_LEGACY = "COSOQ00201"  # 해외주식 종합잔고평가 (서버 파싱 버그 있음)
+TR_ID_ORDER_HISTORY = "COSAQ00102"   # 해외주식 계좌주문체결내역조회
 TR_ID_ORDER = "COSAT00301"           # 해외주식 신규주문
 
 

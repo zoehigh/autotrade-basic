@@ -150,6 +150,28 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
     open_price = price_detail.open
     last_price = price_detail.last
 
+    if last_price <= 0:
+        print(f"[경고] {symbol} 현재가({last_price})를 조회할 수 없습니다 (장외시간?). 주문을 생성하지 않습니다.")
+        return {
+            "symbol": symbol,
+            "exchange": exchange_code,
+            "tradable": tradable,
+            "open_price": open_price,
+            "last_price": last_price,
+            "position_qty": 0,
+            "avg_price": 0.0,
+            "orderable_cash": 0.0,
+            "seed": seed,
+            "remaining_seed": None,
+            "T": T,
+            "unit_amount": 0.0,
+            "unit_qty": 0,
+            "star_point": None,
+            "star_buy_price": None,
+            "take_profit_price": None,
+            "orders": [],
+        }
+
     # ========================================
     # 2. 보유 정보 조회
     # ========================================

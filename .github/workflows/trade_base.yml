@@ -78,12 +78,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 브로커 구현 여부 사전 검증
-        # LS/Toss는 브로커가 아직 구현되지 않았습니다.
+        # Toss 브로커는 아직 구현되지 않았습니다.
         # 전체 의존성 설치 후 Python 에러로 실패하는 것보다 빠르게 실패하는 것이 낫습니다.
         run: |
           BROKER="${{ inputs.broker }}"
           case "$BROKER" in
-            ls|toss)
+            toss)
               echo "::error::$BROKER 증권사 브로커는 아직 구현되지 않았습니다."
               echo "::error::src/broker/$BROKER/adapter.py 구현 후 실행하세요."
               exit 1

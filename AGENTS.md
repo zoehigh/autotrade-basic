@@ -56,7 +56,7 @@ autotrade-basic/
 ## ANTI-PATTERNS (THIS PROJECT)
 - `__pycache__/` — 절대 커밋 금지 (`.gitignore`에 있음)
 - `.state.json` — 커밋 금지 (GH Actions 캐시로만 관리)
-- `KIS_ACCOUNT_NO` 없는 상태로 API 호출 금지
+- `KIS_ACCOUNT_NO` 없는 상태로 KIS API 호출 금지 (KIWOOM/LS/TOSS는 계좌번호 불필요)
 - 모의투자 미지원 주문 유형(LOC/LOO/MOC/MOO) → 자동 LIMIT 변환 (trader.py)
 - `TRADE_MODE` 무단 LIVE 전환 금지 (DRY 먼저 확인)
 - `.venv` 의존성 직접 수정 금지 — 항상 `uv` 사용
@@ -95,3 +95,4 @@ uv run pytest tests/ -v
 - 기본 거래소: TQQQ(NAS), SOXL(AMS)
 - KIS 모의투자는 초당 1회, 실전은 초당 20회 rate-limit
 - 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
+- **KIWOOM/LS/TOSS**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능)

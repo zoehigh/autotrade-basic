@@ -3,8 +3,8 @@ name: 무한매수법 실행 (LS Demo)
 # LS증권 모의투자 계좌 실행
 # GitHub Environment: ls-demo (secrets/variables 분리)
 # 캐시 키: state-ls-demo-*
-# 주의: LS증권 브로커는 아직 구현되지 않았습니다. 실행 시 NotImplementedError로 실패합니다.
-#       브로커 구현 완료 후 바로 실행 가능하도록 워크플로우 구조만 미리 생성해둡니다.
+# 참고: COSAQ01400(잔고) 지원, COSAQ00102(체결내역)/COSAT00301(주문)은 모의투자 미지원
+#       DRY 모드로 전략 검증 후 LIVE 전환 필요
 
 on:
   repository_dispatch:
