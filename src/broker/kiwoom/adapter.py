@@ -158,14 +158,22 @@ class KiwoomBroker(Broker):
 
         return body
 
-    def _request_with_rate_retry(self, tr_id: str, body: dict, token: str) -> dict:
+    def _request_with_rate_retry(
+        self,
+        tr_id: str,
+        body: dict,
+        token: str,
+        extra_headers: dict | None = None,
+        return_headers: bool = False,
+    ) -> dict | tuple[dict, requests.structures.CaseInsensitiveDict]:
         """
         키움 API 요청 래퍼 — rate-limit/타임아웃 재시도 포함.
 
         - rate-limit(HTTP 429 또는 return_code != 0): fixed-wait 후 재시도 (최대 3회)
         - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
 
-        항상 dict(파싱된 JSON)를 반환하거나 예외를 발생시킵니다.
+        기본은 dict(파싱된 JSON)를 반환합니다. return_headers=True면
+        (dict, response.headers)를 반환합니다.
         """
         MAX_RETRIES = 3
         network_retry_count = 0
@@ -173,7 +181,9 @@ class KiwoomBroker(Broker):
         while network_retry_count <= MAX_RETRIES:
             try:
                 for _ in range(MAX_RETRIES + 1):
-                    resp = self._session.request_with_tr(tr_id, body, token)
+                    resp = self._session.request_with_tr(
+                        tr_id, body, token, extra_headers=extra_headers
+                    )
                     try:
                         resp.raise_for_status()
                     except requests.exceptions.HTTPError:
@@ -197,7 +207,10 @@ class KiwoomBroker(Broker):
                             continue
                         raise
 
-                    return self._check_response(resp)
+                    data = self._check_response(resp)
+                    if return_headers:
+                        return data, resp.headers
+                    return data
 
                 raise BrokerError("API 호출 실패: 초당 호출 제한 재시도 초과")
 
@@ -469,7 +482,7 @@ class KiwoomBroker(Broker):
             ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
             tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
 
-        TODO: 키움의 연속조회(페이지네이션) 지원 필요 시 추가 구현.
+        실전 ust21100은 응답 Header의 cont-yn/next-key로 연속조회합니다.
         # 참고: 모의투자(mockapi.kiwoom.com)에서는 거래내역 TR(ust21100)과
         # 기간별 주문내역 TR(ust21180)이 "해당업무가 제공되지 않습니다" 오류로 지원되지 않음.
         # 실전(api.kiwoom.com)에서만 동작.
@@ -541,20 +554,54 @@ class KiwoomBroker(Broker):
             print(f"[주문이력] {symbol} 체결내역 조회(ust21100, 실전): {ord_strt_dt}~{ord_end_dt}")
 
             try:
-                data = self._request_with_rate_retry(tr_id, body, token)
-                raw_items = data.get("result_list", data.get("output", []))
+                cont_yn = "N"
+                next_key = ""
+                seen_next_keys = set()
+                page_no = 1
 
-                for item in raw_items:
-                    normalized = self._normalize_order_item(item)
-                    order_history.append(normalized)
+                while True:
+                    data, response_headers = self._request_with_rate_retry(
+                        tr_id,
+                        body,
+                        token,
+                        extra_headers={
+                            "cont-yn": cont_yn,
+                            "next-key": next_key,
+                        },
+                        return_headers=True,
+                    )
+                    raw_items = data.get("result_list", data.get("output", [])) or []
+                    print(f"[주문이력] {symbol} 체결내역 페이지 {page_no} 조회 성공: {len(raw_items)}건")
+
+                    for item in raw_items:
+                        normalized = self._normalize_order_item(item)
+                        order_history.append(normalized)
+
+                    response_cont_yn = str(response_headers.get("cont-yn") or "").strip().upper()
+                    response_next_key = str(response_headers.get("next-key") or "").strip()
+                    if response_cont_yn != "Y":
+                        break
+                    if not response_next_key:
+                        raise BrokerError("키움 주문체결내역 연속조회 실패: next-key가 비어 있습니다")
+                    if response_next_key in seen_next_keys:
+                        raise BrokerError("키움 주문체결내역 연속조회 실패: next-key 반복 감지")
+
+                    seen_next_keys.add(response_next_key)
+                    cont_yn = response_cont_yn
+                    next_key = response_next_key
+                    page_no += 1
+                    time.sleep(self._rate_limit_wait)
 
             except BrokerError as e:
                 # 키움은 빈 결과를 return_code=20 + 501724(관련자료가 없습니다)로 반환.
                 # 빈 결과는 정상(체결 이력 없음)이므로 빈 리스트로 처리하고 T=0 유지.
                 msg = str(e)
                 if "501724" in msg or "관련자료가 없습니다" in msg:
-                    print(f"[주문이력] {symbol} 체결내역 없음 (빈 결과)")
-                    order_history = []
+                    if order_history:
+                        print(f"[주문이력] {symbol} 추가 체결내역 없음")
+                    else:
+                        print(f"[주문이력] {symbol} 체결내역 없음 (빈 결과)")
+                        order_history = []
                 else:
                     raise
             except requests.exceptions.RequestException as e:

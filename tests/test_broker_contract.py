@@ -15,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pytest
 from broker.base import (
-    Broker,
     StockPrice,
     StockQuotation,
     Balance,
@@ -551,7 +550,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
             TR_HISTORY, TR_BUY, TR_SELL,
         )
 
-        def _side_effect(tr_id, body, token):
+        def _side_effect(tr_id, body, token, extra_headers=None):
             if tr_id == TR_PRICE:  # usa20100 — 현재가
                 return _make_response({
                     "return_code": 0, "output": {"open_pric": "50.00", "cur_prc": "52.00"},
@@ -708,6 +707,79 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         assert item["sll_buy_dvsn_cd_name"] == "매수"
         assert item["ft_ccld_qty"] == "5"
         assert item["odno"] == "36267"
+
+    def test_get_order_history_paginates_with_cont_headers(self):
+        """실전 주문이력은 응답 Header의 cont-yn/next-key로 다음 페이지를 조회해야 합니다."""
+        from broker.kiwoom.tr_registry import TR_HISTORY
+
+        calls = []
+        responses = [
+            _make_response(
+                {
+                    "return_code": 0,
+                    "output": [
+                        {
+                            "ord_dt": "20260615",
+                            "ord_tmd": "093000",
+                            "prdt_name": "TQQQ",
+                            "sll_buy_dvsn_cd_name": "매수",
+                            "ft_ord_qty": "5",
+                            "ft_ccld_qty": "5",
+                            "ft_ccld_unpr3": "54.00",
+                            "ft_ccld_amt3": "270.00",
+                            "nccs_qty": "0",
+                            "prcs_stat_name": "체결완료",
+                            "tr_mket_name": "NASDAQ",
+                            "tr_crcy_cd": "USD",
+                            "odno": "36267",
+                            "ovrs_excg_cd": "ND",
+                        }
+                    ],
+                },
+                headers={"cont-yn": "Y", "next-key": "NEXT-1", "api-id": TR_HISTORY},
+            ),
+            _make_response(
+                {
+                    "return_code": 0,
+                    "output": [
+                        {
+                            "ord_dt": "20260616",
+                            "ord_tmd": "094500",
+                            "prdt_name": "TQQQ",
+                            "sll_buy_dvsn_cd_name": "매도",
+                            "ft_ord_qty": "5",
+                            "ft_ccld_qty": "5",
+                            "ft_ccld_unpr3": "55.00",
+                            "ft_ccld_amt3": "275.00",
+                            "nccs_qty": "0",
+                            "prcs_stat_name": "체결완료",
+                            "tr_mket_name": "NASDAQ",
+                            "tr_crcy_cd": "USD",
+                            "odno": "36268",
+                            "ovrs_excg_cd": "ND",
+                        }
+                    ],
+                },
+                headers={"cont-yn": "N", "next-key": "", "api-id": TR_HISTORY},
+            ),
+        ]
+
+        def _side_effect(tr_id, body, token, extra_headers=None):
+            assert tr_id == TR_HISTORY
+            calls.append({
+                "body": dict(body),
+                "extra_headers": dict(extra_headers or {}),
+            })
+            return responses.pop(0)
+
+        self._mock_session.request_with_tr.side_effect = _side_effect
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+
+        assert len(history) == 2
+        assert len(calls) == 2
+        assert calls[0]["extra_headers"] == {"cont-yn": "N", "next-key": ""}
+        assert calls[1]["extra_headers"] == {"cont-yn": "Y", "next-key": "NEXT-1"}
 
     def test_get_order_history_empty(self):
         """체결 내역이 없으면 빈 리스트를 반환해야 합니다."""

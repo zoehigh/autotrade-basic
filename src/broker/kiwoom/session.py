@@ -17,7 +17,13 @@ class KiwoomSession:
         self.session.verify = certifi.where()
         self.timeout = timeout  # (connect, read) 튜플 또는 단일 값
 
-    def request_with_tr(self, tr_id: str, body: dict, token: str) -> requests.Response:
+    def request_with_tr(
+        self,
+        tr_id: str,
+        body: dict,
+        token: str,
+        extra_headers: dict | None = None,
+    ) -> requests.Response:
         """
         TR ID 기반으로 path/method를 자동 결정하여 요청.
         tr_registry에서 (method, path)를 조회하고 api-id 헤더에 TR ID를 설정합니다.
@@ -30,6 +36,8 @@ class KiwoomSession:
             "Authorization": f"Bearer {token}",
             "api-id": tr_id,
         }
+        if extra_headers:
+            headers.update(extra_headers)
 
         return self.session.request(
             method, url, headers=headers, json=body, timeout=self.timeout
