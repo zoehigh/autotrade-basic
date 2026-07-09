@@ -10,8 +10,6 @@ T값 업데이트 로직 유닛 테스트
 
 import sys
 import os
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -231,6 +229,31 @@ class TestApplyRecentHistory:
         state = _make_state(T=3.0, last_updated="2026-05-27 00:00:00")
         result = update_T_from_history("TQQQ", state, [], balance_qty=None)
         assert result["T"] == 3.0
+
+    def test_T_오추정_재추정_이력없고_보유중이면_보류(self):
+        """T 오추정 재추정 경로도 이력 없음 + 보유 중이면 mismatch를 유지하고 보류."""
+        state = _make_state(T=0.0, last_updated="2026-06-15T00:00:00+00:00")
+        state["balance_mismatch"] = {"note": "T-estimation-suspected-low"}
+        register_order_meta_in_state(state, "ORD030", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        result = update_T_from_history("SOXL", state, [], balance_qty=3)
+        assert result["T"] == 0.0
+        assert result["balance_mismatch"]["note"] == "T-estimation-suspected-low"
+
+    def test_T_오추정_재추정_이력있으면_복구하고_mismatch_제거(self):
+        """T 오추정 재추정 경로에서 orders_meta 이력이 있으면 T를 복구하고 mismatch를 제거."""
+        state = _make_state(T=0.0, last_updated="2026-06-15T00:00:00+00:00")
+        state["balance_mismatch"] = {"note": "T-estimation-suspected-low"}
+        register_order_meta_in_state(state, "ORD031", {
+            "side": "BUY", "total_qty": 1, "t_target": 1.0,
+            "is_additional": False, "processed_filled_qty": 0,
+        })
+        orders = [_make_buy_order("ORD031", "20260614", qty=1)]
+        result = update_T_from_history("SOXL", state, orders, balance_qty=1)
+        assert result["T"] == 1.0
+        assert result.get("balance_mismatch") is None
 
     def test_last_updated_이전_이력_무시(self):
         """last_updated(2026-05-27) 이전 주문(20260526)은 무시."""

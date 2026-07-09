@@ -3,6 +3,7 @@
 # 프로그램이 종료되어도 T값을 잃지 않도록 JSON 파일에 보관합니다.
 import json
 import os
+from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -179,7 +180,8 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
       - 월요일(어제=일요일), 공휴일 다음날 등 어떤 경우에도 올바르게 동작합니다.
       - 최근 이력이 비고 T>0일 때 잔고 교차 검증(balance_qty)으로 리셋 여부를 판단:
           * 보유 중(balance_qty > 0): 이력 조회 누락/정지 복귀로 보고 T 유지 + 경고
-          * 잔고 0 또는 미확인: 잘못된 state 복구를 위해 전체 이력 재추정 fallback
+          * 잔고 0: 잘못된 state 복구를 위해 전체 이력 재추정 fallback
+          * 잔고 미확인(balance_qty is None): 보수적으로 T 유지
 
     Parameters:
         symbol (str): 종목 코드
@@ -225,8 +227,37 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
     mismatch_note = state.get("balance_mismatch", {}).get("note")
     if mismatch_note == "T-estimation-suspected-low" and state.get("orders_meta"):
         print(f"[상태] {symbol} T 오추정 감지 → orders_meta({len(state['orders_meta'])}건) 활용 재추정")
-        state.pop("balance_mismatch", None)
-        return _infer_T_from_full_history(symbol, state, order_history)
+        has_filled_history = False
+        for order in order_history:
+            try:
+                if int(float(order.get("ft_ccld_qty", "0"))) > 0 and order.get("ord_datetime_utc"):
+                    has_filled_history = True
+                    break
+            except Exception:
+                continue
+
+        if not has_filled_history and balance_qty is None:
+            print(f"[경고] {symbol} T 재추정용 이력이 없고 잔고를 확인할 수 없어 재추정을 보류합니다.")
+            return state
+        if not has_filled_history and balance_qty > 0:
+            print(f"[경고] {symbol} T 재추정용 이력이 없지만 보유 {balance_qty}주가 확인되어 재추정을 보류합니다.")
+            return state
+
+        candidate_state = deepcopy(state)
+        candidate_state.pop("balance_mismatch", None)
+        candidate_state = _infer_T_from_full_history(symbol, candidate_state, order_history)
+        inferred_T = float(candidate_state.get("T", 0.0) or 0.0)
+
+        if inferred_T <= 0 and balance_qty is None:
+            print(f"[경고] {symbol} T 재추정 결과가 0이지만 잔고를 확인할 수 없어 재추정을 보류합니다.")
+            return state
+        if inferred_T <= 0 and balance_qty > 0:
+            print(f"[경고] {symbol} T 재추정 결과가 0이지만 보유 {balance_qty}주가 확인되어 T 재추정을 보류합니다.")
+            return state
+
+        state.clear()
+        state.update(candidate_state)
+        return state
 
     # 일반 모드: last_updated_dt 이후의 이력만 T에 반영합니다
     return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty)
@@ -543,10 +574,10 @@ def compute_position_from_history(order_history, cycle_start_date=None):
                     lots.pop(0)
             # 만약 매도량이 더 큰 경우(이상상태) 그냥 무시: 잔여 마이너스는 처리 안함
 
-    net_qty = sum(l["qty"] for l in lots) if lots else 0
+    net_qty = sum(lot["qty"] for lot in lots) if lots else 0
     avg_price = 0.0
     if net_qty > 0:
-        total_val = sum(l["qty"] * l["price"] for l in lots)
+        total_val = sum(lot["qty"] * lot["price"] for lot in lots)
         try:
             avg_price = total_val / net_qty
         except Exception:
@@ -772,4 +803,3 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
     print(f"[상태] {symbol} T값 업데이트 완료 → T={state['T']}")
     return state
-

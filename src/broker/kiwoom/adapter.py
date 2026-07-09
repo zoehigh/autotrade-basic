@@ -11,7 +11,7 @@ KiwoomBroker — 키움증권 Broker 구현체.
 사용법:
     broker = KiwoomBroker()
     price = broker.get_stock_price("TQQQ", "NAS")
-    result = broker.place_order("TQQQ", "NAS", "BUY", 10, 50.0, "LOC")
+    result = broker.place_order("TQQQ", broker.exchange_code("NAS"), "BUY", 10, 50.0, "LOC")
 
 DRY 모드는 DryBroker 래퍼로 처리 — KiwoomBroker 자체는 항상 LIVE로 동작.
 """
