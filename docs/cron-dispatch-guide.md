@@ -1,15 +1,14 @@
 # 외부 Cron 서비스 Dispatch 설정 가이드
 
-> Task 4 of fix-kis-api-timeout-retry plan
-> Purpose: tokenP timeout retry 대응 + 중복 주문 방지를 위한 1회 dispatch 설정
+> KIS API 타임아웃 재시도 대응 + 중복 주문 방지를 위한 1회 dispatch 설정
 
 ---
 
-## ⚠️ 핵심 원칙: 1회 dispatch만 설정
+## 핵심 원칙: 1회 dispatch만 설정
 
 - **각 환경(Demo/Real)당 1회만 dispatch** — 2회 dispatch 시 중복 주문 발생 위험
 - GitHub Actions 내장 `schedule` cron을 사용하지 않고 **외부 cron 서비스**로 `repository_dispatch` 트리거
-- 외부 cron 서비스 예시: cron-job.org, EasyCron, GitHub Actions `schedule` (권장하지 않음), AWS EventBridge, etc.
+- 외부 cron 서비스 예시: cron-job.org, EasyCron, AWS EventBridge
 
 ---
 
@@ -43,8 +42,8 @@
 **타이밍 설명:**
 - KST 17:30 dispatch → GitHub Actions runner 시작 (~1-2분)
 - tokenP 재시도 최대 ~10분 → KST 17:40~17:45경 tokenP 성공
-- **DST 적용 시:** 프리장 17:00 오픈 → dispatch 시각에 이미 오픈 → 바로 진행 ✅
-- **DST 미적용 시:** 프리장 18:00 오픈 → trading_bot.py가 KST 기준으로 18:00까지 sleep → 진행 ✅
+- **DST 적용 시:** 프리장 17:00 오픈 → dispatch 시각에 이미 오픈 → 바로 진행
+- **DST 미적용 시:** 프리장 18:00 오픈 → trading_bot.py가 KST 기준으로 18:00까지 sleep → 진행
 - KST 17:30은 프리장 오픈(DST 17:00 / non-DST 18:00) 직후이므로 tokenP 재시도 시간이 충분함
 
 ---

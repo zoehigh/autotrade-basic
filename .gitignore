@@ -29,7 +29,6 @@ wheels/
 Thumbs.db
 
 *.log
-!.omo/
-.omo/*
-!.omo/plans/
-!.omo/evidence/
+
+# omo 에이전트 작업 공간 (로컬 전용, git 미추적)
+.omo/
