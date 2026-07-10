@@ -61,6 +61,9 @@ on:
         required: false
       TELEGRAM_CHAT_ID:
         required: false
+      # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
+      FINNHUB_API_KEY:
+        required: false
 
 jobs:
   run-trade:
@@ -176,6 +179,9 @@ jobs:
           # 텔레그램 (environment에서 주입 — 브로커+모드별로 다른 채널 가능)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
           # API 연결 타임아웃 (초 단위, 기본값 30초)
           CONNECT_TIMEOUT: 30

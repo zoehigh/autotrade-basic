@@ -184,8 +184,8 @@ class LSBroker(Broker):
         except BrokerError:
             pass
 
-        # 2. LS 실패 (rsp_cd="") → 모의투자에서 Finnhub fallback
-        if self._mode != "real" and FINNHUB_API_KEY:
+        # 2. LS 실패 (rsp_cd="") → Finnhub fallback (실전/모의 공통)
+        if FINNHUB_API_KEY:
             try:
                 symbol_upper = symbol.upper()
                 price = self._get_stock_price_finnhub(symbol_upper)
@@ -195,13 +195,22 @@ class LSBroker(Broker):
             except BrokerError:
                 pass
 
-        # 3. 모두 실패
+        # 3. 모두 실패 (with Finnhub)
         if self._mode != "real" and not FINNHUB_API_KEY:
             raise BrokerError(
                 f"현재가 조회 실패: LS 모의투자에서 g3101 미지원 "
                 f"(rsp_cd='')이고 FINNHUB_API_KEY가 설정되지 않았습니다. "
                 f".env 파일에 FINNHUB_API_KEY를 추가하세요."
             )
+
+        # 4. 실전/모의 모두 유효 가격 없음 → 진단 메시지 출력 후 0.0 반환
+        mode_label = "실전" if self._mode == "real" else "모의"
+        print(f"[경고] {symbol}({exchange}) 현재가 조회 실패: "
+              f"LS {mode_label} g3101이 유효한 가격을 반환하지 않았습니다.")
+        print(f"  원인: 장 마감, 휴장일, 심볼({symbol})/거래소({exchange}) 코드 오류, "
+              f"또는 g3101 TR 자체 실패일 수 있습니다.")
+        print(f"  조치: 미국 장 시간(한국 밤~다음날 오전)에 재실행하거나, "
+              f"심볼/거래소 코드를 확인하세요.")
         return StockPrice(open=0.0, last=0.0)
 
     def _get_stock_price_ls(self, symbol: str, exchange: str) -> StockPrice:
@@ -322,8 +331,8 @@ class LSBroker(Broker):
         except (BrokerError, requests.exceptions.RequestException):
             pass
 
-        # 2. LS 실패 (rsp_cd="") → 모의투자에서 Finnhub fallback
-        if self._mode != "real" and FINNHUB_API_KEY:
+        # 2. LS 실패 (rsp_cd="") → Finnhub fallback (실전/모의 공통)
+        if FINNHUB_API_KEY:
             try:
                 symbol_upper = symbol.upper()
                 price = self._get_stock_price_finnhub(symbol_upper)
@@ -333,7 +342,7 @@ class LSBroker(Broker):
             except BrokerError:
                 pass
 
-        # 3. 모두 실패
+        # 3. 모두 실패 (with Finnhub)
         if self._mode != "real" and not FINNHUB_API_KEY:
             raise BrokerError(
                 f"현재체결가 조회 실패: LS 모의투자에서 g3101 미지원 "
