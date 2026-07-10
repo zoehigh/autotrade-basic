@@ -527,9 +527,12 @@ class LSBroker(Broker):
                 if rsp_cd != "00000":
                     msg = data.get("rsp_msg", "알 수 없는 에러")
                     print(f"[주문이력] {symbol} API 오류: rsp_cd={rsp_cd} rsp_msg={msg}")
-                    # 모의투자 미지원 TR (01900) → 빈 목록 반환
-                    if rsp_cd == "01900":
-                        print(f"[주문이력] {symbol} 모의투자에서 체결내역 미지원, 빈 목록 반환")
+                    # 정상 케이스 → 빈 목록 반환
+                    # 01900: 모의투자 미지원 TR
+                    # 02679: 체결내역 없음 (실전 정상 응답)
+                    if rsp_cd in ("01900", "02679"):
+                        reason = "모의투자 미지원" if rsp_cd == "01900" else "체결내역 없음"
+                        print(f"[주문이력] {symbol} {reason}({rsp_cd}), 빈 목록 반환")
                         return []
                     raise BrokerError(f"체결내역 조회 실패: {msg}")
 
