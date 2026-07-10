@@ -60,11 +60,31 @@ def get_ord_dvsn(order_type: str, side: str = "BUY") -> str:
 
 # ── TR_ID 레지스트리 ─────────────────────────────────────────────────
 # LS증권은 실전/모두 동일한 TR_ID 사용 (AppKey로 환경 구분)
+#
+#   TR               | 용도                          | OutBlock(잔고)
+#   -----------------|-------------------------------|------------------
+#   COSOQ00201 ★     | 해외주식 종합잔고평가 ★       | Block4(종목)
+#                    |                               | Block3(통화별)
+#   COSAQ01400       | 예약주문 처리결과 조회         | Block2(주문내역)
+#                    | (잔고 TR 아님!)                |
+#   COSOQ02701       | 해외주식 예수금 조회           |
+#
+# ★ COSOQ00201 = 유일한 잔고/매수가능금액 TR.
+#   - 실전 정상 (rsp_cd=02679: 조회내역없음)
+#   - OutBlock4: ShtnIsuNo, AstkBalQty, FcstckUprc (종목별 수량/평단가)
+#   - OutBlock3: FcurrOrdAbleAmt (매수가능금액)
+#   - 모의투자 IGW40014 버그 (서버 고정폭 변환 오류)
+#   - 확인 출처: https://github.com/whitehwarang/LSREST/blob/master/FrgStock/Account.py
+#
+# ⚠ COSAQ01400 오용 경고: 이 TR은 "예약주문 처리결과 조회" 전용.
+#   동일 엔드포인트(/overseas-stock/accno)를 쓰고 OutBlock2에
+#   ShtnIsuNo/AstkBalQty/FcstckUprc 필드가 있어 잔고 TR로 오인했으나
+#   공식 카탈로그 명칭은 "예약주문 처리결과 조회"이다.
+#   (dcff6dd 커밋에서 TR_ID_BALANCE로 잘못 사용함 — 수정 완료)
 
 TR_ID_PRICE = "g3101"                # 해외주식 현재가 조회
-TR_ID_BALANCE = "COSAQ01400"         # 해외주식 잔고조회 (COSOQ00201 서버 버그 대체)
-TR_ID_BALANCE_LEGACY = "COSOQ00201"  # 해외주식 종합잔고평가 (서버 파싱 버그 있음)
-TR_ID_ORDER_HISTORY = "COSAQ00102"   # 해외주식 계좌주문체결내역조회
+TR_ID_BALANCE = "COSOQ00201"         # 해외주식 종합잔고평가 (실전 정상, 모의투자 IGW40014)
+TR_ID_ORDER_HISTORY = "COSAQ00102"   # 해외주식 계좌주문체결내역조회 (모의투자 01900 미지원)
 TR_ID_ORDER = "COSAT00301"           # 해외주식 신규주문
 
 

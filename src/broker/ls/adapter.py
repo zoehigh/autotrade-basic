@@ -102,7 +102,7 @@ class LSBroker(Broker):
         rate-limit 대기(1초) 및 타임아웃 재시도를 포함합니다.
 
         Rate-limit:
-        - 조회 TR (g3101, COSOQ00201, COSAQ00103): 초당 1회
+        - 조회 TR (g3101, COSOQ00201, COSAQ00102): 초당 1회
         - 주문 TR (COSAT00301): 초당 10회
         - 안전하게 모든 요청에 1.0s wait 적용
         """
@@ -346,23 +346,18 @@ class LSBroker(Broker):
         """
         해외주식 보유 잔고를 조회합니다 → Balance(quantity, avg_price).
 
-        TR: COSAQ01400 (해외잔고조회, 모의투자 지원)
+        TR: COSOQ00201 (해외주식 종합잔고평가)
+        OutBlock4: 개별 종목별 보유 수량/평단가
         조회할 데이터가 없으면 None을 반환합니다.
         """
         today = get_kst_now().strftime("%Y%m%d")
 
         body = {
-            "COSAQ01400InBlock1": {
+            "COSOQ00201InBlock1": {
                 "RecCnt": 1,
-                "QryTpCode": "1",
-                "CntryCode": "840",
-                "AcntNo": "",
-                "Pwd": "",
-                "SrtDt": today,
-                "EndDt": today,
-                "BnsTpCode": "0",
-                "RsvOrdCndiCode": "",
-                "RsvOrdStatCode": "",
+                "BaseDt": "",
+                "CrcyCode": "USD",
+                "AstkBalTpCode": "00",
             }
         }
 
@@ -373,19 +368,21 @@ class LSBroker(Broker):
             data = resp.json()
 
             rsp_cd = data.get("rsp_cd", "")
-            if rsp_cd != "00000":
-                rsp_msg = data.get("rsp_msg", "")
-                if rsp_cd == "00707":
-                    print(f"[잔고] {symbol} COSAQ01400: {rsp_msg} (None 반환)")
-                    return None
+            rsp_msg = data.get("rsp_msg", "")
+            if rsp_cd in ("00000", "00001"):
+                pass  # 정상 응답
+            elif rsp_cd in ("00200", "00707", "02679"):
+                print(f"[잔고] {symbol} COSOQ00201: {rsp_msg} (None 반환)")
+                return None
+            else:
                 raise BrokerError(f"잔고 조회 실패: {rsp_msg}")
 
-            out_block2 = data.get("COSAQ01400OutBlock2", [])
-            if not out_block2:
+            out_block4 = data.get("COSOQ00201OutBlock4", [])
+            if not out_block4:
                 return None
 
             sym_upper = symbol.upper()
-            for item in out_block2:
+            for item in out_block4:
                 shtn_isu_no = item.get("ShtnIsuNo", "").upper()
                 if sym_upper in shtn_isu_no:
                     return Balance(
@@ -408,27 +405,22 @@ class LSBroker(Broker):
         """
         해외주식 매수가능금액을 조회합니다 → PurchaseAmount(orderable_cash).
 
-        TR: COSAQ01400 (해외잔고) 시도 → 실패 시 시드 기반 fallback.
+        TR: COSOQ00201 (해외주식 종합잔고평가) OutBlock3 → FcurrOrdAbleAmt
+        조회 실패 시 시드 기반 fallback.
         """
 
         def _seed_fallback(msg: str = ""):
             reason = f" ({msg})" if msg else ""
-            print(f"[매수가능] {symbol} COSAQ01400 조회 불가{reason} — 시드 기반으로 진행")
+            print(f"[매수가능] {symbol} COSOQ00201 조회 불가{reason} — 시드 기반으로 진행")
             return PurchaseAmount(orderable_cash=1_000_000.0)
 
-        today = get_kst_now().strftime("%Y%m%d")
+        _, currency = convert_exchange_code(exchange)
         body = {
-            "COSAQ01400InBlock1": {
+            "COSOQ00201InBlock1": {
                 "RecCnt": 1,
-                "QryTpCode": "1",
-                "CntryCode": "840",
-                "AcntNo": "",
-                "Pwd": "",
-                "SrtDt": today,
-                "EndDt": today,
-                "BnsTpCode": "0",
-                "RsvOrdCndiCode": "",
-                "RsvOrdStatCode": "",
+                "BaseDt": "",
+                "CrcyCode": "USD",
+                "AstkBalTpCode": "00",
             }
         }
 
@@ -439,31 +431,23 @@ class LSBroker(Broker):
             data = resp.json()
 
             rsp_cd = data.get("rsp_cd", "")
-            if rsp_cd != "00000":
+            if rsp_cd not in ("00000", "00001"):
                 return _seed_fallback(data.get("rsp_msg", rsp_cd))
 
-            out_block2 = data.get("COSAQ01400OutBlock2", [])
-            if not out_block2:
-                return _seed_fallback("보유 종목 없음")
+            out_block3 = data.get("COSOQ00201OutBlock3", [])
+            if not out_block3:
+                return _seed_fallback("OutBlock3 없음")
 
-            # OutBlock2의 첫 항목에서 구매력 정보 추출 (가능한 필드)
-            fields = out_block2[0]
-            orderable_cash = None
-            for key in ("FcurrOrdAbleAmt", "OrdAbleAmt", "BuyAbleAmt"):
-                val = fields.get(key)
-                if val is not None:
-                    try:
-                        orderable_cash = float(val)
-                        break
-                    except (ValueError, TypeError):
-                        continue
+            for item in out_block3:
+                if item.get("CrcyCode", "").upper() == currency.upper():
+                    amt = float(item.get("FcurrOrdAbleAmt", "0"))
+                    if amt > 0:
+                        return PurchaseAmount(orderable_cash=amt)
+                    return _seed_fallback(f"FcurrOrdAbleAmt={amt}")
 
-            if orderable_cash is None or orderable_cash <= 0:
-                return _seed_fallback()
+            return _seed_fallback(f"{currency} 통화 없음")
 
-            return PurchaseAmount(orderable_cash=orderable_cash)
-
-        except (BrokerError, requests.exceptions.RequestException) as e:
+        except (BrokerError, requests.exceptions.RequestException, ValueError) as e:
             return _seed_fallback(str(e)[:60])
 
     def get_order_history(
