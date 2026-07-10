@@ -2,7 +2,7 @@
 LS증권 거래소 코드 매핑 — 사용자 코드 ↔ LS API 코드/통화 코드.
 
 사용자 입력: NAS, NYS, AMS
-LS API 코드: 82(나스닥), 81(뉴욕), 83(아멕스) — 2자리 숫자
+LS API 코드: 82(나스닥), 81(뉴욕/아멕스) — 2자리 숫자
 """
 from broker.base import BrokerError
 
@@ -11,7 +11,7 @@ from broker.base import BrokerError
 _LS_EXCHANGE_MAP = {
     "NAS": ("82", "USD"),   # NASDAQ
     "NYS": ("81", "USD"),   # NYSE
-    "AMS": ("83", "USD"),   # AMEX (American Stock Exchange)
+    "AMS": ("81", "USD"),   # AMEX → LS 81(=뉴욕/아멕스)
 }
 
 

@@ -94,5 +94,6 @@ uv run pytest tests/ -v
 - GitHub Actions: `repository_dispatch`로만 트리거 (cron 없음)
 - 기본 거래소: TQQQ(NAS), SOXL(AMS)
 - KIS 모의투자는 초당 1회, 실전은 초당 20회 rate-limit
+- LS 조회 TR(g3101 등)은 초당 1회, 주문 TR은 초당 10회 rate-limit (모의/실전 동일)
 - 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
 - **KIWOOM/LS/TOSS**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능)

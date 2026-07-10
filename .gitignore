@@ -32,3 +32,6 @@ Thumbs.db
 
 # omo 에이전트 작업 공간 (로컬 전용, git 미추적)
 .omo/
+
+# 테스트 출력 캐시 (API 응답 덤프)
+tests/output/

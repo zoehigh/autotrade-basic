@@ -197,6 +197,13 @@ COMMISSION_RATE = float(os.getenv("COMMISSION_RATE") or "0.0025")
 _reinvest_raw = (os.getenv("REINVEST") or "true").strip().lower()
 REINVEST = _reinvest_raw == "true"
 
+# Finnhub API 키 (선택 — LS 모의투자 전용 fallback)
+# LS 모의투자 환경은 g3101 해외주식 현재가 조회를 지원하지 않으므로,
+# Finnhub 무료 API로 대체합니다. 실전 모드에서는 사용되지 않습니다.
+# 발급: https://finnhub.io/register (이메일만 있음, 카드 불필요)
+# Free tier: 60 calls/min, 실시간 US 시세, 개인용 무료
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+
 # ── 하위호환 alias (기존 import 경로 유지) ──
 KIS_MODE = BROKER_MODE
 KIS_DOMAIN = BROKER_CONFIG.get("domain", "")

@@ -47,7 +47,7 @@ from broker.ls.order_types import (
     TR_ID_ORDER_HISTORY,
     TR_ID_ORDER,
 )
-from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT
+from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT, FINNHUB_API_KEY
 
 
 _BASE_URL = BROKER_CONFIG.get("domain", "https://openapi.ls-sec.co.kr:8080")
@@ -69,6 +69,8 @@ class LSBroker(Broker):
         self._session = requests.Session()
         self._session.verify = certifi.where()
         self._mode = BROKER_MODE
+        self._finnhub_cache: dict[str, tuple[float, StockPrice]] = {}
+        self._finnhub_ttl = 10  # seconds
 
     @property
     def name(self) -> str:
@@ -167,8 +169,43 @@ class LSBroker(Broker):
         """
         해외주식 현재가를 조회합니다 → StockPrice(open, last).
 
-        LS TR: g3101 (해외주식 현재가 조회)
+        1차: LS g3101 TR (실전/모의 모두 시도)
+        2차: LS 실패 + 모의투자 환경 → Finnhub fallback (설정된 경우)
+
+        LS 모의투자 환경에서는 g3101이 해외주식 현재가를 지원하지 않습니다
+        (rsp_cd="" 반환). 이 경우 Finnhub 무료 API로 fallback합니다.
+        Finnhub를 사용하려면 .env에 FINNHUB_API_KEY를 설정하세요.
         """
+        # 1. LS API 조회
+        try:
+            price = self._get_stock_price_ls(symbol, exchange)
+            if price.last > 0:
+                return price
+        except BrokerError:
+            pass
+
+        # 2. LS 실패 (rsp_cd="") → 모의투자에서 Finnhub fallback
+        if self._mode != "real" and FINNHUB_API_KEY:
+            try:
+                symbol_upper = symbol.upper()
+                price = self._get_stock_price_finnhub(symbol_upper)
+                if price.last > 0:
+                    print(f"[Finnhub Fallback] {symbol}: LS API 실패, Finnhub 사용 → ${price.last:.2f}")
+                    return price
+            except BrokerError:
+                pass
+
+        # 3. 모두 실패
+        if self._mode != "real" and not FINNHUB_API_KEY:
+            raise BrokerError(
+                f"현재가 조회 실패: LS 모의투자에서 g3101 미지원 "
+                f"(rsp_cd='')이고 FINNHUB_API_KEY가 설정되지 않았습니다. "
+                f".env 파일에 FINNHUB_API_KEY를 추가하세요."
+            )
+        return StockPrice(open=0.0, last=0.0)
+
+    def _get_stock_price_ls(self, symbol: str, exchange: str) -> StockPrice:
+        """LS g3101 TR로 현재가 조회 (내부 호출용)."""
         ls_exch, _ = convert_exchange_code(exchange)
         keysymbol = build_symbol(symbol, ls_exch)
 
@@ -188,25 +225,68 @@ class LSBroker(Broker):
             rsp_cd = data.get("rsp_cd", "")
             rsp_msg = data.get("rsp_msg", "")
             if rsp_cd != "00000":
-                # g3101은 장외시간에 rsp_cd="" 반환 — 이때는 마지막 알려진 가격을 0으로
+                # LS 모의투자 환경에서 g3101은 해외주식 현재가를 지원하지 않음
                 if rsp_cd == "":
-                    return StockPrice(open=0.0, last=0.0)
+                    raise BrokerError(f"현재가 조회 실패: rsp_cd='' (LS 모의투자 g3101 미지원)")
                 raise BrokerError(f"현재가 조회 실패: {rsp_msg}")
 
-            output = data.get("g3101OutBlock", {})
+            output = data.get("g3101OutBlock", {}).copy()
+            if not output:
+                raise BrokerError(f"현재가 조회 실패: 응답에 g3101OutBlock 없음 (msg: {rsp_msg})")
+
             return StockPrice(
                 open=float(output.get("open", "0")),
                 last=float(output.get("price", "0")),
             )
 
         except requests.exceptions.RequestException as e:
-            raise BrokerError(f"현재가 조회 실패: {str(e)}")
+            raise BrokerError(f"현재가 조회 실패 (네트워크): {str(e)}")
+
+    def _get_stock_price_finnhub(self, symbol: str) -> StockPrice:
+        """
+        Finnhub 실시간 시세 조회 (10초 캐시).
+
+        Finnhub는 US 종목에 대해 plain ticker를 사용합니다 (TQQQ, SOXL).
+        Free tier: 60 calls/min, 실시간 시세, 개인용 무료.
+        """
+        now = time.time()
+
+        if symbol in self._finnhub_cache:
+            cached_time, cached_price = self._finnhub_cache[symbol]
+            if now - cached_time < self._finnhub_ttl:
+                age = now - cached_time
+                print(f"[Finnhub Cache] {symbol}: 캐시 사용 (age={age:.1f}s) → ${cached_price.last:.2f}")
+                return cached_price
+
+        url = "https://finnhub.io/api/v1/quote"
+        params = {"symbol": symbol, "token": FINNHUB_API_KEY}
+
+        try:
+            resp = self._session.get(url, params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+
+            current = float(data.get("c", 0))
+            open_price = float(data.get("o", 0))
+
+            if current <= 0:
+                raise BrokerError(f"Finnhub 유효하지 않은 가격: symbol={symbol} data={data}")
+
+            price = StockPrice(open=open_price, last=current)
+            self._finnhub_cache[symbol] = (now, price)
+            return price
+
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"Finnhub API 호출 실패 ({symbol}): {e}")
+        except (ValueError, TypeError) as e:
+            raise BrokerError(f"Finnhub 응답 파싱 실패 ({symbol}): {e}")
 
     def get_stock_quotation(self, symbol: str, exchange: str) -> StockQuotation:
         """
         해외주식 현재체결가를 조회합니다 → StockQuotation(tradable, last).
 
         LS TR: g3101 (현재가 조회와 동일 TR, response에서 다른 필드 사용)
+        g3101은 주문가능 여부 플래그를 제공하지 않으므로 tradable은 항상 True입니다.
         """
         ls_exch, _ = convert_exchange_code(exchange)
         keysymbol = build_symbol(symbol, ls_exch)
@@ -228,7 +308,7 @@ class LSBroker(Broker):
             rsp_msg = data.get("rsp_msg", "")
             if rsp_cd != "00000":
                 if rsp_cd == "":
-                    return StockQuotation(tradable=True, last=0.0)
+                    raise BrokerError(f"현재체결가 조회 실패: rsp_cd='' (LS 모의투자 g3101 미지원)")
                 raise BrokerError(f"현재체결가 조회 실패: {rsp_msg}")
 
             output = data.get("g3101OutBlock", {})

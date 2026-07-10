@@ -151,7 +151,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
     last_price = price_detail.last
 
     if last_price <= 0:
-        print(f"[경고] {symbol} 현재가({last_price})를 조회할 수 없습니다 (장외시간?). 주문을 생성하지 않습니다.")
+        print(f"[경고] {symbol} 현재가({last_price})를 조회할 수 없습니다. 주문을 생성하지 않습니다.")
         return {
             "symbol": symbol,
             "exchange": exchange_code,

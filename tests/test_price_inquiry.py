@@ -47,7 +47,7 @@ def test_tqqq_price_inquiry():
         return True
     
     except Exception as e:
-        print(f"\n❌ 테스트 실패")
+        print("\n❌ 테스트 실패")
         print(f"오류: {str(e)}")
         print("\n[해결 방법]")
         print("1. 인증 정보가 올바른지 확인")

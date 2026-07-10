@@ -27,9 +27,9 @@ src/
   trade_kis_real.yml       # KIS 실전
   trade_kiwoom_demo.yml    # 키움 모의투자
   trade_kiwoom_real.yml    # 키움 실전 (self-hosted runner)
-  trade_ls_demo.yml        # LS 모의투자 (구현 예정)
-  trade_ls_real.yml        # LS 실전 (구현 예정)
-  trade_toss_real.yml      # 토스 실전 (real만, 구현 예정)
+  trade_ls_demo.yml        # LS 모의투자
+  trade_ls_real.yml        # LS 실전
+  trade_toss_real.yml      # 토스 실전 (real만, 브로커 구현 예정)
 .state.json           # 상태 파일 (자동 생성, .gitignore 권장)
 ```
 
@@ -227,8 +227,8 @@ uv run python trading_bot.py
   trade_kis_real.yml       # KIS 실전
   trade_kiwoom_demo.yml    # 키움 모의투자
   trade_kiwoom_real.yml    # 키움 실전 (self-hosted runner — IP 제약)
-  trade_ls_demo.yml        # LS 모의투자 (브로커 구현 예정)
-  trade_ls_real.yml        # LS 실전 (브로커 구현 예정)
+  trade_ls_demo.yml        # LS 모의투자
+  trade_ls_real.yml        # LS 실전
   trade_toss_real.yml      # 토스 실전 (real만 지원, 브로커 구현 예정)
 ```
 
@@ -261,6 +261,7 @@ demo/real × 브로커별로 **7개의 Environment**를 생성합니다. 각 Env
 | `LS_APP_SECRET` | | | ✅ | | LS 앱 시크릿 |
 | `TOSS_APP_KEY` | | | | ✅ | 토스 앱 키 |
 | `TOSS_APP_SECRET` | | | | ✅ | 토스 앱 시크릿 |
+| `FINNHUB_API_KEY` | | | ✅ | | LS 모의투자용 Finnhub API 키 (무료, https://finnhub.io/register) |
 | `TELEGRAM_BOT_TOKEN` | ✅ | ✅ | ✅ | ✅ | 텔레그램 봇 토큰 (환경별 채널 분리 가능) |
 | `TELEGRAM_CHAT_ID` | ✅ | ✅ | ✅ | ✅ | 텔레그램 채팅 ID |
 
@@ -270,22 +271,22 @@ demo/real × 브로커별로 **7개의 Environment**를 생성합니다. 각 Env
 
 각 Environment에 아래 variables를 등록합니다. 브로커별로 거래소 코드가 다르므로 `SYMBOLS`를 각각 설정해야 합니다.
 
-| Variable | kis-demo / kis-real | kiwoom-demo / kiwoom-real | 설명 |
-|----------|---------------------|---------------------------|------|
-| `SYMBOLS` | `TQQQ:NAS,SOXL:AMS` | `TQQQ:NAS,SOXL:NYS` | 거래 종목 목록 (거래소 코드 주의) |
-| `TRADE_MODE` | `DRY` (demo) / `LIVE` (real) | `DRY` (demo) / `LIVE` (real) | 기본 거래 모드 |
-| `TQQQ_SPLITS` | `40` | `40` | TQQQ 분할 수 |
-| `TQQQ_SYMBOL_TYPE` | `TQQQ` | `TQQQ` | TQQQ 별지점 공식 타입 |
-| `TQQQ_SEED` | `10000` | `10000` | TQQQ 시드 금액 |
-| `TQQQ_ADDITIONAL_LOC_LEVELS` | `3` | `3` | TQQQ 급락 대비 추가 LOC 단계 수 |
-| `SOXL_SPLITS` | `20` | `20` | SOXL 분할 수 |
-| `SOXL_SYMBOL_TYPE` | `SOXL` | `SOXL` | SOXL 별지점 공식 타입 |
-| `SOXL_SEED` | `5000` | `5000` | SOXL 시드 금액 |
-| `SOXL_ADDITIONAL_LOC_LEVELS` | `3` | `3` | SOXL 급락 대비 추가 LOC 단계 수 |
-| `ADDITIONAL_LOC_LEVELS` | `3` | `3` | 모든 종목 공통 기본값 |
-| `QUIET_HOURS` | `true` (demo) / `false` (real) | `true` (demo) / `false` (real) | 조용한 시간대 기능 |
-| `COMMISSION_RATE` | `0.0025` | `0.0025` | 수수료율 |
-| `REINVEST` | `true` | `true` | 복리 재투자 여부 (해제 시 `false`) |
+| Variable | kis-demo / kis-real | kiwoom-demo / kiwoom-real | ls-demo / ls-real | 설명 |
+|----------|---------------------|---------------------------|-------------------|------|
+| `SYMBOLS` | `TQQQ:NAS,SOXL:AMS` | `TQQQ:NAS,SOXL:NYS` | `TQQQ:NAS,SOXL:AMS` | 거래 종목 목록 (거래소 코드 주의) |
+| `TRADE_MODE` | `DRY` (demo) / `LIVE` (real) | `DRY` (demo) / `LIVE` (real) | `DRY` (demo) / `LIVE` (real) | 기본 거래 모드 |
+| `TQQQ_SPLITS` | `40` | `40` | `40` | TQQQ 분할 수 |
+| `TQQQ_SYMBOL_TYPE` | `TQQQ` | `TQQQ` | `TQQQ` | TQQQ 별지점 공식 타입 |
+| `TQQQ_SEED` | `10000` | `10000` | `10000` | TQQQ 시드 금액 |
+| `TQQQ_ADDITIONAL_LOC_LEVELS` | `3` | `3` | `3` | TQQQ 급락 대비 추가 LOC 단계 수 |
+| `SOXL_SPLITS` | `20` | `20` | `20` | SOXL 분할 수 |
+| `SOXL_SYMBOL_TYPE` | `SOXL` | `SOXL` | `SOXL` | SOXL 별지점 공식 타입 |
+| `SOXL_SEED` | `5000` | `5000` | `5000` | SOXL 시드 금액 |
+| `SOXL_ADDITIONAL_LOC_LEVELS` | `3` | `3` | `3` | SOXL 급락 대비 추가 LOC 단계 수 |
+| `ADDITIONAL_LOC_LEVELS` | `3` | `3` | `3` | 모든 종목 공통 기본값 |
+| `QUIET_HOURS` | `true` (demo) / `false` (real) | `true` (demo) / `false` (real) | `true` (demo) / `false` (real) | 조용한 시간대 기능 |
+| `COMMISSION_RATE` | `0.0025` | `0.0025` | `0.0025` | 수수료율 |
+| `REINVEST` | `true` | `true` | `true` | 복리 재투자 여부 (해제 시 `false`) |
 
 ### repository_dispatch 트리거
 
