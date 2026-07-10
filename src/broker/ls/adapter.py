@@ -285,22 +285,24 @@ class LSBroker(Broker):
         """
         해외주식 현재체결가를 조회합니다 → StockQuotation(tradable, last).
 
-        LS TR: g3101 (현재가 조회와 동일 TR, response에서 다른 필드 사용)
+        LS TR: g3101 (현재가 조회와 동일 TR)
         g3101은 주문가능 여부 플래그를 제공하지 않으므로 tradable은 항상 True입니다.
+
+        1차: LS g3101 TR (실전/모의 모두 시도)
+        2차: LS 실패 + 모의투자 환경 → Finnhub fallback (설정된 경우)
         """
-        ls_exch, _ = convert_exchange_code(exchange)
-        keysymbol = build_symbol(symbol, ls_exch)
-
-        body = {
-            "g3101InBlock": {
-                "delaygb": "R",
-                "keysymbol": keysymbol,
-                "exchcd": ls_exch,
-                "symbol": symbol.upper(),
-            }
-        }
-
+        # 1. LS g3101 TR 조회
         try:
+            ls_exch, _ = convert_exchange_code(exchange)
+            keysymbol = build_symbol(symbol, ls_exch)
+            body = {
+                "g3101InBlock": {
+                    "delaygb": "R",
+                    "keysymbol": keysymbol,
+                    "exchcd": ls_exch,
+                    "symbol": symbol.upper(),
+                }
+            }
             resp = self._post("/overseas-stock/market-data", tr_id=TR_ID_PRICE, body=body)
             data = resp.json()
 
@@ -313,12 +315,32 @@ class LSBroker(Broker):
 
             output = data.get("g3101OutBlock", {})
             return StockQuotation(
-                tradable=True,  # g3101 응답에 주문가능 플래그 별도 필드 없음
+                tradable=True,
                 last=float(output.get("price", "0")),
             )
 
-        except requests.exceptions.RequestException as e:
-            raise BrokerError(f"현재체결가 조회 실패: {str(e)}")
+        except (BrokerError, requests.exceptions.RequestException):
+            pass
+
+        # 2. LS 실패 (rsp_cd="") → 모의투자에서 Finnhub fallback
+        if self._mode != "real" and FINNHUB_API_KEY:
+            try:
+                symbol_upper = symbol.upper()
+                price = self._get_stock_price_finnhub(symbol_upper)
+                if price.last > 0:
+                    print(f"[Finnhub Fallback] {symbol}: LS g3101 실패, Finnhub 사용 → ${price.last:.2f}")
+                    return StockQuotation(tradable=True, last=price.last)
+            except BrokerError:
+                pass
+
+        # 3. 모두 실패
+        if self._mode != "real" and not FINNHUB_API_KEY:
+            raise BrokerError(
+                f"현재체결가 조회 실패: LS 모의투자에서 g3101 미지원 "
+                f"(rsp_cd='')이고 FINNHUB_API_KEY가 설정되지 않았습니다. "
+                f".env 파일에 FINNHUB_API_KEY를 추가하세요."
+            )
+        return StockQuotation(tradable=True, last=0.0)
 
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """
