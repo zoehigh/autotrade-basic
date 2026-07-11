@@ -83,6 +83,7 @@ def get_ord_dvsn(order_type: str, side: str = "BUY") -> str:
 #   (dcff6dd 커밋에서 TR_ID_BALANCE로 잘못 사용함 — 수정 완료)
 
 TR_ID_PRICE = "g3101"                # 해외주식 현재가 조회
+TR_ID_ORDERBOOK = "g3106"            # 해외주식 현재가호가 조회 (10단위 호가 + 현재가 스냅샷)
 TR_ID_BALANCE = "COSOQ00201"         # 해외주식 종합잔고평가 (실전 정상, 모의투자 IGW40014)
 TR_ID_ORDER_HISTORY = "COSAQ00102"   # 해외주식 계좌주문체결내역조회 (모의투자 01900 미지원)
 TR_ID_ORDER = "COSAT00301"           # 해외주식 신규주문
