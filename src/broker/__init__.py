@@ -50,9 +50,8 @@ def create_broker() -> Broker:
         from broker.ls.adapter import LSBroker
         broker = LSBroker()
     elif BROKER == "toss":
-        # from broker.toss.adapter import TossBroker
-        # broker = TossBroker()
-        raise NotImplementedError("토스증권 브로커는 아직 구현되지 않았습니다.")
+        from broker.toss.adapter import TossBroker
+        broker = TossBroker()
     else:
         raise ValueError(
             f"알 수 없는 증권사입니다: BROKER={BROKER}. "

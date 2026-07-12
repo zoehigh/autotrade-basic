@@ -7,7 +7,7 @@ load_dotenv()
 
 # 증권사 선택
 # 환경변수 BROKER로 사용할 증권사를 선택합니다.
-# 지원: kis(기본값), kiwoom, ls, toss(예정)
+# 지원: kis(기본값), kiwoom, ls, toss
 # .env 예: BROKER=kis
 BROKER = os.getenv("BROKER", "kis").strip().lower()
 
@@ -48,6 +48,12 @@ def _get_broker_config(broker_name: str) -> dict:
             "domain": "https://openapi.ls-sec.co.kr:8080",
             "acnt_prdt_cd": "",
         },
+        "toss": {
+            "client_id": os.getenv("TOSS_CLIENT_ID", ""),
+            "client_secret": os.getenv("TOSS_CLIENT_SECRET", ""),
+            "account_seq": os.getenv("TOSS_ACCOUNT_SEQ", ""),
+            "domain": "https://openapi.tossinvest.com",
+        },
     }
     return configs.get(broker_name, {})
 
@@ -57,6 +63,8 @@ BROKER_CONFIG = _get_broker_config(BROKER)
 # 계좌번호 확인
 if BROKER == "kis" and not BROKER_CONFIG.get("account_no", ""):
     print("경고: BROKER=kis 이지만 KIS_ACCOUNT_NO가 설정되어 있지 않습니다.")
+if BROKER == "toss" and not BROKER_CONFIG.get("account_seq", ""):
+    print("경고: BROKER=toss 이지만 TOSS_ACCOUNT_SEQ가 설정되어 있지 않습니다.")
 
 # ── 키움/LS/토스 증권 API 설정 (BROKER_CONFIG에서 관리) ──
 
@@ -132,7 +140,7 @@ def _parse_symbols():
 		# SOXL 상장 거래소 분류가 브로커마다 다릅니다:
 		#   - KIS: AMEX (AMS)
 		#   - Kiwoom: NYSE (NYS)
-		# LS/Toss 등 미구현 브로커는 거래소 코드 체계가 정해지지 않았으므로
+		# LS/Toss 등은 거래소 코드 체계가 다를 수 있으므로
 		# 명시적으로 SYMBOLS 환경변수를 설정해야 합니다.
 		if BROKER == "kiwoom":
 			pairs = [("TQQQ", "NAS"), ("SOXL", "NYS")]

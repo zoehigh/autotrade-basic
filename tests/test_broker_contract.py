@@ -834,3 +834,301 @@ class TestKiwoomBrokerContract(BrokerContractTest):
     def test_exchange_code_ams_to_na(self):
         broker = self._create_broker()
         assert broker.exchange_code("AMS") == "NA"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TossBroker 계약 테스트
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.usefixtures("_patch_toss_dependencies")
+class TestTossBrokerContract(BrokerContractTest):
+    """
+    TossBroker 인터페이스 계약 테스트.
+
+    TossSession.get/post를 mock하여 실제 API 호출 없이
+    모든 Broker 계약을 검증합니다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_toss_dependencies(self, request):
+        """
+        TossBroker가 의존하는 모듈들을 patch합니다.
+
+        - TossSession → mock 인스턴스 반환
+        - get_access_token → 가짜 토큰 반환
+        - is_us_trading_day → True
+        - get_kst_now → 고정 시각
+        - config.BROKER_CONFIG, config.HTTP_TIMEOUT → 가짜 값
+        """
+        fixed_kst = datetime(2026, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+        target = "broker.toss.adapter"
+        patches = [
+            patch(f"{target}.TossSession"),
+            patch(f"{target}.get_access_token", return_value="mock_token"),
+            patch(f"{target}.is_us_trading_day", return_value=True),
+            patch(f"{target}.get_kst_now", return_value=fixed_kst),
+            patch("config.BROKER_CONFIG", {
+                "client_id": "test_client_id",
+                "client_secret": "test_client_secret",
+                "account_seq": "1",
+                "domain": "https://openapi.tossinvest.com",
+            }),
+            patch("config.BROKER_MODE", "real"),
+            patch("config.HTTP_TIMEOUT", (10, 30)),
+        ]
+
+        for p in patches:
+            p.start()
+            request.addfinalizer(p.stop)
+
+        # TossSession mock: 인스턴스 설정
+        mock_session_cls = sys.modules[f"{target}"].TossSession
+        mock_session_instance = MagicMock()
+        mock_session_cls.return_value = mock_session_instance
+        self._mock_session = mock_session_instance
+
+        # 기본 응답 설정
+        self._setup_default_responses(mock_session_instance)
+
+    def _setup_default_responses(self, mock_session):
+        """
+        mock TossSession에 경로 기반 기본 성공 응답을 설정합니다.
+        """
+
+        def _get_side_effect(path, token, params=None, extra_headers=None):
+            if "/api/v1/prices" in path:
+                return _make_response({
+                    "result": [{"symbol": "TQQQ", "lastPrice": "52.00"}],
+                })
+            elif "/api/v1/holdings" in path:
+                return _make_response({
+                    "result": {"items": [], "overview": {}},
+                })
+            elif "/api/v1/buying-power" in path:
+                return _make_response({
+                    "result": {"cashBuyingPower": "5000.00"},
+                })
+            elif "/api/v1/orders" in path:
+                return _make_response(
+                    {"result": {"orders": [], "nextCursor": None}},
+                    headers={"X-RateLimit-Limit": "6"},
+                )
+            else:
+                return _make_response({"result": {}})
+
+        def _post_side_effect(path, token, json_body=None, extra_headers=None):
+            if "/api/v1/orders" in path:
+                return _make_response({
+                    "result": {"orderId": "mock_order_123"},
+                })
+            return _make_response({"result": {}})
+
+        mock_session.get.side_effect = _get_side_effect
+        mock_session.post.side_effect = _post_side_effect
+
+    def _create_broker(self):
+        """mock이 주입된 TossBroker 인스턴스를 반환."""
+        from broker.toss.adapter import TossBroker
+        return TossBroker()
+
+    def _set_mock_response(self, json_data, status_code=200, headers=None):
+        """side_effect를 제거하고 return_value로 단일 응답을 설정합니다."""
+        self._mock_session.get.side_effect = None
+        self._mock_session.post.side_effect = None
+        self._mock_session.get.return_value = _make_response(
+            json_data, status_code, headers
+        )
+        self._mock_session.post.return_value = _make_response(
+            json_data, status_code, headers
+        )
+
+    # ── 토스 전용 테스트 ──────────────────────────────────────────────
+
+    def test_get_stock_price_values(self):
+        """반환된 StockPrice의 last 값이 응답과 일치해야 합니다 (open=0)."""
+        self._set_mock_response({
+            "result": [{"symbol": "TQQQ", "lastPrice": "52.50"}],
+        })
+        broker = self._create_broker()
+        result = broker.get_stock_price("TQQQ", "NAS")
+        assert result.open == 0.0
+        assert result.last == 52.50
+
+    def test_get_stock_price_empty_result_raises(self):
+        """결과가 비어있으면 BrokerError가 발생해야 합니다."""
+        self._set_mock_response({"result": []})
+        broker = self._create_broker()
+        with pytest.raises(BrokerError, match="심볼을 찾을 수 없습니다"):
+            broker.get_stock_price("INVALID", "NAS")
+
+    def test_get_stock_quotation_returns_tradable(self):
+        """토스는 tradable=True를 기본값으로 반환해야 합니다."""
+        self._set_mock_response({
+            "result": [{"symbol": "TQQQ", "lastPrice": "52.00"}],
+        })
+        broker = self._create_broker()
+        result = broker.get_stock_quotation("TQQQ", "NAS")
+        assert result.tradable is True
+        assert result.last == 52.0
+
+    def test_get_balance_with_position(self):
+        """잔고가 있으면 Balance dataclass를 반환해야 합니다."""
+        self._set_mock_response({
+            "result": {
+                "items": [
+                    {
+                        "symbol": "TQQQ",
+                        "name": "ProShares UltraPro QQQ",
+                        "quantity": 10,
+                        "averagePurchasePrice": "48.50",
+                    }
+                ],
+                "overview": {},
+            },
+        })
+        broker = self._create_broker()
+        result = broker.get_balance("TQQQ", "NAS")
+        assert result is not None
+        assert result.quantity == 10
+        assert result.avg_price == 48.5
+
+    def test_get_balance_no_position_returns_none(self):
+        """잔고가 없으면 None을 반환해야 합니다."""
+        self._set_mock_response({
+            "result": {"items": [], "overview": {}},
+        })
+        broker = self._create_broker()
+        result = broker.get_balance("TQQQ", "NAS")
+        assert result is None
+
+    def test_get_purchase_amount_returns_value(self):
+        """매수가능금액을 올바르게 반환해야 합니다."""
+        self._set_mock_response({
+            "result": {"cashBuyingPower": "5000.00"},
+        })
+        broker = self._create_broker()
+        result = broker.get_purchase_amount("TQQQ", "NAS")
+        assert result.orderable_cash == 5000.0
+
+    def test_get_order_history_normalizes_side(self):
+        """side 필드가 "매수"/"매도"로 올바르게 정규화되어야 합니다."""
+        self._set_mock_response({
+            "result": {
+                "orders": [
+                    {
+                        "orderId": "ord_001",
+                        "symbol": "TQQQ",
+                        "side": "BUY",
+                        "orderType": "LIMIT",
+                        "timeInForce": "DAY",
+                        "status": "FILLED",
+                        "quantity": 10,
+                        "price": "50.00",
+                        "orderedAt": "2026-06-15T10:30:00+09:00",
+                        "execution": {
+                            "filledQuantity": 10,
+                            "averagePrice": "50.00",
+                        },
+                    },
+                    {
+                        "orderId": "ord_002",
+                        "symbol": "TQQQ",
+                        "side": "SELL",
+                        "orderType": "LIMIT",
+                        "timeInForce": "DAY",
+                        "status": "FILLED",
+                        "quantity": 5,
+                        "price": "55.00",
+                        "orderedAt": "2026-06-16T14:00:00+09:00",
+                        "execution": {
+                            "filledQuantity": 5,
+                            "averagePrice": "55.00",
+                        },
+                    },
+                ],
+                "nextCursor": None,
+            },
+        })
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+
+        assert len(history) == 2
+        assert history[0]["sll_buy_dvsn_cd_name"] == "매수"
+        assert history[1]["sll_buy_dvsn_cd_name"] == "매도"
+        assert history[0]["ft_ccld_qty"] == "10"
+        assert history[0]["ft_ccld_unpr3"] == "50.0"
+        assert history[0]["odno"] == "ord_001"
+        assert history[0]["ord_dt"] == "20260615"
+        assert history[0]["ord_tmd"] == "103000"
+        assert history[0]["ft_ccld_amt3"] == "500.0"
+
+    def test_get_order_history_empty(self):
+        """체결 내역이 없으면 빈 리스트를 반환해야 합니다."""
+        self._set_mock_response({
+            "result": {"orders": [], "nextCursor": None},
+        })
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+        assert history == []
+
+    def test_place_order_returns_orderresult(self):
+        """성공적인 주문은 OrderResult를 반환해야 합니다."""
+        self._set_mock_response({
+            "result": {"orderId": "mock_order_123"},
+        })
+        broker = self._create_broker()
+        result = broker.place_order("TQQQ", "NASDAQ", "BUY", 10, 50.0, "LIMIT")
+
+        assert result is not None
+        assert isinstance(result, OrderResult)
+        assert result.order_id == "mock_order_123"
+        assert result.is_reservation is False
+
+    def test_place_order_loc_uses_cls_time_in_force(self):
+        """LOC 주문은 timeInForce=CLS로 변환되어야 합니다."""
+        calls = {}
+
+        def _capture_post(path, token, json_body=None, extra_headers=None):
+            calls["body"] = json_body
+            return _make_response({"result": {"orderId": "mock_loc_001"}})
+
+        self._mock_session.post.side_effect = _capture_post
+        broker = self._create_broker()
+        result = broker.place_order("TQQQ", "NASDAQ", "BUY", 10, 50.0, "LOC")
+
+        assert result is not None
+        assert calls["body"]["orderType"] == "LIMIT"
+        assert calls["body"]["timeInForce"] == "CLS"
+
+    def test_place_order_invalid_type_raises(self):
+        """지원하지 않는 주문 유형은 OrderError가 발생해야 합니다."""
+        broker = self._create_broker()
+        with pytest.raises(OrderError, match="지원하지 않는 주문 유형"):
+            broker.place_order("TQQQ", "NASDAQ", "BUY", 10, 50.0, "INVALID")
+
+    # ── 토스 거래소 코드 매핑 ────────────────────────────────────────
+    # 토스는 미국 주식 거래소 이름을 그대로 사용
+
+    def test_exchange_code_nas_to_nasdaq(self):
+        broker = self._create_broker()
+        assert broker.exchange_code("NAS") == "NASDAQ"
+
+    def test_exchange_code_nys_to_nyse(self):
+        broker = self._create_broker()
+        assert broker.exchange_code("NYS") == "NYSE"
+
+    def test_exchange_code_ams_to_amex(self):
+        broker = self._create_broker()
+        assert broker.exchange_code("AMS") == "AMEX"
+
+    # ── Base 계약 테스트 오버라이드 ────────────────────────────────────
+
+    def test_place_order_returns_orderresult_or_none(self):
+        broker = self._create_broker()
+        result = broker.place_order("TQQQ", "NASDAQ", "BUY", 1, 50.0, "LIMIT")
+        if result is not None:
+            assert isinstance(result, OrderResult)
+            assert isinstance(result.order_id, str)
+            assert isinstance(result.order_time, str)
+            assert isinstance(result.is_reservation, bool)
