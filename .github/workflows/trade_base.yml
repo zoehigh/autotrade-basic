@@ -67,8 +67,8 @@ on:
 
 jobs:
   run-trade:
-    # 키움 real은 접근 IP 제약으로 self-hosted runner 사용, 나머지는 ubuntu-latest
-    runs-on: ${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'kiwoom-real' || 'ubuntu-latest' }}
+    # 키움/토스 real은 접근 IP 제약으로 self-hosted runner 사용, 나머지는 ubuntu-latest
+    runs-on: ${{ ((inputs.broker == 'kiwoom' || inputs.broker == 'toss') && inputs.broker_mode == 'real') && format('{0}-real', inputs.broker) || 'ubuntu-latest' }}
     # GitHub Environments: broker-mode 조합별 secrets/variables 분리
     # 환경 예: kis-demo, kis-real, kiwoom-demo, kiwoom-real, ls-demo, ls-real, toss-real
     environment: ${{ inputs.broker }}-${{ inputs.broker_mode }}
@@ -79,19 +79,6 @@ jobs:
     steps:
       - name: 코드 체크아웃
         uses: actions/checkout@v4
-
-      - name: 브로커 구현 여부 사전 검증
-        # Toss 브로커는 아직 구현되지 않았습니다.
-        # 전체 의존성 설치 후 Python 에러로 실패하는 것보다 빠르게 실패하는 것이 낫습니다.
-        run: |
-          BROKER="${{ inputs.broker }}"
-          case "$BROKER" in
-            toss)
-              echo "::error::$BROKER 증권사 브로커는 아직 구현되지 않았습니다."
-              echo "::error::src/broker/$BROKER/adapter.py 구현 후 실행하세요."
-              exit 1
-              ;;
-          esac
 
       - name: uv 설치
         uses: astral-sh/setup-uv@v5
@@ -126,7 +113,7 @@ jobs:
           echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
           echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}"
           echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
-          echo "Runner=${{ (inputs.broker == 'kiwoom' && inputs.broker_mode == 'real') && 'kiwoom-real' || 'ubuntu-latest' }}"
+          echo "Runner=${{ ((inputs.broker == 'kiwoom' || inputs.broker == 'toss') && inputs.broker_mode == 'real') && format('{0}-real', inputs.broker) || 'ubuntu-latest' }}"
 
       - name: 자동매매 봇 실행
         env:

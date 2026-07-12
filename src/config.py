@@ -49,8 +49,8 @@ def _get_broker_config(broker_name: str) -> dict:
             "acnt_prdt_cd": "",
         },
         "toss": {
-            "client_id": os.getenv("TOSS_CLIENT_ID", ""),
-            "client_secret": os.getenv("TOSS_CLIENT_SECRET", ""),
+            "client_id": os.getenv("TOSS_APP_KEY", ""),
+            "client_secret": os.getenv("TOSS_APP_SECRET", ""),
             "account_seq": os.getenv("TOSS_ACCOUNT_SEQ", ""),
             "domain": "https://openapi.tossinvest.com",
         },
