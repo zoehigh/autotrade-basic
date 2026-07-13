@@ -136,6 +136,7 @@ jobs:
           # 토스 인증정보 (environment에서 주입 — broker=toss 일 때만 값이 있음)
           TOSS_APP_KEY: ${{ secrets.TOSS_APP_KEY }}
           TOSS_APP_SECRET: ${{ secrets.TOSS_APP_SECRET }}
+          TOSS_ACCOUNT_SEQ: ${{ vars.TOSS_ACCOUNT_SEQ }}
 
           # 런타임 설정: inputs -> environment vars -> 모드별 기본값 순으로 폴백
           # real 환경은 기본 DRY (fail-safe: 명시적으로 LIVE 선택해야 실전 주문)

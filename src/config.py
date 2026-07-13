@@ -136,21 +136,11 @@ def _parse_symbols():
 			pairs.append((sym, exch))
 
 	if not pairs:
-		# 기본값: TQQQ(나스닥) + SOXL
-		# SOXL 상장 거래소 분류가 브로커마다 다릅니다:
-		#   - KIS: AMEX (AMS)
-		#   - Kiwoom: NYSE (NYS)
-		# LS/Toss 등은 거래소 코드 체계가 다를 수 있으므로
-		# 명시적으로 SYMBOLS 환경변수를 설정해야 합니다.
+		# 기본값: TQQQ(나스닥) + SOXL(아멕스)
+		# 키움은 SOXL 거래소가 NYSE(NYS)로 다르므로 브로커별 분기
 		if BROKER == "kiwoom":
 			pairs = [("TQQQ", "NAS"), ("SOXL", "NYS")]
 		else:
-			if BROKER != "kis":
-				print(
-					f"경고: BROKER={BROKER}인데 SYMBOLS가 설정되지 않아 "
-					f"KIS 기본값(TQQQ:NAS,SOXL:AMS)을 사용합니다. "
-					f"브로커별 거래소 코드가 다를 수 있으니 SYMBOLS를 명시적으로 설정하세요."
-				)
 			pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
 
 	result = []
