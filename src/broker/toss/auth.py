@@ -57,7 +57,7 @@ def get_access_token(
 
     if not client_id or not client_secret:
         raise AuthError(
-            "환경변수 TOSS_CLIENT_ID와 TOSS_CLIENT_SECRET이 설정되어야 합니다. "
+            "환경변수 TOSS_APP_KEY와 TOSS_APP_SECRET이 설정되어야 합니다. "
             ".env 파일을 확인해주세요."
         )
 
