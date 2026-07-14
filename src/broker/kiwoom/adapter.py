@@ -424,8 +424,11 @@ class KiwoomBroker(Broker):
 
         TR: ust21110 (예수금)
         계좌의 외화(USD) 주문가능금액을 반환합니다.
-        응답 result_list[].fc_ord_alowa 필드 사용 (모의투자 검증 완료).
-        모의투자에서 외화 예수금이 없으면 빈 result_list → 0.0 반환.
+        응답 result_list[].fc_ord_alowa 필드 사용.
+
+        주의: 모의투자 응답에 여러 통화(CNY, USD 등)가 포함될 수 있으므로,
+        crnc_code="USD"인 항목을 반드시 찾아야 합니다.
+        USD 항목이 없으면(미국주식 미거래 계좌 등) 0.0 반환.
         """
         token = self._get_token()
 
@@ -440,11 +443,25 @@ class KiwoomBroker(Broker):
                 # 모의투자 등에서 외화 예수금 데이터가 없는 경우 0 반환
                 return PurchaseAmount(orderable_cash=0.0)
 
-            # result_list에서 외화 주문가능금액 추출.
-            # 모의투자 응답으로 검증 완료: result_list[0].fc_ord_alowa (USD 주문가능금액).
-            item = result_list[0] if isinstance(result_list, list) else result_list
+            # result_list에서 USD 통화 항목을 찾습니다.
+            # 모의투자에서는 CNY(중국위안화), USD(미국달러) 등 여러 통화가 반환될 수 있으며,
+            # 첫 번째 항목이 항상 USD인 것은 아닙니다.
+            usd_item = None
+            if isinstance(result_list, list):
+                for item in result_list:
+                    if isinstance(item, dict) and item.get("crnc_code") == "USD":
+                        usd_item = item
+                        break
+            else:
+                # result_list가 단일 dict인 경우 (방어적 처리)
+                usd_item = result_list if isinstance(result_list, dict) else None
+
+            if usd_item is None:
+                # USD 항목이 없으면 0 반환 (미국주식 거래 불가)
+                return PurchaseAmount(orderable_cash=0.0)
+
             return PurchaseAmount(
-                orderable_cash=_parse_price(item.get("fc_ord_alowa")),
+                orderable_cash=_parse_price(usd_item.get("fc_ord_alowa")),
             )
 
         except requests.exceptions.RequestException as e:
