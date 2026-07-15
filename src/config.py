@@ -232,6 +232,17 @@ REINVEST = _reinvest_raw == "true"
 # Free tier: 60 calls/min, 실시간 US 시세, 개인용 무료
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
+# LS 모의투자 API 버그 우회 플래그
+# LS 모의투자 환경에서는 다음 API 문제가 발생합니다:
+#   1. COSOQ00201(잔고조회): IGW40014 서버 고정폭 변환 오류
+#   2. COSAQ00102(체결내역): 모의투자 미지원 (01900)
+# 이 플래그가 true이면:
+#   - 잔고 조회 실패 시 예외 대신 None 반환 → 보수적 T 유지
+#   - 체결내역 조회 실패 시 빈 리스트 반환
+# GitHub Actions: ls-demo 환경에서 자동으로 true 설정
+# .env 예: LS_DEMO_BYPASS_BUGS=true
+LS_DEMO_BYPASS_BUGS = os.getenv("LS_DEMO_BYPASS_BUGS", "false").strip().lower() == "true"
+
 # ── 하위호환 alias (기존 import 경로 유지) ──
 KIS_MODE = BROKER_MODE
 KIS_DOMAIN = BROKER_CONFIG.get("domain", "")

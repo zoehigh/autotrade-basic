@@ -17,7 +17,7 @@ sys.path.append("src")
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER_MODE
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER_MODE, LS_DEMO_BYPASS_BUGS
 from broker import create_broker
 from broker.base import Broker, OrderResult
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
@@ -244,7 +244,11 @@ def run_one_symbol(broker: Broker, symbol_config):
         live_qty = live_balance.quantity if live_balance else 0
         live_avg = live_balance.avg_price if live_balance else 0.0
     except Exception as e:
-        print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용): {e}")
+        # LS 모의투자 IGW40014 버그 우회: 예외 발생 시에도 보수적 T 유지
+        if LS_DEMO_BYPASS_BUGS:
+            print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용) - LS 모의투자 버그 우회: {e}")
+        else:
+            print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용): {e}")
         live_balance = None
         live_qty = None
         live_avg = None

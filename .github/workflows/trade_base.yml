@@ -171,6 +171,10 @@ jobs:
           # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
+          # LS 모의투자 API 버그 우회 (잔고/체결내역 조회 실패 시 빈 결과 반환)
+          # ls-demo 환경에서 기본값 true, 나머지는 false
+          LS_DEMO_BYPASS_BUGS: ${{ vars.LS_DEMO_BYPASS_BUGS || (inputs.broker == 'ls' && inputs.broker_mode == 'demo' && 'true') || 'false' }}
+
           # API 연결 타임아웃 (초 단위, 기본값 30초)
           CONNECT_TIMEOUT: 30
 
