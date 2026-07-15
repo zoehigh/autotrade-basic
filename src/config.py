@@ -85,7 +85,7 @@ HTTP_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 # 예시:
 #   TQQQ_SPLITS=40        → TQQQ 분할 수
 #   TQQQ_SYMBOL_TYPE=TQQQ → 별지점 공식 타입
-#   TQQQ_SEED=10000       → TQQQ에 투입할 시드 (달러, 0이면 계좌 전체 사용)
+#   TQQQ_SEED=10000       → TQQQ에 투입할 시드 (달러, 필수)
 #   TQQQ_ADDITIONAL_LOC_LEVELS=3  → TQQQ 급락 대비 추가 LOC 단계 수
 #   SOXL_SPLITS=20
 #   SOXL_SYMBOL_TYPE=SOXL
@@ -101,7 +101,7 @@ def _parse_symbols():
 	      "symbol": "TQQQ", "exchange": "NAS",
 	      "splits": 40,
 	      "symbol_type": "TQQQ",
-	      "seed": 10000  # 0이면 계좌 전체 사용
+	      "seed": 10000  # 달러 금액 (필수)
 	    },
 	    ...
 	  ]
@@ -110,10 +110,16 @@ def _parse_symbols():
 	  1. SYMBOLS=TQQQ:NAS,SOXL:AMS  (복수 종목)
 	  2. 기본값: TQQQ(나스닥) + SOXL(아멕스)
 
+	시드(seed) 설정:
+	  - 모든 종목에 대해 시드 설정이 필수입니다.
+	  - 달러 금액만 허용 (예: 10000, 5000)
+	  - FULL은 지원하지 않습니다 (예측 불가능한 잔고 변동으로 인한 위험)
+
 	왜 이렇게 바꿨나요?
 	  - 단일 변수(SYMBOL, EXCHANGE)와 미사용 변수(TAKE_PROFIT, BIG_BUY_RANGE)를 제거해
 	    설정 혼선을 줄였습니다.
 	  - 이제 종목별 설정만 보고도 실제 동작을 바로 이해할 수 있습니다.
+	  - 시드 미설정 시 묵시적으로 계좌 전체를 사용하는 위험을 제거했습니다.
 	"""
 	raw = os.getenv("SYMBOLS", "").strip()
 	pairs = []
@@ -144,14 +150,37 @@ def _parse_symbols():
 			pairs = [("TQQQ", "NAS"), ("SOXL", "AMS")]
 
 	result = []
+
 	for sym, exch in pairs:
+		# 시드(seed) 파싱 — 필수 (달러 금액만 허용)
+		seed_raw = os.getenv(f"{sym}_SEED", "").strip()
+		if not seed_raw:
+			raise ValueError(
+				f"{sym}_SEED가 설정되지 않았습니다.\n"
+				f"  .env에 달러 금액을 추가하세요:\n"
+				f"    {sym}_SEED=10000   # 이 종목에 투자할 최대 금액"
+			)
+
+		if seed_raw.upper() == "FULL":
+			raise ValueError(
+				f"FULL은 지원하지 않습니다.\n"
+				f"  계좌 잔고는 실시간으로 변동되므로 예측 불가능합니다.\n"
+				f"  대신 명확한 달러 금액을 지정하세요:\n"
+				f"    {sym}_SEED=10000   # 이 종목에 투자할 최대 금액"
+			)
+
+		seed = float(seed_raw)
+		if seed <= 0:
+			raise ValueError(
+				f"{sym}_SEED는 0보다 커야 합니다 (입력값: {seed_raw})"
+			)
+
 		result.append({
 			"symbol": sym,
 			"exchange": exch,
 			# V4는 종목별 분할 수를 직접 사용합니다.
 			"splits": int(os.getenv(f"{sym}_SPLITS") or "40"),
-			# 시드: 이 종목에 투입할 최대 금액 (달러). 0이면 계좌 전체 주문가능금액 사용
-			"seed": float(os.getenv(f"{sym}_SEED") or "0"),
+			"seed": seed,
 			# 별지점 공식 선택용 종목 타입: "TQQQ" 또는 "SOXL"
 			# - TQQQ: 20분할 별% = (15-1.5T)%, 40분할 별% = (15-0.75T)%
 			# - SOXL: 20분할 별% = (20-2T)%, 40분할 별% = (20-T)%
@@ -165,6 +194,7 @@ def _parse_symbols():
 				or "3"
 			),
 		})
+
 	return result
 
 SYMBOLS = _parse_symbols()

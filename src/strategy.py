@@ -117,7 +117,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         exchange_code (str): 거래소 코드 (예: "NAS")
         splits (int): 분할 수 (20 또는 40)
         symbol_type (str): 종목 타입 ("TQQQ" 또는 "SOXL") — 별지점 공식 결정용
-        seed (float): 이 종목에 투입할 최대 금액 (달러). 0이면 계좌 전체 사용
+        seed (float): 이 종목에 투입할 최대 금액 (달러). 필수.
         T (float): 현재까지의 누적 매수 횟수 (state.py에서 로드)
         additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 3)
 
@@ -309,8 +309,6 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                         }
                 else:
                     print(f"  [주의] {msg}")
-                    if seed == 0:
-                        print("  시드(seed)가 설정되어 있지 않아 시뮬레이션할 수 없습니다.")
                     return {
                         "symbol": symbol, "exchange": exchange_code,
                         "tradable": tradable, "open_price": open_price,

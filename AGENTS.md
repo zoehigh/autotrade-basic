@@ -96,4 +96,5 @@ uv run pytest tests/ -v
 - KIS 모의투자는 초당 1회, 실전은 초당 20회 rate-limit
 - LS 조회 TR(g3101 등)은 초당 1회, 주문 TR은 초당 10회 rate-limit (모의/실전 동일)
 - 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
+- **시드 설정 필수**: 모든 종목에 `{SYMBOL}_SEED` 설정 필수 (달러 금액만 허용, FULL 미지원)
 - **KIWOOM/LS/TOSS**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능)

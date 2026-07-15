@@ -184,7 +184,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             - exchange (str): 거래소 코드 (예: "NAS")
             - splits (int): 분할 수
             - symbol_type (str): 종목 타입 (예: "TQQQ", "SOXL")
-            - seed (float): 투입 시드 금액 (0이면 계좌 전체 사용)
+            - seed (float): 투입 시드 금액 (달러, 필수)
     """
     symbol = symbol_config["symbol"]
     exchange = symbol_config["exchange"]
@@ -645,7 +645,7 @@ def main():
         print(f"거래 모드: {TRADE_MODE}")
         print("종목 목록:")
         for cfg in SYMBOLS:
-            seed_info = f", 시드: ${cfg['seed']:.0f}" if cfg['seed'] > 0 else ""
+            seed_info = f", 시드: ${cfg['seed']:.0f}"
             print(f"  - {cfg['symbol']}({cfg['exchange']}): "
                   f"분할={cfg['splits']}, "
                   f"타입={cfg['symbol_type']}"
