@@ -47,7 +47,7 @@ from broker.ls.order_types import (
     TR_ID_ORDER_HISTORY,
     TR_ID_ORDER,
 )
-from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT, FINNHUB_API_KEY
+from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT, FINNHUB_API_KEY, LS_DEMO_BYPASS_BUGS
 
 
 _BASE_URL = BROKER_CONFIG.get("domain", "https://openapi.ls-sec.co.kr:8080")
@@ -384,6 +384,9 @@ class LSBroker(Broker):
                 print(f"[잔고] {symbol} COSOQ00201: {rsp_msg} (None 반환)")
                 return None
             else:
+                if LS_DEMO_BYPASS_BUGS:
+                    print(f"[잔고] {symbol} COSOQ00201: LS 모의투자 버그 우회 (rsp_cd={rsp_cd}): {rsp_msg}")
+                    return None
                 raise BrokerError(f"잔고 조회 실패: {rsp_msg}")
 
             out_block4 = data.get("COSOQ00201OutBlock4", [])

@@ -1,6 +1,6 @@
 # 매수/매도 여부를 판단하는 전략 로직 — 무한매수법 V4.0
 import math
-from config import TRADE_MODE
+from config import TRADE_MODE, LS_DEMO_BYPASS_BUGS
 from broker.base import Broker
 
 def adjust_price_to_tick(price):
@@ -176,7 +176,14 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
     # 2. 보유 정보 조회
     # ========================================
 
-    balance = broker.get_balance(symbol, exchange_code)
+    try:
+        balance = broker.get_balance(symbol, exchange_code)
+    except Exception as e:
+        if LS_DEMO_BYPASS_BUGS:
+            print(f"[전략] 잔고 조회 실패 — LS 모의투자 버그 우회: {e}")
+            balance = None
+        else:
+            raise
 
     if balance:
         position_qty = balance.quantity
