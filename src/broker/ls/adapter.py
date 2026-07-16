@@ -695,7 +695,9 @@ class LSBroker(Broker):
             order_type = "LIMIT"
 
         ord_dvsn = get_ord_dvsn(order_type, side)
-        ls_exch, _ = convert_exchange_code(exchange)
+        # exchange는 이미 broker.exchange_code()로 변환된 API 코드("82"/"81")이므로
+        # 그대로 사용합니다. convert_exchange_code()를 다시 호출하면 이중 변환됩니다.
+        ls_exch = exchange
 
         # OrdPtnCode: 01=매도, 02=매수
         ord_ptn_code = "02" if side == "BUY" else "01"
