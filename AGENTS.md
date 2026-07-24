@@ -1,49 +1,52 @@
 # PROJECT KNOWLEDGE BASE
 
 **Generated:** 2026-06-25
-**Commit:** `dcbe118`
+**Updated:** 2026-07-24
 **Branch:** `develop`
 
 ## OVERVIEW
-미국 주식 자동매매 봇 (Python). KIS(한국투자증권) Open API로 무한매수법 V4 전략을 실행. GitHub Actions에서 `repository_dispatch`로 트리거됨.
+미국 주식 자동매매 봇 (Python). 4개 증권사(KIS, KIWOOM, LS, TOSS) API를 지원하며, 무한매수법 V4 전략을 실행. GitHub Actions에서 `repository_dispatch`로 트리거됨.
 
 ## STRUCTURE
 ```
 autotrade-basic/
-├── src/             # 핵심 모듈 (전략, API 호출, 상태 관리)
-├── tests/           # pytest 기반 테스트 스크립트
-├── .github/workflows/  # GitHub Actions (trade_real, trade_demo, trade_base)
-└── trading_bot.py   # 메인 파이프라인 진입점
+├── src/
+│   ├── broker/          # 브로커별 API 구현체
+│   │   ├── base.py      # 공통 에러/데이터 클래스
+│   │   ├── kis/         # 한국투자증권
+│   │   ├── kiwoom/      # 키움증권
+│   │   ├── ls/          # LS증권
+│   │   ├── toss/        # 토스증권
+│   │   └── market_utils.py  # 시간/시장 유틸리티
+│   ├── strategy.py      # 전략 로직
+│   ├── state.py         # 상태 관리
+│   ├── config.py        # 환경변수 설정
+│   ├── telegram.py      # 텔레그램 발송
+│   └── notifier.py      # 알림 라우팅
+├── tests/               # pytest 기반 테스트
+├── .github/workflows/   # GitHub Actions
+└── trading_bot.py       # 메인 파이프라인
 ```
 
 ## WHERE TO LOOK
 | Task | Location | Notes |
 |------|----------|-------|
-| 전략 로직 이해 | src/strategy.py | 무한매수법_V4(), T값/별지점 계산 |
-| API 주문/잔고 호출 | src/trader.py | KIS REST API 래퍼 전부 |
+| 전략 로직 이해 | src/strategy.py | `무한매수법_V4()`, T값/별지점 계산 |
+| 브로커 구현 | src/broker/{kis,kiwoom,ls,toss}/ | 각 브로커별 API 어댑터 |
+| 공통 인터페이스 | src/broker/base.py | `Broker`, `OrderResult`, `BrokerError` |
 | 상태 파일 관리 | src/state.py | state.json 로드/저장, T 갱신 |
 | 환경변수 설정 | src/config.py | 종목 설정, 모드, 수수료 |
-| 인증 토큰 | src/authentication.py | OAuth2 토큰 발급/캐싱 |
 | 파이프라인 흐름 | trading_bot.py | state→전략→주문→저장 전체 순서 |
-| CI/CD 설정 | .github/workflows/ | `trade_real.yml`, `trade_demo.yml` |
 
-## CODE MAP
-| Symbol | Type | Location | Role |
-|--------|------|----------|------|
-| `무한매수법_V4()` | func | src/strategy.py | V4 전략 실행 (매수/매도 주문 생성) |
-| `calculate_star_point()` | func | src/strategy.py | 별지점 가격 계산 |
-| `adjust_price_to_tick()` | func | src/strategy.py | 호가 단위 보정 |
-| `place_overseas_order()` | func | src/trader.py | 실제/DRY 주문 실행 |
-| `get_overseas_balance()` | func | src/trader.py | 보유 잔고 조회 |
-| `get_overseas_order_history()` | func | src/trader.py | 체결 이력 조회 (연속조회) |
-| `get_overseas_stock_price()` | func | src/trader.py | 현재가 조회 |
-| `get_access_token()` | func | src/authentication.py | OAuth2 토큰 발급/캐싱 |
-| `load_state()`/`save_state()` | funcs | src/state.py | state.json I/O |
-| `update_T_from_history()` | func | src/state.py | 체결 이력 기반 T 갱신 |
-| `send_telegram()` | func | src/telegram.py | 텔레그램 발송 |
-| `notify()` | func | src/notifier.py | 알림 발송 (조용한 시간 제어) |
-| `KISSession` | class | src/kis_session.py | HTTP 세션 관리 |
-| `generate_cycle_report()` | func | trading_bot.py | 사이클 종료 리포트 생성 |
+## BROKER ERROR HANDLING
+| 브로커 | 성공 코드 | 에러 코드 | 에러 메시지 | 검증 위치 |
+|--------|----------|----------|------------|----------|
+| KIS | `rt_cd == "0"` | `msg_cd` | `msg1` | 각 메서드 |
+| KIWOOM | `return_code == 0` | `return_code` | `return_msg` | `_check_response()` |
+| LS | `rsp_cd == "00000"` | `rsp_cd` | `rsp_msg` | 각 메서드 |
+| TOSS | `error` 없음 | `error.code` | `error.message` | `_request_with_rate_retry()` |
+
+**참고**: 주문 시각은 모든 브로커에서 `get_kst_now()` 로컬 시간 사용 (API 응답 시간 미사용)
 
 ## CONVENTIONS
 - **패키지 의존성**: `requests`, `python-dotenv`, `exchange-calendars` (`uv` 관리)
@@ -57,7 +60,7 @@ autotrade-basic/
 - `__pycache__/` — 절대 커밋 금지 (`.gitignore`에 있음)
 - `.state.json` — 커밋 금지 (GH Actions 캐시로만 관리)
 - `KIS_ACCOUNT_NO` 없는 상태로 KIS API 호출 금지 (KIWOOM/LS/TOSS는 계좌번호 불필요)
-- 모의투자 미지원 주문 유형(LOC/LOO/MOC/MOO) → 자동 LIMIT 변환 (trader.py)
+- 모의투자 미지원 주문 유형(LOC/LOO/MOC/MOO) → 자동 LIMIT 변환 (broker별 adapter)
 - `TRADE_MODE` 무단 LIVE 전환 금지 (DRY 먼저 확인)
 - `.venv` 의존성 직접 수정 금지 — 항상 `uv` 사용
 
@@ -98,3 +101,4 @@ uv run pytest tests/ -v
 - 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
 - **시드 설정 필수**: 모든 종목에 `{SYMBOL}_SEED` 설정 필수 (달러 금액만 허용, FULL 미지원)
 - **KIWOOM/LS/TOSS**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능)
+- **주문 시각**: 모든 브로커에서 `get_kst_now()` 사용 (API 응답 시간 미사용)

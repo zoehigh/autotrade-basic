@@ -628,21 +628,24 @@ class KISBroker(Broker):
             if response_data.get("rt_cd") != "0":
                 msg_cd = response_data.get("msg_cd", "")
                 msg1 = response_data.get("msg1", "알 수 없는 에러")
-                raise OrderError(f"주문 실패 (응답코드: {msg_cd}): {msg1}")
+                if msg_cd:
+                    raise OrderError(f"주문 실패 (응답코드: {msg_cd}): {msg1}")
+                else:
+                    raise OrderError(f"주문 실패: {msg1}")
 
             output = response_data.get("output", {})
+            order_id = output.get("ODNO", "")
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {output.get('ODNO', '')}")
-            print(f"주문시각: {output.get('ORD_TMD', '')}")
+            print(f"주문번호: {order_id}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")
 
             return OrderResult(
-                order_id=output.get("ODNO", ""),
-                order_time=output.get("ORD_TMD", ""),
+                order_id=order_id,
+                order_time=get_kst_now().strftime("%Y%m%d%H%M%S"),
                 is_reservation=False,
             )
 
@@ -688,7 +691,10 @@ class KISBroker(Broker):
             if response_data.get("rt_cd") != "0":
                 msg_cd = response_data.get("msg_cd", "")
                 msg1 = response_data.get("msg1", "알 수 없는 에러")
-                raise OrderError(f"예약주문 실패 (응답코드: {msg_cd}): {msg1}")
+                if msg_cd:
+                    raise OrderError(f"예약주문 실패 (응답코드: {msg_cd}): {msg1}")
+                else:
+                    raise OrderError(f"예약주문 실패: {msg1}")
 
             output = response_data.get("output", {})
 

@@ -135,7 +135,7 @@ class LSBroker(Broker):
                 # LS API는 비즈니스 오류를 HTTP 500 + JSON rsp_cd로 반환
                 # raise_for_status()를 사용하지 않고 caller가 rsp_cd를 직접 확인
                 if resp.status_code == 429:
-                    print(f"⏳ LS rate-limit 초과 (429), 1초 후 재시도...")
+                    print("⏳ LS rate-limit 초과 (429), 1초 후 재시도...")
                     time.sleep(1.0)
                     continue
 
@@ -359,8 +359,6 @@ class LSBroker(Broker):
         OutBlock4: 개별 종목별 보유 수량/평단가
         조회할 데이터가 없으면 None을 반환합니다.
         """
-        today = get_kst_now().strftime("%Y%m%d")
-
         body = {
             "COSOQ00201InBlock1": {
                 "RecCnt": 1,
@@ -723,23 +721,23 @@ class LSBroker(Broker):
             data = resp.json()
 
             if data.get("rsp_cd") != "00000":
-                msg_cd = data.get("msg_cd", "")
+                rsp_cd = data.get("rsp_cd", "")
                 rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
-                raise OrderError(f"주문 실패 (응답코드: {msg_cd}): {rsp_msg}")
+                raise OrderError(f"주문 실패 (응답코드: {rsp_cd}): {rsp_msg}")
 
             output = data.get("COSAT00301OutBlock1", {})
+            order_id = output.get("OrdNo", "") or output.get("ODNO", "")
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {output.get('ODNO', '')}")
-            print(f"주문시각: {output.get('ORD_TMD', '')}")
+            print(f"주문번호: {order_id}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")
 
             return OrderResult(
-                order_id=output.get("ODNO", ""),
-                order_time=output.get("ORD_TMD", ""),
+                order_id=order_id,
+                order_time=get_kst_now().strftime("%Y%m%d%H%M%S"),
                 is_reservation=False,
             )
 

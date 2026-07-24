@@ -727,19 +727,20 @@ class KiwoomBroker(Broker):
 
         try:
             data = self._request_with_rate_retry(tr_id, body, token)
-            output = data.get("output", {})
+            # KIWOOM API는 flat 구조 (output 래퍼 없음) + ord_no (소문자)
+            # 주문시각은 KIWOOM API에서 미제공
+            order_id = data.get("ord_no", "")
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {output.get('ODNO', '')}")
-            print(f"주문시각: {output.get('ORD_TMD', '')}")
+            print(f"주문번호: {order_id}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")
 
             return OrderResult(
-                order_id=output.get("ODNO", ""),
-                order_time=output.get("ORD_TMD", ""),
+                order_id=order_id,
+                order_time=get_kst_now().strftime("%Y%m%d%H%M%S"),
                 is_reservation=False,
             )
 
