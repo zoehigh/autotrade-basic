@@ -224,6 +224,11 @@ def run_one_symbol(broker: Broker, symbol_config):
     # order_history/balance 조회 후 스마트 부트스트랩 여부를 판단합니다.
     state_unavailable = state.get("_state_unavailable")
 
+    # 첫 실행 워터마크 오염 방지 안내: state 없음 + last_updated 없음 + LIVE면
+    # 차단 없이 경고 1줄만 출력합니다 (notify 호출 금지, exit 금지).
+    if state_unavailable and TRADE_MODE == "LIVE" and not state.get("last_updated"):
+        print("[권장] 첫 실행으로 보입니다. DRY 1회 실행 후 LIVE 전환을 권장합니다.")
+
     unresolved_zero_invested = (
         state.get("net_invested_status", "unresolved") != "valid"
         and float(state.get("net_invested", 0.0) or 0.0) <= 0

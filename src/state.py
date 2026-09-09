@@ -159,8 +159,11 @@ def save_state(symbol, state_dict):
     # state_dict에 이미 'last_updated' 값이 있으면 그 값을 우선 사용합니다 (UTC ISO 권장).
     last_updated_val = state_dict.get("last_updated")
     if not last_updated_val:
-        # 기본값: 현재 UTC 시각 ISO
-        last_updated_val = datetime.now(ZoneInfo("UTC")).isoformat()
+        # 빈이력 첫RUN 워터마크 오염 방지: last_updated가 ""/None이면 now(UTC)로 채우지 않고
+        # "" 그대로 저장합니다. 다음RUN도 초기모드(전체스캔)로 유지되어, 캐시삭제 후 첫RUN의
+        # 빈 이력이 now(UTC) 워터마크로 오염되어 진짜 체결(백데이트 UTC)이 기간외 제외되는
+        # 사고(T=0 vs 잔고 LIVE fatal)를 막습니다.
+        last_updated_val = ""
 
     # Allow optional new fields to be persisted for diagnostic purposes
     all_states[symbol] = {
@@ -851,6 +854,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
     if not filled_orders:
         print(f"[상태] {symbol} 초기 상태 - 이력 없음 → T=0으로 시작합니다")
         state["T"] = 0.0
+        # 빈이력 첫RUN 워터마크 오염 방지: last_updated를 ""로 명시적으로 유지합니다.
+        # (기존 동작과 동일 — save_state가 ""를 그대로 저장하므로 다음RUN도 초기모드 전체스캔)
         state["last_updated"] = ""
         state["last_processed_ordno"] = ""
         state["net_invested"] = float(state.get("net_invested", 0.0))
