@@ -270,6 +270,12 @@ class DryBroker(Broker):
         print("=========================================\n")
         return None
 
+    # ── 주문 취소: DRY 모드는 로그만 출력 (실제 취소 없음) ──
+    def cancel_order(
+        self, odno: str, symbol: str | None = None, exchange: str | None = None,
+    ) -> None:
+        print(f"[DRY 모드] 주문 취소 무시: odno={odno}")
+
     # ── 유틸리티: 실제 브로커에 위임 ──
     def exchange_code(self, user_code: str) -> str:
         return self._real.exchange_code(user_code)

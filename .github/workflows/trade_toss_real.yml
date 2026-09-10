@@ -1,11 +1,10 @@
 name: 무한매수법 실행 (Toss Real)
 
-# 토스증권 실전 계좌 실행 (real만 지원)
+# 토스증권 실전 계좌 실행 (real만 지원, 모의투자 없음)
 # GitHub Environment: toss-real (secrets/variables 분리)
 # 캐시 키: state-toss-real-*
-# 주의: 토스증권 브로커는 아직 구현되지 않았습니다. 실행 시 NotImplementedError로 실패합니다.
-#       브로커 구현 완료 후 바로 실행 가능하도록 워크플로우 구조만 미리 생성해둡니다.
-#       토스는 demo(모의)를 지원하지 않으므로 real 워크플로우만 있습니다.
+# 브로커 어댑터 구현됨 (주문/취소/이력/잔고). 실전 기본 DRY fail-safe.
+# 주의: pre-market CLS(LOC) 접수 여부는 미실증 — 첫 실전 주문 전 preflight로 검증할 것.
 
 on:
   repository_dispatch:

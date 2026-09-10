@@ -623,6 +623,152 @@ class TossBroker(Broker):
             raise OrderError(f"주문 실행 실패: {str(e)}")
 
     # ═══════════════════════════════════════════════════════════════════
+    # 주문 취소
+    # ═══════════════════════════════════════════════════════════════════
+
+    def cancel_order(
+        self,
+        odno: str,
+        symbol: str | None = None,
+        exchange: str | None = None,
+    ) -> None:
+        """
+        토스 주문을 취소합니다.
+
+        POST /api/v1/orders/{orderId}/cancel (json_body={})
+
+        - 이미 취소된 주문은 idempotent하게 성공으로 처리
+        - 취소 불가능한 주문(이미 체결, 취소 제한 등)은 OrderNotAcceptedError 발생
+        - 처리 중인 주문은 1회 재시도
+        """
+        odno = str(odno).strip() if odno else ""
+        if not odno:
+            raise OrderNotAcceptedError("취소할 주문번호가 비어있습니다")
+
+        token = self._get_token()
+        path = f"/api/v1/orders/{odno}/cancel"
+
+        MAX_NETWORK_RETRIES = 3
+        network_retry_count = 0
+
+        while network_retry_count <= MAX_NETWORK_RETRIES:
+            try:
+                time.sleep(self._rate_limit_wait)
+                resp = self._session.post(path, token, json_body={})
+
+                # rate-limit (429) 처리
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After", "1")
+                    try:
+                        wait_time = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait_time = 1.0
+                    wait_time = max(wait_time, 1.0)
+                    print(f"토스 rate-limit 초과 (429), {wait_time:.1f}초 후 재시도...")
+                    time.sleep(wait_time)
+                    continue
+
+                # 응답 바디 파싱
+                try:
+                    body = resp.json()
+                except (ValueError, TypeError):
+                    body = {}
+
+                # 성공: 200 + error envelope 없음
+                if resp.status_code == 200 and "error" not in body:
+                    print(f"[토스] 주문 취소 성공: odno={odno}")
+                    return None
+
+                # error envelope 처리
+                error = body.get("error", {})
+                code = error.get("code", "")
+                message = error.get("message", "")
+
+                # 인증 오류 → OrderError (접수 여부 불확실)
+                if code in ("invalid-token", "expired-token", "edge-blocked"):
+                    raise OrderError(f"토스 인증 오류 [{code}]: {message}")
+
+                # 이미 취소됨 (409) → idempotent 성공
+                if resp.status_code == 409 and code == "already-canceled":
+                    print(f"[토스] 주문 이미 취소됨 (idempotent): odno={odno}")
+                    return None
+
+                # 처리 중 → 1회 재시도
+                if code == "already-processing":
+                    retry_after = 1.0
+                    data = error.get("data") or {}
+                    try:
+                        retry_after = float(data.get("retryAfterSeconds", 1.0))
+                    except (ValueError, TypeError):
+                        retry_after = 1.0
+                    print(
+                        f"[토스] 주문 처리 중 (already-processing), "
+                        f"{retry_after:.1f}초 후 재시도: odno={odno}"
+                    )
+                    time.sleep(retry_after)
+                    # 1회 재시도
+                    time.sleep(self._rate_limit_wait)
+                    resp2 = self._session.post(path, token, json_body={})
+                    try:
+                        body2 = resp2.json()
+                    except (ValueError, TypeError):
+                        body2 = {}
+                    if resp2.status_code == 200 and "error" not in body2:
+                        print(f"[토스] 주문 취소 성공 (재시도): odno={odno}")
+                        return None
+                    error2 = body2.get("error", {})
+                    code2 = error2.get("code", "")
+                    msg2 = error2.get("message", "")
+                    if code2 == "already-canceled":
+                        print(f"[토스] 주문 이미 취소됨 (idempotent): odno={odno}")
+                        return None
+                    if code2 in (
+                        "already-filled", "cancel-restricted",
+                        "order-hours-closed", "order-not-found",
+                    ):
+                        raise OrderNotAcceptedError(
+                            f"토스 주문 취소 불가 [{code2}]: {msg2}"
+                        )
+                    raise OrderError(f"토스 주문 취소 실패 [{code2}]: {msg2}")
+
+                # 확정적 취소 불가
+                if code in (
+                    "already-filled", "cancel-restricted",
+                    "order-hours-closed", "order-not-found",
+                ):
+                    raise OrderNotAcceptedError(
+                        f"토스 주문 취소 불가 [{code}]: {message}"
+                    )
+
+                # 기타 오류
+                if code:
+                    raise OrderError(f"토스 주문 취소 실패 [{code}]: {message}")
+
+                raise OrderError(
+                    f"토스 주문 취소 실패: HTTP {resp.status_code}"
+                )
+
+            except AuthError as e:
+                raise OrderError(str(e)) from e
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                network_retry_count += 1
+                if network_retry_count <= MAX_NETWORK_RETRIES:
+                    wait = (
+                        min(30, 2 ** network_retry_count)
+                        * random.uniform(0.75, 1.25)
+                    )
+                    print(f"토스 API 타임아웃: {str(e)[:60]}...")
+                    print(
+                        f"   {wait:.1f}초 후 재시도... "
+                        f"({network_retry_count}/{MAX_NETWORK_RETRIES})"
+                    )
+                    time.sleep(wait)
+                    continue
+                raise OrderError(f"토스 API 호출 실패 (네트워크): {str(e)}")
+
+        raise OrderError("토스 API 호출 실패: 재시도 한도 초과")
+
+    # ═══════════════════════════════════════════════════════════════════
     # 유틸리티
     # ═══════════════════════════════════════════════════════════════════
 

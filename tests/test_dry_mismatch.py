@@ -138,10 +138,7 @@ class TestDryBranch2:
 
         trading_bot.run_one_symbol(broker, _symbol_config())
 
-        assert ctx["saved_states"], "상태 저장이 한 번 이상 있어야 합니다"
-        for saved in ctx["saved_states"]:
-            assert saved.get("balance_mismatch", {}) == {}, \
-                "DRY는 balance_mismatch를 기록하지 않아야 합니다"
+        assert not ctx["saved_states"], "DRY는 상태를 저장하지 않아야 합니다"
         assert any("불일치" in m for m in ctx["notify_messages"]), \
             "불일치 경고가 텔레그램으로 1회 전송되어야 합니다"
 
@@ -185,11 +182,8 @@ class TestDryBranch1:
 
         trading_bot.run_one_symbol(broker, _symbol_config())
 
-        # update_T_from_history가 최근 매수 1건을 반영: T = 5.0 + 0.5
-        assert len(ctx["saved_states"]) == 1, \
-            "DRY 사이클 종료는 캐시를 저장하지 않아야 합니다 (line 337 저장 1회뿐)"
-        assert ctx["saved_states"][0]["T"] == 5.5, \
-            "사이클 종료 리셋(T=0)이 캐시에 저장되면 안 됩니다"
+        assert len(ctx["saved_states"]) == 0, \
+            "DRY 사이클 종료는 캐시를 저장하지 않아야 합니다"
         # 리포트는 로그/알림으로 제공됩니다
         assert any("사이클" in m or "🏁" in m for m in ctx["notify_messages"])
 

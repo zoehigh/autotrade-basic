@@ -242,7 +242,7 @@ SYMBOLS = _parse_symbols()
 # 환경변수에서 값을 읽어 대문자로 정규화하고 유효성 검사 수행
 _trade_mode_raw = os.getenv("TRADE_MODE") or ""
 _trade_mode = _trade_mode_raw.strip().upper()
-if _trade_mode not in ("DRY", "LIVE"):
+if _trade_mode not in ("DRY", "LIVE", "REPAIR"):
 	if _trade_mode_raw:
 		print(f"경고: 잘못된 TRADE_MODE 값('{_trade_mode_raw}')이 감지되어 'DRY'로 설정합니다.")
 	TRADE_MODE = "DRY"
@@ -266,6 +266,15 @@ REINVEST = _reinvest_raw == "true"
 # GitHub Actions에서 state 캐시가 깨졌거나 state 없이 시작한 경우 사용합니다.
 # .env 예: FORCE_T_REINFERENCE=true
 FORCE_T_REINFERENCE = os.getenv("FORCE_T_REINFERENCE", "").strip().lower() == "true"
+
+# REPAIR 모드 액션 지정
+# TRADE_MODE=REPAIR에서 수행할 작업을 지정합니다.
+# 단일 값만 허용하며, 미지정 또는 복수 지정 시 sys.exit(1)으로 즉시 중단합니다.
+# 사용 가능한 값:
+#   DIAGNOSTIC, REVERSE_AUDIT, REVERSE_RECONCILE, REVERSE_RESET, REVERSE_T_FIX,
+#   FENCE_CLEAR, NET_INVESTED_REPAIR, ASSUME_EXPIRY, REINFERENCE, FORCE_T
+# .env 예: REPAIR_ACTION=DIAGNOSTIC
+REPAIR_ACTION = os.getenv("REPAIR_ACTION", "").strip().upper()
 
 # Finnhub API 키 (선택 — LS 모의투자 전용 fallback)
 # LS 모의투자 환경은 g3101 해외주식 현재가 조회를 지원하지 않으므로,

@@ -20,7 +20,7 @@ sys.path.append("src")
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER, BROKER_MODE, LS_DEMO_BYPASS_BUGS, ORDER_HISTORY_VERBOSE
+from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER, BROKER_MODE, LS_DEMO_BYPASS_BUGS, ORDER_HISTORY_VERBOSE, REPAIR_ACTION
 from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
@@ -338,7 +338,9 @@ def run_one_symbol(broker: Broker, symbol_config):
         if _has_unresolved_reverse_orders(state):
             state.setdefault("reverse_mode", {})["reconciliation_only"] = True
             state["reverse_mode"]["active"] = False
-            save_state(symbol, state)
+            # [DRY READONLY] cycle-end unresolved-reverse save: LIVE only
+            if TRADE_MODE == "LIVE":
+                save_state(symbol, state)
             return
         print(f"\n{'=' * 60}")
         print(f"[사이클 종료] {symbol} — {completed_cycle_start} ~ 완료")
@@ -368,8 +370,9 @@ def run_one_symbol(broker: Broker, symbol_config):
         state["net_invested_status"] = "valid"
         state["reverse_mode"] = {}
 
-    # T 갱신 후 즉시 상태를 저장하여 다음 실행 시 일관성을 보장합니다.
-    save_state(symbol, state)
+    # [DRY READONLY] T 갱신 후 상태 저장: DRY에서는 절대 저장하지 않습니다.
+    if TRADE_MODE == "LIVE":
+        save_state(symbol, state)
 
     # ── 상태-잔고 교차검증 (conservative reconciliation) ──
     try:
@@ -386,7 +389,9 @@ def run_one_symbol(broker: Broker, symbol_config):
             if _has_unresolved_reverse_orders(state):
                 state.setdefault("reverse_mode", {})["reconciliation_only"] = True
                 state["reverse_mode"]["active"] = False
-                save_state(symbol, state)
+                # [DRY READONLY] unresolved-reverse balance=0 save: LIVE only
+                if TRADE_MODE == "LIVE":
+                    save_state(symbol, state)
                 return
             msg = (
                 f"[불일치] 이력으로는 보유 {comp_qty}주(평단 ${comp_avg:.2f})로 추정되나, 브로커 잔고는 0입니다."
@@ -470,7 +475,9 @@ def run_one_symbol(broker: Broker, symbol_config):
             # 일치하는 경우, 기존 불일치 표시 제거
             if state.get("balance_mismatch"):
                 state.pop("balance_mismatch", None)
-                save_state(symbol, state)
+                # [DRY READONLY] balance_mismatch removal save: LIVE only
+                if TRADE_MODE == "LIVE":
+                    save_state(symbol, state)
 
     # ── 주문 fence 복구 (이전 세션 이력 정착 시 자동 해제) ──
     # 주문이력/잔고 reconciliation이 정상 통과한 뒤에만 도달합니다.
@@ -483,6 +490,9 @@ def run_one_symbol(broker: Broker, symbol_config):
         if _has_unresolved_reverse_orders(state):
             state.setdefault("reverse_mode", {})["reconciliation_only"] = True
             state["reverse_mode"]["active"] = False
+            # TODO [REPAIR MIGRATION] FORCE_T save in DRY: 명시적 보정용으로 유지, REPAIR로 이관 예정.
+            # For now kept as-is (FORCE_T is user-initiated state repair).
+            # Migrate to STATE_NET_INVESTED_REPAIR_ONLY or similar read-only tool.
             save_state(symbol, state)
             raise RuntimeError("미해결 리버스 주문이 있어 FORCE_T 적용을 중단합니다.")
         old_T = state["T"]
@@ -515,6 +525,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["net_invested_status"] = "valid"
         print(f"[T 보정] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), "
               f"orders_meta/balance_mismatch 초기화, last_updated 갱신")
+        # TODO [REPAIR MIGRATION] FORCE_T save in DRY: allowed for explicit correction.
         save_state(symbol, state)
 
     T = state["T"]
@@ -599,7 +610,9 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["reverse_mode"]["active"] = False
         else:
             state["reverse_mode"] = {}
-        save_state(symbol, state)
+        # [DRY READONLY] reverse_mode cleanup save: LIVE only
+        if TRADE_MODE == "LIVE":
+            save_state(symbol, state)
 
     # ── seed 적용 (복리 재투자) ────────────────────────────────
     if REINVEST:
@@ -636,6 +649,7 @@ def run_one_symbol(broker: Broker, symbol_config):
         save_state(symbol, state)
 
     last_price = strategy_result['last_price']
+    # [DRY READONLY] close_prices: in-memory only — no save_state() reachable in DRY
     close_prices = state.get("close_prices", [])
     if last_price > 0:
         close_prices = [p for p in close_prices if isinstance(p, (int, float)) and p > 0]
@@ -1401,6 +1415,222 @@ def _clear_fence_only():
     print(f"[fence 복구] {symbol} 주문 fence를 해제했습니다.")
 
 
+# ── REPAIR 모드 핸들러 ──
+# REPAIR_ACTION이 지정되면 기존 STATE_*_ONLY 핸들러를 재사용합니다.
+# REINFERENCE/FORCE_T는 REPAIR 전용 핸들러로 별도 구현합니다.
+
+# REPAIR_ACTION → 기존 핸들러 매핑 (DIAGNOSTIC除外 — 별도 함수)
+_REPAIR_LEGACY_MAP = {
+    "REVERSE_AUDIT": "_reverse_audit_only",
+    "REVERSE_RECONCILE": "_reverse_reconcile_only",
+    "REVERSE_RESET": "_repair_state_only",
+    "REVERSE_T_FIX": "_repair_state_only",
+    "FENCE_CLEAR": "_clear_fence_only",
+    "NET_INVESTED_REPAIR": "_net_invested_repair_only",
+    "ASSUME_EXPIRY": "_assume_reverse_expiry_only",
+}
+
+# REPAIR 모드에서 허용되는 액션 목록
+_REPAIR_ACTIONS = {"DIAGNOSTIC", "REVERSE_AUDIT", "REVERSE_RECONCILE", "REVERSE_RESET",
+                   "REVERSE_T_FIX", "FENCE_CLEAR", "NET_INVESTED_REPAIR",
+                   "ASSUME_EXPIRY", "REINFERENCE", "FORCE_T"}
+
+
+def _repair_reinference():
+    """REPAIR 모드 전용: FORCE_T_REINFERENCE를 단독 실행합니다.
+
+    기존 main()의 FORCE_T_REINFERENCE 처리를 모방하지만, REPAIR 모드 전용으로
+    브로커/전략/주문 없이 T 재추정만 수행합니다.
+    """
+    import config as runtime_config
+    # REPAIR는 LIVE이더라도 DRY로 고정 (T 재추정 중 주문 방지)
+    if runtime_config.TRADE_MODE != "DRY":
+        runtime_config.TRADE_MODE = "DRY"
+        globals()["TRADE_MODE"] = "DRY"
+        print("[REPAIR] REINFERENCE — 브로커 생성 전 DRY 모드로 고정합니다.")
+
+    broker = create_broker()
+    try:
+        for symbol_config in SYMBOLS:
+            symbol = symbol_config["symbol"]
+            exchange = symbol_config["exchange"]
+            print(f"\n[REPAIR:REINFERENCE] {symbol} T 재추정 시작")
+            state = load_state(symbol)
+
+            # last_updated 초기화 → update_T_from_history가 전체 이력에서 T 재추정
+            if state.get("last_updated"):
+                state["last_updated"] = ""
+
+            history_days = 90
+            order_history = broker.get_order_history(symbol, exchange, days=history_days, verbose=False)
+            try:
+                live_balance = broker.get_balance(symbol, exchange)
+                live_qty = live_balance.quantity if live_balance else 0
+            except Exception as e:
+                print(f"[REPAIR:REINFERENCE] {symbol} 잔고 조회 실패(참고): {e}")
+                live_qty = None
+
+            state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
+            save_state(symbol, state)
+            print(
+                f"[REPAIR:REINFERENCE] {symbol} T 재추정 완료 → T={state['T']}, "
+                f"state_hash={canonical_state_hash(state)}"
+            )
+    finally:
+        broker.close()
+    print("[REPAIR:REINFERENCE] 모든 종목 T 재추정 완료. 주문은 실행하지 않았습니다.")
+
+
+def _repair_force_t():
+    """REPAIR 모드 전용: {SYMBOL}_FORCE_T를 단독 실행합니다.
+
+    기존 run_one_symbol()의 FORCE_T 처리를 REPAIR 전용으로 재현합니다.
+    주문은 생성하지 않습니다.
+    """
+    broker = create_broker()
+    try:
+        for symbol_config in SYMBOLS:
+            symbol = symbol_config["symbol"]
+            exchange = symbol_config["exchange"]
+            force_t = symbol_config.get("force_t")
+            if force_t is None:
+                print(f"[REPAIR:FORCE_T] {symbol} FORCE_T 미설정 — 건너뜁니다.")
+                continue
+
+            print(f"\n[REPAIR:FORCE_T] {symbol} FORCE_T={force_t} 적용 시작")
+            state = load_state(symbol)
+
+            if _has_unresolved_reverse_orders(state):
+                print(f"[REPAIR:FORCE_T] {symbol} 미해결 리버스 주문이 있어 FORCE_T 적용 불가 — 건너뜁니다.")
+                continue
+
+            old_T = state["T"]
+            state["T"] = force_t
+            state.pop("balance_mismatch", None)
+            state["orders_meta"] = {}
+            state["additional_loc_odno"] = []
+            state["reverse_mode"] = {}
+
+            # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
+            # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
+            # 주문 시각으로 last_updated를 갱신합니다.
+            order_history = broker.get_order_history(symbol, exchange, days=90, verbose=False)
+            latest_ord_dt = ""
+            for o in order_history:
+                odt = o.get("ord_datetime_utc", "")
+                if odt and odt > latest_ord_dt:
+                    latest_ord_dt = odt
+            if latest_ord_dt:
+                state["last_updated"] = latest_ord_dt
+                latest_order = next(
+                    o for o in order_history
+                    if o.get("ord_datetime_utc") == latest_ord_dt
+                )
+                state["last_processed_ordno"] = latest_order.get("odno", "")
+            else:
+                state["last_updated"] = datetime.now(ZoneInfo("UTC")).isoformat()
+                state["last_processed_ordno"] = ""
+
+            if force_t == 0:
+                state["cycle_start_date"] = ""
+                state["net_invested"] = 0.0
+                state["net_invested_status"] = "valid"
+
+            save_state(symbol, state)
+            print(f"[REPAIR:FORCE_T] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), 저장 완료.")
+    finally:
+        broker.close()
+    print("[REPAIR:FORCE_T] 모든 종목 FORCE_T 적용 완료. 주문은 실행하지 않았습니다.")
+
+
+def _dispatch_repair():
+    """REPAIR 모드의 메인 진입점.
+
+    액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 **정확히
+    하나**일 때만 실행합니다. 0개 또는 2개 이상이면 sys.exit(1)로 중단합니다.
+    단일 소스가 레거시 변수면 기존 핸들러로, REPAIR_ACTION이면 매핑된
+    핸들러(REINFERENCE/FORCE_T는 REPAIR 전용)로 디스패치합니다.
+    """
+    import config as runtime_config
+
+    # ── 액션 소스 집계 ──
+    # FORCE_T*는 "FORCE_T 계열"을 하나의 소스로 봅니다 (여러 종목 동시 설정 허용).
+    sources = []
+    if REPAIR_ACTION:
+        sources.append(f"REPAIR_ACTION={REPAIR_ACTION}")
+    legacy_flags = {
+        "STATE_DIAGNOSTIC_ONLY": STATE_DIAGNOSTIC_ONLY,
+        "STATE_REPAIR_ONLY": STATE_REPAIR_ONLY,
+        "STATE_CLEAR_FENCE_ONLY": STATE_CLEAR_FENCE_ONLY,
+        "STATE_REVERSE_AUDIT_ONLY": STATE_REVERSE_AUDIT_ONLY,
+        "STATE_REVERSE_RECONCILE_ONLY": STATE_REVERSE_RECONCILE_ONLY,
+        "STATE_NET_INVESTED_REPAIR_ONLY": STATE_NET_INVESTED_REPAIR_ONLY,
+        "STATE_ASSUME_REVERSE_EXPIRY_ONLY": STATE_ASSUME_REVERSE_EXPIRY_ONLY,
+    }
+    for name, enabled in legacy_flags.items():
+        if enabled:
+            sources.append(name)
+    if runtime_config.FORCE_T_REINFERENCE:
+        sources.append("FORCE_T_REINFERENCE")
+    if any(cfg.get("force_t") is not None for cfg in SYMBOLS):
+        sources.append("{SYMBOL}_FORCE_T")
+
+    if len(sources) != 1:
+        print(f"[REPAIR] 액션 소스가 {len(sources)}개 감지되었습니다. 정확히 1개여야 합니다.")
+        for s in sources:
+            print(f"  - {s}")
+        print("  REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T* 중 하나만 설정하세요.")
+        sys.exit(1)
+
+    source = sources[0]
+    print(f"[REPAIR] 액션 소스: {source}")
+
+    # ── 디스패치 ──
+    if source.startswith("REPAIR_ACTION="):
+        action = REPAIR_ACTION
+        if action not in _REPAIR_ACTIONS:
+            print(f"[REPAIR] 잘못된 REPAIR_ACTION: '{action}'. 허용 값: {sorted(_REPAIR_ACTIONS)}")
+            sys.exit(1)
+        if action == "DIAGNOSTIC":
+            _print_state_diagnostic()
+        elif action == "REINFERENCE":
+            _repair_reinference()
+        elif action == "FORCE_T":
+            _repair_force_t()
+        elif action in _REPAIR_LEGACY_MAP:
+            globals()[_REPAIR_LEGACY_MAP[action]]()
+        else:
+            # 방어적 — 위 검증에서 걸러지지만 추가 안전장치
+            print(f"[REPAIR] 처리할 수 없는 액션: {action}")
+            sys.exit(1)
+    else:
+        # 레거시 단일 소스 → 기존 핸들러로 디스패치
+        if source == "STATE_DIAGNOSTIC_ONLY":
+            _print_state_diagnostic()
+        elif source == "STATE_REPAIR_ONLY":
+            _repair_state_only()
+        elif source == "STATE_CLEAR_FENCE_ONLY":
+            _clear_fence_only()
+        elif source == "STATE_REVERSE_AUDIT_ONLY":
+            _reverse_audit_only()
+        elif source == "STATE_REVERSE_RECONCILE_ONLY":
+            _reverse_reconcile_only()
+        elif source == "STATE_NET_INVESTED_REPAIR_ONLY":
+            _net_invested_repair_only()
+        elif source == "STATE_ASSUME_REVERSE_EXPIRY_ONLY":
+            _assume_reverse_expiry_only()
+        elif source == "FORCE_T_REINFERENCE":
+            _repair_reinference()
+        elif source == "{SYMBOL}_FORCE_T":
+            _repair_force_t()
+        else:
+            # 방어적 — 위 집계에서 걸러지지만 추가 안전장치
+            print(f"[REPAIR] 처리할 수 없는 소스: {source}")
+            sys.exit(1)
+
+    print(f"[REPAIR] {source} 완료.")
+
+
 def main():
     """
     자동매매 봇의 메인 실행 함수입니다.
@@ -1408,9 +1638,20 @@ def main():
     SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
     한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
     """
+    # ── 모드 불변식 ──
+    # TRADE_MODE는 DRY(프리뷰, 상태 저장 없음) / LIVE(실주문) / REPAIR(유지보수) 중 하나입니다.
+    # REPAIR는 액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 정확히
+    # 하나일 때만 실행하며, 0개 또는 2개 이상이면 _dispatch_repair()가 sys.exit(1)로 중단합니다.
+    # REPAIR 체크를 레거시 STATE_*_ONLY보다 먼저 수행해 REPAIR 모드의 단일 액션
+    # 불변식을 항상 강제합니다.
+    if TRADE_MODE == "REPAIR":
+        _dispatch_repair()
+        return
+
     if STATE_DIAGNOSTIC_ONLY:
         _print_state_diagnostic()
         return
+
     if STATE_REPAIR_ONLY:
         _repair_state_only()
         return
@@ -1535,6 +1776,16 @@ def main():
         for symbol_config in SYMBOLS:
             try:
                 run_one_symbol(broker, symbol_config)
+
+                # 섀도우 원장: DRY + SHADOW_LOG=true 시에만 실행합니다.
+                # 실제 state.json/주문/텔레그램에 닿지 않는 독립 가상 원장이며,
+                # 실패해도 DRY 실행을 절대 깨지 않습니다 (경고 출력만).
+                if TRADE_MODE == "DRY" and os.getenv("SHADOW_LOG", "").strip().lower() == "true":
+                    try:
+                        from shadow import run_shadow_symbol
+                        run_shadow_symbol(broker, symbol_config)
+                    except Exception as shadow_error:
+                        print(f"[shadow] 경고: {symbol_config['symbol']} 섀도우 원장 실행 실패 — {shadow_error}")
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]

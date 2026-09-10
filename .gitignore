@@ -38,3 +38,6 @@ Thumbs.db
 
 # 테스트 출력 캐시 (API 응답 덤프)
 tests/output/
+
+# 섀도우 원장 (가상 원장 — git 미추적, 로컬 전용)
+.shadow/
