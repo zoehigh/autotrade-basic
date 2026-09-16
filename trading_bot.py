@@ -1777,15 +1777,6 @@ def main():
             try:
                 run_one_symbol(broker, symbol_config)
 
-                # 섀도우 원장: DRY + SHADOW_LOG=true 시에만 실행합니다.
-                # 실제 state.json/주문/텔레그램에 닿지 않는 독립 가상 원장이며,
-                # 실패해도 DRY 실행을 절대 깨지 않습니다 (경고 출력만).
-                if TRADE_MODE == "DRY" and os.getenv("SHADOW_LOG", "").strip().lower() == "true":
-                    try:
-                        from shadow import run_shadow_symbol
-                        run_shadow_symbol(broker, symbol_config)
-                    except Exception as shadow_error:
-                        print(f"[shadow] 경고: {symbol_config['symbol']} 섀도우 원장 실행 실패 — {shadow_error}")
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]

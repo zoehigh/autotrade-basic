@@ -5,6 +5,9 @@
 - (a) 연속 2회 실행 시 가상 T/cash가 이월되고 원장에 2건이 추가됩니다.
 - (b) 실제 state.json에 닿지 않습니다 (save_state 호출 0회).
 - (c) broker.place_order를 호출하지 않습니다.
+- (d) 전량매도 후 T>0 → 사이클 리셋 (T=0, 시드 갱신).
+- (e) SHADOW_FEE_RATE 수수료가 매수/매도에 반영됩니다.
+- (f) SHADOW_SLIPPAGE_BPS 슬리피지가 체결가에 반영됩니다.
 """
 import json
 import os
@@ -23,6 +26,9 @@ if _src_path not in sys.path:
 
 import shadow.ledger as shadow_ledger
 from broker.base import Balance, PurchaseAmount, StockPrice, StockQuotation
+
+# v1.1 가정 목록 (A1-A6 + B1-B4)
+_EXPECTED_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "B4"]
 
 
 def _symbol_config(seed=8000.0):
@@ -80,21 +86,25 @@ def shadow_env(monkeypatch, tmp_path):
 
 class TestShadowLedger:
     def test_two_runs_carry_forward_and_append(self, shadow_env):
-        """(a) 연속 2회 실행: T/cash 이월 + 원장 2건."""
+        """(a) 연속 2회 실행: T/cash 이월 + 원장 2건.
+
+        기본 수수료(COMMISSION_RATE=0.0025)가 적용됩니다:
+          BUY 2주 @50 → cash -= 2*50*1.0025 = 100.25
+        """
         broker = _make_broker()
         cfg = _symbol_config(seed=8000.0)
 
         shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
         shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
 
-        # 스냅샷: T=2.0, cash=8000-200, holdings=4, net_invested=200
+        # 스냅샷: T=2.0, cash=8000-100.25*2, holdings=4, net_invested=200
         with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
             snap = json.load(f)
         assert snap["T"] == 2.0
-        assert snap["cash_usd"] == 7800.0
+        assert snap["cash_usd"] == 7799.5
         assert snap["holdings"] == 4
         assert snap["net_invested"] == 200.0
-        assert snap["assumption_version"] == "v1.0"
+        assert snap["assumption_version"] == "v1.1"
 
         # 원장: 2건 (JSONL 1파일)
         ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
@@ -102,14 +112,14 @@ class TestShadowLedger:
         with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
             lines = [json.loads(line) for line in f if line.strip()]
         assert len(lines) == 2
-        assert all(e["assumption_version"] == "v1.0" for e in lines)
+        assert all(e["assumption_version"] == "v1.1" for e in lines)
         assert all(e["fill_ratio"] == 1.0 for e in lines)
-        assert all(e["fee_usd"] == 0.0 for e in lines)
-        assert all(e["assumptions"] == ["A1", "A2", "A3", "A4", "A5", "A6"] for e in lines)
+        assert all(e["fee_usd"] == 0.25 for e in lines)  # 2*50*0.0025
+        assert all(e["assumptions"] == _EXPECTED_ASSUMPTIONS for e in lines)
         assert lines[0]["virtual_state_after"]["T"] == 1.0
         assert lines[1]["virtual_state_after"]["T"] == 2.0
-        assert lines[0]["virtual_state_after"]["cash_usd"] == 7900.0
-        assert lines[1]["virtual_state_after"]["cash_usd"] == 7800.0
+        assert lines[0]["virtual_state_after"]["cash_usd"] == 7899.75
+        assert lines[1]["virtual_state_after"]["cash_usd"] == 7799.5
 
     def test_no_save_state_call(self, shadow_env, monkeypatch):
         """(b) 실제 state.json에 닿지 않습니다 — save_state 호출 0회."""
@@ -163,3 +173,104 @@ class TestShadowLedger:
             "주문이 없으면 원장 디렉터리를 만들지 않아야 합니다"
         assert os.path.exists(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")), \
             "스냅샷은 as_of 갱신을 위해 저장되어야 합니다"
+
+    def test_fee_applied(self, shadow_env, monkeypatch):
+        """(e) SHADOW_FEE_RATE 수수료가 매수에 반영됩니다 (fee 1%)."""
+        monkeypatch.setenv("SHADOW_FEE_RATE", "0.01")
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+
+        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        # BUY 2주 @50, fee 1% → cash = 8000 - 2*50*1.01 = 7899
+        assert snap["cash_usd"] == 7899.0
+        assert snap["holdings"] == 2
+        assert snap["net_invested"] == 100.0  # fee는 net_invested에 미포함
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            event = json.loads(f.readline())
+        assert event["fee_usd"] == 1.0
+        assert event["assumed_fill_price"] == 50.0  # 슬리피지 없음
+
+    def test_slippage_applied(self, shadow_env, monkeypatch):
+        """(f) SHADOW_SLIPPAGE_BPS 슬리피지가 매수 체결가에 반영됩니다 (2%)."""
+        monkeypatch.setenv("SHADOW_SLIPPAGE_BPS", "200")
+        monkeypatch.setenv("SHADOW_FEE_RATE", "0")  # 슬리피지만 검증
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+
+        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        # BUY 2주 @50, slippage 2% → fill 51.0 → cash = 8000 - 2*51 = 7898
+        assert snap["cash_usd"] == 7898.0
+        assert snap["avg_price"] == 51.0
+        assert snap["net_invested"] == 102.0
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            event = json.loads(f.readline())
+        assert event["assumed_fill_price"] == 51.0
+        assert event["fee_usd"] == 0.0  # 수수료 미설정
+
+    def test_cycle_reset_after_full_sell(self, shadow_env, monkeypatch):
+        """(d) 전량매도 후 T>0 → 사이클 리셋 (T=0, 시드 갱신)."""
+        monkeypatch.setenv("SHADOW_FEE_RATE", "0")  # 수수료 없이 리셋만 검증
+
+        def _sell_strategy(broker, **kwargs):
+            state = kwargs.get("state", {})
+            holdings = state.get("holdings", 0)
+            return {
+                "symbol": kwargs.get("symbol", "TQQQ"),
+                "exchange": kwargs.get("exchange_code", "NAS"),
+                "tradable": True,
+                "open_price": 49.0,
+                "last_price": 50.0,
+                "position_qty": holdings,
+                "avg_price": 50.0,
+                "orderable_cash": 8000.0,
+                "seed": kwargs.get("seed", 8000.0),
+                "remaining_seed": 8000.0,
+                "T": kwargs.get("T", 0.0),
+                "unit_amount": 0.0,
+                "unit_qty": 0,
+                "star_point": None,
+                "star_buy_price": None,
+                "take_profit_price": None,
+                "orders": [
+                    {"side": "SELL", "quantity": holdings, "price": 50.0,
+                     "order_type": "MOC", "comment": "테스트 전량매도",
+                     "t_target": 0.9},
+                ],
+            }
+        monkeypatch.setattr(shadow_ledger, "무한매수법_V4", _sell_strategy)
+
+        # 사전 스냅샷: T=5, holdings=5, cash=7500 (5주 @50 매수 후)
+        snap_dir = os.path.join(shadow_env, "snapshots")
+        os.makedirs(snap_dir, exist_ok=True)
+        with open(os.path.join(snap_dir, "TQQQ_latest.json"), "w") as f:
+            json.dump({
+                "symbol": "TQQQ", "T": 5.0, "cash_usd": 7500.0, "holdings": 5,
+                "avg_price": 50.0, "net_invested": 250.0,
+                "net_invested_status": "valid",
+                "reverse_mode": {"active": False}, "close_prices": [],
+                "assumption_version": "v1.1",
+                "as_of": "2026-01-01T00:00:00+00:00",
+            }, f)
+
+        shadow_ledger.run_shadow_symbol(
+            _make_broker(), _symbol_config(seed=8000.0), snapshot_dir=shadow_env
+        )
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["T"] == 0.0
+        assert snap["holdings"] == 0
+        assert snap["net_invested"] == 0.0
+        assert snap["avg_price"] == 0.0
+        # cash = 7500 + 5*50 = 7750 (수수료 0) → 다음 시드로 갱신
+        assert snap["cash_usd"] == 7750.0
