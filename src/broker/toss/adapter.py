@@ -163,10 +163,26 @@ class TossBroker(Broker):
                         time.sleep(wait_time)
                         continue
 
-                    resp.raise_for_status()
+                    # 4xx/5xx: 에러 envelope 먼저 파싱后再 raise (raise_for_status 전에)
+                    if resp.status_code >= 400:
+                        try:
+                            err_body = resp.json()
+                        except (ValueError, TypeError):
+                            err_body = {}
+                        err_envelope = err_body.get("error", {}) if isinstance(err_body, dict) else {}
+                        if err_envelope:
+                            code = err_envelope.get("code", "")
+                            message = err_envelope.get("message", "알 수 없는 오류")
+                            if code in ("invalid-token", "expired-token", "edge-blocked"):
+                                raise AuthError(f"토스 인증 오류 [{code}]: {message}")
+                            raise BrokerError(f"토스 API 오류 [{code}]: {message}")
+                        # envelope 없음 — transport 수준 이상으로 간주
+                        reason = resp.reason or resp.status_code
+                        raise BrokerError(f"토스 API 오류 [HTTP {resp.status_code}]: {str(reason)[:100]}")
+
                     body = resp.json()
 
-                    # 토스 공통 에러 envelope 처리
+                    # 토스 공통 에러 envelope 처리 (200 + error)
                     if "error" in body:
                         error = body["error"]
                         code = error.get("code", "")
