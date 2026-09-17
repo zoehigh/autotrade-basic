@@ -2,12 +2,13 @@
 섀도우 원장(shadow/) 테스트.
 
 검증 대상:
-- (a) 연속 2회 실행 시 가상 T/cash가 이월되고 원장에 2건이 추가됩니다.
+- (a) 연속 2회 전체 사이클(GENERATE+SETTLE): 가상 T/cash 이월 + 원장 4건.
 - (b) 실제 state.json에 닿지 않습니다 (save_state 호출 0회).
 - (c) broker.place_order를 호출하지 않습니다.
 - (d) 전량매도 후 T>0 → 사이클 리셋 (T=0, 시드 갱신).
 - (e) SHADOW_FEE_RATE 수수료가 매수/매도에 반영됩니다.
 - (f) SHADOW_SLIPPAGE_BPS 슬리피지가 체결가에 반영됩니다.
+- 2단계(v1.2): generate는 의도만 기록, settle은 종가 대조 체결/만료.
 """
 import json
 import os
@@ -28,8 +29,8 @@ import shadow.ledger as shadow_ledger
 from broker.base import Balance, PurchaseAmount, StockPrice, StockQuotation
 from shadow.broker import VirtualBroker
 
-# v1.1 가정 목록 (A1-A6 + B1-B4)
-_EXPECTED_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "B4"]
+# v1.2 가정 목록 (A1-A6 + C1)
+_EXPECTED_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "C1"]
 
 
 def _symbol_config(seed=8000.0):
@@ -49,7 +50,65 @@ def _make_broker():
     broker.get_stock_price.return_value = StockPrice(open=49.0, last=50.0)
     broker.get_balance.return_value = Balance(quantity=0, avg_price=0.0)
     broker.get_purchase_amount.return_value = PurchaseAmount(orderable_cash=8000.0)
+    broker.get_daily_closes.return_value = [50.0]
     return broker
+
+
+def _orders_strategy(orders):
+    """지정된 주문 목록을 반환하는 가짜 전략 (state 기반 position)."""
+    def _strategy(broker, **kwargs):
+        state = kwargs.get("state", {})
+        holdings = state.get("holdings", 0)
+        return {
+            "symbol": kwargs.get("symbol", "TQQQ"),
+            "exchange": kwargs.get("exchange_code", "NAS"),
+            "tradable": True,
+            "open_price": 49.0,
+            "last_price": 50.0,
+            "position_qty": holdings,
+            "avg_price": state.get("avg_price", 0.0),
+            "orderable_cash": state.get("cash_usd", 8000.0),
+            "seed": kwargs.get("seed", 8000.0),
+            "remaining_seed": 8000.0,
+            "T": kwargs.get("T", 0.0),
+            "unit_amount": 0.0,
+            "unit_qty": 0,
+            "star_point": None,
+            "star_buy_price": None,
+            "take_profit_price": None,
+            "orders": orders,
+        }
+    return _strategy
+
+
+def _seed_snapshot(snapshot_dir, holdings=0, T=0.0, cash=8000.0, avg=0.0, net_invested=0.0):
+    """사전 상태 스냅샷을 생성합니다 (v1.2 스키마)."""
+    snap_dir = os.path.join(snapshot_dir, "snapshots")
+    os.makedirs(snap_dir, exist_ok=True)
+    with open(os.path.join(snap_dir, "TQQQ_latest.json"), "w") as f:
+        json.dump({
+            "symbol": "TQQQ",
+            "schema_version": "v1.2",
+            "phase": "settled",
+            "T": T,
+            "cash_usd": cash,
+            "holdings": holdings,
+            "avg_price": avg,
+            "net_invested": net_invested,
+            "net_invested_status": "valid",
+            "reverse_mode": {"active": False},
+            "close_prices": [],
+            "pending_intents": [],
+            "assumption_version": "v1.2",
+            "as_of": "2026-01-01T00:00:00+00:00",
+        }, f)
+
+
+def _generate_and_settle(broker, cfg, snapshot_dir, close_price):
+    """GENERATE → SETTLE 전체 사이클 (fake broker 종가 고정)."""
+    shadow_ledger.generate_symbol(broker, cfg, snapshot_dir=snapshot_dir)
+    broker.get_daily_closes.return_value = [close_price]
+    shadow_ledger.settle_symbol(broker, cfg, snapshot_dir=snapshot_dir)
 
 
 def _fake_strategy(broker, **kwargs):
@@ -87,16 +146,16 @@ def shadow_env(monkeypatch, tmp_path):
 
 class TestShadowLedger:
     def test_two_runs_carry_forward_and_append(self, shadow_env):
-        """(a) 연속 2회 실행: T/cash 이월 + 원장 2건.
+        """(a) 2회 전체 사이클(GENERATE+SETTLE): T/cash 이월 + 원장 4건.
 
         기본 수수료(COMMISSION_RATE=0.0025)가 적용됩니다:
-          BUY 2주 @50 → cash -= 2*50*1.0025 = 100.25
+          BUY 2주 @50(종가) → cash -= 2*50*1.0025 = 100.25
         """
         broker = _make_broker()
         cfg = _symbol_config(seed=8000.0)
 
-        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
-        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
+        for _ in range(2):
+            _generate_and_settle(broker, cfg, shadow_env, close_price=50.0)
 
         # 스냅샷: T=2.0, cash=8000-100.25*2, holdings=4, net_invested=200
         with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
@@ -105,22 +164,36 @@ class TestShadowLedger:
         assert snap["cash_usd"] == 7799.5
         assert snap["holdings"] == 4
         assert snap["net_invested"] == 200.0
-        assert snap["assumption_version"] == "v1.1"
+        assert snap["assumption_version"] == "v1.2"
+        assert snap["schema_version"] == "v1.2"
+        assert snap["phase"] == "settled"
+        assert snap["pending_intents"] == []
 
-        # 원장: 2건 (JSONL 1파일)
+        # 원장: 4건 (intent 2 + settlement 2, JSONL 1파일)
         ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
         assert len(ledger_files) == 1
         with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
             lines = [json.loads(line) for line in f if line.strip()]
-        assert len(lines) == 2
-        assert all(e["assumption_version"] == "v1.1" for e in lines)
-        assert all(e["fill_ratio"] == 1.0 for e in lines)
-        assert all(e["fee_usd"] == 0.25 for e in lines)  # 2*50*0.0025
+        assert len(lines) == 4
+        assert all(e["assumption_version"] == "v1.2" for e in lines)
         assert all(e["assumptions"] == _EXPECTED_ASSUMPTIONS for e in lines)
-        assert lines[0]["virtual_state_after"]["T"] == 1.0
-        assert lines[1]["virtual_state_after"]["T"] == 2.0
-        assert lines[0]["virtual_state_after"]["cash_usd"] == 7899.75
-        assert lines[1]["virtual_state_after"]["cash_usd"] == 7799.5
+
+        intents = [e for e in lines if e["event_type"] == "intent"]
+        settlements = [e for e in lines if e["event_type"] == "settlement"]
+        assert len(intents) == 2
+        assert len(settlements) == 2
+        assert all(e["status"] == "pending" for e in intents)
+        assert all("virtual_state_before" in e for e in intents)
+        assert all(e["filled"] is True for e in settlements)
+        assert all(e["fill_price"] == 50.0 for e in settlements)
+        assert all(e["fee_usd"] == 0.25 for e in settlements)  # 2*50*0.0025
+        # intent_event_id 링크
+        assert settlements[0]["intent_event_id"] == intents[0]["event_id"]
+        assert settlements[1]["intent_event_id"] == intents[1]["event_id"]
+        assert settlements[0]["virtual_state_after"]["T"] == 1.0
+        assert settlements[1]["virtual_state_after"]["T"] == 2.0
+        assert settlements[0]["virtual_state_after"]["cash_usd"] == 7899.75
+        assert settlements[1]["virtual_state_after"]["cash_usd"] == 7799.5
 
     def test_no_save_state_call(self, shadow_env, monkeypatch):
         """(b) 실제 state.json에 닿지 않습니다 — save_state 호출 0회."""
@@ -176,12 +249,12 @@ class TestShadowLedger:
             "스냅샷은 as_of 갱신을 위해 저장되어야 합니다"
 
     def test_fee_applied(self, shadow_env, monkeypatch):
-        """(e) SHADOW_FEE_RATE 수수료가 매수에 반영됩니다 (fee 1%)."""
+        """(e) SHADOW_FEE_RATE 수수료가 매수 체결에 반영됩니다 (fee 1%)."""
         monkeypatch.setenv("SHADOW_FEE_RATE", "0.01")
         broker = _make_broker()
         cfg = _symbol_config(seed=8000.0)
 
-        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
+        _generate_and_settle(broker, cfg, shadow_env, close_price=50.0)
 
         with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
             snap = json.load(f)
@@ -192,9 +265,10 @@ class TestShadowLedger:
 
         ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
         with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
-            event = json.loads(f.readline())
-        assert event["fee_usd"] == 1.0
-        assert event["assumed_fill_price"] == 50.0  # 슬리피지 없음
+            events = [json.loads(line) for line in f if line.strip()]
+        settlement = [e for e in events if e["event_type"] == "settlement"][0]
+        assert settlement["fee_usd"] == 1.0
+        assert settlement["fill_price"] == 50.0  # 슬리피지 없음
 
     def test_slippage_applied(self, shadow_env, monkeypatch):
         """(f) SHADOW_SLIPPAGE_BPS 슬리피지가 매수 체결가에 반영됩니다 (2%)."""
@@ -203,7 +277,7 @@ class TestShadowLedger:
         broker = _make_broker()
         cfg = _symbol_config(seed=8000.0)
 
-        shadow_ledger.run_shadow_symbol(broker, cfg, snapshot_dir=shadow_env)
+        _generate_and_settle(broker, cfg, shadow_env, close_price=50.0)
 
         with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
             snap = json.load(f)
@@ -214,9 +288,10 @@ class TestShadowLedger:
 
         ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
         with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
-            event = json.loads(f.readline())
-        assert event["assumed_fill_price"] == 51.0
-        assert event["fee_usd"] == 0.0  # 수수료 미설정
+            events = [json.loads(line) for line in f if line.strip()]
+        settlement = [e for e in events if e["event_type"] == "settlement"][0]
+        assert settlement["fill_price"] == 51.0
+        assert settlement["fee_usd"] == 0.0  # 수수료 미설정
 
     def test_cycle_reset_after_full_sell(self, shadow_env, monkeypatch):
         """(d) 전량매도 후 T>0 → 사이클 리셋 (T=0, 시드 갱신)."""
@@ -251,21 +326,10 @@ class TestShadowLedger:
         monkeypatch.setattr(shadow_ledger, "무한매수법_V4", _sell_strategy)
 
         # 사전 스냅샷: T=5, holdings=5, cash=7500 (5주 @50 매수 후)
-        snap_dir = os.path.join(shadow_env, "snapshots")
-        os.makedirs(snap_dir, exist_ok=True)
-        with open(os.path.join(snap_dir, "TQQQ_latest.json"), "w") as f:
-            json.dump({
-                "symbol": "TQQQ", "T": 5.0, "cash_usd": 7500.0, "holdings": 5,
-                "avg_price": 50.0, "net_invested": 250.0,
-                "net_invested_status": "valid",
-                "reverse_mode": {"active": False}, "close_prices": [],
-                "assumption_version": "v1.1",
-                "as_of": "2026-01-01T00:00:00+00:00",
-            }, f)
+        _seed_snapshot(shadow_env, holdings=5, T=5.0, cash=7500.0, avg=50.0, net_invested=250.0)
 
-        shadow_ledger.run_shadow_symbol(
-            _make_broker(), _symbol_config(seed=8000.0), snapshot_dir=shadow_env
-        )
+        broker = _make_broker()
+        _generate_and_settle(broker, _symbol_config(seed=8000.0), shadow_env, close_price=50.0)
 
         with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
             snap = json.load(f)
@@ -410,3 +474,176 @@ class TestVirtualBroker:
         assert vb.name == "fake"
         real_broker.get_stock_price.assert_called_once()
         real_broker.get_daily_closes.assert_called_once()
+
+
+class TestShadowTwoPhase:
+    """2단계(v1.2) GENERATE/SETTLE: 의도 기록 → 종가 대조 체결/만료."""
+
+    def test_generate_writes_pendings_no_state_change(self, shadow_env):
+        """(a) GENERATE: 의도만 기록 — cash/holdings/T 변화 없음."""
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+
+        shadow_ledger.generate_symbol(broker, cfg, snapshot_dir=shadow_env)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["T"] == 0.0
+        assert snap["cash_usd"] == 8000.0
+        assert snap["holdings"] == 0
+        assert snap["net_invested"] == 0.0
+        assert snap["phase"] == "generating"
+        assert len(snap["pending_intents"]) == 1
+        pi = snap["pending_intents"][0]
+        assert pi["side"] == "BUY"
+        assert pi["order_type"] == "LOC"
+        assert pi["intent_price"] == 50.0
+        assert pi["intent_qty"] == 2
+
+        # 원장: intent 이벤트 1건 (virtual_state_before, status=pending)
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["event_type"] == "intent"
+        assert ev["status"] == "pending"
+        assert ev["assumption_version"] == "v1.2"
+        assert ev["assumptions"] == _EXPECTED_ASSUMPTIONS
+        assert "virtual_state_before" in ev
+        assert "virtual_state_after" not in ev
+        assert ev["virtual_state_before"]["cash_usd"] == 8000.0
+
+    def test_settle_buy_loc_fills_at_close(self, shadow_env):
+        """(b) SETTLE: BUY LOC는 close<=limit이면 종가에 체결됩니다."""
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+
+        shadow_ledger.generate_symbol(broker, cfg, snapshot_dir=shadow_env)
+        broker.get_daily_closes.return_value = [45.0]  # close 45 <= limit 50
+        shadow_ledger.settle_symbol(broker, cfg, snapshot_dir=shadow_env)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["phase"] == "settled"
+        assert snap["pending_intents"] == []
+        assert snap["holdings"] == 2
+        assert snap["T"] == 1.0
+        # BUY 2 @45(종가), fee 0.0025 → cash = 8000 - 2*45*1.0025 = 7909.775
+        assert snap["cash_usd"] == 7909.775
+        assert snap["avg_price"] == 45.0
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        assert len(events) == 2
+        intent, settlement = events
+        assert settlement["event_type"] == "settlement"
+        assert settlement["intent_event_id"] == intent["event_id"]
+        assert settlement["filled"] is True
+        assert settlement["daily_close"] == 45.0
+        assert settlement["fill_price"] == 45.0  # 종가 체결
+        assert settlement["fill_qty"] == 2
+        assert settlement["fill_ratio"] == 1.0
+        assert settlement["fee_usd"] == 0.225  # 2*45*0.0025
+        assert settlement["t_delta"] == 1.0
+
+    def test_unfilled_expires_no_state_change(self, shadow_env):
+        """(c) SETTLE: BUY LOC 미체결(close>limit) → 만료, 상태 변화 없음."""
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+
+        shadow_ledger.generate_symbol(broker, cfg, snapshot_dir=shadow_env)
+        broker.get_daily_closes.return_value = [55.0]  # close 55 > limit 50 → 미체결
+        shadow_ledger.settle_symbol(broker, cfg, snapshot_dir=shadow_env)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["phase"] == "settled"
+        assert snap["pending_intents"] == []
+        assert snap["T"] == 0.0
+        assert snap["cash_usd"] == 8000.0
+        assert snap["holdings"] == 0
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        settlement = events[1]
+        assert settlement["event_type"] == "settlement"
+        assert settlement["filled"] is False
+        assert settlement["fill_qty"] == 0
+        assert settlement["fill_ratio"] == 0.0
+        assert settlement["fee_usd"] == 0.0
+        assert settlement["t_delta"] == 0.0
+        assert settlement["virtual_state_after"]["cash_usd"] == 8000.0
+
+    def test_moc_always_fills(self, shadow_env, monkeypatch):
+        """(d) SETTLE: MOC는 close와 무관하게 항상 종가 체결됩니다."""
+        monkeypatch.setenv("SHADOW_FEE_RATE", "0")  # 수수료 없이 체결만 검증
+        _seed_snapshot(shadow_env, holdings=5, T=5.0, cash=7500.0, avg=50.0, net_invested=250.0)
+
+        monkeypatch.setattr(
+            shadow_ledger, "무한매수법_V4",
+            _orders_strategy([
+                {"side": "SELL", "quantity": 1, "price": 50.0,
+                 "order_type": "MOC", "comment": "테스트 MOC 매도", "t_target": 0.9},
+            ]),
+        )
+
+        broker = _make_broker()
+        _generate_and_settle(broker, _symbol_config(seed=8000.0), shadow_env, close_price=60.0)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["holdings"] == 4
+        assert snap["T"] == 5.9
+        assert snap["cash_usd"] == 7560.0  # 7500 + 1*60 (수수료 0)
+        assert snap["net_invested"] == 190.0  # 250 - 60
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        settlement = events[1]
+        assert settlement["filled"] is True
+        assert settlement["fill_price"] == 60.0  # 종가 체결
+        assert settlement["t_delta"] == 0.9
+
+    def test_limit_day_fills_at_intent_price(self, shadow_env, monkeypatch):
+        """(e) SETTLE: LIMIT DAY는 close가 조건을 만족하면 의도가격 체결 (C1)."""
+        monkeypatch.setenv("SHADOW_FEE_RATE", "0")
+        _seed_snapshot(shadow_env, holdings=5, T=5.0, cash=7500.0, avg=50.0, net_invested=250.0)
+
+        monkeypatch.setattr(
+            shadow_ledger, "무한매수법_V4",
+            _orders_strategy([
+                {"side": "SELL", "quantity": 2, "price": 55.0,
+                 "order_type": "LIMIT", "comment": "테스트 익절 LIMIT", "t_target": 0.0},
+            ]),
+        )
+
+        broker = _make_broker()
+        cfg = _symbol_config(seed=8000.0)
+        # close 60 >= limit 55 → 체결, 의도가격(55) 체결
+        _generate_and_settle(broker, cfg, shadow_env, close_price=60.0)
+
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["holdings"] == 3
+        assert snap["cash_usd"] == 7610.0  # 7500 + 2*55 (의도가격, 수수료 0)
+        assert snap["T"] == 5.0  # t_target=0
+
+        ledger_files = os.listdir(os.path.join(shadow_env, "ledger"))
+        with open(os.path.join(shadow_env, "ledger", ledger_files[0])) as f:
+            events = [json.loads(line) for line in f if line.strip()]
+        settlement = events[1]
+        assert settlement["filled"] is True
+        assert settlement["fill_price"] == 55.0  # 의도가격 (C1), close 60 아님
+        assert settlement["daily_close"] == 60.0
+
+        # 미체결 케이스: close 50 < limit 55 → SELL LIMIT 만료, 상태 변화 없음
+        _generate_and_settle(broker, cfg, shadow_env, close_price=50.0)
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["holdings"] == 3
+        assert snap["cash_usd"] == 7610.0
+        assert snap["T"] == 5.0

@@ -1,4 +1,4 @@
-"""섀도우 원장 구현 (v1.1 — 로컬 전용 독립 러너).
+"""섀도우 원장 구현 (v1.2 — 2단계 GENERATE/SETTLE, 로컬 전용 독립 러너).
 
 실제 state.json / save_state / GH 캐시 / 실제 주문 / 텔레그램에 전혀 닿지 않는
 독립 가상 원장입니다. scripts/shadow_runner.py에서 호출합니다.
@@ -6,17 +6,28 @@
 ⚠️  GH Actions 미지원 — .state.json만 캐시하는 ephemeral 러너입니다.
     실계좌 파생값(수수료율 등)이 포함되므로 artifact를 장기보관하지 마세요.
 
-가정(Assumptions) v1.1:
-  A1: 주문은 의도가격(intent_price)에 전량 체결된다
-  A2: 체결 비율(fill_ratio)은 항상 1.0이다
+2단계 흐름 (v1.2):
+  - generate_symbol(): 전략 호출 → 의도(intent)만 기록 (체결/회계 없음)
+  - settle_symbol():   pending 의도를 실제 일봉 종가와 대조해 체결/만료 처리
+  - run_shadow_symbol(): generate 래퍼 (v1.1 하위 호환 — 테스트/러너 기본값)
+
+가정(Assumptions) v1.2:
+  A1: 주문은 전량 체결(all-or-none)된다 — 부분체결 없음
+  A2: 체결 비율(fill_ratio)은 1.0(전량) 또는 0.0(미체결)이다
   A3: 수수료(fee_usd)는 기본 0.0이나 SHADOW_FEE_RATE로 제어 가능하다
   A4: 주문 거부(rejection)는 없다
   A5: 가상 원장은 실제 state.json과 완전히 독립적이다
   A6: 시장 데이터는 읽기 전용 참조이며 실패 시 무시된다
-  B1: 수수료(fee)는 매수·매도 양방향에 fee_rate × qty × price로 부과된다
-  B2: 슬리피지(slippage)는 slippage_bps/10000로 가격을 보정한다
-  B3: 미체결/부분체결은 없다 (A2와 동일, future 확장용 명시)
-  B4: 전량매도(보유=0) 후 T>0이면 사이클 리셋 — 시드=시드+순수익, T/net_invested/avg=0
+  C1: LIMIT DAY 주문은 close가 limit 조건을 만족하면 의도가격(intent_price)에 체결된다
+  (B1 수수료/B2 슬리피지/B4 사이클 리셋 동작은 v1.1과 동일하게 유지 —
+   이벤트 assumptions 목록에는 A1-A6+C1만 기록)
+
+체결 규칙 (settle):
+  - BUY  LOC: close <= limit 이면 종가 체결
+  - SELL LOC: close >= limit 이면 종가 체결
+  - MOC:      항상 종가 체결 (TOSS SELL MOC→$0.01 proxy도 MOC로 간주)
+  - LIMIT DAY: close가 limit 조건을 만족하면 의도가격 체결 (C1)
+  - 미체결은 만료(expire) — 다음 날로 이월하지 않음
 """
 import hashlib
 import json
@@ -28,8 +39,13 @@ from datetime import datetime, timezone
 from shadow.broker import VirtualBroker
 from strategy import 무한매수법_V4
 
-_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "B4"]
-_ASSUMPTION_VERSION = "v1.1"
+_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "C1"]
+_ASSUMPTION_VERSION = "v1.2"
+
+_REVERSE_FIELDS = (
+    "reverse_action", "reverse_day", "reverse_base_t",
+    "reverse_t_factor", "reverse_t_target",
+)
 
 
 def _utc_now_iso():
@@ -40,6 +56,8 @@ def _bootstrap_snapshot(symbol_config):
     """신규 가상 스냅샷을 생성합니다. 실제 state.json은 절대 읽지 않습니다."""
     return {
         "symbol": symbol_config["symbol"],
+        "schema_version": _ASSUMPTION_VERSION,
+        "phase": "settled",  # 대기 의도 없음
         "T": 0.0,
         "cash_usd": float(symbol_config["seed"]),
         "holdings": 0,
@@ -48,6 +66,7 @@ def _bootstrap_snapshot(symbol_config):
         "net_invested_status": "valid",  # 신규 부트스트랩은 신뢰 가능
         "reverse_mode": {"active": False},
         "close_prices": [],
+        "pending_intents": [],
         "assumption_version": _ASSUMPTION_VERSION,
         "as_of": _utc_now_iso(),
     }
@@ -203,16 +222,34 @@ def _strategy_output_ref(result):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
-    """섀도우 원장 1회 실행 (로컬 전용 독립 러너).
+def _decide_fill(order_type, side, intent_price, daily_close):
+    """체결 여부/체결가 결정 (v1.2 fill rules).
 
-    ⚠️  GH Actions 미지원 — .state.json만 캐시하는 ephemeral 러너입니다.
-        실계좌 파생값(수수료율 등)이 포함되므로 artifact를 장기보관하지 마세요.
+    Returns:
+        tuple[bool, float]: (체결 여부, 체결가). 미체결 시 체결가는 daily_close.
+    """
+    if order_type == "MOC":
+        return True, daily_close  # MOC는 항상 종가 체결
+    if order_type == "LOC":
+        if side == "BUY":
+            return (daily_close <= intent_price), daily_close
+        return (daily_close >= intent_price), daily_close
+    if order_type == "LIMIT":
+        # LIMIT DAY: close가 limit 조건을 만족하면 의도가격 체결 (C1)
+        if side == "BUY":
+            return (daily_close <= intent_price), intent_price
+        return (daily_close >= intent_price), intent_price
+    # 그 외 주문 유형(MOO/LOO 등)은 shadow 미지원 → 미체결
+    return False, daily_close
+
+
+def generate_symbol(broker, symbol_config, snapshot_dir=".shadow"):
+    """1단계 GENERATE: 전략 호출 → 의도(intent)만 기록 (체결/회계 없음).
 
     - 실제 state.json / save_state / 주문 / 텔레그램에 절대 닿지 않습니다.
-    - 전략은 가상 상태 복사본으로 호출하고, 결과 주문을 fee+slippage 반영
-      가상 회계에 반영한 뒤 JSONL 원장 + 스냅샷을 기록합니다.
-    - 주문이 없으면 원장 기록은 생략하고 스냅샷 as_of만 갱신합니다.
+    - 전략은 가상 상태 복사본으로 호출하고, 결과 주문을 pending 의도로만
+      JSONL 원장 + 스냅샷(pending_intents)에 기록합니다.
+    - 주문이 없으면 원장 기록은 생략하고 스냅샷 phase만 갱신합니다.
     """
     symbol = symbol_config["symbol"]
     exchange = symbol_config["exchange"]
@@ -228,11 +265,17 @@ def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
 
     # ── 시뮬레이션 경고 ──
     print(
-        f"[shadow] ⚠️  SIMULATION ONLY — {symbol} "
+        f"[shadow] ⚠️  SIMULATION ONLY — {symbol} GENERATE "
         f"({_ASSUMPTION_VERSION}, fee={fee_rate*100:.2f}%, slippage={slippage_bps:.0f}bps)"
     )
 
     snapshot = _load_snapshot(snapshot_dir, symbol_config)
+
+    if snapshot.get("pending_intents"):
+        print(
+            f"[shadow] {symbol} 기존 대기 의도 {len(snapshot['pending_intents'])}건을 "
+            f"새 의도로 대체합니다."
+        )
 
     # ── 가상 브로커: 전략이 읽는 잔고/주문가능금액을 스냅샷 기준으로 제공 ──
     #    실제 브로커 잔고를 그대로 읽으면 가상 포트폴리오에 없는 주식의
@@ -275,53 +318,185 @@ def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
 
     ref = _strategy_output_ref(result)
 
-    # ── 주문별 가상 체결 + 원장 기록 ──
-    total_fee = 0.0
+    # ── 의도(intent)만 기록 — 체결/회계 없음 ──
+    pending = []
     for order in orders:
         qty = int(order.get("quantity", 0))
         price = float(order.get("price", 0.0) or 0.0)
-        fill_result = _apply_order(snapshot, order, fee_rate=fee_rate, slippage_bps=slippage_bps)
-        t_delta = fill_result["t_delta"]
-        fee_usd = fill_result["fee_usd"]
-        fill_price = fill_result["assumed_fill_price"]
-        total_fee += fee_usd
+        event_id = uuid.uuid4().hex
 
         event = {
-            "event_id": uuid.uuid4().hex,
+            "event_id": event_id,
             "timestamp_utc": _utc_now_iso(),
+            "event_type": "intent",
+            "status": "pending",
             "symbol": symbol,
             "side": order.get("side"),
             "order_type": order.get("order_type"),
             "intent_price": price,
             "intent_qty": qty,
-            "assumed_fill_price": fill_price,
-            "fill_ratio": 1.0,            # A2
-            "fee_usd": fee_usd,
             "t_target": order.get("t_target"),
-            "t_delta": t_delta,
             "assumptions": list(_ASSUMPTIONS),
             "assumption_version": _ASSUMPTION_VERSION,
             "market_snapshot": market_snapshot,
-            "virtual_state_after": deepcopy(snapshot),
+            "virtual_state_before": deepcopy(snapshot),
             "strategy_output_ref": ref,
         }
         # 리버스 필드 passthrough (order에 있으면 그대로 기록)
-        for key in (
-            "reverse_action", "reverse_day", "reverse_base_t",
-            "reverse_t_factor", "reverse_t_target",
-        ):
+        for key in _REVERSE_FIELDS:
             if order.get(key) is not None:
                 event[key] = order[key]
 
         _append_ledger(snapshot_dir, symbol, event)
 
-    # ── 사이클 리셋 (B4): 전량매도 후 T>0이면 시드 갱신 ──
-    cycle_reset = _maybe_reset_cycle(snapshot, seed, fee_rate)
+        # pending_intents 최소 필드 (settle에서 사용)
+        pending.append({
+            "event_id": event_id,
+            "side": order.get("side"),
+            "order_type": order.get("order_type"),
+            "intent_price": price,
+            "intent_qty": qty,
+            "t_target": order.get("t_target"),
+            "comment": order.get("comment"),
+            **{key: order.get(key) for key in _REVERSE_FIELDS if order.get(key) is not None},
+        })
 
-    # ── 스냅샷 저장 (주문이 없어도 as_of 갱신) ──
+    # ── 스냅샷 저장 (pending 의도 + phase) ──
+    snapshot["pending_intents"] = pending
+    snapshot["phase"] = "generating" if pending else "settled"
     _save_snapshot(snapshot_dir, symbol, snapshot)
     print(
-        f"[shadow] {symbol} 실행 완료 — 주문 {len(orders)}건, "
+        f"[shadow] {symbol} GENERATE 완료 — 의도 {len(orders)}건 기록 (체결 대기), "
+        f"T={snapshot['T']}, cash=${snapshot['cash_usd']:.2f}, "
+        f"holdings={snapshot['holdings']}"
+    )
+    return snapshot
+
+
+def settle_symbol(broker, symbol_config, snapshot_dir=".shadow"):
+    """2단계 SETTLE: pending 의도를 실제 일봉 종가와 대조해 체결/만료 처리.
+
+    - get_daily_closes(days=1) 마지막 값을 일봉 종가로 사용합니다.
+    - 체결 규칙은 _decide_fill 참고. 체결 시에만 가상 회계(_apply_order) 적용.
+    - 미체결 의도는 만료(expire) — 다음 날로 이월하지 않습니다.
+    - 종가를 구할 수 없으면(휴장 등) 의도를 유지하고 종료합니다.
+    """
+    symbol = symbol_config["symbol"]
+    exchange = symbol_config["exchange"]
+    seed = float(symbol_config["seed"])
+
+    # ── 수수료/슬리피지 파라미터 (환경변수) ──
+    default_commission = float(os.getenv("COMMISSION_RATE", "0.0025"))
+    fee_rate = float(os.getenv("SHADOW_FEE_RATE", str(default_commission)))
+    slippage_bps = float(os.getenv("SHADOW_SLIPPAGE_BPS", "0"))
+
+    snapshot = _load_snapshot(snapshot_dir, symbol_config)
+    pending = snapshot.get("pending_intents", []) or []
+
+    if not pending:
+        print(f"[shadow] {symbol} SETTLE — 대기 의도 없음 (스킵)")
+        snapshot["phase"] = "settled"
+        _save_snapshot(snapshot_dir, symbol, snapshot)
+        return snapshot
+
+    # ── 일봉 종가 조회 (days=1 마지막 값) ──
+    try:
+        closes = broker.get_daily_closes(symbol, exchange, days=1)
+    except Exception as e:
+        print(f"[shadow] {symbol} SETTLE — 종가 조회 실패, 의도 유지: {e}")
+        return snapshot
+    if not closes:
+        print(f"[shadow] {symbol} SETTLE — 종가 없음 (휴장?), 의도 유지")
+        return snapshot
+    daily_close = float(closes[-1])
+
+    print(
+        f"[shadow] {symbol} SETTLE — 일봉 종가 ${daily_close:.2f}, "
+        f"의도 {len(pending)}건"
+    )
+
+    total_fee = 0.0
+    filled_count = 0
+    for intent in pending:
+        order_type = intent.get("order_type")
+        side = intent.get("side")
+        intent_price = float(intent.get("intent_price", 0.0) or 0.0)
+        intent_qty = int(intent.get("intent_qty", 0))
+
+        filled, fill_price = _decide_fill(order_type, side, intent_price, daily_close)
+
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "timestamp_utc": _utc_now_iso(),
+            "event_type": "settlement",
+            "intent_event_id": intent.get("event_id"),
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "intent_price": intent_price,
+            "intent_qty": intent_qty,
+            "daily_close": daily_close,
+            "filled": filled,
+            "assumptions": list(_ASSUMPTIONS),
+            "assumption_version": _ASSUMPTION_VERSION,
+        }
+        # 리버스 필드 passthrough
+        for key in _REVERSE_FIELDS:
+            if intent.get(key) is not None:
+                event[key] = intent[key]
+
+        if filled:
+            # 체결: 가상 회계 적용 (fill_price 기준, B1 수수료 + B2 슬리피지)
+            order = {
+                "side": side,
+                "quantity": intent_qty,
+                "price": fill_price,
+                "order_type": order_type,
+                "comment": intent.get("comment"),
+                "t_target": intent.get("t_target"),
+            }
+            for key in _REVERSE_FIELDS:
+                if intent.get(key) is not None:
+                    order[key] = intent[key]
+            fill_result = _apply_order(
+                snapshot, order, fee_rate=fee_rate, slippage_bps=slippage_bps
+            )
+            event["fill_price"] = fill_result["assumed_fill_price"]
+            event["fill_qty"] = intent_qty
+            event["fill_ratio"] = 1.0            # A2
+            event["fee_usd"] = fill_result["fee_usd"]
+            event["t_delta"] = fill_result["t_delta"]
+            total_fee += fill_result["fee_usd"]
+            filled_count += 1
+        else:
+            # 미체결 → 만료 (상태 변화 없음)
+            event["fill_price"] = None
+            event["fill_qty"] = 0
+            event["fill_ratio"] = 0.0
+            event["fee_usd"] = 0.0
+            event["t_delta"] = 0.0
+
+        event["virtual_state_after"] = deepcopy(snapshot)
+        _append_ledger(snapshot_dir, symbol, event)
+
+    # ── pending 초기화 + 사이클 리셋 (B4) ──
+    snapshot["pending_intents"] = []
+    snapshot["phase"] = "settled"
+    _maybe_reset_cycle(snapshot, seed, fee_rate)
+
+    _save_snapshot(snapshot_dir, symbol, snapshot)
+    print(
+        f"[shadow] {symbol} SETTLE 완료 — 체결 {filled_count}/{len(pending)}건, "
         f"수수료=${total_fee:.4f}, T={snapshot['T']}, "
         f"cash=${snapshot['cash_usd']:.2f}, holdings={snapshot['holdings']}"
     )
+    return snapshot
+
+
+def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
+    """GENERATE 래퍼 (v1.1 하위 호환 — 테스트/러너 기본값).
+
+    v1.2부터는 generate_symbol()/settle_symbol() 2단계로 분리되었습니다.
+    이 함수는 1단계(GENERATE)만 수행합니다.
+    """
+    return generate_symbol(broker, symbol_config, snapshot_dir)
