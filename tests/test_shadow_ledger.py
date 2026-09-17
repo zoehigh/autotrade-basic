@@ -26,6 +26,7 @@ if _src_path not in sys.path:
 
 import shadow.ledger as shadow_ledger
 from broker.base import Balance, PurchaseAmount, StockPrice, StockQuotation
+from shadow.broker import VirtualBroker
 
 # v1.1 가정 목록 (A1-A6 + B1-B4)
 _EXPECTED_ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "B4"]
@@ -274,3 +275,138 @@ class TestShadowLedger:
         assert snap["avg_price"] == 0.0
         # cash = 7500 + 5*50 = 7750 (수수료 0) → 다음 시드로 갱신
         assert snap["cash_usd"] == 7750.0
+
+
+class TestVirtualBroker:
+    """VirtualBroker: 전략이 가상 스냅샷을 읽도록 강제하는 래퍼."""
+
+    def test_real_holdings_do_not_produce_phantom_sell(self, shadow_env, monkeypatch):
+        """(a) 실제 브로커가 100주를 보유해도 가상 스냅샷(0주) 기준이면 SELL 없음.
+
+        회귀 버그: run_shadow_symbol이 실제 브로커를 전략에 넘겨
+        가상 포트폴리오에 없는 주식의 팬텀 매도가 발생하던 문제.
+        """
+        def _balance_based_strategy(broker, **kwargs):
+            # 전략은 broker.get_balance()로 보유 수량을 판단합니다.
+            balance = broker.get_balance(
+                kwargs.get("symbol"), kwargs.get("exchange_code")
+            )
+            holdings = balance.quantity if balance else 0
+            orders = []
+            if holdings > 0:
+                orders.append({
+                    "side": "SELL", "quantity": holdings, "price": 50.0,
+                    "order_type": "MOC", "comment": "테스트 매도", "t_target": 0.9,
+                })
+            return {
+                "symbol": kwargs.get("symbol", "TQQQ"),
+                "exchange": kwargs.get("exchange_code", "NAS"),
+                "tradable": True,
+                "open_price": 49.0,
+                "last_price": 50.0,
+                "position_qty": holdings,
+                "avg_price": balance.avg_price if balance else 0.0,
+                "orderable_cash": 8000.0,
+                "seed": kwargs.get("seed", 8000.0),
+                "remaining_seed": 8000.0,
+                "T": kwargs.get("T", 0.0),
+                "unit_amount": 0.0,
+                "unit_qty": 0,
+                "star_point": None,
+                "star_buy_price": None,
+                "take_profit_price": None,
+                "orders": orders,
+            }
+        monkeypatch.setattr(shadow_ledger, "무한매수법_V4", _balance_based_strategy)
+
+        # 실제 브로커: 100주 보유 + 현금 $999,999 (버그 시 팬텀 매도 유발)
+        real_broker = MagicMock()
+        real_broker.get_stock_quotation.return_value = StockQuotation(tradable=True, last=50.0)
+        real_broker.get_stock_price.return_value = StockPrice(open=49.0, last=50.0)
+        real_broker.get_balance.return_value = Balance(quantity=100, avg_price=50.0)
+        real_broker.get_purchase_amount.return_value = PurchaseAmount(orderable_cash=999999.0)
+
+        shadow_ledger.run_shadow_symbol(
+            real_broker, _symbol_config(seed=8000.0), snapshot_dir=shadow_env
+        )
+
+        # 가상 스냅샷: holdings=0 그대로, cash=8000 그대로 (매도 없음)
+        with open(os.path.join(shadow_env, "snapshots", "TQQQ_latest.json")) as f:
+            snap = json.load(f)
+        assert snap["holdings"] == 0, "가상 포트폴리오에 없는 주식을 매도하면 안 됩니다"
+        assert snap["cash_usd"] == 8000.0, "팬텀 매도로 가상 현금이 늘면 안 됩니다"
+        assert snap["T"] == 0.0
+
+        # 원장에 SELL 이벤트가 없어야 합니다 (주문 0건 → 원장 미생성)
+        assert not os.path.exists(os.path.join(shadow_env, "ledger")), \
+            "SELL 주문이 없으므로 원장이 생성되면 안 됩니다"
+
+    def test_place_order_raises(self):
+        """(b) VirtualBroker.place_order/cancel_order는 항상 RuntimeError."""
+        real_broker = MagicMock()
+        vb = VirtualBroker(real_broker, {"holdings": 0, "avg_price": 0.0, "cash_usd": 8000.0})
+
+        with pytest.raises(RuntimeError, match="가상 체결만 사용"):
+            vb.place_order("TQQQ", "NAS", "BUY", 1, 50.0, "LIMIT")
+        with pytest.raises(RuntimeError, match="가상 체결만 사용"):
+            vb.cancel_order("odno123")
+        # 실제 브로커의 주문 메서드는 절대 호출되지 않아야 합니다
+        real_broker.place_order.assert_not_called()
+        real_broker.cancel_order.assert_not_called()
+
+    def test_balance_and_purchase_amount_from_snapshot(self):
+        """(c) get_balance/get_purchase_amount는 스냅샷 값을 제공합니다.
+
+        스냅샷 dict를 live 참조하므로, 스냅샷 변경이 다음 읽기에 즉시 반영됩니다.
+        """
+        snapshot = {"holdings": 3, "avg_price": 70.0, "cash_usd": 5000.0}
+        real_broker = MagicMock()
+        real_broker.get_balance.return_value = Balance(quantity=100, avg_price=50.0)
+        real_broker.get_purchase_amount.return_value = PurchaseAmount(orderable_cash=999999.0)
+        vb = VirtualBroker(real_broker, snapshot)
+
+        # 가상 값 제공 (실제 브로커 값 아님)
+        bal = vb.get_balance("TQQQ", "NAS")
+        assert bal.quantity == 3
+        assert bal.avg_price == 70.0
+        ps = vb.get_purchase_amount("TQQQ", "NAS")
+        assert ps.orderable_cash == 5000.0
+
+        # holdings<=0 → None (실제 브로커와 동일 규약)
+        snapshot["holdings"] = 0
+        assert vb.get_balance("TQQQ", "NAS") is None
+
+        # live 참조: 스냅샷 변경이 즉시 반영
+        snapshot["holdings"] = 5
+        snapshot["avg_price"] = 80.0
+        snapshot["cash_usd"] = 6000.0
+        bal2 = vb.get_balance("TQQQ", "NAS")
+        assert bal2.quantity == 5
+        assert bal2.avg_price == 80.0
+        assert vb.get_purchase_amount("TQQQ", "NAS").orderable_cash == 6000.0
+
+        # 실제 브로커 조회는 호출되지 않아야 합니다
+        real_broker.get_balance.assert_not_called()
+        real_broker.get_purchase_amount.assert_not_called()
+
+    def test_delegates_market_data_to_real_broker(self):
+        """시세/이력/거래일 등은 실제 브로커에 그대로 위임됩니다."""
+        real_broker = MagicMock()
+        real_broker.get_stock_price.return_value = StockPrice(open=49.0, last=50.0)
+        real_broker.get_stock_quotation.return_value = StockQuotation(tradable=True, last=50.0)
+        real_broker.get_daily_closes.return_value = [48.0, 49.0, 50.0]
+        real_broker.get_order_history.return_value = [{"odno": "1"}]
+        real_broker.is_trading_day.return_value = True
+        real_broker.exchange_code.return_value = "NASD"
+        real_broker.name = "fake"
+        vb = VirtualBroker(real_broker, {"holdings": 0, "avg_price": 0.0, "cash_usd": 8000.0})
+
+        assert vb.get_stock_price("TQQQ", "NAS").last == 50.0
+        assert vb.get_stock_quotation("TQQQ", "NAS").tradable is True
+        assert vb.get_daily_closes("TQQQ", "NAS", 5) == [48.0, 49.0, 50.0]
+        assert vb.get_order_history("TQQQ", "NAS") == [{"odno": "1"}]
+        assert vb.is_trading_day() is True
+        assert vb.exchange_code("NAS") == "NASD"
+        assert vb.name == "fake"
+        real_broker.get_stock_price.assert_called_once()
+        real_broker.get_daily_closes.assert_called_once()

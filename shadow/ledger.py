@@ -25,6 +25,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 
+from shadow.broker import VirtualBroker
 from strategy import 무한매수법_V4
 
 _ASSUMPTIONS = ["A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "B3", "B4"]
@@ -233,10 +234,17 @@ def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
 
     snapshot = _load_snapshot(snapshot_dir, symbol_config)
 
+    # ── 가상 브로커: 전략이 읽는 잔고/주문가능금액을 스냅샷 기준으로 제공 ──
+    #    실제 브로커 잔고를 그대로 읽으면 가상 포트폴리오에 없는 주식의
+    #    팬텀 매도(무료 가상 현금)가 발생하고 매수가 항상 생략됩니다.
+    #    VirtualBroker는 스냅샷 dict를 live 참조하므로 아래 가상 체결 반영이
+    #    다음 전략 호출에 즉시 보입니다.
+    virtual_broker = VirtualBroker(broker, snapshot)
+
     # ── 전략 호출 (가상 상태 복사본, T는 스냅샷 기준) ──
     virtual_state = deepcopy(snapshot)
     result = 무한매수법_V4(
-        broker,
+        virtual_broker,
         symbol=symbol,
         exchange_code=exchange,
         splits=splits,
@@ -260,7 +268,7 @@ def run_shadow_symbol(broker, symbol_config, snapshot_dir=".shadow"):
         "avg_price": result.get("avg_price"),
     }
     try:
-        psamount = broker.get_purchase_amount(symbol, exchange)
+        psamount = virtual_broker.get_purchase_amount(symbol, exchange)
         market_snapshot["purchase_amount"] = psamount.orderable_cash
     except Exception:
         market_snapshot["purchase_amount"] = None

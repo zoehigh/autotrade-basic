@@ -3,6 +3,7 @@
 로컬 전용 독립 러너(scripts/shadow_runner.py)에서 호출합니다.
 실제 state.json / save_state / GH 캐시 / 실제 주문 / 텔레그램에 절대 닿지 않습니다.
 """
+from shadow.broker import VirtualBroker
 from shadow.ledger import run_shadow_symbol
 
-__all__ = ["run_shadow_symbol"]
+__all__ = ["run_shadow_symbol", "VirtualBroker"]
