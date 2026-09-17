@@ -138,6 +138,7 @@ uv run pytest tests/test_kiwoom_integration.py -v  # 특정 파일도 자격증�
 - 대체: `cancel` 미구현 시 비정상 주문(예: `99999주/$0.01`)으로 `OrderNotAcceptedError` 거부 확인만으로 대체. 성공 접수 경로는 모의 첫 주문으로 위임.
 - 전량매도 복원(`매수 체결→다음날 매도해 잔고 0`)은 사전 필수 아님 — 모의 진입 후 보정으로 위임.
 - 데모 `LOC/MOC→LIMIT` 변환은 어댑터 로그(`요청 타입 vs 실제 전송 타입`)로만 확인. 종가 체결 차이는 실전 소액 LIVE에서 확인.
+- TOSS: 접수 직후 CLOSED 이력에 열린 주문이 잡히지 않음 → `odno` 매칭은 취소 후 이력에서 검증. 취소는 try/finally로 보장하며(실주문 방치 금지), 취소 실패 시 odno를 경고 출력해 수동 취소.
 
 **실행**:
 ```bash
@@ -264,16 +265,18 @@ uv run pytest tests/test_broker_preflight.py -v
   - **BUY LOC +19% 보정과 쿼터매수 상호작용**: `trading_bot.py`의 BUY LOC 가격 보정(`last_price × 1.19` 초과 시 `last×1.19`로 교정)이 리버스 쿼터매수(`star-0.01`, 별지점=5일MA)에도 적용됨. 하락장이 전제인 리버스에서는 별지점이 현재가보다 19% 이상 높아 **일반모드보다 훨씬 자주 발동** → notify 다발 + 매수가가 의도(별지점 대기)와 다른 `last×1.19`로 보정될 수 있음. 미해결 리스크로 기록 (기능 실패는 아님)
   - **데모 모드 MOC/LOC→LIMIT 변환**: KIS/KIWOOM 데모는 MOC/LOC/LOO/MOO를 `LIMIT`으로 자동 변환(LS는 `DEMO_UNSUPPORTED_ORDER_TYPES`가 비어 있어 변환 없음). 리버스 "마감 체결" 전제가 깨져 데모(장중 체결 가능)와 실전(마감 체결) 결과가 달라질 수 있음. T 반영은 체결 이력 기준이라 정합성은 유지
   - **실전 pre-market MOC/LOC 제출 미실증**: `trading_bot.py`는 실전에서 pre-market(ET ~04:00)까지 대기 후 주문. MOC/LOC(마감가 주문)는 통상 정규장에만 접수되므로 ET 04:00 제출 시 브로커가 거부/보류할 수 있음. KIS(33)/LS(M4)/KIWOOM(33) 실전의 "MOC+가격" 전송 및 TOSS CLS 주문의 pre-market 접수 여부는 **실전 배포 전 1회 검증 필요**
+  - **TOSS `prerequisite-required` 실측**: `ETF 거래를 위한 요건이 부족합니다` — 신규 매수 주문에 걸리며 기존 보유와 무관(보유 중이어도 매수 차단). 투자성향(자금투자성향) 앱 등록으로 해소됨 확인 (교육 이수 아님). 해소 후 다음 관문은 `insufficient-buying-power`(주문가능금액 부족). 4xx 응답은 에러 envelope 선파싱 후 `OrderNotAcceptedError` 확정거부로 처리 (`toss/adapter.py _request_with_rate_retry()`)
 - **STATE_DIAGNOSTIC_ONLY=true**: GitHub Actions 캐시의 T/reverse_mode 상태만 출력하고 브로커 API, 전략, 주문을 실행하지 않음. 일회성 진단 후 즉시 해제
 - **STATE_REPAIR_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 리버스 상태를 1회 초기화. `STATE_REPAIR_*` 변수는 실행 직후 삭제
   - `STATE_REPAIR_TARGET_T={value}` (선택): 기본 초기화 대신 **T만 보정**하고 리버스 cycle/orders_meta를 보존. ord_dt vs submitted_at 날짜 컨벤션 버그로 오반영된 T(예: 20→15)를 되돌려 다음 RUN의 `reconcile_reverse_fills`가 체결 기반으로 재계산(예: 20→18)하도록 하는 용도. fingerprint는 기존과 동일하게 필요
 - **STATE_CLEAR_FENCE_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 주문 fence(`pending_order_intent`/`pending_order_batch`)를 1회 초기화. `STATE_CLEAR_FENCE_SYMBOL` + `STATE_CLEAR_FENCE_EXPECT_T`/`EXPECT_LAST_UPDATED`/`EXPECT_INTENT`/`EXPECT_BATCH` 필요 (intent/batch는 빈 값 = "fence 없음" 의미, env var 존재만 필수). 실행 직후 변수 삭제
 - **LIVE 주문 fence**: 주문 전 `pending_order_batch`/`pending_order_intent`를 캐시에 저장하며, fence가 남아 있어도 **전체 중단하지 않고** 해당 종목만 복구를 시도합니다 (다른 종목은 계속 진행)
   - **미접수 확정(`OrderNotAcceptedError`)**: 브로커가 명시적으로 거부(사전검증 실패 또는 거부 응답)해 주문이 접수되지 않았음이 보장되면 fence를 해제하고 해당 종목의 남은 주문만 중단 → 다음 종목 계속 진행
-  - **불확실(네트워크 타임아웃/연결 오류, 주문번호 누락, checkpoint 실패)**: fence 유지 → 그 실행은 중단. **다음 RUN에서 자동 복구**를 시도합니다
+  - **불확실(네트워크 타임아웃/연결 오류, 주문번호 누락)**: fence 유지 → 해당 종목만 중단, 다음 종목은 계속 진행 (`SymbolScopedError`). **다음 RUN에서 자동 복구**를 시도합니다. state 저장 실패(intent/checkpoint)는 공통 장애로 전체 중단 (`GlobalScopedError`, 단일 `.state.json` 공유 때문)
   - **이전 세션 자동 복구** (`_recover_order_fence`, `trading_bot.py`): 주문이력/잔고 reconciliation(Step 1~3)을 정상 통과한 뒤, fence의 `submitted_session`(intent)/`session`(batch)이 오늘 미국(ET) 세션보다 과거면 이력이 정착된 것으로 보고 fence를 해제하고 정상 진행. 잔고 조회 실패(None) 또는 같은 세션/세션 정보 없음이면 보수적으로 fence 유지 + 해당 종목만 중단
   - fence 복구는 1일 1회 실행 + 당일 유효 주문(LOC/MOC/LIMIT) 특성상 전일 미확정 주문이 하루 뒤 이력으로 판별 가능하므로 안전합니다
   - `STATE_CLEAR_FENCE_ONLY`로 수동 해소 가능 (자동 복구가 안 되는 경우)
+  - **collar 경계 probe** (`tests/test_broker_preflight.py`, `COLLAR_PROBES`): 시장성 probe(매수 상단 ×1.19/×1.21, 매도 하단 ×0.80)는 실전에서 실제 체결이 발생하므로 `COLLAR_PROBE_LIVE_FILL=true`일 때만 실행(기본 skip). 비시장성(매수 하단 ×0.90, 매도 상단 ×1.50)만 접수→이력 매칭→취소→0체결 확인. 매도 probe는 보유 수량 있을 때만 시도. KIS 운용 기준: 매수 현재가 −97%~+20%, 매도 −20%~+200% (현지 브로커별 변동, LS FAQ는 브로커별 10~20% 명시)
 - **close_prices**: state.json에 최근 5거래일 종가 저장 (Finnhub fallback용)
 - **`get_daily_closes()`** (`src/broker/base.py`):
   - Broker 추상 메서드: `(symbol, exchange, days=5) → list[float]` (오래된 종가순)

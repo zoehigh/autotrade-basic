@@ -29,6 +29,23 @@ from state import load_state, save_state, update_T_from_history, compute_positio
 from notifier import notify
 
 
+class SymbolScopedError(RuntimeError):
+    """해당 종목만 중단하고 다음 종목으로 계속 진행하는 예외입니다.
+
+    브로커 불확실 실패(네트워크 오류, 주문번호 누락, 접수 응답 없음)로
+    주문 fence를 유지해야 하는 경우에 사용합니다. main()은 이 예외를 받으면
+    로그/알림만 남기고 다음 종목으로 계속 진행합니다.
+    """
+
+
+class GlobalScopedError(RuntimeError):
+    """공통 장애로 전체 실행을 중단하는 예외입니다.
+
+    state 파일 저장 실패 등 모든 종목에 영향을 주는 공통 장애에 사용합니다.
+    main()은 이 예외를 받으면 치명 에러로 처리해 전체 실행을 중단합니다.
+    """
+
+
 STATE_DIAGNOSTIC_ONLY = os.getenv("STATE_DIAGNOSTIC_ONLY", "").strip().lower() == "true"
 STATE_REPAIR_ONLY = os.getenv("STATE_REPAIR_ONLY", "").strip().lower() == "true"
 STATE_CLEAR_FENCE_ONLY = os.getenv("STATE_CLEAR_FENCE_ONLY", "").strip().lower() == "true"
@@ -758,7 +775,7 @@ def run_one_symbol(broker: Broker, symbol_config):
                 try:
                     save_state(symbol, state)
                 except Exception as intent_error:
-                    raise RuntimeError(
+                    raise GlobalScopedError(
                         f"주문 전 intent checkpoint 실패: {intent_error}"
                     ) from intent_error
 
@@ -773,7 +790,9 @@ def run_one_symbol(broker: Broker, symbol_config):
 
             if result:
                 if not str(result.order_id or "").strip():
-                    raise RuntimeError("주문 접수 응답에 유효한 주문번호가 없습니다.")
+                    raise SymbolScopedError(
+                        "주문 접수 응답에 유효한 주문번호가 없습니다. 주문 fence를 유지합니다."
+                    )
                 is_additional = "[추가매수]" in order.get("comment", "")
 
                 # 기존: additional_loc_odno 유지 (미등록 호환)
@@ -823,7 +842,7 @@ def run_one_symbol(broker: Broker, symbol_config):
                     try:
                         save_state(symbol, state)
                     except Exception as checkpoint_error:
-                        raise RuntimeError(
+                        raise GlobalScopedError(
                             f"주문은 접수됐지만 상태 checkpoint에 실패했습니다: {checkpoint_error}"
                         ) from checkpoint_error
 
@@ -857,7 +876,9 @@ def run_one_symbol(broker: Broker, symbol_config):
                     notify(message)
             else:
                 if TRADE_MODE == "LIVE":
-                    raise RuntimeError("주문 접수 응답이 없어 pending intent를 해소하지 못했습니다.")
+                    raise SymbolScopedError(
+                        "주문 접수 응답이 없어 pending intent를 해소하지 못했습니다. 주문 fence를 유지합니다."
+                    )
                 print("✓ 주문 정보 출력 완료")
 
         except OrderNotAcceptedError as error:
@@ -892,13 +913,6 @@ fence: 해제"""
             print(f"✗ 주문 실패: {str(error)}")
             if TRADE_MODE == "LIVE":
                 fatal_order_error = True
-            if any(marker in str(error) for marker in (
-                "checkpoint에 실패했습니다",
-                "intent checkpoint 실패",
-                "유효한 주문번호가 없습니다",
-                "주문 접수 응답",
-            )):
-                fatal_order_error = True
             failed_orders.append(
                 {
                     "comment": order["comment"],
@@ -913,14 +927,20 @@ fence: 해제"""
 접수 여부: 불확실
 fence: 유지"""
             notify(message, urgent=True)
+            if isinstance(error, GlobalScopedError):
+                # 공통 장애(상태 저장 실패)는 전체 실행을 중단합니다.
+                raise
+            if isinstance(error, SymbolScopedError):
+                # 해당 종목만 중단하고 다음 종목으로 계속 진행합니다.
+                raise
             if fatal_order_error:
                 break
             continue
 
     if fatal_order_error:
-        raise RuntimeError(
-            "주문 결과 또는 상태 checkpoint를 확정할 수 없어 주문 fence를 유지합니다. "
-            "추가 주문과 다음 LIVE 실행을 중단합니다."
+        raise SymbolScopedError(
+            "주문 결과를 확정할 수 없어 주문 fence를 유지합니다. "
+            "해당 종목의 남은 주문을 중단합니다 (fence는 종목별로 복구되며 다른 종목은 계속 진행)."
         )
 
     if TRADE_MODE == "LIVE":
@@ -1777,17 +1797,26 @@ def main():
             try:
                 run_one_symbol(broker, symbol_config)
 
+            except GlobalScopedError:
+                # 공통 장애(상태 파일 저장 실패 등)는 전체 실행을 중단합니다.
+                raise
+
+            except SymbolScopedError as error:
+                # 해당 종목만 중단하고 다음 종목으로 계속 진행합니다.
+                symbol = symbol_config["symbol"]
+                print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
+                if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
+                    notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
                 symbol = symbol_config["symbol"]
                 print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
                 if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
                     notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                # 공통/치명 사안(상태 파일, T 불일치, preflight 실패 등)은 전체 중단합니다.
                 if any(marker in str(error) for marker in (
                     "checkpoint 실패",
-                    "fence를 유지",
-                    "유효한 주문번호가 없습니다",
-                    "주문 접수 응답",
                     "상태 파일을 확인할 수 없어",
                     "T=0인데 브로커 잔고",
                     "이력 포지션과 브로커 잔고가 불일치",
