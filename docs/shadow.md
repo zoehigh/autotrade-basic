@@ -42,9 +42,9 @@ TRADE_MODE=DRY uv run python scripts/shadow_runner.py --phase settle
 
 ```
 # 생성: 월~금 17시(서머) / 동절기는 18시로 변경
-0 17 * * 1-5 cd /path/to/autotrade-basic && PATH=/home/ubuntu/.local/bin:/usr/bin:/bin TRADE_MODE=DRY flock -n /tmp/shadow-gen.lock /home/ubuntu/.local/bin/uv run python scripts/shadow_runner.py --phase generate >> .shadow/runner.log 2>&1
+0 17 * * 1-5 cd /path/to/autotrade-basic && mkdir -p .shadow && PATH=/home/ubuntu/.local/bin:/usr/bin:/bin TRADE_MODE=DRY flock -n /tmp/shadow-gen.lock /home/ubuntu/.local/bin/uv run python scripts/shadow_runner.py --phase generate >> .shadow/runner.log 2>&1
 # 정산: 화~토 07시 (금요일분을 토요일 아침에 정산)
-0 7 * * 2-6 cd /path/to/autotrade-basic && PATH=/home/ubuntu/.local/bin:/usr/bin:/bin TRADE_MODE=DRY flock -n /tmp/shadow-settle.lock /home/ubuntu/.local/bin/uv run python scripts/shadow_runner.py --phase settle >> .shadow/runner.log 2>&1
+0 7 * * 2-6 cd /path/to/autotrade-basic && mkdir -p .shadow && PATH=/home/ubuntu/.local/bin:/usr/bin:/bin TRADE_MODE=DRY flock -n /tmp/shadow-settle.lock /home/ubuntu/.local/bin/uv run python scripts/shadow_runner.py --phase settle >> .shadow/runner.log 2>&1
 ```
 
 - `which uv` 경로·repo 경로 교체. 휴장일은 cron 요일(주말) + runner `is_trading_day()` 조기종료로 커버.

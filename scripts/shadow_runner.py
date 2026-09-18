@@ -23,9 +23,9 @@
 
 cron 예시 (평일, 로컬에서만 — 주말은 cron 요일로 제외):
     생성(프리장, 실전 슬롯): 0 17 * * 1-5 (서머) / 0 18 * * 1-5 (동절기)
-        cd /path/to/autotrade-basic && uv run python scripts/shadow_runner.py --phase generate >> .shadow/runner.log 2>&1
+        cd /path/to/autotrade-basic && mkdir -p .shadow && uv run python scripts/shadow_runner.py --phase generate >> .shadow/runner.log 2>&1
     정산(익일 아침, 전일 종가 확정 후):
-        0 7 * * 2-6 cd /path/to/autotrade-basic && uv run python scripts/shadow_runner.py --phase settle >> .shadow/runner.log 2>&1
+        0 7 * * 2-6 cd /path/to/autotrade-basic && mkdir -p .shadow && uv run python scripts/shadow_runner.py --phase settle >> .shadow/runner.log 2>&1
     30 7 * * 1-5 cd /path/to/autotrade-basic && uv run python scripts/shadow_runner.py --phase settle >> .shadow/runner.log 2>&1
 미국 휴장일은 generate가 시작 시 is_trading_day()로 감지해 원장 기록 없이 종료합니다.
 settle은 거래일 체크 없이 실행되며, 대기 의도/종가가 없으면 로그만 남기고 exit 0입니다.
