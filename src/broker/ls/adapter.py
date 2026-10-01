@@ -196,26 +196,29 @@ class LSBroker(Broker):
         raise BrokerError(f"일별종가 조회 실패: LS g3204 및 Finnhub 모두 실패")
 
     def _get_daily_closes_ls(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """LS g3204 TR로 일별주가 조회."""
+        """LS g3204 TR로 일별주가 조회 (차트 경로, 일봉 gubun=2)."""
         ls_exch, _ = convert_exchange_code(exchange)
         keysymbol = build_symbol(symbol, ls_exch)
 
-        end_date = get_kst_now()
-        start_date = end_date - timedelta(days=days * 2 + 5)
-
         body = {
             "g3204InBlock": {
+                "delaygb": "R",
                 "keysymbol": keysymbol,
                 "exchcd": ls_exch,
                 "symbol": symbol.upper(),
-                "gubun": "0",
-                "sdate": start_date.strftime("%Y%m%d"),
-                "edate": end_date.strftime("%Y%m%d"),
+                "gubun": "2",
+                "qrycnt": 100,
+                "comp_yn": "N",
+                "sdate": "",
+                "edate": "",
+                "cts_date": "",
+                "cts_info": "",
+                "sujung": "Y",
             }
         }
 
         try:
-            resp = self._post("/overseas-stock/market-data", tr_id=TR_ID_DAILY_CLOSE, body=body)
+            resp = self._post("/overseas-stock/chart", tr_id=TR_ID_DAILY_CLOSE, body=body)
             data = resp.json()
 
             rsp_cd = data.get("rsp_cd", "")
@@ -226,14 +229,13 @@ class LSBroker(Broker):
             closes = []
             for item in output:
                 try:
-                    close = float(item.get("clos", "0"))
+                    close = float(item.get("close", "0"))
                     if close > 0:
                         closes.append(close)
                 except (ValueError, TypeError):
                     continue
 
-            # KIS/Kiwoom과 동일하게 LS g3204도 최신순 반환 가정 → 역순
-            closes.reverse()
+            # g3204은 오래된순(ascending) 반환 → 마지막 days개가 최근
             return closes[-days:]
 
         except requests.exceptions.RequestException as e:
