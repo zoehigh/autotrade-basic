@@ -266,6 +266,7 @@ uv run pytest tests/test_broker_preflight.py -v
   - **데모 모드 MOC/LOC→LIMIT 변환**: KIS/KIWOOM 데모는 MOC/LOC/LOO/MOO를 `LIMIT`으로 자동 변환(LS는 `DEMO_UNSUPPORTED_ORDER_TYPES`가 비어 있어 변환 없음). 리버스 "마감 체결" 전제가 깨져 데모(장중 체결 가능)와 실전(마감 체결) 결과가 달라질 수 있음. T 반영은 체결 이력 기준이라 정합성은 유지
   - **실전 pre-market MOC/LOC 제출 미실증**: `trading_bot.py`는 실전에서 pre-market(ET ~04:00)까지 대기 후 주문. MOC/LOC(마감가 주문)는 통상 정규장에만 접수되므로 ET 04:00 제출 시 브로커가 거부/보류할 수 있음. KIS(33)/LS(M4)/KIWOOM(33) 실전의 "MOC+가격" 전송 및 TOSS CLS 주문의 pre-market 접수 여부는 **실전 배포 전 1회 검증 필요**
   - **TOSS `prerequisite-required` 실측**: `ETF 거래를 위한 요건이 부족합니다` — 신규 매수 주문에 걸리며 기존 보유와 무관(보유 중이어도 매수 차단). 투자성향(자금투자성향) 앱 등록으로 해소됨 확인 (교육 이수 아님). 해소 후 다음 관문은 `insufficient-buying-power`(주문가능금액 부족). 4xx 응답은 에러 envelope 선파싱 후 `OrderNotAcceptedError` 확정거부로 처리 (`toss/adapter.py _request_with_rate_retry()`)
+  - **LS `08507` 실측**: `ETF/ETN 교육이수 확인 후 매매 가능 합니다` — 레버리지 ETF(TQQQ 등) 매수 시 교육이수 요구. **거래확인서 등록으로 해소됨 확인** (교육이수 불필요). preflight 거부 경로(`99999주/$0.01`)에서도 동일 코드로 확인 가능하며 이력 오염 없음
 - **STATE_DIAGNOSTIC_ONLY=true**: GitHub Actions 캐시의 T/reverse_mode 상태만 출력하고 브로커 API, 전략, 주문을 실행하지 않음. 일회성 진단 후 즉시 해제
 - **STATE_REPAIR_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 리버스 상태를 1회 초기화. `STATE_REPAIR_*` 변수는 실행 직후 삭제
   - `STATE_REPAIR_TARGET_T={value}` (선택): 기본 초기화 대신 **T만 보정**하고 리버스 cycle/orders_meta를 보존. ord_dt vs submitted_at 날짜 컨벤션 버그로 오반영된 T(예: 20→15)를 되돌려 다음 RUN의 `reconcile_reverse_fills`가 체결 기반으로 재계산(예: 20→18)하도록 하는 용도. fingerprint는 기존과 동일하게 필요
@@ -281,7 +282,7 @@ uv run pytest tests/test_broker_preflight.py -v
 - **`get_daily_closes()`** (`src/broker/base.py`):
   - Broker 추상 메서드: `(symbol, exchange, days=5) → list[float]` (오래된 종가순)
   - KIS: HHDFS76240000 → `GET /uapi/overseas-price/v1/quotations/dailyprice` (최신순 → 역순)
-  - LS: g3204 → `POST /overseas-stock/market-data` (최신순 → 역순) + Finnhub candle fallback
+  - LS: g3204 → `POST /overseas-stock/chart` (차트 경로, `gubun="2"` 일봉, 종가 `close`, 오래된순 그대로) + Finnhub candle fallback. 시세 경로(`/market-data`)로 보내면 `IGW00215` 거부됨 (421baf0 실측)
   - KIWOOM: usa06012 → `POST /api/us/chart` (최신순 → 역순)
   - TOSS: `GET /api/v1/candles?interval=1d` (최신순 → `reversed()`)
   - 리버스모드 `_get_reverse_star_point()`에서 close_prices 보강용으로 사용 가능
