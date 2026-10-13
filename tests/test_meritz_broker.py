@@ -588,7 +588,7 @@ def test_history_filters_rows_by_symbol(make_broker):
 
 
 def test_history_pagination_follows_tr_cont_key(make_broker):
-    """rsp_cd=5762/다음 페이지는 tr_cont_key를 원문 그대로 다음 요청에 전달합니다."""
+    """다음 페이지는 tr_cont_key 원문 + tr_cont="1"을 다음 요청에 전달합니다."""
     page2 = dict(PERIOD_ROW, der_no="4614", der_date="20260805",
                  der_exec_ymdh="20260805 04:16:50")
     broker, session = make_broker(
@@ -600,9 +600,89 @@ def test_history_pagination_follows_tr_cont_key(make_broker):
     )
     rows = broker.get_order_history("TQQQ", "NAS")
     assert len(rows) == 2
+    # 첫 요청에는 tr_cont/tr_cont_key 없음
     assert "tr_cont_key" not in session.calls[0]["params"]
+    assert "tr_cont" not in session.calls[0]["params"]
+    # 다음 요청에는 tr_cont="1" + 원문 키 동봉 (공식 paginate와 동일)
+    assert session.calls[1]["params"]["tr_cont"] == "1"
     assert session.calls[1]["params"]["tr_cont_key"] == "NEXTKEY"
     assert len(session.calls) == 3  # 페이지 2 + 당일 1
+
+
+def test_history_pagination_preserves_raw_key(make_broker):
+    """tr_cont_key는 공백 포함 원문 그대로 전달 — strip() 금지 (공식 errors.md 경고)."""
+    broker, session = make_broker(
+        [
+            ok(rsp_cd="5766", data=[dict(PERIOD_ROW)], tr_cont_key="  KEY WITH SPACES  "),
+            ok(rsp_cd="5766", data=[]),          # 두 번째 페이지 — 키 없음 → 종료
+            ok(rsp_cd="5766", data=[]),          # 당일
+        ]
+    )
+    broker.get_order_history("TQQQ", "NAS")
+    # 원문 그대로 (앞뒤 공백 보존) — 공백 제거 시 구간 어긋남/반복 위험
+    assert session.calls[1]["params"]["tr_cont_key"] == "  KEY WITH SPACES  "
+    assert session.calls[1]["params"]["tr_cont"] == "1"
+
+
+def test_next_page_key_raw_preservation():
+    """_next_page_key: 원문 유지, None/빈 문자열만 '' 처리, data 내부 키 인식."""
+    next_key = MeritzBroker._next_page_key
+    assert next_key({}) == ""
+    assert next_key({"tr_cont_key": None}) == ""
+    assert next_key({"tr_cont_key": ""}) == ""
+    # None/""이 아니면 공백만 있는 키도 원문 그대로
+    assert next_key({"tr_cont_key": " "}) == " "
+    assert next_key({"tr_cont_key": "  K  "}) == "  K  "
+    # 본문 최상위 우선, 없으면 data 객체 내부
+    assert next_key({"tr_cont_key": "TOP", "data": {"tr_cont_key": "DATA"}}) == "TOP"
+    assert next_key({"data": {"tr_cont_key": "DATAKEY"}}) == "DATAKEY"
+
+
+def test_history_pagination_stops_on_repeated_key(make_broker, capsys):
+    """이미 본 키가 재등장하면 순회를 중단하고 경고 출력 (무한 루프 방지)."""
+    broker, session = make_broker(
+        [
+            ok(rsp_cd="5766", data=[dict(PERIOD_ROW)], tr_cont_key="SAMEKEY"),
+            ok(rsp_cd="5766", data=[], tr_cont_key="SAMEKEY"),  # 동일 키 반복
+            ok(rsp_cd="5766", data=[]),          # 당일
+        ]
+    )
+    rows = broker.get_order_history("TQQQ", "NAS")
+    out = capsys.readouterr().out
+    assert "페이지 키 반복 감지" in out
+    # 반복 감지 후 중단 → 히스토리 호출 2회 + 당일 1회 (3회 초과 없음)
+    assert len(session.calls) == 3
+    assert session.calls[2]["path"].endswith("/orders/today")
+    assert len(rows) == 1  # 반복 페이지는 수집하지 않음 (첫 페이지분만)
+
+
+def test_history_reaches_page_cap_50(make_broker, capsys):
+    """페이지 상한은 50 — 50페이지까지 순회 후 상한 경고 출력."""
+    from broker.meritz.adapter import _MAX_HISTORY_PAGES
+
+    assert _MAX_HISTORY_PAGES == 50
+
+    # 페이지마다 고유 키 (1..50) → 상한까지 순회, 당일 조회 1회 추가
+    pages = [
+        ok(
+            rsp_cd="5766",
+            data=[dict(PERIOD_ROW, der_no=str(9000 + i))],
+            tr_cont_key=f"KEY{i}",
+        )
+        for i in range(1, 51)
+    ]
+    responses = pages + [ok(rsp_cd="5766", data=[])]  # 당일
+    broker, session = make_broker(responses)
+
+    broker.get_order_history("TQQQ", "NAS")
+    out = capsys.readouterr().out
+    # 50페이지(히스토리) + 당일 1 = 51 호출, 상한 경고 출력
+    assert len(session.calls) == 51
+    assert session.calls[0]["params"].get("tr_cont_key") is None          # 첫 요청엔 키 없음
+    assert session.calls[49]["params"]["tr_cont_key"] == "KEY49"          # 50번째 요청 = 49번째 페이지 키
+    assert session.calls[49]["params"]["tr_cont"] == "1"
+    assert session.calls[50]["path"].endswith("/orders/today")            # 당일은 계속 수행
+    assert "페이지 상한(50) 도달" in out
 
 
 def test_history_5820_returns_empty(make_broker):

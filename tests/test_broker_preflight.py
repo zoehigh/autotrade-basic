@@ -38,6 +38,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -229,17 +230,25 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS",
         time.sleep(1.5)
         history_canceled = broker.get_order_history(symbol, exchange, days=5)
         canceled = [h for h in history_canceled if str(h.get("odno")) == odno or str(h.get("odno")).lstrip("0") == odno.lstrip("0")]
-        assert canceled, f"취소 후 이력에서 odno={odno} 미발견"
-        item = canceled[0]
-        _check_standard_fields([item])
-        ft_ccld = int(float(item.get("ft_ccld_qty", "0") or 0))
-        nccs = int(float(item.get("nccs_qty", "0") or 0)) if item.get("nccs_qty") is not None else 0
-        status = str(item.get("prcs_stat_name", ""))
-        print(f"  취소 후 상태={status} ft_ccld_qty={ft_ccld} nccs_qty={nccs}")
-        assert ft_ccld == 0, f"0체결 취소 기대였으나 ft_ccld_qty={ft_ccld} — 체결 발생 시 전량매도 복원 없이 모의 진입 금지"
-        # remaining 0은 브로커별 nccs_qty 0 또는 prcs_stat_name 취소로 확인
-        assert nccs == 0 or "취소" in status or "CANCEL" in status.upper(), f"취소 미완료: {item}"
-        print("[preflight 통과] read-only 전수 + 주문·취소 1건 0체결 확인")
+        if not canceled:
+            if broker_name == "meritz" and cancel_attempted:
+                # 2026-10-13 실계좌 실측: 메리츠 취소 주문은 기간·당일 이력에 나타나지 않음
+                # → cancel_order가 예외 없이 완료된 것을 갈음 (타 브로커 기존 단정 유지)
+                print("  [정보] 메리츠 취소 주문은 이력에 남지 않을 수 있음 — 취소 API 성공으로 갈음")
+                print("[preflight 통과] read-only 전수 + 주문·취소 1건 접수 확인 (이력 부재는 메리츠 정상)")
+            else:
+                raise AssertionError(f"취소 후 이력에서 odno={odno} 미발견")
+        else:
+            item = canceled[0]
+            _check_standard_fields([item])
+            ft_ccld = int(float(item.get("ft_ccld_qty", "0") or 0))
+            nccs = int(float(item.get("nccs_qty", "0") or 0)) if item.get("nccs_qty") is not None else 0
+            status = str(item.get("prcs_stat_name", ""))
+            print(f"  취소 후 상태={status} ft_ccld_qty={ft_ccld} nccs_qty={nccs}")
+            assert ft_ccld == 0, f"0체결 취소 기대였으나 ft_ccld_qty={ft_ccld} — 체결 발생 시 전량매도 복원 없이 모의 진입 금지"
+            # remaining 0은 브로커별 nccs_qty 0 또는 prcs_stat_name 취소로 확인
+            assert nccs == 0 or "취소" in status or "CANCEL" in status.upper(), f"취소 미완료: {item}"
+            print("[preflight 통과] read-only 전수 + 주문·취소 1건 0체결 확인")
     else:
         print("  cancel 미구현 → OrderNotAcceptedError 거부 확인으로 대체")
         ex_code = broker.exchange_code(exchange)
@@ -604,6 +613,81 @@ def test_preflight_kis_tqqq():
     if not _has_credentials("kis"):
         pytest.skip("KIS 자격증명 없음")
     assert run_preflight("kis", "TQQQ", "NAS") in ("pass", "skip")
+
+
+# ── 취소-이력 부재 단정 검증 (mock, 실 API 미사용) ──────────────────
+# 2026-10-13 메리츠 실계좌 실측: 취소 주문이 기간·당일 이력에 나타나지 않음.
+# run_preflight는 브로커가 meritz이고 cancel_order가 예외 없이 완료됐을 때만
+# 이력 부재를 [정보] 후 통과로 갈음하고, 타 브로커 기존 단정은 유지합니다.
+
+class _FakePreflightBroker:
+    """run_preflight 목 검증용 최소 브로커 — 실 API를 호출하지 않습니다."""
+
+    def __init__(self):
+        self.cancel_calls = 0
+
+    def is_trading_day(self):
+        return True
+
+    def get_stock_price(self, symbol, exchange):
+        return SimpleNamespace(open=71.0, last=72.5)
+
+    def get_stock_quotation(self, symbol, exchange):
+        return SimpleNamespace(tradable=True, last=72.5)
+
+    def get_balance(self, symbol, exchange):
+        return None
+
+    def get_purchase_amount(self, symbol, exchange):
+        return SimpleNamespace(orderable_cash=1000.0)
+
+    def get_daily_closes(self, symbol, exchange, days=5):
+        return [70.0, 71.0, 72.0, 73.0, 74.0]
+
+    def get_order_history(self, symbol, exchange, days=5):
+        return []  # 취소 후 이력에도 미노출 (2026-10-13 실측 재현)
+
+    def exchange_code(self, exchange):
+        return "OQ"
+
+    def place_order(self, symbol, ex_code, side, qty, price, order_type):
+        return SimpleNamespace(
+            order_id="0000000123", order_time="2026-10-13 04:10:00", is_reservation=False
+        )
+
+    def cancel_order(self, odno):
+        self.cancel_calls += 1  # 예외 없이 완료
+
+    def close(self):
+        pass
+
+
+def _patch_preflight(monkeypatch, fake_broker):
+    """자격증명/브로커 생성/sleep 을 목으로 교체합니다 (실 API 차단)."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_has_credentials", lambda _b: True)
+    monkeypatch.setattr(module, "_create_real_broker", lambda _b: fake_broker)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+
+def test_meritz_cancel_absent_from_history_passes(monkeypatch, capsys):
+    """메리츠: 취소 성공 후 이력에 odno가 없어도 [정보] 출력 후 통과 처리."""
+    fake = _FakePreflightBroker()
+    _patch_preflight(monkeypatch, fake)
+
+    assert run_preflight("meritz", "TQQQ", "NAS", live_order_probe=True) == "pass"
+    out = capsys.readouterr().out
+    assert "[정보] 메리츠 취소 주문은 이력에 남지 않을 수 있음 — 취소 API 성공으로 갈음" in out
+    assert fake.cancel_calls >= 1
+
+
+def test_non_meritz_cancel_absent_still_fails(monkeypatch):
+    """타 브로커: 취소 후 이력 미발견 단정은 기존 그대로 실패 유지."""
+    fake = _FakePreflightBroker()
+    _patch_preflight(monkeypatch, fake)
+
+    with pytest.raises(AssertionError, match="취소 후 이력에서 odno="):
+        run_preflight("kis", "TQQQ", "NAS")
 
 
 # 콜라 경계 probe — 자격증명 없으면 skip, 있으면 실 API 호출

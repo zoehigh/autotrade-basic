@@ -20,7 +20,8 @@ DRY 모드는 DryBroker 래퍼로 처리 — MeritzBroker 자체는 항상 LIVE�
     일봉    GET  /market/v1/overseas/candles/days   (+ mod_stpr_cls_code=0, 최신 40건)
     보유    GET  /accounts/v1/me/overseas/holdings  (rsp 5766, ovrs_stck_symb_iscd 매칭)
     매수가능 GET  /trading/v1/overseas/orders/estimate (rsp 5766, crcd=USD 행)
-    이력    GET  /trading/v1/overseas/orders/history (oder_sta_date/oder_fin_date/cntg_cls_code, tr_cont_key 페이지)
+    이력    GET  /trading/v1/overseas/orders/history (oder_sta_date/oder_fin_date/cntg_cls_code,
+                                                     다음 페이지는 tr_cont="1" + 원문 tr_cont_key 동봉, 상한 50p)
     당일    GET  /trading/v1/overseas/orders/today   (종목 파라미터 없음 → iscd 클라이언트 필터)
     매수    POST /trading/v1/overseas/orders/buy     (응답 data.oder_no/warn_cls_code/warn_msg)
     매도    POST /trading/v1/overseas/orders/sell
@@ -80,7 +81,7 @@ _ORDER_ACCEPT_RSP_CD = "0001"                            # 주문 접수 성공
 _NO_DATA_RSP_CD = "5820"                                 # 조회결과 없음
 _QUERY_RETRY_RSP_CD = "EGW00200"                         # 조회 API 전용 재시도 코드
 _QUERY_RETRY_LIMIT = 2
-_MAX_HISTORY_PAGES = 10                                  # 이력 페이지 순회 상한 (무한 루프 방지)
+_MAX_HISTORY_PAGES = 50                                  # 이력 페이지 순회 상한 (당일 도달용 + 무한 루프 방지)
 
 # ── 주문 유형 → 주문구분(oder_cls_code, openapi.json 2026-10-02) ──
 # 01: 지정가 / 05: 시장가 / 31: LOC... 등 (아래 공식 매핑 사용)
@@ -264,7 +265,11 @@ class MeritzBroker(Broker):
             data = body.get("data")
             if isinstance(data, dict):
                 key = data.get("tr_cont_key")
-        return str(key).strip() if key not in (None, "") else ""
+        if key in (None, ""):
+            return ""
+        # 원문 그대로 반환 — strip() 금지 (공식 errors.md: 공백 제거 시
+        # 구간 어긋남/키 반복이 발생할 수 있음)
+        return str(key)
 
     @staticmethod
     def _error_message(body: dict) -> str:
@@ -850,8 +855,9 @@ class MeritzBroker(Broker):
         GET /trading/v1/overseas/orders/history (기간) + /orders/today (당일) 병합
 
         - 이력 API에는 종목 파라미터가 없으므로 iscd로 클라이언트 필터링합니다.
-        - rsp_cd=5762면 다음 페이지가 있어 body의 tr_cont_key를 원문 그대로
-          다음 요청에 전달합니다 (_MAX_HISTORY_PAGES 상한).
+        - rsp_cd=5762면 다음 페이지 → body의 tr_cont_key를 **원문 그대로**(strip 금지)
+          다음 요청에 `tr_cont="1"`과 함께 전달 (공식 paginate 동일, _MAX_HISTORY_PAGES=50 상한,
+          이미 본 키가 재등장하면 중단 + 경고로 무한 루프 방지).
         - 5820(조회결과 없음) → 빈 목록
 
         표준 필드 16종:
@@ -875,6 +881,7 @@ class MeritzBroker(Broker):
 
         try:
             period_rows: list[dict] = []
+            seen_keys: set[str] = set()
             for page in range(_MAX_HISTORY_PAGES):
                 body = self._request("GET", PATH_ORDER_HISTORY, params=params)
                 if str(body.get("rsp_cd", "") or "") == _NO_DATA_RSP_CD:
@@ -887,7 +894,16 @@ class MeritzBroker(Broker):
                 next_key = self._next_page_key(body)
                 if not next_key:
                     break
-                params = dict(params, tr_cont_key=next_key)
+                if next_key in seen_keys:
+                    # 같은 키가 재등장하면 다음 페이지가 오지 않는 상태 — 무한 루프 방지
+                    print(
+                        f"[주문이력] 페이지 키 반복 감지 → 순회 중단 "
+                        f"(page={page + 1}, key={next_key!r})"
+                    )
+                    break
+                seen_keys.add(next_key)
+                # 공식 paginate와 동일: 다음 요청에 tr_cont="1" + 원문 tr_cont_key 동봉
+                params = dict(params, tr_cont="1", tr_cont_key=next_key)
             else:
                 print(
                     f"[주문이력] 페이지 상한({_MAX_HISTORY_PAGES}) 도달 — "
