@@ -7,7 +7,7 @@ load_dotenv()
 
 # 증권사 선택
 # 환경변수 BROKER로 사용할 증권사를 선택합니다.
-# 지원: kis(기본값), kiwoom, ls, toss, nhplug
+# 지원: kis(기본값), kiwoom, ls, toss, nhplug, meritz
 # .env 예: BROKER=kis
 BROKER = os.getenv("BROKER", "kis").strip().lower()
 
@@ -16,6 +16,11 @@ BROKER = os.getenv("BROKER", "kis").strip().lower()
 # 기본값은 demo(모의)입니다. .env 예: BROKER_MODE=real
 BROKER_MODE = os.getenv("BROKER_MODE") or os.getenv("KIS_MODE", "demo")
 BROKER_MODE = BROKER_MODE.strip().lower()
+
+
+# 메리츠증권 Open API 운영 서버 기본 주소 (공식 예제 기본값).
+# MERITZ_BASE_URL 미설정·빈 값이면 이 주소를 사용합니다.
+MERITZ_DEFAULT_BASE_URL = "https://openapi.imeritz.com:9443"
 
 
 def _get_broker_config(broker_name: str) -> dict:
@@ -76,6 +81,15 @@ def _get_broker_config(broker_name: str) -> dict:
             # 지원하지 않아 403을 반환하므로, 토큰 발급은 항상 운영 도메인에서 수행합니다.
             "live_domain": "https://api.nhplug.com:8443",
         },
+        "meritz": {
+            "app_key": os.getenv("MERITZ_APP_KEY", ""),
+            "app_secret": os.getenv("MERITZ_APP_SECRET", ""),
+            # 계좌번호 없음 — AppKey/AppSecret만으로 계좌가 식별됩니다
+            # 미설정·빈 값이면 운영 서버 기본 주소 사용
+            "base_url": os.getenv("MERITZ_BASE_URL", "").strip() or MERITZ_DEFAULT_BASE_URL,
+            # 단말 식별용 MAC 주소(12자리 HEX) — 미설정 시 uuid.getnode() 유도
+            "mac_address": os.getenv("MERITZ_MAC_ADDRESS", "").strip(),
+        },
     }
     return configs.get(broker_name, {})
 
@@ -91,6 +105,10 @@ if BROKER == "nhplug" and not BROKER_CONFIG.get("app_key", ""):
     print("경고: BROKER=nhplug 이지만 NHPLUG_APP_KEY가 설정되어 있지 않습니다.")
 if BROKER == "nhplug" and not BROKER_CONFIG.get("account_no", ""):
     print("경고: BROKER=nhplug 이지만 NHPLUG_ACCT_NO가 설정되어 있지 않습니다.")
+if BROKER == "meritz" and not BROKER_CONFIG.get("app_key", ""):
+    print("경고: BROKER=meritz 이지만 MERITZ_APP_KEY가 설정되어 있지 않습니다.")
+if BROKER == "meritz" and not BROKER_CONFIG.get("app_secret", ""):
+    print("경고: BROKER=meritz 이지만 MERITZ_APP_SECRET이 설정되어 있지 않습니다.")
 
 # ── 키움/LS/토스 증권 API 설정 (BROKER_CONFIG에서 관리) ──
 

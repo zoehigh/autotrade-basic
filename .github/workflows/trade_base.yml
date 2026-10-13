@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       broker:
-        description: '증권사 (kis, kiwoom, ls, toss, nhplug)'
+        description: '증권사 (kis, kiwoom, ls, toss, nhplug, meritz)'
         required: false
         type: string
         default: kis
@@ -62,6 +62,11 @@ on:
       NHPLUG_APP_SECRET:
         required: false
       NHPLUG_ACCT_NO:
+        required: false
+      # 메리츠 secrets (broker=meritz 일 때만 사용됨 — 계좌번호 불필요)
+      MERITZ_APP_KEY:
+        required: false
+      MERITZ_APP_SECRET:
         required: false
       # 공통 secrets
       TELEGRAM_BOT_TOKEN:
@@ -149,6 +154,15 @@ jobs:
           NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
           NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
           NHPLUG_ACCT_NO: ${{ secrets.NHPLUG_ACCT_NO }}
+
+          # 메리츠 인증정보 (environment에서 주입 — broker=meritz 일 때만 값이 있음)
+          # 계좌번호 불필요, BASE_URL/MAC_ADDRESS는 vars로 주입 (비밀 아님)
+          MERITZ_APP_KEY: ${{ secrets.MERITZ_APP_KEY }}
+          MERITZ_APP_SECRET: ${{ secrets.MERITZ_APP_SECRET }}
+          MERITZ_BASE_URL: ${{ vars.MERITZ_BASE_URL }}
+          MERITZ_MAC_ADDRESS: ${{ vars.MERITZ_MAC_ADDRESS }}
+          # 주문 경고 재확인 전송 허용 등급 (선택, 기본 OFF — 예: 1,3)
+          MERITZ_CONFIRM_WARNINGS: ${{ vars.MERITZ_CONFIRM_WARNINGS }}
 
           # 런타임 설정: inputs -> environment vars -> 모드별 기본값 순으로 폴백
           # real 환경은 기본 DRY (fail-safe: 명시적으로 LIVE 선택해야 실전 주문)

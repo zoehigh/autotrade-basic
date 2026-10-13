@@ -5,7 +5,7 @@
 **Branch:** `develop`
 
 ## OVERVIEW
-미국 주식 자동매매 봇 (Python). 5개 증권사(KIS, KIWOOM, LS, TOSS, NHPLUG) API를 지원하며, 무한매수법 V4 전략을 실행. GitHub Actions에서 `repository_dispatch`로 트리거됨.
+미국 주식 자동매매 봇 (Python). 6개 증권사(KIS, KIWOOM, LS, TOSS, NHPLUG, MERITZ) API를 지원하며, 무한매수법 V4 전략을 실행. GitHub Actions에서 `repository_dispatch`로 트리거됨.
 
 ## STRUCTURE
 ```
@@ -18,6 +18,7 @@ autotrade-basic/
 │   │   ├── ls/          # LS증권
 │   │   ├── toss/        # 토스증권
 │   │   ├── nhplug/      # NH투자증권 나무
+│   │   ├── meritz/      # 메리츠증권 (real 전용)
 │   │   └── market_utils.py  # 시간/시장 유틸리티
 │   ├── market_data.py   # 시세 데이터 (Finnhub 5일 MA)
 │   ├── strategy.py      # 전략 로직 (+ 리버스모드)
@@ -34,9 +35,9 @@ autotrade-basic/
 | Task | Location | Notes |
 |------|----------|-------|
 | 전략 로직 이해 | src/strategy.py | `무한매수법_V4()`, T값/별지점 계산, `execute_reverse_mode()` |
-| 브로커 구현 | src/broker/{kis,kiwoom,ls,toss,nhplug}/ | 각 브로커별 API 어댑터 |
+| 브로커 구현 | src/broker/{kis,kiwoom,ls,toss,nhplug,meritz}/ | 각 브로커별 API 어댑터 |
 | 공통 인터페이스 | src/broker/base.py | `Broker`, `OrderResult`, `BrokerError`, `get_daily_closes()` |
-| 일봉 종가 조회 | src/broker/base.py `get_daily_closes()` | TR: KIS=HHDFS76240000, LS=g3204, KIWOOM=usa06012, TOSS=GET /api/v1/candles |
+| 일봉 종가 조회 | src/broker/base.py `get_daily_closes()` | TR: KIS=HHDFS76240000, LS=g3204, KIWOOM=usa06012, TOSS=GET /api/v1/candles, MERITZ=GET /market/v1/overseas/candles/days |
 | 상태 파일 관리 | src/state.py | state.json 로드/저장, T 갱신, reverse_mode 상태 |
 | 환경변수 설정 | src/config.py | 종목 설정, 모드, 수수료, T 보정 env var |
 | 시세 데이터 | src/market_data.py | Finnhub 5일 이동평균 조회 |
@@ -50,8 +51,10 @@ autotrade-basic/
 | LS | `rsp_cd == "00000"` | `rsp_cd` | `rsp_msg` | 각 메서드 |
 | TOSS | `error` 없음 | `error.code` | `error.message` | `_request_with_rate_retry()` |
 | NHPLUG | `rsp_cd in {"00000","00166","00221","13578","XA102","00048"} or "완료" in rsp_msg/usr_msg` | `rsp_cd`/`msg_code` | `rsp_msg`/`usr_msg` | `_request_with_rate_retry()` |
+| MERITZ | 주문 `rsp_cd=="0001"` AND `data.warn_cls_code==0`, 조회 계열별 상이 (시세 `0000` / 잔고·매수가능 `5766` / 이력·당일 `5766`·`5762`(다음페이지) / 취소 `0001`) — 5820은 data 유무로 판단, EGW00200은 조회만 제한 재시도 | `rsp_cd` | `rsp_msg`+`rsp_sub_msg` | `_check_rsp_cd()` |
 
 **참고**: 주문 시각은 모든 브로커에서 `get_kst_now()` 로컬 시간 사용 (API 응답 시간 미사용)
+**MERITZ 주문 시각**: 합성 주문번호 `YYYYMMDD:제로패딩주문번호`, `oder_exec_ymdh/cntg_ymdh`는 KST 그대로 파싱 (resolve_real_kst_from_ord 미적용, `_ord_dt_is_kst_date=True`)
 
 ## CONVENTIONS
 - **패키지 의존성**: `requests`, `python-dotenv`, `exchange-calendars` (`uv` 관리)
@@ -65,7 +68,7 @@ autotrade-basic/
 ## ANTI-PATTERNS (THIS PROJECT)
 - `__pycache__/` — 절대 커밋 금지 (`.gitignore`에 있음)
 - `.state.json` — 커밋 금지 (GH Actions 캐시로만 관리)
-- `KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없는 상태로 KIS/NHPLUG API 호출 금지 (KIWOOM/LS/TOSS는 계좌번호 불필요)
+- `KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없는 상태로 KIS/NHPLUG API 호출 금지 (KIWOOM/LS/TOSS/MERITZ는 계좌번호 불필요)
 - 모의투자 미지원 주문 유형(LOC/LOO/MOC/MOO) → 자동 LIMIT 변환 (broker별 adapter)
 - 주문가 소수점 초과(예: $1+ 3자리) 전송 금지 — 각 broker `place_order()`가 `normalize_order_price()`로 호가 단위($1+ → 2자리, $1 미만 → 4자리, 버림) 정규화 후 전송
 - `TRADE_MODE` 무단 LIVE 전환 금지 (DRY 먼저 확인)
@@ -102,12 +105,12 @@ TQQQ_FORCE_T=29 SOXL_FORCE_T=20 TRADE_MODE=DRY uv run python trading_bot.py
 SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
 
 # 테스트 실행
-# 브로커 실 API 통합 테스트는 pytest 마커(kis/kiwoom/ls/toss/nhplug)로 구분됩니다.
+# 브로커 실 API 통합 테스트는 pytest 마커(kis/kiwoom/ls/toss/nhplug/meritz)로 구분됩니다.
 # tests/conftest.py가 .env 자격증명만으로 실행 여부를 판단합니다 — BROKER 값과 무관하게
 # 해당 브로커 키가 설정돼 있으면 실행되고, 없으면 자동 skip됩니다.
 # 마커 없는 유닛/모의 테스트는 항상 실행됩니다.
 uv run pytest tests/ -v                          # 키 설정된 브로커 통합 테스트 + 유닛
-uv run pytest tests/ -m kis -v                   # 특정 브로커만 (kis/kiwoom/ls/toss/nhplug)
+uv run pytest tests/ -m kis -v                   # 특정 브로커만 (kis/kiwoom/ls/toss/nhplug/meritz)
 uv run pytest tests/test_kiwoom_integration.py -v  # 특정 파일도 자격증명 기준으로 동작
 
 # 참고: 브로커별 필수 자격증명
@@ -116,6 +119,7 @@ uv run pytest tests/test_kiwoom_integration.py -v  # 특정 파일도 자격증�
 #   ls    = LS_APP_KEY + LS_APP_SECRET
 #   toss  = TOSS_APP_KEY + TOSS_APP_SECRET
 #   nhplug= NHPLUG_APP_KEY + NHPLUG_APP_SECRET + NHPLUG_ACCT_NO
+#   meritz= MERITZ_APP_KEY + MERITZ_APP_SECRET (계좌번호 불필요, real 전용, 모의 없음)
 # 유닛/모의 테스트(test_broker_contract, test_reverse_mode, test_state_t_updates 등)는
 # API를 호출하지 않아 자격증명 없이 항상 실행됩니다.
 ```
@@ -150,6 +154,8 @@ uv run pytest tests/test_broker_preflight.py -v
 - 통과 로그를 남기고 모의(`TRADE_MODE=DRY → LIVE demo`) 진입. 중간 운영 중 API 응답 변경은 `balance_mismatch`/`T 경고`/`STATE_REVERSE_AUDIT_ONLY`로 감지·보정.
 
 **실전 소액 LIVE 1세션**: 별도 테스트가 아니라 전략의 첫 실전 주문 자체를 smoke 테스트로 봅니다. `LOC/MOC` 실전 접수 여부와 파이프라인 1회 정상 동작만 확인.
+
+**MERITZ 10/12 신청 게이트 (2026-10-02 기준)**: 메리츠 오픈API는 모바일앱 신청이 차단되고 포털도 미개방 상태라 **실검증 보류**. 유동IP 사용 가능 확인됨 (고정IP 불필요, ubuntu-latest 그대로 사용). MAC 사전등록도 별도 절차 없음 (요청 헤더에 12자리 HEX를 넣어 전송하면 됨). 자격증명 발급 전까지 preflight 주문 단계는 `--live-order-probe`로만 실행하고, 기본 실행은 read-only 조회(1~6단계) + skip 출력으로 통과 처리합니다. 신청 개방 확인 후 preflight 1회 통과 + 실전 소액 LIVE 1세션 검증 순서로 진행.
 
 ## COMMUNICATION RULES
 
@@ -201,7 +207,7 @@ uv run pytest tests/test_broker_preflight.py -v
       `STATE_ASSUME_REVERSE_EXPIRY_SYMBOL`/`_ORDER`/`_EXPECT_HASH` 필요.
   - `canonical_state_hash()` (`src/state.py`): `save_state()`가 기록하는 필드만 SHA-256 — 복구 CAS/audit용.
     네 복구 모드(`STATE_REVERSE_AUDIT_ONLY`/`RECONCILE_ONLY`/`NET_INVESTED_REPAIR_ONLY`/`ASSUME_REVERSE_EXPIRY_ONLY`)는 **동시 설정 금지**.
-- **KIWOOM/LS/TOSS**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능), **KIS/NHPLUG는 계좌번호 필수** (`KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없으면 호출 금지)
+- **KIWOOM/LS/TOSS/MERITZ**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능), **KIS/NHPLUG는 계좌번호 필수** (`KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없으면 호출 금지)
 - **주문 시각**: 모든 브로커에서 `get_kst_now()` 사용 (API 응답 시간 미사용)
 - **KIS ODNO 정규화**: 주문 접수 API는 leading zero 10자리(`0000052248`), 체결 조회는 trimmed(`52248`) 반환 → `kis/adapter.py`에서 `str(int(odno))`로 정규화 후 반환 (다른 브로커는 해당 없음)
 - **KIWOOM 모의투자 주문이력(ust21150)**: 날짜별 개별 조회, 빈 결과/`501724` 에러 시 `[정보]` 로그 출력 (line 534-545)

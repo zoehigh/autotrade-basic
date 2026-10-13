@@ -1,0 +1,36 @@
+name: 무한매수법 실행 (Meritz Real)
+
+# 메리츠증권 실전 계좌 실행 (real만 지원, 모의투자 없음)
+# GitHub Environment: meritz-real (secrets/variables 분리)
+# 캐시 키: state-meritz-real-*
+# 브로커 어댑터 구현됨 (주문/취소/이력/잔고). 실전 기본 DRY fail-safe.
+# 주의: pre-market LOC/MOC 접수 여부는 미실증 — 첫 실전 주문 전 preflight로 검증할 것.
+
+on:
+  repository_dispatch:
+    types:
+      - trigger_trade_meritz_real
+  workflow_dispatch:
+    inputs:
+      trade_mode:
+        description: '거래 모드 선택 (기본: DRY)'
+        required: false
+        type: choice
+        options:
+          - DRY
+          - LIVE
+      symbols:
+        description: '거래 심볼 — 비워두면 환경 변수 SYMBOLS 사용'
+        required: false
+        type: string
+
+jobs:
+  trade_meritz_real:
+    uses: ./.github/workflows/trade_base.yml
+    with:
+      broker: meritz
+      broker_mode: real
+      trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
+      symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
+
+    secrets: inherit

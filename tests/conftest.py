@@ -39,6 +39,8 @@ _REQUIRED_KEYS = {
     "ls": ("LS_APP_KEY", "LS_APP_SECRET"),
     "toss": ("TOSS_APP_KEY", "TOSS_APP_SECRET"),
     "nhplug": ("NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"),
+    # 메리츠: 계좌번호 불필요, MAC은 선택 override라 게이트 제외
+    "meritz": ("MERITZ_APP_KEY", "MERITZ_APP_SECRET"),
 }
 
 

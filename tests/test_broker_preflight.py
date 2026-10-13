@@ -6,8 +6,12 @@
 실행:
   uv run python tests/test_broker_preflight.py --broker kis --symbol TQQQ
   uv run python tests/test_broker_preflight.py --broker kis --symbol TQQQ --collar
+  uv run python tests/test_broker_preflight.py --broker meritz --symbol TQQQ --live-order-probe
   uv run pytest tests/test_broker_preflight.py -v
   uv run pytest tests/test_broker_preflight.py -m preflight -v
+
+메리츠(meritz)는 real-only(모의 없음)라 주문/취소 단계와 콜라 probe가 기본 실행에서
+생략됩니다. --live-order-probe 플래그로 명시할 때만 실계좌 주문 단계가 진행됩니다.
 
 전략이 실제 호출하는 API만 검증합니다:
   - get_daily_closes(5) → list[float]
@@ -55,6 +59,8 @@ CREDENTIALS = {
     "ls": ["LS_APP_KEY", "LS_APP_SECRET"],
     "toss": ["TOSS_APP_KEY", "TOSS_APP_SECRET"],
     "nhplug": ["NHPLUG_APP_KEY", "NHPLUG_APP_SECRET", "NHPLUG_ACCT_NO"],
+    # 메리츠: 계좌번호 불필요 (MAC은 선택 override)
+    "meritz": ["MERITZ_APP_KEY", "MERITZ_APP_SECRET"],
 }
 
 
@@ -81,6 +87,20 @@ def _create_real_broker(broker: str):
     if broker == "nhplug":
         from broker.nhplug.adapter import NHPlugBroker
         return NHPlugBroker()
+    if broker == "meritz":
+        # 메리츠는 real 전용 — preflight read-only 수행을 위해 config 모듈 속성만
+        # 임시로 real로 강제합니다 (env/reload 없이 생성 후 원복).
+        from broker.meritz.adapter import MeritzBroker
+        import config
+        saved_mode = config.BROKER_MODE
+        saved_config = config.BROKER_CONFIG
+        config.BROKER_MODE = "real"
+        config.BROKER_CONFIG = config._get_broker_config("meritz")
+        try:
+            return MeritzBroker()
+        finally:
+            config.BROKER_MODE = saved_mode
+            config.BROKER_CONFIG = saved_config
     raise ValueError(f"알 수 없는 브로커: {broker}")
 
 
@@ -92,7 +112,7 @@ def _check_standard_fields(history):
         assert not missing, f"표준 필드 누락: {missing} / keys={sorted(item.keys())}"
 
 
-def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS"):
+def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS", live_order_probe: bool = False):
     broker_name = broker_name.lower()
     symbol = symbol.upper()
 
@@ -142,6 +162,14 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS")
 
     # 7) 주문 사전 테스트 — 비시장성 LIMIT 1주
     # 전략 종목과 동일 계좌에서 이력을 남기므로, 비시장성 가격으로 0체결을 노립니다.
+    # 메리츠는 real-only(모의 없음)라 주문은 실계좌에 즉시 체결 대상입니다.
+    # 10/12 신청 게이트 미개방 상태이므로 기본 실행에서는 주문 단계를 생략하고,
+    # --live-order-probe 로 명시한 경우에만 진행합니다.
+    if broker_name == "meritz" and not live_order_probe:
+        print("[live-order-probe skip] meritz 실계좌 주문 단계 생략 (--live-order-probe 로 명시 시에만 실행)")
+        broker.close()
+        return "pass"
+
     has_cancel = hasattr(broker, "cancel_order")
     print(f"[7/7] 주문 사전 테스트 (cancel 구현={has_cancel})")
 
@@ -467,13 +495,19 @@ def _run_collar_probe(
     return result
 
 
-def run_collar_probes(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS"):
+def run_collar_probes(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS", live_order_probe: bool = False):
     """콜라 경계 probe 매트릭스를 실행하고 비교표 요약을 출력합니다."""
     broker_name = broker_name.lower()
     symbol = symbol.upper()
 
     if not _has_credentials(broker_name):
         print(f"[preflight skip] {broker_name} 자격증명 없음 → skip")
+        return "skip"
+
+    # 메리츠는 real-only(모의 없음)라 probe의 비시장성 주문도 실계좌에 접수됩니다.
+    # 10/12 신청 게이트 미개방 상태이므로 --live-order-probe 로 명시한 경우에만 실행합니다.
+    if broker_name == "meritz" and not live_order_probe:
+        print("[live-order-probe skip] meritz 콜라 probe 생략 (실계좌 체결 위험 — --live-order-probe 로 명시 시에만 실행)")
         return "skip"
 
     broker = _create_real_broker(broker_name)
@@ -558,7 +592,7 @@ def run_collar_probes(broker_name: str, symbol: str = "TQQQ", exchange: str = "N
 
 # pytest 진입점 — 자격증명 없으면 skip, 있으면 실 API 호출
 @pytest.mark.preflight
-@pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug"])
+@pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug", "meritz"])
 def test_preflight_all_brokers(broker_name):
     if not _has_credentials(broker_name):
         pytest.skip(f"{broker_name} 자격증명 없음")
@@ -574,7 +608,7 @@ def test_preflight_kis_tqqq():
 
 # 콜라 경계 probe — 자격증명 없으면 skip, 있으면 실 API 호출
 @pytest.mark.preflight
-@pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug"])
+@pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug", "meritz"])
 def test_collar_probes_all_brokers(broker_name):
     if not _has_credentials(broker_name):
         pytest.skip(f"{broker_name} 자격증명 없음")
@@ -584,14 +618,23 @@ def test_collar_probes_all_brokers(broker_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="브로커 preflight — 모의 전 API 사전 테스트")
-    parser.add_argument("--broker", required=True, help="kis|kiwoom|ls|toss|nhplug")
+    parser.add_argument("--broker", required=True, help="kis|kiwoom|ls|toss|nhplug|meritz")
     parser.add_argument("--symbol", default="TQQQ", help="예: TQQQ, SOXL")
     parser.add_argument("--exchange", default="NAS", help="예: NAS, AMS")
+    parser.add_argument(
+        "--live-order-probe", action="store_true",
+        help="실계좌 주문 단계 허용 — meritz는 이 플래그가 있을 때만 주문/취소 단계 실행 "
+             "(기본: read-only 조회 1~6단계만)",
+    )
     parser.add_argument(
         "--collar", action="store_true",
         help="콜라 경계 probe만 실행 (기본: 표준 preflight)",
     )
     args = parser.parse_args()
     if args.collar:
-        sys.exit(0 if run_collar_probes(args.broker, args.symbol, args.exchange) in ("pass", "skip") else 1)
-    sys.exit(0 if run_preflight(args.broker, args.symbol, args.exchange) in ("pass", "skip") else 1)
+        sys.exit(
+            0 if run_collar_probes(args.broker, args.symbol, args.exchange, args.live_order_probe) in ("pass", "skip") else 1
+        )
+    sys.exit(
+        0 if run_preflight(args.broker, args.symbol, args.exchange, args.live_order_probe) in ("pass", "skip") else 1
+    )

@@ -19,6 +19,7 @@ markers = [
     "ls: LS 실 API 통합 테스트 (LS_APP_KEY/SECRET 필요)",
     "toss: TOSS 실 API 통합 테스트 (TOSS_APP_KEY/SECRET 필요)",
     "nhplug: NHPLUG 실 API 통합 테스트 (NHPLUG_APP_KEY/SECRET 필요)",
+    "meritz: MERITZ 실 API 통합 테스트 (MERITZ_APP_KEY/SECRET 필요, 실전전용)",
     "live_order: 실제 주문이 발생하는 위험 테스트",
 ]
 

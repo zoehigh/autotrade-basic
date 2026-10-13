@@ -271,6 +271,10 @@ def _order_real_kst_date(order):
     ord_tmd = str(order.get("ord_tmd", ""))
     if not ord_dt or not ord_tmd:
         return ord_dt
+    # ord_dt가 이미 KST 날짜인 브로커(메리츠)는 ET round-trip 복원을 건너뜁니다.
+    # `_ord_dt_is_kst_date`는 메리츠 어댑터만 설정하므로 다른 브로커는 영향 없음.
+    if order.get("_ord_dt_is_kst_date"):
+        return ord_dt
     resolved = resolve_real_kst_from_ord(ord_dt, ord_tmd)
     if resolved is None:
         return ord_dt
