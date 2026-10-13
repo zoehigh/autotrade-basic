@@ -518,6 +518,9 @@ def run_one_symbol(broker: Broker, symbol_config):
         state["orders_meta"] = {}
         state["additional_loc_odno"] = []
         state["reverse_mode"] = {}
+        # FORCE_T은 1회성 보정 — env 시드가 복리 반영 주체이므로 effective_seed 초기화
+        # (과거 완료 사이클 손익이 현 사이클 시드에 이중 가산되는 것 방지)
+        state["effective_seed"] = 0.0
         # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
         # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
         # 주문 시각으로 last_updated를 갱신합니다. 이력이 없으면 현재 UTC를 사용합니다.
@@ -1530,6 +1533,8 @@ def _repair_force_t():
             state["orders_meta"] = {}
             state["additional_loc_odno"] = []
             state["reverse_mode"] = {}
+            # FORCE_T은 1회성 보정 — env 시드가 복리 반영 주체이므로 effective_seed 초기화
+            state["effective_seed"] = 0.0
 
             # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
             # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
