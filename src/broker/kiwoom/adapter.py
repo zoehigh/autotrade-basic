@@ -94,6 +94,24 @@ def _parse_price(value, default: float = 0.0) -> float:
         return default
 
 
+def _is_transient_delay_error(body) -> bool:
+    """
+    키움 일시적 서비스 지연 오류(RC9002) 여부를 판별합니다.
+
+    예: return_code=20 + "[2000](RC9002:모의투자 서비스가 지연되고 있습니다. 잠시후 재시도 바랍니다.)"
+
+    판별은 return_msg 문자열 기준입니다 — return_code=20만으로는
+    501724(관련자료가 없습니다) 빈 결과와 구분할 수 없습니다.
+    """
+    if not isinstance(body, dict):
+        return False
+    return_code = body.get("return_code")
+    if return_code is None or return_code == 0:
+        return False
+    return_msg = str(body.get("return_msg") or "")
+    return "RC9002" in return_msg or "지연되고" in return_msg
+
+
 class KiwoomBroker(Broker):
     """
     키움증권 미국주식 REST API Broker 구현체.
@@ -164,18 +182,23 @@ class KiwoomBroker(Broker):
         extra_headers: dict | None = None,
         return_headers: bool = False,
         retry_network: bool = True,
+        retry_transient: bool = True,
     ) -> dict | tuple[dict, requests.structures.CaseInsensitiveDict]:
         """
         키움 API 요청 래퍼 — rate-limit/타임아웃 재시도 포함.
 
         - rate-limit(HTTP 429 또는 return_code != 0): fixed-wait 후 재시도 (최대 3회)
         - 타임아웃(ConnectTimeout, ReadTimeout): 지수 백오프 + jitter 후 재시도 (최대 3회)
+        - 일시적 서비스 지연 오류(RC9002, HTTP 200 + return_code != 0):
+          rate-limit wait 후 재시도 (최대 3회). 멱등한 조회경로 전용 —
+          주문 경로(place_order)는 retry_transient=False로 재시도하지 않습니다.
 
         기본은 dict(파싱된 JSON)를 반환합니다. return_headers=True면
         (dict, response.headers)를 반환합니다.
         """
         MAX_RETRIES = 3
         network_retry_count = 0
+        transient_retry_count = 0
 
         while network_retry_count <= MAX_RETRIES:
             try:
@@ -205,6 +228,27 @@ class KiwoomBroker(Broker):
                             time.sleep(self._rate_limit_wait)
                             continue
                         raise
+
+                    # 일시적 서비스 지연 오류(RC9002) 재시도 — 조회경로 전용.
+                    # HTTP 200 + return_code != 0은 _check_response가 즉시
+                    # BrokerError를 올리므로, 검사 전에 응답을 선파싱합니다.
+                    if retry_transient:
+                        transient_body = None
+                        try:
+                            transient_body = resp.json()
+                        except ValueError:
+                            transient_body = None
+                        if _is_transient_delay_error(transient_body):
+                            transient_retry_count += 1
+                            if transient_retry_count <= MAX_RETRIES:
+                                print(
+                                    f"⏳ 키움 일시적 지연 오류(RC9002) — "
+                                    f"{self._rate_limit_wait}초 후 재시도 "
+                                    f"({transient_retry_count}/{MAX_RETRIES})"
+                                )
+                                time.sleep(self._rate_limit_wait)
+                                continue
+                            # 재시도 초과 → 아래 _check_response가 기존대로 BrokerError 발생
 
                     data = self._check_response(resp)
                     if return_headers:
@@ -811,7 +855,11 @@ class KiwoomBroker(Broker):
         }
 
         try:
-            data = self._request_with_rate_retry(tr_id, body, token, retry_network=False)
+            # retry_network=False: 주문 POST 중복접수 방지를 위해 네트워크 재시도 금지.
+            # retry_transient=False: RC9002 일시지연 재시도도 주문경로에는 적용하지 않음.
+            data = self._request_with_rate_retry(
+                tr_id, body, token, retry_network=False, retry_transient=False
+            )
             # KIWOOM API는 flat 구조 (output 래퍼 없음) + ord_no (소문자)
             # 주문시각은 KIWOOM API에서 미제공
             order_id = data.get("ord_no", "")
