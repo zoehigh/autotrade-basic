@@ -10,6 +10,6 @@
 # 동절기(11월~3월)에는 17:20에 시작해 18:00까지 내부 대기 후 주문합니다.
 #
 # 되돌리기 (DRY 로):
-#   (crontab -l | grep -v muhan-v4/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/run_daily.sh") | crontab -
+#   (crontab -l | grep -v muhan-v4/ops/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") | crontab -
 #
-20 17 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/run_daily.sh
+20 17 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
