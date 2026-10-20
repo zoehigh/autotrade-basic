@@ -1055,14 +1055,23 @@ def _cancel_open_bot_orders(
     for odno, status, remaining in targets:
         print(f"  - {odno} ({status}, 잔량 {remaining}주)")
 
+    failures: list[tuple[str, str]] = []
+
     for odno, _status, _remaining in targets:
         try:
             cancel(odno, symbol=symbol, exchange=exchange)
+            print(f"  ✓ 취소 완료: {odno}")
         except Exception as error:
-            raise SymbolScopedError(
-                f"기존 주문 취소 실패로 신규 주문을 생략합니다: {odno} — {str(error)[:160]}"
-            )
-        print(f"  ✓ 취소 완료: {odno}")
+            # 실패해도 나머지 취소는 계속합니다 (부분 취소 상태로 남지 않도록).
+            # 신규 주문은 아래에서 일괄 중단합니다.
+            failures.append((odno, str(error)))
+            print(f"  ✗ 취소 실패: {odno} — {str(error)[:160]}")
+
+    if failures:
+        raise SymbolScopedError(
+            "기존 주문 취소 실패로 신규 주문을 생략합니다: "
+            + ", ".join(f"{odno}({msg[:60]})" for odno, msg in failures)
+        )
 
     print("[잔여 주문 정리] 완료 — 신규 주문을 제출합니다.")
     return len(targets)

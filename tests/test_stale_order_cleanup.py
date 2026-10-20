@@ -132,8 +132,11 @@ def test_broker_without_cancel_support_is_ignored():
 def test_cancel_failure_raises_symbol_scoped_error():
     """취소 실패 시 신규 주문을 내지 않도록 종목만 중단합니다."""
     broker = _FakeBroker(fail_on="OD1")
-    state = {"orders_meta": {"OD1": {}}}
-    history = [_row("OD1")]
+    state = {"orders_meta": {"OD1": {}, "OD2": {}}}
+    history = [_row("OD1"), _row("OD2")]
 
     with pytest.raises(SymbolScopedError):
         _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, history)
+
+    # 실패가 있어도 나머지 취소는 모두 시도합니다 (부분 취소 상태 방지)
+    assert [c[0] for c in broker.calls] == ["OD1", "OD2"]
