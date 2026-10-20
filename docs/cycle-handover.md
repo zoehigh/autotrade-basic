@@ -50,10 +50,13 @@
 - reconcile-only: TQQQ 6건 / SOXL 8건 체결 반영, `[불일치]` 없음
 - DRY 실행 전후 `.state.json` sha256 **불변** → DRY 미저장 확인
 - 주의: 브로커 주문가능금액($11,752.21)은 시드 기준 잔여($4,080.58)보다 큼 → 봇은 시드 캡 적용
-- 수수료: **운영 VPS `.env` 의 `COMMISSION_RATE=0.0025` (0.25%) 가 실효값**입니다.
-  `src/config.py` 기본값도 `0.0025` 이므로 미설정 시 동일하게 동작합니다.
-  `COMMISSION_RATE` 는 `generate_cycle_report()` 의 순수익 계산에만 쓰이므로 **전략 주문 신호에는 영향 없음**.
-  (계좌 수수료 면제 여부는 brokerage 확인 후 필요 시 운영 `.env` 한 줄만 바꾸면 됩니다.)
+- 수수료: **운영 VPS `.env` 의 `COMMISSION_RATE=0.00` 가 현재 실효값**입니다
+  (2026-10-20 20:19 KST 사용자가 직접 수정, 봇 로드 확인 `config.COMMISSION_RATE = 0.0`).
+  `COMMISSION_RATE` 는 `generate_cycle_report()` 의 순수익 계산에만 쓰이므로 **전략 주문 신호에는 영향 없음**,
+  그리고 곱셈 전용이라 0 이어도 동작에 문제가 없습니다.
+  - 단, **수수료가 생기는 시점에는 `0.0025` 로 되돌려야** 합니다. 0 으로 두는 동안
+    사이클 리포트 순수익이 실제보다 약 0.25% (매매대금 기준) 과대 표시됩니다.
+  - `src/config.py` 기본값은 `0.0025` 이므로, `.env` 에서 키를 지우면 자동으로 0.0025 로 돌아갑니다.
 
 **미추적 백업**: `.state.json.bak-20261013`, `.state.json.bak-20261013-effix`,
 `.state.json.bak-20261020-090926`, `.state.json.bak-20261020-091421-pre-cycle-start`
