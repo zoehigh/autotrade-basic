@@ -1,0 +1,15 @@
+# 운영 crontab (ubuntu 사용자)
+#
+# 설치:
+#   crontab -e  에 아래 한 줄을 추가하세요.
+#
+# 서버 TZ가 Asia/Seoul 이므로 CRON_TZ 없이 KST 기준으로 동작합니다.
+#
+# 17:20 KST 실행 → trading_bot.py 가 프리장 시간(서머 17시 / 동절기 18시) 기준 대기를
+# 자체 처리하므로, 별도 시간 분기를 넣지 않아도 됩니다.
+# 동절기(11월~3월)에는 17:20에 시작해 18:00까지 내부 대기 후 주문합니다.
+#
+# 되돌리기 (DRY 로):
+#   (crontab -l | grep -v muhan-v4/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/run_daily.sh") | crontab -
+#
+20 17 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/run_daily.sh
