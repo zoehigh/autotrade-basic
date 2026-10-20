@@ -49,9 +49,28 @@
 - reconcile-only: TQQQ 6건 / SOXL 8건 체결 반영, `[불일치]` 없음
 - DRY 실행 전후 `.state.json` sha256 **불변** → DRY 미저장 확인
 - 주의: 브로커 주문가능금액($11,752.21)은 시드 기준 잔여($4,080.58)보다 큼 → 봇은 시드 캡 적용
+- 수수료: 메리츠 계좌 **2026-12-31까지 수수료 면제** → `COMMISSION_RATE=0.0000` 사용 중.
+  `COMMISSION_RATE`는 `generate_cycle_report()`의 순수익 계산에만 쓰이므로 **전략 신호에는 영향 없음**.
+  **2027-01-01부터 실제 요율(예: `0.0025`)로 반드시 변경** — 변경 전까지 사이클 리포트 순수익이 과대표시됩니다.
 
 **미추적 백업**: `.state.json.bak-20261013`, `.state.json.bak-20261013-effix`,
 `.state.json.bak-20261020-090926`, `.state.json.bak-20261020-091421-pre-cycle-start`
+
+**운영 실행 방식 (2026-10-20 준비 완료)**
+
+| 항목 | 값 |
+|---|---|
+| 런처 | `~/investment/muhan-v4/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) |
+| cron (현재, 검증용) | `20 17 * * 1-5 FORCE_SYMBOLS=TQQQ:NAS LAUNCH_MODE=DRY .../run_daily.sh` |
+| cron (운영 예정) | `30 17 * * 1-5 .../run_daily.sh` (LIVE, 양종목) — LIVE 1세션 검증 후 교체 |
+| 서버 TZ | `Asia/Seoul` → `CRON_TZ` 불필요 (이미 설정돼 있음) |
+| 텔레그램 | `.env` 설정 완료, 발송 테스트 성공 |
+| 로그 | `logs/run-YYYYMMDD-HHMMSS.log` |
+
+- 같은 VPS에 기존 인스턴스 `~/investment/autotrade-basic`(rev `c8a5efa`, `BROKER=toss`,
+  `TRADE_MODE=DRY`, shadow_runner 17:00/07:00)과 KIS 봇이 함께 돌고 있습니다.
+  디렉터리·`.state.json`·lock 파일이 분리되어 **주문 충돌 없음**.
+- `LAUNCH_MODE`/`FORCE_SYMBOLS`를 지정하지 않으면 `.env`의 `TRADE_MODE=LIVE` + 양종목으로 실행됩니다.
 
 ---
 
