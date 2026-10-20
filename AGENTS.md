@@ -157,6 +157,10 @@ uv run pytest tests/test_broker_preflight.py -v
 
 **MERITZ 주문조건구분(`oder_cond_cls_code`)**: 값이 `oder_cls_code`에 따라 고정됩니다 — `01`·`05`·`35~38` → `0`, `31`·`33` → `2`, `32`·`34` → `7`. 위반 시 주문이 `IGW50002`로 거부됩니다 (2026-10-20 LOC 쿼터매도 실측 미접수). 매핑은 `src/broker/meritz/adapter.py`의 `_ODER_COND_CLS_CODE`.
 
+**MERITZ 주문 정정** (`POST /trading/v1/overseas/orders/modify`): `MeritzBroker.modify_order()` 구현. 필수 6필드 `oder_date`/`orgl_oder_no`/`oder_cls_code`/`odqt`/`ovrs_stck_oder_prc`/`oder_cond_cls_code`. **해외는 재정정 시 직전 정정 건의 주문번호를 씁니다** (국내는 최초 주문번호 유지 — 기준이 반대). 정정하면 주문번호가 바뀌므로 `state.json`의 `orders_meta` 키도 새 번호로 옮기고 `total_qty`를 정정 수량으로 갱신해야 합니다.
+
+**MERITZ 경고확인값**: 해외주식의 `warn_cnfr_yn` 재전송 값은 **`"Y"`** 입니다 (공식 안내 기준). 응답 설명의 `"A"`는 국내 관례이므로 사용하지 않습니다.
+
 **MERITZ 10/12 신청 게이트 (2026-10-02 기준)**: 메리츠 오픈API는 모바일앱 신청이 차단되고 포털도 미개방 상태라 **실검증 보류**. 유동IP 사용 가능 확인됨 (고정IP 불필요, ubuntu-latest 그대로 사용). MAC 사전등록도 별도 절차 없음 (요청 헤더에 12자리 HEX를 넣어 전송하면 됨). 자격증명 발급 전까지 preflight 주문 단계는 `--live-order-probe`로만 실행하고, 기본 실행은 read-only 조회(1~6단계) + skip 출력으로 통과 처리합니다. 신청 개방 확인 후 preflight 1회 통과 + 실전 소액 LIVE 1세션 검증 순서로 진행.
 
 ## COMMUNICATION RULES

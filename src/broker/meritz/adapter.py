@@ -70,6 +70,7 @@ PATH_ORDER_TODAY = "/trading/v1/overseas/orders/today"
 PATH_ORDER_BUY = "/trading/v1/overseas/orders/buy"
 PATH_ORDER_SELL = "/trading/v1/overseas/orders/sell"
 PATH_ORDER_CANCEL = "/trading/v1/overseas/orders/cancel"
+PATH_ORDER_MODIFY = "/trading/v1/overseas/orders/modify"
 
 # ── 응답 판정 코드 ──
 # 성공 코드(rsp_cd)는 API 계열별로 상이합니다.
@@ -130,6 +131,14 @@ _ORDER_NO_PAD_WIDTH = 10
 _CANCEL_STATUS_NAME = "취소"
 _REJECT_STATUS_NAME = "거부"
 _CANCEL_REQUIRED_FIELDS = ("oder_date", "orgl_oder_no", "oder_cls_code", "odqt")
+_MODIFY_REQUIRED_FIELDS = (
+    "oder_date",
+    "orgl_oder_no",
+    "oder_cls_code",
+    "odqt",
+    "ovrs_stck_oder_prc",
+    "oder_cond_cls_code",
+)
 
 
 class _ResponseParseError(BrokerError):
@@ -1096,7 +1105,7 @@ class MeritzBroker(Broker):
         경고(warn_cls_code) 처리 (공식: 응답 data 안에 warn_cls_code/der_no):
         - 0: 정상 접수
         - 1/3: 기본 OrderNotAcceptedError,
-                MERITZ_CONFIRM_WARNINGS에 명시된 경우에만 warn_cnfr_yn="A" 1회 재전송
+                MERITZ_CONFIRM_WARNINGS에 명시된 경우에만 warn_cnfr_yn="Y" 1회 재전송
         - 2: 재전송 없이 OrderNotAcceptedError (중복 주문 위험)
         - rsp_cd != "0001": 브로커 거부 → OrderNotAcceptedError
         - der_no(주문번호) 누락: 접수 여부 불확실 → OrderError
@@ -1141,9 +1150,11 @@ class MeritzBroker(Broker):
                     confirm_sent = True
                     print(
                         f"[메리츠] 주문 경고(등급 {warn_cls_code}) → "
-                        f"warn_cnfr_yn=A 로 1회 재전송합니다: {symbol} {side} {quantity}주"
+                        f"warn_cnfr_yn=Y 로 1회 재전송합니다: {symbol} {side} {quantity}주"
                     )
-                    order_body = dict(order_body, warn_cnfr_yn="A")
+                    # 해외주식의 경고 확인 값은 "Y" 입니다 (공식 안내 기준).
+                    # 응답 설명의 "A" 는 국내 주문 관례이므로 그대로 쓰면 안 됩니다.
+                    order_body = dict(order_body, warn_cnfr_yn="Y")
                     continue
                 raise OrderNotAcceptedError(
                     f"메리츠 주문 경고(등급 {warn_cls_code}, 확인 미설정): {message}"
@@ -1270,6 +1281,113 @@ class MeritzBroker(Broker):
                     "odqt": row["_ordered_qty"],
                 }
         return None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 주문 정정 (해외주식 정정 API)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def modify_order(
+        self,
+        odno: str,
+        symbol: str,
+        exchange: str,
+        side: str,
+        quantity: int,
+        price: float,
+        order_type: str,
+    ) -> str:
+        """
+        메리츠 해외주식 주문을 정정합니다.
+
+        POST /trading/v1/overseas/orders/modify
+        필수 6필드: oder_date, orgl_oder_no, oder_cls_code, odqt,
+                    ovrs_stck_oder_prc, oder_cond_cls_code
+
+        주의 (공식 FAQ):
+        - 해외주식은 **재정정 시 직전 정정 건의 주문번호**를 원주문번호로 씁니다.
+          국내는 최초 주문번호를 계속 씁니다 — 두 기준이 반대입니다.
+        - oder_cond_cls_code 는 주문구분에 따라 고정입니다 (01/05→0, 31/33→2, 32/34→7).
+        - 경고 확인 재전송 값은 해외주식이 "Y" 입니다 (국내 "A" 안내를 그대로 쓰면 안 됨).
+
+        Returns:
+            str: 정정 후 새 합성 주문번호
+        """
+        oder_date, orgl_oder_no = self._parse_synthetic_odno(odno)
+
+        cls_code = _ORDER_TYPE_MAP.get((order_type or "").upper())
+        if cls_code is None:
+            raise OrderNotAcceptedError(f"지원하지 않는 주문 유형입니다: {order_type}")
+        if side not in ("BUY", "SELL"):
+            raise OrderNotAcceptedError(f"지원하지 않는 주문 방향입니다: {side}")
+
+        # 시장가 계열은 단가 없이 접수되므로 0을 전송합니다
+        if (order_type or "").upper() in _MARKET_ORDER_TYPES:
+            send_price = 0.0
+        else:
+            send_price = normalize_order_price(price)
+
+        body = {
+            "oder_date": oder_date,
+            "orgl_oder_no": orgl_oder_no,
+            "oder_cls_code": cls_code,
+            "odqt": int(quantity),
+            "ovrs_stck_oder_prc": float(send_price),
+            "oder_cond_cls_code": _ODER_COND_CLS_CODE.get(cls_code, "0"),
+            "warn_cnfr_yn": "N",
+        }
+        assert all(body.get(field) not in (None, "") for field in _MODIFY_REQUIRED_FIELDS)
+
+        try:
+            resp_body = self._request(
+                "POST", PATH_ORDER_MODIFY, json_body=body, is_query=False
+            )
+        except _ResponseParseError as e:
+            raise OrderError(str(e)) from e
+        except AuthError as e:
+            raise OrderNotAcceptedError(str(e)) from e
+        except BrokerError as e:
+            raise OrderNotAcceptedError(str(e)) from e
+        except requests.exceptions.RequestException as e:
+            raise OrderError(
+                f"메리츠 주문 정정 실패 (접수 여부 불확실): {str(e)}"
+            ) from e
+
+        rsp_cd = str(resp_body.get("rsp_cd", "") or "")
+        if rsp_cd != _ORDER_ACCEPT_RSP_CD:
+            raise OrderNotAcceptedError(
+                f"메리츠 주문 정정 거부 [{rsp_cd}]: {self._error_message(resp_body)} "
+                f"({symbol} {side} {quantity}주 ${send_price})"
+            )
+
+        warn_code = self._warn_cls_code(resp_body)
+        if warn_code != _WARN_NONE:
+            raise OrderNotAcceptedError(
+                f"메리츠 주문 정정 미접수 [warn_cls_code={warn_code}]: "
+                f"{self._error_message(resp_body)} (odno={odno})"
+            )
+
+        new_oder_no = str(self._order_no_from(resp_body) or "").strip()
+        if not new_oder_no:
+            raise OrderError(
+                f"메리츠 주문 정정 응답에 주문번호(der_no)가 없습니다: "
+                f"{self._error_message(resp_body)} ({symbol} {side} {quantity}주)"
+            )
+
+        new_odno = self._build_synthetic_odno(
+            self._oder_date_from(resp_body), new_oder_no
+        )
+        # 이후 정정/취소가 원주문번호를 찾을 수 있도록 새 주문번호로 캐시를 옮깁니다.
+        self._submitted_orders[new_odno] = {
+            "oder_cls_code": cls_code,
+            "odqt": int(quantity),
+        }
+        self._submitted_orders.pop(odno, None)
+
+        print(
+            f"[메리츠] 주문 정정 성공: {odno} → {new_odno} "
+            f"({side} {quantity}주 ${send_price}, {order_type}→{cls_code})"
+        )
+        return new_odno
 
     # ═══════════════════════════════════════════════════════════════════
     # 유틸리티

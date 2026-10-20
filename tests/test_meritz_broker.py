@@ -958,7 +958,10 @@ def test_place_order_warn1_3_default_rejected(make_broker, warn_code):
 
 @pytest.mark.parametrize("warn_code", ["1", "3"])
 def test_place_order_warn1_3_confirm_resends_once(make_broker, monkeypatch, warn_code):
-    """MERITZ_CONFIRM_WARNINGS에 명시된 등급만 warn_cnfr_yn=A 1회 재전송."""
+    """MERITZ_CONFIRM_WARNINGS에 명시된 등급만 warn_cnfr_yn=Y 1회 재전송.
+
+    해외주식의 경고 확인 값은 "Y" 입니다 (공식 안내 기준, 국내 "A" 아님).
+    """
     monkeypatch.setenv("MERITZ_CONFIRM_WARNINGS", warn_code)
     broker, session = make_broker(
         [
@@ -969,7 +972,7 @@ def test_place_order_warn1_3_confirm_resends_once(make_broker, monkeypatch, warn
     result = broker.place_order("TQQQ", "OQ", "BUY", 1, 70.0, "LIMIT")
     assert result.order_id == "20260806:0000004615"
     assert len(session.calls) == 2
-    assert session.calls[1]["json_body"]["warn_cnfr_yn"] == "A"
+    assert session.calls[1]["json_body"]["warn_cnfr_yn"] == "Y"
 
 
 def test_place_order_warn2_never_resends(make_broker, monkeypatch):
@@ -1072,6 +1075,99 @@ def test_cancel_order_without_meta_is_not_accepted(make_broker):
     with pytest.raises(OrderNotAcceptedError):
         broker.cancel_order("20260806:0000009999", symbol="TQQQ", exchange="NAS")
     assert len(session.calls) == 1  # 오늘 이력 조회만 수행 (취소 POST 없음)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 주문 정정 (POST /trading/v1/overseas/orders/modify)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_modify_order_sends_official_body(make_broker):
+    """정정 본문 6필드와 경로가 공식 스키마와 일치합니다."""
+    broker, session = make_broker(
+        [ok(rsp_cd="0001", data={"der_no": "4616", "oder_date": "20261020",
+                                 "warn_cls_code": "0"})]
+    )
+
+    new_odno = broker.modify_order(
+        "20261020:0000759959", "TQQQ", "NAS", "SELL", 18, 73.74, "LOC"
+    )
+
+    call = session.calls[0]
+    assert call["path"] == "/trading/v1/overseas/orders/modify"
+    body = call["json_body"]
+    assert body["oder_date"] == "20261020"
+    assert body["orgl_oder_no"] == "759959"
+    assert body["oder_cls_code"] == "32"
+    assert body["odqt"] == 18
+    assert body["ovrs_stck_oder_prc"] == 73.74
+    assert body["oder_cond_cls_code"] == "7"
+    assert body["warn_cnfr_yn"] == "N"
+    assert new_odno == "20261020:0000004616"
+
+
+def test_modify_order_allows_quantity_increase(make_broker):
+    """수량 증량 정정(1주 → 7주)이 그대로 전달됩니다."""
+    broker, session = make_broker(
+        [ok(rsp_cd="0001", data={"der_no": "4617", "oder_date": "20261020",
+                                 "warn_cls_code": "0"})]
+    )
+
+    broker.modify_order(
+        "20261020:0000759969", "TQQQ", "NAS", "BUY", 7, 73.73, "LOC"
+    )
+
+    assert session.calls[0]["json_body"]["odqt"] == 7
+
+
+def test_modify_order_rejection_is_not_accepted(make_broker):
+    """정정 거부는 OrderNotAcceptedError입니다."""
+    broker, _session = make_broker(
+        [FakeResponse({"rsp_cd": "IGW50002", "rsp_msg": "주문조건구분코드 오류"})]
+    )
+    with pytest.raises(OrderNotAcceptedError):
+        broker.modify_order(
+            "20261020:0000759959", "TQQQ", "NAS", "SELL", 18, 73.74, "LOC"
+        )
+
+
+def test_modify_order_without_oder_no_is_uncertain(make_broker):
+    """접수 응답에 주문번호가 없으면 접수 여부가 불확실하므로 OrderError입니다."""
+    broker, _session = make_broker(
+        [ok(rsp_cd="0001", data={"warn_cls_code": "0"})]
+    )
+    with pytest.raises(OrderError):
+        broker.modify_order(
+            "20261020:0000759959", "TQQQ", "NAS", "SELL", 18, 73.74, "LOC"
+        )
+
+
+def test_modify_order_moves_cancel_cache_to_new_odno(make_broker):
+    """정정 후 새 주문번호로 취소 캐시가 이동합니다."""
+    broker, _session = make_broker(
+        [ok(rsp_cd="0001", data={"der_no": "4618", "oder_date": "20261020",
+                                 "warn_cls_code": "0"})]
+    )
+    broker._submitted_orders["20261020:0000759959"] = {
+        "oder_cls_code": "32", "odqt": 18,
+    }
+
+    new_odno = broker.modify_order(
+        "20261020:0000759959", "TQQQ", "NAS", "SELL", 18, 73.74, "LOC"
+    )
+
+    assert "20261020:0000759959" not in broker._submitted_orders
+    assert broker._submitted_orders[new_odno]["odqt"] == 18
+
+
+def test_modify_order_rejects_unknown_order_type(make_broker):
+    """지원하지 않는 주문 유형은 전송 없이 차단합니다."""
+    broker, session = make_broker([])
+    with pytest.raises(OrderNotAcceptedError):
+        broker.modify_order(
+            "20261020:0000759959", "TQQQ", "NAS", "SELL", 18, 73.74, "STOP"
+        )
+    assert len(session.calls) == 0
 
 
 def test_cancel_order_rejection_is_not_accepted(make_broker):
