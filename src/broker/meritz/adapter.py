@@ -96,6 +96,18 @@ _ORDER_TYPE_MAP = {
 # 시장가 계열(05/33/34/37/38)은 단가를 0으로 전송합니다 (37/38은 봇 미사용)
 _MARKET_ORDER_TYPES = {"MKT", "MOC", "MOO"}
 
+# 주문조건구분(oder_cond_cls_code) — 메리츠 규칙 (IGW50002 실측 2026-10-20):
+#   oder_cls_code 01·05·35~38 → 0, 31·33 → 2, 32·34 → 7
+#   (거부 사례: LOC(32)에 0을 보내 쿼터매도 주문이 접수되지 않음)
+_ODER_COND_CLS_CODE = {
+    "01": "0",   # 지정가
+    "05": "0",   # 시장가
+    "31": "2",   # 장시작 LOO
+    "32": "7",   # 장시작 LOC
+    "33": "2",   # 장마감 MOO
+    "34": "7",   # 장마감 MOC
+}
+
 # ── aspr_type_code → 주문구분 역매핑 (이력에서 취소 메타 복원용) ──
 _ASPR_TO_ODER_CLS_CODE = {
     "1": "05",   # 시장가
@@ -1033,7 +1045,7 @@ class MeritzBroker(Broker):
             "ovrs_stck_symb_iscd": symbol.upper(),
             "ovrs_exch_vndr_idno": vendor_code,
             "oder_cls_code": cls_code,
-            "oder_cond_cls_code": "0",           # 주문조건: 0=일반 (기본값)
+            "oder_cond_cls_code": _ODER_COND_CLS_CODE.get(cls_code, "0"),
             "odqt": int(quantity),
             "ovrs_stck_oder_prc": float(price),  # 시장가 계열(05/33/34)은 0
             "warn_cnfr_yn": "N",                 # 경고 1차는 미확인으로 전송

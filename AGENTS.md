@@ -155,6 +155,8 @@ uv run pytest tests/test_broker_preflight.py -v
 
 **실전 소액 LIVE 1세션**: 별도 테스트가 아니라 전략의 첫 실전 주문 자체를 smoke 테스트로 봅니다. `LOC/MOC` 실전 접수 여부와 파이프라인 1회 정상 동작만 확인.
 
+**MERITZ 주문조건구분(`oder_cond_cls_code`)**: 값이 `oder_cls_code`에 따라 고정됩니다 — `01`·`05`·`35~38` → `0`, `31`·`33` → `2`, `32`·`34` → `7`. 위반 시 주문이 `IGW50002`로 거부됩니다 (2026-10-20 LOC 쿼터매도 실측 미접수). 매핑은 `src/broker/meritz/adapter.py`의 `_ODER_COND_CLS_CODE`.
+
 **MERITZ 10/12 신청 게이트 (2026-10-02 기준)**: 메리츠 오픈API는 모바일앱 신청이 차단되고 포털도 미개방 상태라 **실검증 보류**. 유동IP 사용 가능 확인됨 (고정IP 불필요, ubuntu-latest 그대로 사용). MAC 사전등록도 별도 절차 없음 (요청 헤더에 12자리 HEX를 넣어 전송하면 됨). 자격증명 발급 전까지 preflight 주문 단계는 `--live-order-probe`로만 실행하고, 기본 실행은 read-only 조회(1~6단계) + skip 출력으로 통과 처리합니다. 신청 개방 확인 후 preflight 1회 통과 + 실전 소액 LIVE 1세션 검증 순서로 진행.
 
 ## COMMUNICATION RULES

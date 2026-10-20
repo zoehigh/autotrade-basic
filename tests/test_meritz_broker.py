@@ -496,6 +496,33 @@ def test_order_post_is_not_retried_on_query_retry_code(make_broker):
     assert len(session.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "order_type, expected_cls, expected_cond",
+    [
+        ("LIMIT", "01", "0"),
+        ("MKT", "05", "0"),
+        ("LOO", "31", "2"),
+        ("LOC", "32", "7"),
+        ("MOO", "33", "2"),
+        ("MOC", "34", "7"),
+    ],
+)
+def test_order_cond_cls_code_matches_order_type(
+    make_broker, order_type, expected_cls, expected_cond
+):
+    """IGW50002: oder_cond_cls_code는 oder_cls_code에 따라 0·2·7이어야 합니다.
+
+    실측 거부 사례(2026-10-20): LOC(32)에 0을 보내 쿼터매도가 미접수.
+    """
+    broker, session = make_broker([accepted_response()])
+
+    broker.place_order("TQQQ", "OQ", "SELL", 1, 70.0, order_type)
+
+    body = session.calls[0]["json_body"]
+    assert body["oder_cls_code"] == expected_cls
+    assert body["oder_cond_cls_code"] == expected_cond
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 주문 이력 (표준 16필드 / 공식 파라미터 / 합성 ID / KST 플래그)
 # ═══════════════════════════════════════════════════════════════════
