@@ -50,9 +50,10 @@
 - reconcile-only: TQQQ 6건 / SOXL 8건 체결 반영, `[불일치]` 없음
 - DRY 실행 전후 `.state.json` sha256 **불변** → DRY 미저장 확인
 - 주의: 브로커 주문가능금액($11,752.21)은 시드 기준 잔여($4,080.58)보다 큼 → 봇은 시드 캡 적용
-- 수수료: 메리츠 계좌 **2026-12-31까지 수수료 면제** → `COMMISSION_RATE=0.0000` 사용 중.
-  `COMMISSION_RATE`는 `generate_cycle_report()`의 순수익 계산에만 쓰이므로 **전략 신호에는 영향 없음**.
-  **2027-01-01부터 실제 요율(예: `0.0025`)로 반드시 변경** — 변경 전까지 사이클 리포트 순수익이 과대표시됩니다.
+- 수수료: **운영 VPS `.env` 의 `COMMISSION_RATE=0.0025` (0.25%) 가 실효값**입니다.
+  `src/config.py` 기본값도 `0.0025` 이므로 미설정 시 동일하게 동작합니다.
+  `COMMISSION_RATE` 는 `generate_cycle_report()` 의 순수익 계산에만 쓰이므로 **전략 주문 신호에는 영향 없음**.
+  (계좌 수수료 면제 여부는 brokerage 확인 후 필요 시 운영 `.env` 한 줄만 바꾸면 됩니다.)
 
 **미추적 백업**: `.state.json.bak-20261013`, `.state.json.bak-20261013-effix`,
 `.state.json.bak-20261020-090926`, `.state.json.bak-20261020-091421-pre-cycle-start`
