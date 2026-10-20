@@ -53,6 +53,7 @@ STATE_REVERSE_AUDIT_ONLY = os.getenv("STATE_REVERSE_AUDIT_ONLY", "").strip().low
 STATE_REVERSE_RECONCILE_ONLY = os.getenv("STATE_REVERSE_RECONCILE_ONLY", "").strip().lower() == "true"
 STATE_NET_INVESTED_REPAIR_ONLY = os.getenv("STATE_NET_INVESTED_REPAIR_ONLY", "").strip().lower() == "true"
 STATE_ASSUME_REVERSE_EXPIRY_ONLY = os.getenv("STATE_ASSUME_REVERSE_EXPIRY_ONLY", "").strip().lower() == "true"
+STATE_SET_CYCLE_START_ONLY = os.getenv("STATE_SET_CYCLE_START_ONLY", "").strip().lower() == "true"
 
 
 def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
@@ -1002,6 +1003,8 @@ def _print_state_diagnostic():
             odno for odno, meta in state.get("orders_meta", {}).items()
             if meta.get("reverse_action")
         )
+        pending_intent = state.get("pending_order_intent")
+        pending_batch = state.get("pending_order_batch")
         print(
             f"[상태 진단] {symbol} → "
             f"T={state.get('T', 0.0)}, "
@@ -1009,6 +1012,9 @@ def _print_state_diagnostic():
             f"cumulative_sell_proceeds=${reverse_mode.get('cumulative_sell_proceeds', 0.0):.2f}, "
             f"net_invested=${state.get('net_invested', 0.0):.2f} "
             f"({state.get('net_invested_status', 'unresolved')}), "
+            f"effective_seed=${state.get('effective_seed', 0.0):.2f}, "
+            f"cycle_start_date={state.get('cycle_start_date', '') or '(없음)'}, "
+            f"pending_intent={bool(pending_intent)}, pending_batch={bool(pending_batch)}, "
             f"reverse_order_ids={reverse_order_ids}, "
             f"order_meta_ids={sorted(state.get('orders_meta', {}).keys())}, "
             f"last_updated={state.get('last_updated', '')}, "
@@ -1330,6 +1336,93 @@ def _net_invested_repair_only():
     print(f"[net_invested 복구] {symbol} net_invested=${target:.2f}/valid 저장 완료.")
 
 
+def _set_cycle_start_only():
+    """cycle_start_date를 명시 값으로 1회 복구합니다 (CAS, 상태 파일만 수정).
+
+    사용:
+        STATE_SET_CYCLE_START_ONLY=true
+        STATE_SET_CYCLE_START_SYMBOL=TQQQ
+        STATE_SET_CYCLE_START_DATE=2026-09-23
+        STATE_SET_CYCLE_START_EXPECT_HASH=<진단에서 출력한 state_hash>
+        STATE_SET_CYCLE_START_EXPECT_T=9.375
+        STATE_SET_CYCLE_START_EXPECT_CURRENT=          # 현재 값(비어 있으면 빈 문자열)
+
+    - 브로커 API/전략/주문은 실행하지 않습니다.
+    - 진단 직후의 canonical hash가 일치할 때만 적용합니다 (CAS).
+    - T, net_invested, watermark, orders_meta, reverse_mode, fence는 보존합니다.
+    - 미종결 리버스 주문 또는 pending fence가 남아 있으면 거부합니다.
+    - date는 YYYY-MM-DD 형식이며 기준일(last_updated 날짜, 없으면 오늘) 이하여야 합니다.
+    """
+    def _required(name, allow_empty=False):
+        raw = os.environ.get(name)
+        if raw is None:
+            raise RuntimeError(f"cycle_start_date 복구 fingerprint 환경변수가 없습니다: {name}")
+        if not allow_empty and not raw.strip():
+            raise RuntimeError(f"cycle_start_date 복구 fingerprint 환경변수가 비어 있습니다: {name}")
+        return raw.strip()
+
+    symbol = _required("STATE_SET_CYCLE_START_SYMBOL").upper()
+    date_str = _required("STATE_SET_CYCLE_START_DATE")
+    expect_hash = _required("STATE_SET_CYCLE_START_EXPECT_HASH")
+    expect_t = float(_required("STATE_SET_CYCLE_START_EXPECT_T"))
+    # 현재 cycle_start_date는 "없음"(빈 문자열)을 의미할 수 있으므로 빈 값 허용
+    expect_current = _required("STATE_SET_CYCLE_START_EXPECT_CURRENT", allow_empty=True)
+
+    # 날짜 형식 검증 (YYYY-MM-DD)
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise RuntimeError(f"cycle_start_date 복구 거부: 날짜 형식이 YYYY-MM-DD가 아닙니다: {date_str}")
+
+    state = load_state(symbol)
+    actual_hash = canonical_state_hash(state)
+    actual_t = float(state.get("T", 0.0))
+    actual_current = state.get("cycle_start_date", "") or ""
+
+    if actual_hash != expect_hash:
+        raise RuntimeError(
+            f"cycle_start_date 복구 hash 불일치: actual={actual_hash}, expected={expect_hash}"
+        )
+    if abs(actual_t - expect_t) > 0.0005:
+        raise RuntimeError(
+            f"cycle_start_date 복구 T 불일치: actual={actual_t}, expected={expect_t}"
+        )
+    if actual_current != expect_current:
+        raise RuntimeError(
+            f"cycle_start_date 복구 현재값 불일치: actual='{actual_current}', expected='{expect_current}'"
+        )
+    if _has_unresolved_reverse_orders(state):
+        raise RuntimeError(
+            "cycle_start_date 복구 거부: 미종결 리버스 주문이 남아 있습니다. reconcile/audit을 먼저 진행하세요."
+        )
+    if state.get("pending_order_intent") or state.get("pending_order_batch"):
+        raise RuntimeError(
+            "cycle_start_date 복구 거부: pending 주문 fence가 남아 있습니다. fence 확인 필요."
+        )
+
+    # 사이클 시작일은 과거여야 합니다: 기준일(last_updated 날짜, 없으면 오늘) 이하만 허용.
+    last_updated = str(state.get("last_updated", ""))
+    ref_date = None
+    if len(last_updated) >= 10:
+        try:
+            ref_date = datetime.strptime(last_updated[:10], "%Y-%m-%d").date()
+        except ValueError:
+            ref_date = None
+    if ref_date is None:
+        ref_date = datetime.now(ZoneInfo("UTC")).date()
+    if target_date > ref_date:
+        raise RuntimeError(
+            f"cycle_start_date 복구 거부: date({date_str})가 기준일({ref_date.isoformat()})보다 미래입니다."
+        )
+
+    print(
+        f"[cycle_start_date 복구] {symbol} '{actual_current or '(없음)'}' → '{date_str}'로 복구합니다."
+    )
+    state["cycle_start_date"] = date_str
+    save_state(symbol, state)
+    print(f"[cycle_start_date 복구] {symbol} cycle_start_date={date_str} 저장 완료.")
+
+
 def _assume_reverse_expiry_only():
     """키움 모의의 이전 세션 zero-fill 주문을 정책상 종결 처리합니다.
 
@@ -1447,13 +1540,14 @@ _REPAIR_LEGACY_MAP = {
     "REVERSE_T_FIX": "_repair_state_only",
     "FENCE_CLEAR": "_clear_fence_only",
     "NET_INVESTED_REPAIR": "_net_invested_repair_only",
+    "CYCLE_START_SET": "_set_cycle_start_only",
     "ASSUME_EXPIRY": "_assume_reverse_expiry_only",
 }
 
 # REPAIR 모드에서 허용되는 액션 목록
 _REPAIR_ACTIONS = {"DIAGNOSTIC", "REVERSE_AUDIT", "REVERSE_RECONCILE", "REVERSE_RESET",
                    "REVERSE_T_FIX", "FENCE_CLEAR", "NET_INVESTED_REPAIR",
-                   "ASSUME_EXPIRY", "REINFERENCE", "FORCE_T"}
+                   "CYCLE_START_SET", "ASSUME_EXPIRY", "REINFERENCE", "FORCE_T"}
 
 
 def _repair_reinference():
@@ -1586,6 +1680,7 @@ def _dispatch_repair():
         "STATE_REVERSE_RECONCILE_ONLY": STATE_REVERSE_RECONCILE_ONLY,
         "STATE_NET_INVESTED_REPAIR_ONLY": STATE_NET_INVESTED_REPAIR_ONLY,
         "STATE_ASSUME_REVERSE_EXPIRY_ONLY": STATE_ASSUME_REVERSE_EXPIRY_ONLY,
+        "STATE_SET_CYCLE_START_ONLY": STATE_SET_CYCLE_START_ONLY,
     }
     for name, enabled in legacy_flags.items():
         if enabled:
@@ -1685,6 +1780,7 @@ def main():
         "STATE_REVERSE_RECONCILE_ONLY": STATE_REVERSE_RECONCILE_ONLY,
         "STATE_NET_INVESTED_REPAIR_ONLY": STATE_NET_INVESTED_REPAIR_ONLY,
         "STATE_ASSUME_REVERSE_EXPIRY_ONLY": STATE_ASSUME_REVERSE_EXPIRY_ONLY,
+        "STATE_SET_CYCLE_START_ONLY": STATE_SET_CYCLE_START_ONLY,
     }
     _enabled = [name for name, enabled in _exclusive_modes.items() if enabled]
     if len(_enabled) > 1:
@@ -1702,6 +1798,9 @@ def main():
         return
     if STATE_ASSUME_REVERSE_EXPIRY_ONLY:
         _assume_reverse_expiry_only()
+        return
+    if STATE_SET_CYCLE_START_ONLY:
+        _set_cycle_start_only()
         return
 
     # 전체 T 재추정은 주문을 절대 발생시키지 않아야 합니다.

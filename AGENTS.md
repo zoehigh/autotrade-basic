@@ -207,6 +207,7 @@ uv run pytest tests/test_broker_preflight.py -v
       `STATE_ASSUME_REVERSE_EXPIRY_SYMBOL`/`_ORDER`/`_EXPECT_HASH` 필요.
   - `canonical_state_hash()` (`src/state.py`): `save_state()`가 기록하는 필드만 SHA-256 — 복구 CAS/audit용.
     네 복구 모드(`STATE_REVERSE_AUDIT_ONLY`/`RECONCILE_ONLY`/`NET_INVESTED_REPAIR_ONLY`/`ASSUME_REVERSE_EXPIRY_ONLY`)는 **동시 설정 금지**.
+    `STATE_SET_CYCLE_START_ONLY`도 같은 배타 그룹(`_exclusive_modes`)에 포함됩니다.
 - **KIWOOM/LS/TOSS/MERITZ**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능), **KIS/NHPLUG는 계좌번호 필수** (`KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없으면 호출 금지)
 - **주문 시각**: 모든 브로커에서 `get_kst_now()` 사용 (API 응답 시간 미사용)
 - **KIS ODNO 정규화**: 주문 접수 API는 leading zero 10자리(`0000052248`), 체결 조회는 trimmed(`52248`) 반환 → `kis/adapter.py`에서 `str(int(odno))`로 정규화 후 반환 (다른 브로커는 해당 없음)
@@ -277,6 +278,8 @@ uv run pytest tests/test_broker_preflight.py -v
 - **STATE_REPAIR_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 리버스 상태를 1회 초기화. `STATE_REPAIR_*` 변수는 실행 직후 삭제
   - `STATE_REPAIR_TARGET_T={value}` (선택): 기본 초기화 대신 **T만 보정**하고 리버스 cycle/orders_meta를 보존. ord_dt vs submitted_at 날짜 컨벤션 버그로 오반영된 T(예: 20→15)를 되돌려 다음 RUN의 `reconcile_reverse_fills`가 체결 기반으로 재계산(예: 20→18)하도록 하는 용도. fingerprint는 기존과 동일하게 필요
 - **STATE_CLEAR_FENCE_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 주문 fence(`pending_order_intent`/`pending_order_batch`)를 1회 초기화. `STATE_CLEAR_FENCE_SYMBOL` + `STATE_CLEAR_FENCE_EXPECT_T`/`EXPECT_LAST_UPDATED`/`EXPECT_INTENT`/`EXPECT_BATCH` 필요 (intent/batch는 빈 값 = "fence 없음" 의미, env var 존재만 필수). 실행 직후 변수 삭제
+- **STATE_SET_CYCLE_START_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 `cycle_start_date`를 1회 설정. `STATE_SET_CYCLE_START_SYMBOL` + `STATE_SET_CYCLE_START_DATE`(YYYY-MM-DD) + `STATE_SET_CYCLE_START_EXPECT_HASH`/`EXPECT_T`/`EXPECT_CURRENT` 필요 (EXPECT_CURRENT는 빈 값 허용 = "현재 값 없음"). `REPAIR_ACTION=CYCLE_START_SET`으로도 실행 가능. 미종결 리버스 주문 또는 pending fence가 있으면 거부하고, date가 기준일(last_updated 날짜, 없으면 오늘)보다 미래면 거부. 실행 직후 변수 삭제
+  - 배경: 수동 주입(REPAIR CAS) 후 `cycle_start_date`가 비면 `generate_cycle_report`가 **전체 이력**을 집계해 B안 시드(`next_cycle_seed = seed + net_profit`)가 틀어짐. `cycle_start_date`는 full-history 추정 경로에서만 자동 설정되므로(현재 T>0인 진행 중 사이클은 미설정), 이 액션으로 정정
 - **LIVE 주문 fence**: 주문 전 `pending_order_batch`/`pending_order_intent`를 캐시에 저장하며, fence가 남아 있어도 **전체 중단하지 않고** 해당 종목만 복구를 시도합니다 (다른 종목은 계속 진행)
   - **미접수 확정(`OrderNotAcceptedError`)**: 브로커가 명시적으로 거부(사전검증 실패 또는 거부 응답)해 주문이 접수되지 않았음이 보장되면 fence를 해제하고 해당 종목의 남은 주문만 중단 → 다음 종목 계속 진행
   - **불확실(네트워크 타임아웃/연결 오류, 주문번호 누락)**: fence 유지 → 해당 종목만 중단, 다음 종목은 계속 진행 (`SymbolScopedError`). **다음 RUN에서 자동 복구**를 시도합니다. state 저장 실패(intent/checkpoint)는 공통 장애로 전체 중단 (`GlobalScopedError`, 단일 `.state.json` 공유 때문)
