@@ -1,49 +1,57 @@
 # 손매매 계좌 인계 → 자동매매 시딩 → 사이클 종료(B안) 런북
 
-작성: 2026-10-15 · 갱신: 2026-10-19
+작성: 2026-10-15 · 갱신: 2026-10-20
 대상: TQQQ, SOXL (메리츠 실전)
 코드 근거: `trading_bot.py`, `src/state.py`, `src/strategy.py`
 
-## 전제 (2026-10-19 확정)
+## 전제 (2026-10-20 확정)
 
 - **이 코드는 메리츠 실전에 적용된 적이 없습니다.** 계좌는 사용자가 **손으로 직접 매매**해 왔고,
   코드는 preflight / DRY / 명시적 보정으로만 사용됐습니다.
 - **운영 호스트: 별도 전용 VPS + `cron` + `flock`.** GH Actions는 사용하지 않습니다
   (외부 cron dispatch도 꺼져 있음).
+- 배포 위치: 운영 VPS `~/investment/muhan-v4` (commit `5e48e69`)
 - **개발 머신은 preflight / DRY / 보정 전용 — 실주문 금지.**
 - 운영 상태는 **운영 VPS의 `.state.json`** 이 권위입니다. (GH Actions 캐시 아님)
 
 ---
 
-## 0. 현재 상태 (2026-10-19 read-only 실측)
+## 0. 현재 상태 (2026-10-20 VPS 동기화 완료)
 
-`.state.json`은 **10/14 스냅샷으로 stale**이며, 10/15·10/16 손매매 체결이 미반영입니다.
-아래 "실제" 값은 메리츠 실계좌를 read-only로 조회한 reconciliation 결과입니다.
+`.state.json`은 10/14 스냅샷이었고, **2026-10-20 VPS에서 `STATE_REVERSE_RECONCILE_ONLY`로 동기화를 완료**했습니다.
+아래 "VPS (동기화 후)" 값이 현재 운영 기준입니다.
 
-| 항목 | 로컬 state (10/14) | **실제 (2026-10-19)** |
+| 항목 | 로컬 state (10/14, stale) | **VPS (동기화 후)** |
 |---|---|---|
-| TQQQ T | 9.375 | **11.375** |
-| TQQQ net_invested | $4,126.91 | **$5,121.12** |
-| SOXL T | 9.65625 | **11.65625** |
-| SOXL net_invested | $3,996.61 | **$4,880.68** |
+| TQQQ T | 9.375 | **12.375** (수동 보정, §2-보정 참고) |
+| TQQQ net_invested | $4,126.91 | **$5,615.60** |
+| SOXL T | 9.65625 | **12.6562** |
+| SOXL net_invested | $3,996.61 | **$5,373.93** |
 | net_invested_status | valid | valid |
 | **effective_seed** | **0.0** | **0.0** (→ config `{SYMBOL}_SEED` 폴백) |
-| **cycle_start_date** | **`""` ⚠️** | **`""` ⚠️** (→ §2에서 설정) |
-| watermark(last_updated) | 2026-10-14T08:09:04Z / 08:05:55Z | 10/16 체결로 전진 예정 |
-| last_processed_ordno | `20261014:0001650552` / `20261014:0001647177` | 10/16 최신 체결로 전진 예정 |
-| 보유 | — | TQQQ 67주 @ $77.0777 / SOXL 39주 @ $128.091 |
-| 최근가 | — | TQQQ $68.21 / SOXL $93.67 |
+| **cycle_start_date** | **`""`** | **2026-09-23 / 2026-09-22** (설정 완료) |
+| watermark(last_updated) | 2026-10-14T08:09:04Z / 08:05:55Z | 2026-10-19T08:06:49Z / 08:04:19Z |
+| last_processed_ordno | `20261014:0001650552` / `20261014:0001647177` | `20261019:0000076920` / `20261019:0000073422` |
+| 보유 | — | TQQQ 74주 @ $76.4687 / SOXL 44주 @ $124.7454 |
+| 최근가 | — | TQQQ $70.64 / SOXL $98.65 |
 | 확정 시드(운영) | — | **$9,696.18 / $9,627.46** |
+| state_hash | — | `0a146fd5…` / `72937302…` |
 
-**미반영 체결**: 10/15 · 10/16 (TQQQ 3+2건, SOXL 3+3건).
+**반영된 손매매 체결**: 10/15 · 10/16 · 10/19 (TQQQ 3+2+1건, SOXL 3+3+2건).
 
-**검증 로그 요약 (방법 A, `TRADE_MODE=DRY` + 메리츠 실계좌 read-only)**
-- exit 0, `.state.json` sha256 **불변** → DRY는 상태를 저장하지 않음 확인
-- `[불일치]` 경고 **없음** → 이력 기반 포지션과 브로커 잔고 일치 (상태 무결성 양호)
-- 문제는 **최신성(stale)** 과 **시드 값**뿐
+**TQQQ T 보정 (2026-10-20)**: reconcile 결과 11.875는 **과소값**이었습니다.
+`orders_meta`가 없는 수동매수 폴백(`src/state.py:1419`)이 `1건 → +0.5`로 계산했으나,
+10/13→10/14 실적(3주×2건 → **+2.0**)과 `src/strategy.py:618-621` 규칙(1건 주문 = 1회차)은 `1건 → +1.0`입니다.
+10/19 1건을 1회차로 보고 `STATE_REPAIR_TARGET_T=12.375`로 보정했습니다.
 
-**미추적 백업**: `.state.json.bak-20261013`, `.state.json.bak-20261013-effix`
-(10/13 백업의 `effective_seed`는 TQQQ 10,231.81 / SOXL 11,792.01 → 이후 0으로 초기화됨)
+**검증 로그 요약 (2026-10-20, 운영 VPS)**
+- preflight 1~6단계 통과 (read-only, 주문 단계는 `--live-order-probe` 없이 skip)
+- reconcile-only: TQQQ 6건 / SOXL 8건 체결 반영, `[불일치]` 없음
+- DRY 실행 전후 `.state.json` sha256 **불변** → DRY 미저장 확인
+- 주의: 브로커 주문가능금액($11,752.21)은 시드 기준 잔여($4,080.58)보다 큼 → 봇은 시드 캡 적용
+
+**미추적 백업**: `.state.json.bak-20261013`, `.state.json.bak-20261013-effix`,
+`.state.json.bak-20261020-090926`, `.state.json.bak-20261020-091421-pre-cycle-start`
 
 ---
 
@@ -53,7 +61,7 @@
 
 - `effective_seed = 0.0` → 시드는 **config `{SYMBOL}_SEED`로 폴백**
   (`trading_bot.py:365-367`, `571-573`, `635-639`).
-- **운영 VPS `.env`에 확정 시드를 설정해야 합니다**: `TQQQ_SEED=9696.18`, `SOXL_SEED=9627.46`.
+- **운영 VPS `.env`에 확정 시드를 설정해야 합니다**: `TQQQ_SEED=9696.18`, `SOXL_SEED=9627.46`. ✅ 설정 완료
 - 🔴 **실측 확인된 문제**: 로컬 `.env` 값(`10000` / `5000`)으로 DRY를 돌리면
   SOXL은 `seed 5000 − net_invested 4880.68 = 잔여 $119.32` → **"1회 매수금 부족"으로 매수가 전면 생략**됩니다.
   시드는 장식이 아니라 **주문 규모를 결정**합니다.
@@ -70,19 +78,17 @@
 
 - TQQQ → `OQ` (NAS), SOXL → `AX` (AMS). **SOXL은 AMS가 맞음**(NYS 아님).
 
-### (d) `cycle_start_date` — BLOCKER, 수단 구현됨
+### (d) `cycle_start_date` — ✅ 설정 완료
 
 - 증상: `generate_cycle_report`가 `cycle_start_date`가 비면 **전체 이력**을 집계
   (`trading_bot.py:86-102`) → `net_profit`이 전 기간 누적이 되어 **B안 시드가 틀어짐**.
-- 수단: `STATE_SET_CYCLE_START_ONLY` (CAS repair, `_set_cycle_start_only`) — 구현·테스트 완료
-  (`tests/test_cycle_start_repair.py`, 11건).
-- 설정 순서는 **§2 Step 5** (reconcile 이후 해시로 CAS).
+- 2026-10-20 VPS에서 `STATE_SET_CYCLE_START_ONLY`(CAS)로 **TQQQ `2026-09-23` / SOXL `2026-09-22` 설정 완료**.
+- 손매매가 다시 발생해 재동기화가 필요하면 **§2 Step 3 → Step 5**를 새 해시로 다시 수행합니다.
 
 ### (e) 기타
 
-- **텔레그램**: 로컬 `.env`에 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` 없음 → 알림 미발송.
-  운영 VPS에는 설정 필요.
-- **×1.19 BUY 캡 재현**: 별지점 매수 `$82.05 → $81.16` (`현재가 $68.21 × 1.19`).
+- **텔레그램**: 로컬/운영 VPS `.env` 모두 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` 비어 있음 → 알림 미발송.
+- **×1.19 BUY 캡 재현**: 별지점 매수 `$82.05 → $81.16`, SOXL `$118.10 → $117.39`.
   AGENTS.md에 기록된 알려진 동작.
 
 ---
@@ -101,13 +107,16 @@ cp .state.json .state.json.bak-$(date +%Y%m%d-%H%M%S)
 ### Step 1 — preflight
 
 ```bash
+set -a && . ./.env && set +a
 uv run python tests/test_broker_preflight.py --broker meritz --symbol TQQQ
 ```
 
+> ⚠️ `tests/test_broker_preflight.py`의 `__main__`은 `.env`를 로드하지 않습니다.
+> 위처럼 환경변수를 주입하지 않으면 **자격증명 없음으로 조용히 skip**됩니다.
+
 ### Step 2 — `.state.json` 이관
 
-개발 머신의 `.state.json`(10/14 스냅샷)을 운영 VPS로 복사(`scp`/`rsync`).
-**이후 모든 변경은 VPS에서만** 수행합니다.
+개발 머신의 `.state.json`을 운영 VPS로 복사(`scp`/`rsync`). **이후 모든 변경은 VPS에서만** 수행합니다.
 
 ### Step 3 — 주문 없이 상태 동기화 (핵심)
 
@@ -118,12 +127,14 @@ TRADE_MODE=DRY STATE_REVERSE_RECONCILE_ONLY=true uv run python trading_bot.py
 이름과 달리 **일반 reconciliation 전체를 실행하고 저장**합니다
 (`trading_bot.py:1233-1272`: `update_T_from_history` → `save_state`, DRY 강제, 전략/주문 없음).
 
-기대 출력:
+2026-10-20 실측 출력:
 
 ```
-[reconcile-only] TQQQ 저장 완료 → T=11.375, net_invested=$5121.12 (valid), state_hash=<H_TQQQ>
-[reconcile-only] SOXL 저장 완료 → T=11.65625, net_invested=$4880.68 (valid), state_hash=<H_SOXL>
+[reconcile-only] TQQQ 저장 완료 → T=11.875, net_invested=$5615.60 (valid), state_hash=<H_TQQQ>
+[reconcile-only] SOXL 저장 완료 → T=12.6562, net_invested=$5373.93 (valid), state_hash=<H_SOXL>
 ```
+
+> 값은 **실행 시점 계좌 기준**으로 달라집니다. 항상 출력값을 그대로 사용하세요.
 
 ### Step 4 — 진단 검증 + 해시 확보
 
@@ -131,8 +142,8 @@ TRADE_MODE=DRY STATE_REVERSE_RECONCILE_ONLY=true uv run python trading_bot.py
 STATE_DIAGNOSTIC_ONLY=true uv run python trading_bot.py
 ```
 
-확인: T=11.375 / 11.65625, net_invested=$5,121.12 / $4,880.68, status=`valid`,
-`cycle_start_date=""`, `pending_*`=`null`, `reverse_mode={}` → **해시 2개 기록**
+확인: T=11.875 / 12.6562, net_invested=$5,615.60 / $5,373.93, status=`valid`,
+`pending_*`=`null`, `reverse_mode={}` → **해시 2개 기록**
 
 ### Step 5 — `cycle_start_date` 설정 (CAS, 종목별 개별 실행)
 
@@ -141,16 +152,17 @@ STATE_SET_CYCLE_START_ONLY=true \
 STATE_SET_CYCLE_START_SYMBOL=TQQQ \
 STATE_SET_CYCLE_START_DATE=2026-09-23 \
 STATE_SET_CYCLE_START_EXPECT_HASH=<H_TQQQ> \
-STATE_SET_CYCLE_START_EXPECT_T=11.375 \
+STATE_SET_CYCLE_START_EXPECT_T=11.875 \
 STATE_SET_CYCLE_START_EXPECT_CURRENT= \
 uv run python trading_bot.py
 ```
 
-SOXL: `_SYMBOL=SOXL`, `_DATE=2026-09-22`, `_EXPECT_T=11.65625`, `_EXPECT_HASH=<H_SOXL>`, `_EXPECT_CURRENT=`
+SOXL: `_SYMBOL=SOXL`, `_DATE=2026-09-22`, `_EXPECT_T=12.6562`, `_EXPECT_HASH=<H_SOXL>`, `_EXPECT_CURRENT=`
 
 - 보존: T, net_invested, watermark, `orders_meta`, `reverse_mode`, fence
 - 거부: hash/T/현재값 불일치, 미종결 리버스 주문, pending fence, 날짜가 기준일(last_updated 날짜) 이후
 - `REPAIR_ACTION=CYCLE_START_SET`으로도 실행 가능
+- 이미 설정된 뒤 재실행 시 `_EXPECT_CURRENT`에 기존 날짜를 넣습니다
 
 ### Step 6 — 재검증
 
@@ -179,9 +191,14 @@ TRADE_MODE=DRY uv run python trading_bot.py
 
 ### Step 9 — cron + flock 활성화
 
-- 실행 시각: **KST 17:30** (프리장 대기는 코드가 자동 처리, `trading_bot.py:713-722`; DST 무관)
-- `flock -n`으로 중복 실행 방지 (`docs/shadow.md` 패턴 참고)
+- 실행 시각: **KST 17:30** (`docs/cron-dispatch-guide.md:38`; 프리장 오픈 직후, DST는 코드가 자동 처리)
+- `flock -n`으로 중복 실행 방지
 - run 전 state 백업 + 로그 append/회전
+
+```cron
+CRON_TZ=Asia/Seoul
+30 17 * * 1-5 cd ~/investment/muhan-v4 && PATH=$HOME/.local/bin:/usr/bin:/bin flock -n /tmp/autotrade.lock $HOME/.local/bin/uv run python trading_bot.py >> run.log 2>&1
+```
 
 ### 순서 근거 (Step 3 → Step 5)
 
@@ -193,7 +210,7 @@ TRADE_MODE=DRY uv run python trading_bot.py
 
 | 시점 | 통과 조건 | 실패 시 |
 |---|---|---|
-| Step 3 후 | T=11.375 / 11.65625, net_invested 일치, status=valid | 중단 → `STATE_REVERSE_AUDIT_ONLY`로 이력 대조 |
+| Step 3 후 | T=11.875 / 12.6562, net_invested 일치, status=valid | 중단 → `STATE_REVERSE_AUDIT_ONLY`로 이력 대조 |
 | Step 4 후 | `[불일치]` 없음, fence/리버스 없음 | LIVE 금지, 원인 조사 |
 | Step 5 후 | `cycle_start_date` 설정, T 불변 | 해시 재획득 후 재실행 |
 | Step 7 후 | SOXL 매수 생략 해소, 주문 목록 정상 | 진행 중단 |
@@ -204,6 +221,8 @@ TRADE_MODE=DRY uv run python trading_bot.py
 - `cycle_start_date` 설정은 비가역에 가까움(해시 변경) → **Step 0 백업 필수**
 - Step 3의 T/net_invested는 **그 시점 계좌 기준 재계산**입니다. 확인 이후 손매매가 있었다면
   값이 달라지므로 **항상 출력값**을 CAS에 넣으세요.
+- 손매매가 계속되면 Step 3을 다시 실행해 재동기화하고, **새 해시로 Step 5를 다시** 수행합니다
+  (이미 설정된 경우 `EXPECT_CURRENT`에 그 값을 넣습니다).
 
 ---
 
@@ -274,13 +293,15 @@ TRADE_MODE=DRY uv run python trading_bot.py
 
 | 항목 | 상태 |
 |---|---|
-| 로컬 `.state.json` stale (10/14) | 🔴 **해결 절차 확정** — §2 Step 3 reconcile-only |
-| `cycle_start_date=""` | 🟠 **수단 구현됨** — §2 Step 5에서 설정 |
-| 운영 시드 소스 | 🟠 VPS `.env`에 확정값 설정 필요 (미설정 시 SOXL 매수 생략) |
+| 로컬 `.state.json` stale (10/14) | ✅ **해결** — 2026-10-20 VPS reconcile-only 완료 |
+| `cycle_start_date=""` | ✅ **해결** — TQQQ 2026-09-23 / SOXL 2026-09-22 |
+| 운영 시드 소스 | ✅ VPS `.env`에 9,696.18 / 9,627.46 설정 완료 |
+| 손매매 지속 시 state 재-stale | ⚠️ 컷오버(수동 주문 중단) 후 §2 Step 3 재실행 |
+| 수동매수 T 폴백 과소계산 | ⚠️ `src/state.py:1419` (`1건 → 0.5`). TQQQ는 12.375로 보정, **SOXL 재검토 필요** |
 | 메리츠 이력 ~1일 후행 | ⚠️ `net_profit` 불완전 가능 → 익일 재확인 |
 | 미체결/예약 조건 | ❌ 코드 미검증 → 수동 게이트 |
-| 리비전 고정 | ⚠️ `trading_bot.py`, 본 문서, `tests/test_cycle_start_repair.py` **미커밋** → 운영 배포 전 고정 필요 |
-| 텔레그램 | ⚠️ 로컬 미설정, 운영 VPS 설정 필요 |
+| 텔레그램 | ⚠️ 운영 VPS에도 미설정 → 알림 없음 |
+| preflight `.env` 미로드 | ⚠️ `set -a && . ./.env`로 주입 필요 |
 
 ---
 
