@@ -7,6 +7,61 @@ from broker.base import Broker
 from broker.market_utils import normalize_order_price
 from market_data import get_finnhub_ma5
 
+# BUY LOC 가격 상한 — 브로커가 현재가 대비 +20% 초과 주문을 거부하므로 미리 낮춥니다.
+BUY_LOC_PRICE_CAP_RATIO = 1.19
+
+# 추가매수 주문 식별용 (정상매수와 구분)
+_ADDITIONAL_MARK = "[추가매수]"
+
+
+def cap_buy_loc_price(price, last_price):
+    """
+    BUY LOC 가격을 현재가 ×1.19 상한으로 보정합니다.
+
+    Returns:
+        tuple: (보정 후 가격, 보정 여부)
+    """
+    price = float(price or 0)
+    if price <= 0 or not last_price or last_price <= 0:
+        return price, False
+    max_allowed = adjust_price_to_tick(last_price * BUY_LOC_PRICE_CAP_RATIO)
+    if price > max_allowed:
+        return max_allowed, True
+    return price, False
+
+
+def build_additional_loc_prices(unit_amount, base_qty, levels, ceiling):
+    """
+    추가매수 LOC 가격을 계단식으로 만듭니다.
+
+    - 후보 가격: unit_amount / (base_qty + i)
+    - ceiling(정상매수 보정가) 이상인 후보는 건너뜁니다
+      (1.19 상한에 걸리면 여러 후보가 같은 가격으로 뭉칠 수 있기 때문)
+    - 앞 단계보다 엄격히 낮은 가격만 유지합니다
+
+    Parameters:
+        unit_amount (float): 이번 회차 1회 매수금
+        base_qty (int): 기준 수량 (정상매수 수량)
+        levels (int): 필요한 추가매수 단계 수
+        ceiling (float): 추가매수가 넘지 못할 상한 가격 (정상매수 보정가)
+
+    Returns:
+        list: [(단계 번호, 가격), ...]
+    """
+    result: list[tuple[int, float]] = []
+    previous = float(ceiling)
+    index = 1
+    max_iterations = max(levels, 0) * 3 + 5
+    while len(result) < levels and index <= max_iterations:
+        price = adjust_price_to_tick(unit_amount / (base_qty + index))
+        if price <= 0:
+            break
+        if price < previous:
+            result.append((len(result) + 1, price))
+            previous = price
+        index += 1
+    return result
+
 def adjust_price_to_tick(price):
     """
     미국 주식 거래소의 호가 단위 규칙에 맞춰 가격을 조정합니다.
@@ -498,6 +553,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
     # ========================================
 
     orders = []
+    cap_notes: list[dict] = []
 
     if T == 0 and position_qty == 0:
         # ── 최초 진입 ──────────────────────────────────────────────
@@ -554,6 +610,19 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
             else:
                 raise Exception(msg)
 
+        original_entry_price = entry_price
+        entry_price, entry_capped = cap_buy_loc_price(entry_price, last_price)
+        if entry_capped:
+            cap_notes.append({
+                "comment": "초기 진입 (1회 매수)",
+                "from": original_entry_price,
+                "to": entry_price,
+            })
+            print(
+                f"  ⚠️ LOC 가격 보정: ${original_entry_price:.2f} → ${entry_price:.2f} "
+                f"(현재가 ${last_price:.2f} × {BUY_LOC_PRICE_CAP_RATIO} 기준)"
+            )
+
         orders.append({
             "side": "BUY",
             "quantity": entry_qty,
@@ -564,16 +633,16 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         })
 
         # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (entry_qty + i))
-        for i in range(1, additional_loc_levels + 1):
-            add_price = adjust_price_to_tick(unit_amount / (entry_qty + i))
-            if add_price <= 0:
-                break
+        # 1.19 상한에 걸린 후보는 건너뛰고 진입가보다 낮은 단계부터 배치합니다.
+        for level, add_price in build_additional_loc_prices(
+            unit_amount, entry_qty, additional_loc_levels, entry_price
+        ):
             orders.append({
                 "side": "BUY",
                 "quantity": 1,
                 "price": add_price,
                 "order_type": "LOC",
-                "comment": f"초기진입 추가매수 {i}단계 (급락 대비) [추가매수]",
+                "comment": f"초기진입 추가매수 {level}단계 (급락 대비) {_ADDITIONAL_MARK}",
                 "t_target": 0.0,
             })
 
@@ -620,38 +689,65 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 t_target_each = 1.0 if active_round_orders == 1 else 0.5
                 t_target_label = "1.0" if active_round_orders == 1 else "0.5"
 
+                normal_buy_prices: list[float] = []
+
                 if qty_at_star > 0:
+                    buy_price, capped = cap_buy_loc_price(star_buy_price, last_price)
+                    if capped:
+                        cap_notes.append({
+                            "comment": "전반전 별지점 매수",
+                            "from": star_buy_price,
+                            "to": buy_price,
+                        })
+                        print(
+                            f"  ⚠️ LOC 가격 보정: ${star_buy_price:.2f} → ${buy_price:.2f} "
+                            f"(현재가 ${last_price:.2f} × {BUY_LOC_PRICE_CAP_RATIO} 기준)"
+                        )
+                    normal_buy_prices.append(buy_price)
                     orders.append({
                         "side": "BUY",
                         "quantity": qty_at_star,
-                        "price": star_buy_price,
+                        "price": buy_price,
                         "order_type": "LOC",
                         "comment": f"전반전 별지점 매수 — 체결 시 T += {t_target_label}",
                         "t_target": t_target_each,
                     })
 
                 if qty_at_avg > 0:
+                    buy_price, capped = cap_buy_loc_price(avg_buy_price, last_price)
+                    if capped:
+                        cap_notes.append({
+                            "comment": "전반전 평단 매수",
+                            "from": avg_buy_price,
+                            "to": buy_price,
+                        })
+                        print(
+                            f"  ⚠️ LOC 가격 보정: ${avg_buy_price:.2f} → ${buy_price:.2f} "
+                            f"(현재가 ${last_price:.2f} × {BUY_LOC_PRICE_CAP_RATIO} 기준)"
+                        )
+                    normal_buy_prices.append(buy_price)
                     orders.append({
                         "side": "BUY",
                         "quantity": qty_at_avg,
-                        "price": avg_buy_price,
+                        "price": buy_price,
                         "order_type": "LOC",
                         "comment": f"전반전 평단 매수 — 체결 시 T += {t_target_label}",
                         "t_target": t_target_each,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))
+                # 1.19 상한에 걸린 후보는 건너뛰고 정상매수보다 낮은 단계부터 배치합니다.
                 if base_qty > 0:
-                    for i in range(1, additional_loc_levels + 1):
-                        add_price = adjust_price_to_tick(unit_amount / (base_qty + i))
-                        if add_price <= 0:
-                            break
+                    ceiling = min(normal_buy_prices) if normal_buy_prices else float("inf")
+                    for level, add_price in build_additional_loc_prices(
+                        unit_amount, base_qty, additional_loc_levels, ceiling
+                    ):
                         orders.append({
                             "side": "BUY",
                             "quantity": 1,
                             "price": add_price,
                             "order_type": "LOC",
-                            "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                            "comment": f"추가매수 {level}단계 (급락 대비) {_ADDITIONAL_MARK}",
                             "t_target": 0.0,
                         })
 
@@ -659,28 +755,43 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 # 후반전: 전체 금액을 별지점 LOC 한 곳에
                 qty_at_star = math.floor(unit_amount / star_buy_price)
 
+                normal_buy_prices: list[float] = []
+
                 if qty_at_star > 0:
+                    buy_price, capped = cap_buy_loc_price(star_buy_price, last_price)
+                    if capped:
+                        cap_notes.append({
+                            "comment": "후반전 별지점 매수",
+                            "from": star_buy_price,
+                            "to": buy_price,
+                        })
+                        print(
+                            f"  ⚠️ LOC 가격 보정: ${star_buy_price:.2f} → ${buy_price:.2f} "
+                            f"(현재가 ${last_price:.2f} × {BUY_LOC_PRICE_CAP_RATIO} 기준)"
+                        )
+                    normal_buy_prices.append(buy_price)
                     orders.append({
                         "side": "BUY",
                         "quantity": qty_at_star,
-                        "price": star_buy_price,
+                        "price": buy_price,
                         "order_type": "LOC",
                         "comment": "후반전 별지점 매수 (1회 매수) — 체결 시 T += 1",
                         "t_target": 1.0,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (qty_at_star + i))
+                # 1.19 상한에 걸린 후보는 건너뛰고 정상매수보다 낮은 단계부터 배치합니다.
                 if qty_at_star > 0:
-                    for i in range(1, additional_loc_levels + 1):
-                        add_price = adjust_price_to_tick(unit_amount / (qty_at_star + i))
-                        if add_price <= 0:
-                            break
+                    ceiling = min(normal_buy_prices) if normal_buy_prices else float("inf")
+                    for level, add_price in build_additional_loc_prices(
+                        unit_amount, qty_at_star, additional_loc_levels, ceiling
+                    ):
                         orders.append({
                             "side": "BUY",
                             "quantity": 1,
                             "price": add_price,
                             "order_type": "LOC",
-                            "comment": f"추가매수 {i}단계 (급락 대비) [추가매수]",
+                            "comment": f"추가매수 {level}단계 (급락 대비) {_ADDITIONAL_MARK}",
                             "t_target": 0.0,
                         })
         else:
@@ -712,4 +823,5 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         "star_buy_price": star_buy_price,
         "take_profit_price": take_profit_price,
         "orders": orders,
+        "price_cap_notes": cap_notes,
     }

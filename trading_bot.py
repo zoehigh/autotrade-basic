@@ -689,6 +689,14 @@ def run_one_symbol(broker: Broker, symbol_config):
 
     orders = strategy_result["orders"]
 
+    # BUY LOC 1.19 상한 보정과 추가매수 계단 배치는 전략 단계에서 이미 반영되어 있습니다.
+    # (trading_bot에서 다시 보정하면 추가매수 가격이 정상매수와 같아질 수 있습니다)
+    for note in strategy_result.get("price_cap_notes") or []:
+        notify(
+            f"{symbol} ⚠️ LOC 가격 보정\n원가격: ${note['from']:.2f}\n"
+            f"현재가 대비 상한: ${note['to']:.2f}"
+        )
+
     print(f"\n[Step 3] 생성된 주문 목록 ({len(orders)}개)")
     print("-" * 60)
 
@@ -749,17 +757,6 @@ def run_one_symbol(broker: Broker, symbol_config):
 
         try:
             order_price = order["price"] if order["price"] else 0
-
-            # BUY LOC 가격 보정: 현재가 대비 +20% 초과 시 브로커가 주문을 거부하므로 미리 조정합니다
-            if order["side"] == "BUY" and order_price > 0:
-                strategy_last_price = strategy_result.get("last_price", 0)
-                if strategy_last_price > 0:
-                    max_allowed_price = strategy_last_price * 1.19
-                    if order_price > max_allowed_price:
-                        corrected_price = adjust_price_to_tick(max_allowed_price)
-                        print(f"  ⚠️ LOC 가격 보정: ${order_price:.2f} → ${corrected_price:.2f} (현재가 ${strategy_last_price:.2f} × 1.19 기준)")
-                        notify(f"{symbol} ⚠️ LOC 가격 보정\n원가격: ${order_price:.2f}\n현재가: ${strategy_last_price:.2f}\n보정가: ${corrected_price:.2f}")
-                        order_price = corrected_price
 
             if TRADE_MODE == "LIVE":
                 state["pending_order_intent"] = {
