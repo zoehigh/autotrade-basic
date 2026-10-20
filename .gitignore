@@ -13,11 +13,17 @@ wheels/
 .env
 .env.local
 .env.*.local
+# 환경변수 백업 (자격증명 포함 — 커밋 금지)
+.env.bak*
+.env.*.bak
 
 # 자동매매 봇 런타임 상태 파일 (운영 VPS 전용, git 미추적)
 .state.json
 .state.json.bak*
 .state.json.*.bak
+
+# 런처 잠금 파일 (런타임 생성물)
+.run.lock
 
 # IDE settings
 .vscode/
