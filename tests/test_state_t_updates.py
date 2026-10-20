@@ -424,3 +424,69 @@ class TestHelpers:
         from state import get_order_meta
         state = _make_state()
         assert get_order_meta(state, "NOTEXIST") is None
+
+
+# ─────────────────────────────────────────────────────────
+# 테스트: 체결 없는 정상 상태의 경고 억제
+# ─────────────────────────────────────────────────────────
+
+def _make_unfilled_order(odno, ord_dt, qty, utc_dt=None):
+    """체결 없는(미체결) 주문 레코드 생성."""
+    if utc_dt is None:
+        utc_dt = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}T10:00:00+00:00"
+    return {
+        "odno": odno,
+        "ord_dt": ord_dt,
+        "sll_buy_dvsn_cd_name": "매수",
+        "ft_ccld_qty": "0",
+        "ord_datetime_utc": utc_dt,
+    }
+
+
+def test_bot_orders_visible_no_warning(capsys):
+    """봇 주문이 이력에 보이면 정상 미체결 상태 → 경고 없이 안내만."""
+    state = _make_state(
+        T=12.375,
+        last_updated="2026-10-19 08:06:49+00:00",
+        orders_meta={"OD1": {"side": "BUY", "total_qty": 7, "t_target": 1.0}},
+    )
+    orders = [_make_unfilled_order("OD1", "20261020", 7)]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=74)
+
+    assert result["T"] == 12.375
+    out = capsys.readouterr().out
+    assert "[경고]" not in out
+    assert "아직 체결 안 됨" in out
+
+
+def test_bot_orders_missing_keeps_warning(capsys):
+    """봇 주문이 이력에 없으면 조회 누락 가능성이 있으므로 경고를 유지."""
+    state = _make_state(
+        T=12.375,
+        last_updated="2026-10-19 08:06:49+00:00",
+        orders_meta={"OD1": {"side": "BUY", "total_qty": 7, "t_target": 1.0}},
+    )
+    orders = [_make_unfilled_order("OTHER", "20261020", 7)]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=74)
+
+    assert result["T"] == 12.375
+    out = capsys.readouterr().out
+    assert "[경고]" in out
+    assert "이력이 없는데 보유 중" in out
+
+
+def test_empty_history_keeps_warning(capsys):
+    """이력이 비면 조회 누락 → 경고 유지."""
+    state = _make_state(
+        T=12.375,
+        last_updated="2026-10-19 08:06:49+00:00",
+        orders_meta={"OD1": {"side": "BUY", "total_qty": 7, "t_target": 1.0}},
+    )
+
+    result = update_T_from_history("TQQQ", state, [], balance_qty=74)
+
+    assert result["T"] == 12.375
+    out = capsys.readouterr().out
+    assert "[경고]" in out

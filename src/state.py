@@ -1230,8 +1230,19 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 if state.get("reverse_mode", {}).get("active"):
                     print(f"[상태] {symbol} {last_updated_dt.date()} 이후 일반모드 체결 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (리버스 체결은 reconciliation에서 반영)")
                 else:
-                    print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (이력 조회 누락/정지 복귀 가능)")
-                    print(f"[경고] {symbol} 이력이 없는데 보유 중입니다. state.json과 잔고를 확인하세요.")
+                    # 봇이 낸 주문이 이력에 보이면 조회 자체는 정상이고,
+                    # 아직 체결이 없었을 뿐입니다 → 매일 나오는 경고가 되지 않도록 안내로 처리합니다.
+                    # 봇 주문이 아예 이력에 없으면 조회 누락 가능성이 있으므로 경고를 유지합니다.
+                    bot_order_ids = {str(k) for k in (state.get("orders_meta") or {})}
+                    visible_bot_orders = any(
+                        str(row.get("odno", "")) in bot_order_ids
+                        for row in (order_history or [])
+                    )
+                    if visible_bot_orders:
+                        print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (주문은 이력에 보이나 아직 체결 안 됨)")
+                    else:
+                        print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (이력 조회 누락/정지 복귀 가능)")
+                        print(f"[경고] {symbol} 이력이 없는데 보유 중입니다. state.json과 잔고를 확인하세요.")
                 return state
             # 잔고 0 → 잘못된 state.json(T>0, 잔고0, 이력0) 복구를 위해 전체 재추정.
             # 전체 이력도 비면 _infer_T_from_full_history가 T=0으로 리셋합니다.
