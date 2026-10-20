@@ -246,6 +246,8 @@ class TestMainScope:
                 )
 
         calls, notify_messages = self._patch_main(monkeypatch, impl)
+        exited = []
+        monkeypatch.setattr(trading_bot.sys, "exit", lambda code: exited.append(code))
 
         trading_bot.main()
 
@@ -253,6 +255,8 @@ class TestMainScope:
             "SymbolScopedError는 해당 종목만 중단하고 다음 종목으로 계속 진행해야 합니다"
         assert any("fence를 유지" in m for m in notify_messages), \
             "종목 오류 알림에 fence 유지 문구가 포함되어야 합니다"
+        assert exited == [1], \
+            "무인 자동 운영에서 실패를 감지할 수 있도록 종료코드가 1 이어야 합니다"
 
     def test_global_scoped_error_stops_all(self, monkeypatch):
         """GlobalScopedError → 전체 중단 (다음 종목 미처리 + 치명 종료)."""

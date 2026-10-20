@@ -256,7 +256,15 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                 })
             new_T_sell = round(T * sell_factor, 4)
 
-            buy_price = adjust_price_to_tick(adjusted_star - 0.01)
+            # 리버스 쿼터매수도 현재가 ×1.19 상한을 적용합니다.
+            # (브로커가 +20% 초과 주문을 거부합니다 — 일반매수와 동일 규칙)
+            original_buy_price = adjust_price_to_tick(adjusted_star - 0.01)
+            buy_price, buy_capped = cap_buy_loc_price(original_buy_price, last_price)
+            if buy_capped:
+                print(
+                    f"  ⚠️ LOC 가격 보정: ${original_buy_price:.2f} → ${buy_price:.2f} "
+                    f"(현재가 ${last_price:.2f} × {BUY_LOC_PRICE_CAP_RATIO} 기준)"
+                )
             orders.append({
                 "side": "BUY",
                 "quantity": buy_qty,

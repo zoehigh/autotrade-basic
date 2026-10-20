@@ -995,6 +995,30 @@ fence: 유지"""
         for order in failed_orders:
             print(f"  ✗ {order['comment']}: {order['error']}")
 
+    return {
+        "symbol": symbol,
+        "executed": len(executed_orders),
+        "reserved": len(reserved_orders),
+        "failed": len(failed_orders),
+        "errors": [order["error"] for order in failed_orders],
+    }
+
+
+def _order_remaining_qty(row: dict) -> int:
+    """이력 행의 미체결(잔량) 수량을 안전하게 읽습니다."""
+    try:
+        return int(float(row.get("nccs_qty", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _order_filled_qty(row: dict) -> int:
+    """이력 행의 체결 수량을 안전하게 읽습니다."""
+    try:
+        return int(float(row.get("ft_ccld_qty", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 def _cancel_open_bot_orders(
     broker,
@@ -1004,17 +1028,25 @@ def _cancel_open_bot_orders(
     order_history: list,
 ) -> int:
     """
-    봇이 직접 낸 미체결 주문을 취소합니다 (신규 주문 제출 전 정리).
+    봇이 직접 낸 미체결 주문을 취소하고 **취소 확정까지 확인**합니다.
 
-    매 세션마다 새 주문 전체를 새로 내므로, 이전에 낸 주문이 남아 있으면
+    매 세션마다 새 주문 전체를 새로 내므로, 이전에 낸 주문이 아직 살아 있으면
     목표매도 같은 주문이 중복되어 매도 수량이 보유량을 초과할 수 있습니다.
 
-    - state 의 orders_meta 에 있는 **봇 소유 주문만** 정리합니다 (수동 주문 무관)
+    처리 순서
+      1. 대상 선정 — state.orders_meta 의 봇 소유 주문 중 미체결/부분체결(잔량>0)
+      2. 취소 요청 — 실패해도 나머지 취소는 계속 (부분 취소 상태 방지)
+      3. **취소 확정 확인** — 이력을 재조회해 잔량 0 / 취소 / 체결을 확인
+         (이력 반영 지연 대비 재시도)
+      4. 취소 도중 체결이 발생했거나 확정이 안 되면 신규 주문을 내지 않고 중단
+
+    - 수동 주문은 건드리지 않습니다 (orders_meta 에 있는 것만)
     - 리버스 주문/리버스 활성 상태는 건드리지 않습니다 (기간 관리 대상)
-    - 취소에 실패하면 신규 주문을 내지 않고 해당 종목만 중단합니다
+    - 이전 세션 주문은 만료 대상이라 취소하지 않습니다 (당일 주문 규칙)
+    - 취소 미지원 브로커는 조용히 건너뜀
 
     Returns:
-        int: 취소한 주문 수
+        int: 취소하고 확정한 주문 수
     """
     orders_meta = state.get("orders_meta") or {}
     if not orders_meta:
@@ -1030,7 +1062,9 @@ def _cancel_open_bot_orders(
         return 0
 
     by_odno = {str(o.get("odno")): o for o in (order_history or [])}
+    today = get_kst_now().strftime("%Y%m%d")
     targets: list[tuple[str, str, int]] = []
+    expired_candidates: list[str] = []
     for odno, meta in list(orders_meta.items()):
         if (meta or {}).get("reverse_action"):
             continue  # 리버스 주문은 기간 관리 대상
@@ -1040,13 +1074,22 @@ def _cancel_open_bot_orders(
         status = str(row.get("prcs_stat_name", "") or "")
         if status not in ("미체결", "부분체결"):
             continue
-        try:
-            remaining = int(float(row.get("nccs_qty", "0") or 0))
-        except (TypeError, ValueError):
-            remaining = 0
-        if remaining <= 0:
+        if _order_remaining_qty(row) <= 0:
             continue
-        targets.append((str(odno), status, remaining))
+        if str(row.get("ord_dt", "") or "") == today:
+            # 오늘 세션 주문 — 아직 체결될 수 있으므로 반드시 취소해야 합니다.
+            targets.append((str(odno), status, _order_remaining_qty(row)))
+        else:
+            # 이전 세션 주문 — 메리츠 주문 API에는 유효기간(GTC) 파라미터가 없어
+            # 모든 주문이 당일 주문입니다. 세션이 종료되면 자동으로 만료되므로
+            # 취소하지 않습니다 (만료 주문 취소 거부를 오탐으로 보지 않기 위함).
+            expired_candidates.append(str(odno))
+
+    if expired_candidates:
+        print(
+            f"[잔여 주문 정리] 이전 세션 주문 {len(expired_candidates)}건은 만료 대상이라 "
+            f"취소하지 않습니다 (당일 주문 규칙)."
+        )
 
     if not targets:
         return 0
@@ -1055,26 +1098,71 @@ def _cancel_open_bot_orders(
     for odno, status, remaining in targets:
         print(f"  - {odno} ({status}, 잔량 {remaining}주)")
 
-    failures: list[tuple[str, str]] = []
-
+    rejected: list[tuple[str, str]] = []
     for odno, _status, _remaining in targets:
         try:
             cancel(odno, symbol=symbol, exchange=exchange)
-            print(f"  ✓ 취소 완료: {odno}")
         except Exception as error:
             # 실패해도 나머지 취소는 계속합니다 (부분 취소 상태로 남지 않도록).
-            # 신규 주문은 아래에서 일괄 중단합니다.
-            failures.append((odno, str(error)))
-            print(f"  ✗ 취소 실패: {odno} — {str(error)[:160]}")
+            rejected.append((odno, str(error)))
+            print(f"  ✗ 취소 요청 실패: {odno} — {str(error)[:160]}")
 
-    if failures:
+    # ── 취소 확정 확인 ────────────────────────────────────────────
+    # 메리츠 상세조회에는 잔량 정보가 없고(문서상 ncnt_odqt 항상 0),
+    # 취소는 이력에 별도 행으로 남습니다. 따라서 이력 재조회가 유일한 확인 방법입니다.
+    confirmed: set[str] = set()
+    still_open: list[str] = []
+    filled_during_cancel: list[str] = []
+    history = list(order_history or [])
+    for attempt in range(1, 4):
+        if attempt > 1:
+            time.sleep(2)
+        try:
+            history = broker.get_order_history(symbol, exchange, days=30, verbose=False)
+        except Exception as error:
+            print(f"  ⚠️ 이력 재조회 실패 (확인 시도 {attempt}): {str(error)[:120]}")
+            history = list(order_history or [])
+        current = {str(o.get("odno")): o for o in (history or [])}
+        still_open = []
+        filled_during_cancel = []
+        for odno, _status, _remaining in targets:
+            row = current.get(odno)
+            if row is None:
+                # 이력에서 사라진 주문은 존재하지 않는 것으로 간주
+                confirmed.add(odno)
+                continue
+            status = str(row.get("prcs_stat_name", "") or "")
+            if status not in ("미체결", "부분체결"):
+                confirmed.add(odno)
+                continue
+            if _order_remaining_qty(row) <= 0:
+                confirmed.add(odno)
+                continue
+            if _order_filled_qty(row) > 0:
+                filled_during_cancel.append(odno)
+            still_open.append(odno)
+        if not still_open:
+            break
+        print(f"  · 취소 확인 시도 {attempt}: 미확정 {len(still_open)}건")
+
+    if filled_during_cancel:
         raise SymbolScopedError(
-            "기존 주문 취소 실패로 신규 주문을 생략합니다: "
-            + ", ".join(f"{odno}({msg[:60]})" for odno, msg in failures)
+            "취소 과정에서 체결이 발생해 포지션이 바뀝니다. "
+            "신규 주문을 생략하고 다음 실행에서 재계획합니다: "
+            + ", ".join(filled_during_cancel)
         )
 
-    print("[잔여 주문 정리] 완료 — 신규 주문을 제출합니다.")
-    return len(targets)
+    if still_open:
+        detail = []
+        for odno in still_open:
+            reason = next((m for o, m in rejected if o == odno), "취소 접수 후에도 잔량 유지")
+            detail.append(f"{odno}({reason[:60]})")
+        raise SymbolScopedError(
+            "이전 주문 취소를 확정하지 못해 신규 주문을 생략합니다: " + ", ".join(detail)
+        )
+
+    print(f"[잔여 주문 정리] 취소 확정 {len(confirmed)}건 — 신규 주문을 제출합니다.")
+    return len(confirmed)
 
 
 def _print_state_diagnostic():
@@ -1977,9 +2065,13 @@ def main():
         # ========================================
         # 종목별 순차 처리
         # ========================================
+        run_results: list[dict] = []
         for symbol_config in SYMBOLS:
+            symbol = symbol_config["symbol"]
             try:
-                run_one_symbol(broker, symbol_config)
+                result = run_one_symbol(broker, symbol_config)
+                if result:
+                    run_results.append(result)
 
             except GlobalScopedError:
                 # 공통 장애(상태 파일 저장 실패 등)는 전체 실행을 중단합니다.
@@ -1987,17 +2079,23 @@ def main():
 
             except SymbolScopedError as error:
                 # 해당 종목만 중단하고 다음 종목으로 계속 진행합니다.
-                symbol = symbol_config["symbol"]
                 print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
                 if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
                     notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                run_results.append({
+                    "symbol": symbol, "executed": 0, "reserved": 0,
+                    "failed": 1, "errors": [str(error)],
+                })
 
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
-                symbol = symbol_config["symbol"]
                 print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
                 if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
                     notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                run_results.append({
+                    "symbol": symbol, "executed": 0, "reserved": 0,
+                    "failed": 1, "errors": [str(error)],
+                })
                 # 공통/치명 사안(상태 파일, T 불일치, preflight 실패 등)은 전체 중단합니다.
                 if any(marker in str(error) for marker in (
                     "checkpoint 실패",
@@ -2010,6 +2108,37 @@ def main():
 
             if len(SYMBOLS) > 1:
                 time.sleep(1)
+
+        # ── 실행 결과 집계 ────────────────────────────────────────
+        # 자동 운영에서는 exit 0만 보고 성공으로 판단하면 안 됩니다.
+        # 종목 실패/주문 실패가 있으면 종료코드 1 로 알립니다.
+        total_executed = sum(r.get("executed", 0) for r in run_results)
+        total_reserved = sum(r.get("reserved", 0) for r in run_results)
+        total_failed = sum(r.get("failed", 0) for r in run_results)
+        print("\n" + "=" * 60)
+        print("[실행 결과]")
+        print("=" * 60)
+        for r in run_results:
+            print(
+                f"  {r.get('symbol')}: 성공 {r.get('executed', 0)}건 / "
+                f"예약 {r.get('reserved', 0)}건 / 실패 {r.get('failed', 0)}건"
+            )
+        print(
+            f"  합계: 성공 {total_executed}건 / 예약 {total_reserved}건 / 실패 {total_failed}건"
+        )
+
+        if total_failed > 0:
+            summary = "\n".join(
+                f"- {r.get('symbol')}: {r.get('failed', 0)}건 실패"
+                + (f" — {r['errors'][0][:120]}" if r.get("errors") else "")
+                for r in run_results if r.get("failed", 0)
+            )
+            message = f"""⚠️ 자동매매 일부 실패
+{summary}
+성공 {total_executed}건 / 예약 {total_reserved}건 / 실패 {total_failed}건"""
+            notify(message, urgent=True)
+            print(f"\n✗ 실패가 있어 종료코드 1 로 종료합니다.")
+            sys.exit(1)
 
         print("\n프로그램을 정상적으로 종료합니다.")
 

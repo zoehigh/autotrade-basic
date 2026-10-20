@@ -15,16 +15,36 @@ import trading_bot
 from trading_bot import SymbolScopedError, _cancel_open_bot_orders
 
 
+def _today() -> str:
+    return trading_bot.get_kst_now().strftime("%Y%m%d")
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """취소 확정 확인의 재시도 대기를 빠르게 합니다."""
+    monkeypatch.setattr(trading_bot.time, "sleep", lambda _s: None)
+
+
 class _FakeBroker:
-    def __init__(self, fail_on=None):
+    """취소 후 이력 재조회까지 시뮬레이션하는 브로커."""
+
+    def __init__(self, fail_on=None, after_cancel_rows=None):
         self.calls = []
         self.fail_on = fail_on
+        self.after_cancel_rows = after_cancel_rows
 
     def cancel_order(self, odno, symbol=None, exchange=None):
         self.calls.append((odno, symbol, exchange))
         if self.fail_on and self.fail_on == odno:
             raise RuntimeError("취소 거부")
         return None
+
+    def get_order_history(self, symbol, exchange, days=30, verbose=False):
+        if self.after_cancel_rows is not None:
+            return list(self.after_cancel_rows)
+        # 기본: 취소된 상태(잔량 0)로 반환
+        return [_row(odno, status="취소", remaining="0")
+                for odno, _s, _e in self.calls]
 
 
 class _BrokerWithoutCancel:
@@ -33,12 +53,14 @@ class _BrokerWithoutCancel:
         self.calls = []
 
 
-def _row(odno, status="미체결", remaining="18", side="매도"):
+def _row(odno, status="미체결", remaining="18", side="매도", ord_dt=None, filled="0"):
     return {
         "odno": odno,
         "prcs_stat_name": status,
         "nccs_qty": remaining,
+        "ft_ccld_qty": filled,
         "sll_buy_dvsn_cd_name": side,
+        "ord_dt": ord_dt or _today(),
     }
 
 
@@ -131,7 +153,11 @@ def test_broker_without_cancel_support_is_ignored():
 
 def test_cancel_failure_raises_symbol_scoped_error():
     """취소 실패 시 신규 주문을 내지 않도록 종목만 중단합니다."""
-    broker = _FakeBroker(fail_on="OD1")
+    broker = _FakeBroker(
+        fail_on="OD1",
+        after_cancel_rows=[_row("OD1", status="미체결", remaining="18"),
+                           _row("OD2", status="미체결", remaining="18")],
+    )
     state = {"orders_meta": {"OD1": {}, "OD2": {}}}
     history = [_row("OD1"), _row("OD2")]
 
