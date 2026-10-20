@@ -374,6 +374,64 @@ class TossBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"일봉 종가 조회 실패: {str(e)}")
 
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """
+        해외주식 일봉 캔들을 날짜 포함 조회합니다 → list[dict] (오래된 순).
+
+        토스 API: GET /api/v1/candles?symbol={ticker}&interval=1d&count=N
+        각 캔들의 timestamp 필드(ISO8601, KST)에서 미국 세션 날짜를 추출합니다.
+        close ≤ 0 또는 날짜 파싱 불가인 캔들은 건너뜁니다.
+        """
+        token = self._get_token()
+        ticker = symbol.upper()
+
+        try:
+            data = self._request_with_rate_retry(
+                "GET", "/api/v1/candles", token,
+                params={"symbol": ticker, "interval": "1d", "count": days},
+            )
+            result = data.get("result", {})
+            candles = result.get("candles", [])
+
+            out: list[dict] = []
+            for c in reversed(candles):
+                try:
+                    price = float(c.get("closePrice", 0))
+                except (ValueError, TypeError):
+                    continue
+                if price <= 0:
+                    continue
+
+                date_str = self._parse_toss_candle_date(c.get("timestamp"))
+                if date_str is None:
+                    continue
+
+                out.append({"date": date_str, "close": price})
+
+            return out[-days:]
+
+        except BrokerError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"일봉 캔들 조회 실패: {str(e)}")
+
+    @staticmethod
+    def _parse_toss_candle_date(timestamp) -> str | None:
+        """
+        토스 캔들 timestamp(ISO8601, KST)에서 미국 세션 날짜("YYYY-MM-DD")를 추출합니다.
+
+        토스 일봉 timestamp는 자정 ET에 해당하는 KST 시각이므로
+        America/New_York으로 변환 후 날짜를 취합니다.
+        파싱 실패 시 None을 반환합니다.
+        """
+        if not timestamp or not isinstance(timestamp, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(timestamp)
+            return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """
         해외주식 보유 잔고를 조회합니다 → Balance(quantity, avg_price).

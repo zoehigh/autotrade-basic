@@ -4,7 +4,7 @@
 KIS, 키움, LS 등 모든 증권사가 공통으로 사용하는
 시간 계산, 미국 장 영업일 확인 등의 유틸리티를 제공합니다.
 """
-from datetime import datetime, time as dtime, timedelta
+from datetime import date as _date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals
@@ -86,3 +86,106 @@ def is_us_trading_day() -> bool:
         _XNYS_CALENDAR = xcals.get_calendar("XNYS")
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return _XNYS_CALENDAR.is_session(now_et.strftime("%Y-%m-%d"))
+
+
+def _get_xnys_calendar():
+    """XNYS 캘린더를 반환합니다 (캐시된 인스턴스 재사용)."""
+    global _XNYS_CALENDAR
+    if _XNYS_CALENDAR is None:
+        _XNYS_CALENDAR = xcals.get_calendar("XNYS")
+    return _XNYS_CALENDAR
+
+
+def us_session_date_now(now_utc: datetime | None = None) -> str | None:
+    """
+    현재(또는 지정 시각) 기준 미국(XNYS) 세션 날짜를 반환합니다.
+
+    ET(America/New_York) 기준 날짜를 사용하며, 오늘날 세션이 아니면
+    가장 최근 세션 날짜(≤ 오늘)를 반환합니다.
+
+    Parameters:
+        now_utc (datetime | None): 기준 시각(UTC). None이면 현재 시각 사용.
+
+    Returns:
+        str | None: "YYYY-MM-DD" 형식의 세션 날짜.
+            None은 캘린더 범위 이전(now_utc가 첫 세션보다 이전)으로
+            이전 세기를 찾을 수 없을 때만 반환됩니다. 운영 환경에서는
+            사실상 발생하지 않지만, None을 받으면 **미정산(pending)**으로
+            처리하고 세션 날짜 확정 전에는 settlement를 보류해야 합니다.
+    """
+    cal = _get_xnys_calendar()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    date_str = now_et.strftime("%Y-%m-%d")
+    # 오늘 세션이면 오늘, 아니면 가장 최근 세션 (≤ 오늘)
+    session = cal.date_to_session(date_str, direction="previous")
+    return session.strftime("%Y-%m-%d") if session is not None else None
+
+
+def us_session_closed(session_date: str, now_utc: datetime | None = None) -> bool:
+    """
+    지정된 세션 날짜의 장이 이미 마감되었는지 확인합니다.
+
+    XNYS 캘린더의 세션 마감 시각(조기 마감 포함)을 기준으로 판단합니다.
+
+    Parameters:
+        session_date (str): "YYYY-MM-DD" 형식의 세션 날짜.
+        now_utc (datetime | None): 기준 시각(UTC). None이면 현재 시각 사용.
+
+    Returns:
+        bool: 세션이 존재하고 현재 UTC ≥ 세션 마감 시각이면 True.
+              세션이 없는 날짜(비영업일)는 False (호출 측에서 "미정산"으로 처리).
+    """
+    cal = _get_xnys_calendar()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    if not cal.is_session(session_date):
+        return False
+
+    close_ts = cal.session_close(session_date)  # pandas.Timestamp (UTC)
+    close_utc = close_ts.to_pydatetime()
+    return now_utc >= close_utc
+
+
+def us_session_last_closed_date(now_utc: datetime | None = None) -> str | None:
+    """
+    이미 마감된 가장 최근 세션 날짜를 반환합니다.
+
+    Parameters:
+        now_utc (datetime | None): 기준 시각(UTC). None이면 현재 시각 사용.
+
+    Returns:
+        str | None: 가장 최근 마감된 세션 날짜("YYYY-MM-DD").
+                    아직 마감된 세션이 없으면 None.
+    """
+    cal = _get_xnys_calendar()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    today_et = now_utc.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    # 오늘(ET) 기준으로 가장 최근 세션부터 확인
+    session_str = today_et
+    prev_session = cal.date_to_session(today_et, direction="previous")
+    if prev_session is not None:
+        session_str = prev_session.strftime("%Y-%m-%d")
+
+    checked = set()
+    while session_str is not None and session_str not in checked:
+        checked.add(session_str)
+        if us_session_closed(session_str, now_utc=now_utc):
+            return session_str
+        # 이전 세션으로 이동: 현재 세션 날짜 - 1일 후 date_to_session(previous)
+        d = _date.fromisoformat(session_str) - timedelta(days=1)
+        nxt = cal.date_to_session(d.strftime("%Y-%m-%d"), direction="previous")
+        if nxt is None:
+            return None
+        session_str = nxt.strftime("%Y-%m-%d")
+    return None

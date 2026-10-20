@@ -167,6 +167,33 @@ class Broker(ABC):
         """
         pass
 
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """
+        최근 N거래일 일봉 캔들을 날짜 포함 조회합니다 → list[dict] (오래된 순).
+
+        각 dict는 다음 필드를 포함합니다:
+            - "date": "YYYY-MM-DD" 형식의 미국(XNYS) 세션 날짜.
+              날짜를 제공하지 않는 브로커는 None을 반환합니다.
+            - "close": 종가 (float)
+
+        기본 구현은 get_daily_closes()를 사용하여 date=None으로 채웁니다.
+        브로커가 세션 날짜를 제공할 수 있으면 get_daily_candles를 오버라이드하세요.
+
+        Parameters:
+            symbol (str): 종목 코드 (예: "TQQQ")
+            exchange (str): 거래소 코드 (예: "NAS")
+            days (int): 조회할 거래일 수 (기본 5)
+
+        Returns:
+            list[dict]: [{"date": "YYYY-MM-DD" | None, "close": float}, ...],
+                        오래된 순.
+
+        Raises:
+            BrokerError: API 호출 실패 시
+        """
+        closes = self.get_daily_closes(symbol, exchange, days)
+        return [{"date": None, "close": c} for c in closes]
+
     # ── 주문 API (trading_bot.py가 호출) ───────────────────────────────
 
     @abstractmethod
@@ -253,6 +280,11 @@ class DryBroker(Broker):
         self, symbol: str, exchange: str, days: int = 5,
     ) -> list[float]:
         return self._real.get_daily_closes(symbol, exchange, days)
+
+    def get_daily_candles(
+        self, symbol: str, exchange: str, days: int = 5,
+    ) -> list[dict]:
+        return self._real.get_daily_candles(symbol, exchange, days)
 
     # ── 주문 API: 로그만 출력 ──
     def place_order(

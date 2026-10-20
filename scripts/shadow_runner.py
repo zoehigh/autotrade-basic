@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""섀도우 v1.2 독립 러너 — 로컬 전용, GH Actions 미지원.
+"""섀도우 v1.4 독립 러너 — 로컬 전용, GH Actions 미지원.
 
 실제 state.json / save_state / GH 캐시 / 실제 주문 / 텔레그램에 절대 닿지 않는
 독립 가상 원장(섀도우)을 종목별로 순차 실행합니다. trading_bot.py에서 import하지
 않는 standalone 스크립트입니다.
 
-2단계 실행 (v1.2):
+2단계 실행 (v1.4):
     generate — 전략 호출 → 의도(intent)만 기록 (체결/회계 없음)
+               **반드시 미국 장 마감 전(프리장)에 실행**한다. 마감 후에 돌면
+               가드(C)가 그 세션을 건너뛰어 의도가 생성되지 않는다
+               (로그: "세션이 이미 마감됨").
     settle   — pending 의도를 실제 일봉 종가와 대조해 체결/만료 처리
+               **반드시 대상 세션 마감 후에 실행**한다 (S1: 날짜 일치 캔들 필요).
 
 사용법:
     uv run python scripts/shadow_runner.py --symbol TQQQ --exchange NAS
@@ -19,7 +23,25 @@
     SYMBOLS / {SYMBOL}_SEED / {SYMBOL}_SPLITS — 종목 설정 (config.py 규칙)
     SHADOW_FEE_RATE     — 수수료율 (기본: COMMISSION_RATE=0.0025)
     SHADOW_SLIPPAGE_BPS — 슬리피지 bps (기본: 0)
+    REINVEST            — 복리 재투자 (기본 true). false면 사이클 시드는 config seed
+    SHADOW_FORCE_NEW_INTENTS — true면 미정산 pending을 expired 처리 후 새 의도 생성
+    SHADOW_RESET_ON_CORRUPT — true면 손상 스냅샷을 fresh 시작 (snapshot_reset 기록)
     BROKER / BROKER_MODE — 시세/잔고 조회용 브로커 (DRY 래핑, 주문 없음)
+
+v1.4 동작 요약:
+    - generate는 us_session_date_now()로 세션 날짜를 확정해 의도/스냅샷에 기록하고,
+      이미 마감된 세션이면 아무것도 생성하지 않습니다.
+    - settle은 의도의 session_date가 마감됐고 get_daily_candles()에 같은 date
+      캔들이 있을 때만 체결/만료를 확정합니다 (최신 종가 대체 금지).
+    - 미정산 pending이 있으면 generate를 건너뜁니다 (위 force 변수로만 우회).
+    - 리버스 모드는 reverse_mode(day_count/last_planned_session/누적 매도대금)를
+      스냅샷에 영속화해 다음 세션으로 이어집니다.
+    - settle은 의도별 체크포인트로 멱등하며, 스냅샷이 권위이고 JSONL은 projection입니다
+      (저장 → 원장 순서: at-most-once 회계, crash 시 원장 gap 가능).
+    - 사이클 리셋은 cycle_reset_pending 마커로 crash 복구되며 정확히 1회 적용됩니다.
+    - 손상 스냅샷/버전 불일치는 자동 재시작하지 않고 exit 2로 중단합니다.
+    - 운영 감시: pending이 2세션 이상 남으면 날짜 일치 캔들을 못 찾은 것이므로
+      API 지연/휴장 갭/세션 날짜 불일치를 점검하세요.
 
 cron 예시 (평일, 로컬에서만 — 주말은 cron 요일로 제외):
     생성(프리장, 실전 슬롯): 0 17 * * 1-5 (서머) / 0 18 * * 1-5 (동절기)
@@ -46,6 +68,7 @@ for _path in (_REPO_ROOT, _SRC_PATH):
 from broker import create_broker
 from config import SYMBOLS
 from shadow import generate_symbol, settle_symbol
+from shadow.ledger import ShadowSnapshotCorruptError, ShadowVersionMismatchError
 
 
 def _build_symbol_config(symbol, exchange):
@@ -76,7 +99,7 @@ def _build_symbol_config(symbol, exchange):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="섀도우 v1.2 독립 러너 (로컬 전용, GH Actions 미지원)"
+        description="섀도우 v1.4 독립 러너 (로컬 전용, GH Actions 미지원)"
     )
     parser.add_argument("--symbol", help="종목코드 (예: TQQQ). 미지정 시 SYMBOLS 전체")
     parser.add_argument("--exchange", help="거래소 (예: NAS). --symbol과 함께 사용")
@@ -84,7 +107,10 @@ def main():
         "--phase",
         choices=["generate", "settle"],
         default="generate",
-        help="실행 단계: generate(의도 기록) | settle(종가 대조 체결) (기본: generate)",
+        help=(
+            "실행 단계: generate(의도 기록 — 미국 장 마감 전) | "
+            "settle(종가 대조 체결 — 대상 세션 마감 후) (기본: generate)"
+        ),
     )
     parser.add_argument(
         "--snapshot-dir",
@@ -105,7 +131,7 @@ def main():
     broker = create_broker()
 
     print("=" * 60)
-    print(f"섀도우 v1.2 러너 시작 ({args.phase} 단계 — SIMULATION ONLY, 실제 주문/상태 무관)")
+    print(f"섀도우 v1.4 러너 시작 ({args.phase} 단계 — SIMULATION ONLY, 실제 주문/상태 무관)")
     print("=" * 60)
 
     try:
@@ -126,6 +152,18 @@ def main():
             #    대기 의도/종가가 없으면(휴장 등) 로그만 남기고 exit 0
             for symbol_config in targets:
                 settle_symbol(broker, symbol_config, snapshot_dir=args.snapshot_dir)
+    except ShadowVersionMismatchError as e:
+        print("[shadow] ❌ 스냅샷 가정 버전이 현재 코드와 다릅니다.")
+        print(f"        {e}")
+        print("        자동 마이그레이션을 거부합니다. 기존 .shadow 디렉터리를")
+        print("        보관(archive)한 뒤 삭제하고 다시 실행하세요. (exit 2)")
+        return 2
+    except ShadowSnapshotCorruptError as e:
+        print("[shadow] ❌ 스냅샷을 읽을 수 없어 중단합니다.")
+        print(f"        {e}")
+        print("        파일을 보관/점검한 뒤 복구하거나, 의도적으로 새로 시작하려면")
+        print("        SHADOW_RESET_ON_CORRUPT=true로 1회 실행하세요. (exit 2)")
+        return 2
     finally:
         broker.close()
 
