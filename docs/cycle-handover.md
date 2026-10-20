@@ -65,7 +65,8 @@
 
 | 항목 | 값 |
 |---|---|
-| 런처 | `~/investment/muhan-v4/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) |
+| 런처 | `~/investment/muhan-v4/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) — 원본: `ops/run_daily.sh` |
+| 상태 확인 | `~/investment/muhan-v4/status.sh` — 마지막 실행 결과·cron·state 진단 (read-only) — 원본: `ops/status.sh` |
 | cron (현재) | `20 17 * * 1-5 LAUNCH_MODE=LIVE .../run_daily.sh` (2026-10-20 자동 운영 전환) |
 | 자동 실행 | **LIVE 전환 완료** — 되돌리기: 아래 명령 |
 | 되돌리기 | `(crontab -l \| grep -v muhan-v4/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/run_daily.sh") \| crontab -` |
@@ -229,6 +230,8 @@ SOXL 정정 결과 (현재가 $94.89, 상한 $112.91):
 ```bash
 ~/investment/muhan-v4/run_daily.sh
 ```
+
+- 상태 확인: `~/investment/muhan-v4/status.sh` (마지막 실행 결과 + cron + state 진단)
 
 - LOC 주문은 **당일 마감 기준**이라 매 거래일 재제출해야 합니다. 실행을 건너뛰면 그날 전략이 진행되지 않습니다.
 - 결과 확인: `ls -1t ~/investment/muhan-v4/logs/ | head -1` → `vi <로그경로>` (`/주문` 검색, `:q` 종료)
