@@ -71,6 +71,7 @@ PATH_ORDER_BUY = "/trading/v1/overseas/orders/buy"
 PATH_ORDER_SELL = "/trading/v1/overseas/orders/sell"
 PATH_ORDER_CANCEL = "/trading/v1/overseas/orders/cancel"
 PATH_ORDER_MODIFY = "/trading/v1/overseas/orders/modify"
+PATH_ORDER_DETAIL = "/trading/v1/overseas/orders/detail"
 
 # ── 응답 판정 코드 ──
 # 성공 코드(rsp_cd)는 API 계열별로 상이합니다.
@@ -1226,6 +1227,12 @@ class MeritzBroker(Broker):
                 self._submitted_orders[cache_key] = meta
 
         if meta is None:
+            # 당일 이력이 비어 있는 경우(주문 후 프로세스가 바뀐 경우 등) 상세조회로 복원
+            meta = self._lookup_order_meta_via_detail(oder_date, orgl_oder_no)
+            if meta is not None:
+                self._submitted_orders[cache_key] = meta
+
+        if meta is None:
             raise OrderNotAcceptedError(
                 f"취소할 주문의 주문구분/수량을 확인할 수 없습니다: odno={odno}. "
                 f"주문 시점 캐시가 없고 당일 이력에도 없습니다."
@@ -1261,6 +1268,45 @@ class MeritzBroker(Broker):
             )
 
         print(f"[메리츠] 주문 취소 성공: odno={odno} (oder_date={oder_date})")
+
+    def _lookup_order_meta_via_detail(
+        self,
+        oder_date: str,
+        orgl_oder_no: str,
+    ) -> Optional[dict]:
+        """
+        주문 상세조회로 취소/정정에 필요한 주문구분·수량을 복원합니다 (없으면 None).
+
+        당일 이력(/orders/today)이 비어 있는 상황(접수 후 프로세스 재시작 등)에서
+        취소·정정을 계속할 수 있도록 하는 폴백입니다.
+        """
+        try:
+            body = self._request(
+                "GET",
+                PATH_ORDER_DETAIL,
+                params={"oder_sta_date": oder_date, "oder_no": orgl_oder_no},
+            )
+        except BrokerError as e:
+            print(f"[메리츠] 주문 상세 조회 실패: {str(e)[:80]}")
+            return None
+
+        data = body.get("data")
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict) or not data:
+            return None
+
+        aspr_code = str(data.get("aspr_type_code") or "").strip()
+        cls_code = _ASPR_TO_ODER_CLS_CODE.get(aspr_code, "") or str(
+            data.get("oder_cls_code") or ""
+        )
+        if not cls_code:
+            return None
+
+        qty = self._to_int(data.get("oder_dqty"))
+        if qty <= 0:
+            return None
+        return {"oder_cls_code": cls_code, "odqt": qty}
 
     def _lookup_cancel_meta(
         self,

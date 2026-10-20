@@ -1070,11 +1070,42 @@ def test_cancel_order_falls_back_to_today_history(make_broker):
 
 
 def test_cancel_order_without_meta_is_not_accepted(make_broker):
-    """캐시에도 당일 이력에도 없으면 전송 없이 차단합니다."""
-    broker, session = make_broker([ok(rsp_cd="5766", data=[])])
+    """캐시에도 당일 이력에도 상세조회에도 없으면 전송 없이 차단합니다."""
+    broker, session = make_broker(
+        [ok(rsp_cd="5766", data=[]), ok(rsp_cd="5766", data=[])]
+    )
     with pytest.raises(OrderNotAcceptedError):
         broker.cancel_order("20260806:0000009999", symbol="TQQQ", exchange="NAS")
-    assert len(session.calls) == 1  # 오늘 이력 조회만 수행 (취소 POST 없음)
+    assert len(session.calls) == 2  # 당일 이력 + 상세 조회만 (취소 POST 없음)
+
+
+def test_cancel_order_falls_back_to_order_detail(make_broker):
+    """당일 이력이 비어 있어도 주문 상세조회로 취소 정보를 복원합니다."""
+    detail_row = {
+        "iscd": "TQQQ.OQ",
+        "seln_byov_clcd": "2",
+        "oder_dqty": "7.0000000000",
+        "aspr_type_code": "5",   # 5 → LOC(32)
+        "ovrs_stck_oder_prc": "73.73",
+    }
+    broker, session = make_broker(
+        [
+            ok(rsp_cd="5766", data=[]),                       # 당일 이력 → 비어 있음
+            ok(rsp_cd="5766", data=detail_row),              # 상세 조회 → 복원 성공
+            ok(rsp_cd="0001", data={"warn_cls_code": "0"}),  # 취소 접수
+        ]
+    )
+
+    broker.cancel_order("20261020:0000771669", symbol="TQQQ", exchange="NAS")
+
+    detail_call = session.calls[1]
+    assert detail_call["path"] == "/trading/v1/overseas/orders/detail"
+    assert detail_call["params"] == {"oder_sta_date": "20261020", "oder_no": "771669"}
+    cancel_call = session.calls[2]
+    assert cancel_call["path"] == "/trading/v1/overseas/orders/cancel"
+    assert cancel_call["json_body"]["oder_cls_code"] == "32"
+    assert cancel_call["json_body"]["odqt"] == 7
+    assert cancel_call["json_body"]["orgl_oder_no"] == "771669"
 
 
 # ═══════════════════════════════════════════════════════════════════
