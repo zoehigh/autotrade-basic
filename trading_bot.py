@@ -731,6 +731,13 @@ def run_one_symbol(broker: Broker, symbol_config):
 
     order_exchange_code = broker.exchange_code(exchange)
 
+    # ── 잔여 주문 정리 ────────────────────────────────────────────
+    # 매 세션마다 새 주문 전체를 새로 냅니다. 이전에 낸 주문이 아직 살아 있으면
+    # (특히 목표매도 LIMIT) 새 주문과 중복되어 매도 수량이 보유량을 넘을 수 있습니다.
+    # 새 주문을 내기 전에 봇 소유의 미체결 주문을 정리합니다.
+    if TRADE_MODE == "LIVE":
+        _cancel_open_bot_orders(broker, symbol, exchange, state, order_history)
+
     if TRADE_MODE == "LIVE":
         state["pending_order_batch"] = {
             "session": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
@@ -987,6 +994,78 @@ fence: 유지"""
         print("\n[실패한 주문]")
         for order in failed_orders:
             print(f"  ✗ {order['comment']}: {order['error']}")
+
+
+def _cancel_open_bot_orders(
+    broker,
+    symbol: str,
+    exchange: str,
+    state: dict,
+    order_history: list,
+) -> int:
+    """
+    봇이 직접 낸 미체결 주문을 취소합니다 (신규 주문 제출 전 정리).
+
+    매 세션마다 새 주문 전체를 새로 내므로, 이전에 낸 주문이 남아 있으면
+    목표매도 같은 주문이 중복되어 매도 수량이 보유량을 초과할 수 있습니다.
+
+    - state 의 orders_meta 에 있는 **봇 소유 주문만** 정리합니다 (수동 주문 무관)
+    - 리버스 주문/리버스 활성 상태는 건드리지 않습니다 (기간 관리 대상)
+    - 취소에 실패하면 신규 주문을 내지 않고 해당 종목만 중단합니다
+
+    Returns:
+        int: 취소한 주문 수
+    """
+    orders_meta = state.get("orders_meta") or {}
+    if not orders_meta:
+        return 0
+
+    cancel = getattr(broker, "cancel_order", None)
+    if cancel is None:
+        return 0  # 취소를 지원하지 않는 브로커는 건너뜁니다
+
+    reverse_state = state.get("reverse_mode") or {}
+    if reverse_state.get("active"):
+        print("[잔여 주문 정리] 리버스모드 활성 — 주문을 건드리지 않습니다.")
+        return 0
+
+    by_odno = {str(o.get("odno")): o for o in (order_history or [])}
+    targets: list[tuple[str, str, int]] = []
+    for odno, meta in list(orders_meta.items()):
+        if (meta or {}).get("reverse_action"):
+            continue  # 리버스 주문은 기간 관리 대상
+        row = by_odno.get(str(odno))
+        if row is None:
+            continue
+        status = str(row.get("prcs_stat_name", "") or "")
+        if status not in ("미체결", "부분체결"):
+            continue
+        try:
+            remaining = int(float(row.get("nccs_qty", "0") or 0))
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining <= 0:
+            continue
+        targets.append((str(odno), status, remaining))
+
+    if not targets:
+        return 0
+
+    print(f"\n[잔여 주문 정리] 봇 소유 미체결 주문 {len(targets)}건 취소")
+    for odno, status, remaining in targets:
+        print(f"  - {odno} ({status}, 잔량 {remaining}주)")
+
+    for odno, _status, _remaining in targets:
+        try:
+            cancel(odno, symbol=symbol, exchange=exchange)
+        except Exception as error:
+            raise SymbolScopedError(
+                f"기존 주문 취소 실패로 신규 주문을 생략합니다: {odno} — {str(error)[:160]}"
+            )
+        print(f"  ✓ 취소 완료: {odno}")
+
+    print("[잔여 주문 정리] 완료 — 신규 주문을 제출합니다.")
+    return len(targets)
 
 
 def _print_state_diagnostic():
