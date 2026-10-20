@@ -803,6 +803,72 @@ def test_cancel_pair_requires_same_date(make_broker):
     assert cancel_row["prcs_stat_name"] == "취소"
 
 
+def test_order_history_amend_row_supersedes_original(make_broker):
+    """정정행(rctf=1)은 원주문을 대체된 상태(잔량 0)로 표시합니다."""
+    original = dict(
+        PERIOD_ROW,
+        der_date="20261020",
+        der_no="759969",
+        der_exec_ymdh="20261020 17:37:08",
+        orgl_oder_no="",
+        der_rctf_cncl_cls_code="0",
+        rctf_cncl_cls_name="",
+    )
+    amended = dict(
+        original,
+        der_no="771669",
+        der_exec_ymdh="20261020 18:04:37",
+        orgl_oder_no="759969",
+        der_rctf_cncl_cls_code="1",
+        rctf_cncl_cls_name="정정",
+        cntg_dqty="0",
+        ovrs_stck_oder_prc="73.73",
+    )
+    broker, _session = make_broker(
+        [ok(rsp_cd="5766", data=[original, amended]), ok(rsp_cd="5766", data=[])]
+    )
+
+    rows = broker.get_order_history("TQQQ", "NAS")
+
+    old = next(r for r in rows if r["_plain_oder_no"] == "759969")
+    assert old["prcs_stat_name"] == "정정됨"
+    assert old["nccs_qty"] == "0"
+    assert old["_remaining"] == 0
+    new = next(r for r in rows if r["_plain_oder_no"] == "771669")
+    assert new["prcs_stat_name"] == "미체결"
+    assert new["nccs_qty"] == "10"  # 주문 10 - 체결 0 = 잔량 10
+
+
+def test_amend_row_does_not_supersede_other_date(make_broker):
+    """주문일자가 다르면 정정이 원주문에 연결되지 않습니다."""
+    original = dict(
+        PERIOD_ROW,
+        der_date="20261019",
+        der_no="759969",
+        der_exec_ymdh="20261019 17:37:08",
+        orgl_oder_no="",
+        der_rctf_cncl_cls_code="0",
+        rctf_cncl_cls_name="",
+    )
+    amended = dict(
+        original,
+        der_date="20261020",
+        der_no="771669",
+        der_exec_ymdh="20261020 18:04:37",
+        orgl_oder_no="759969",
+        der_rctf_cncl_cls_code="1",
+        rctf_cncl_cls_name="정정",
+    )
+    broker, _session = make_broker(
+        [ok(rsp_cd="5766", data=[original, amended]), ok(rsp_cd="5766", data=[])]
+    )
+
+    rows = broker.get_order_history("TQQQ", "NAS")
+
+    old = next(r for r in rows if r["_plain_oder_no"] == "759969")
+    assert old["prcs_stat_name"] != "정정됨"  # 다른 날짜 → 미연결
+
+
 def test_order_history_survives_today_failure(make_broker):
     """당일 이력 조회가 실패해도 기간 이력으로 진행합니다."""
     broker, _session = make_broker(

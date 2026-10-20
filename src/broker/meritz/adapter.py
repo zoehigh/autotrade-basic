@@ -130,6 +130,7 @@ _ENV_CONFIRM_WARNINGS = "MERITZ_CONFIRM_WARNINGS"
 _ODNO_SEPARATOR = ":"
 _ORDER_NO_PAD_WIDTH = 10
 _CANCEL_STATUS_NAME = "취소"
+_SUPERSEDED_STATUS_NAME = "정정됨"
 _REJECT_STATUS_NAME = "거부"
 _CANCEL_REQUIRED_FIELDS = ("oder_date", "orgl_oder_no", "oder_cls_code", "odqt")
 _MODIFY_REQUIRED_FIELDS = (
@@ -647,8 +648,10 @@ class MeritzBroker(Broker):
             der_dqty, ovrs_stck_oder_prc, cntg_dqty, cntg_crnc_prc, cntg_camt,
             ovrs_stck_oder_stat_cls_code(0=정상/비0=거부),
             der_rctf_cncl_cls_code(0=원주문/1=정정/2=취소), rctf_cncl_cls_name,
-            der_exec_ymdh/cntg_ymdh(KST), aspr_type_code(취소메타 역매핑), crcd
-            (당일 API는 odqt/cntg_qty/ncnt_qty 표기 — 양쪽 모두 인식)
+                "der_exec_ymdh/cntg_ymdh(KST), aspr_type_code(취소메타 역매핑), crcd
+                (당일 API는 odqt/cntg_qty/ncnt_qty 표기 — 양쪽 모두 인식)
+
+        rctf/정정 판정에 필요한 원시값도 `_rctf_code`/`_rctf_name` 으로 함께 보관합니다.
 
         시각 규칙: der_exec_ymdh/cntg_ymdh 는 **한국(KST) 일시**이므로
         그대로 KST로 파싱합니다 (resolve_real_kst_from_ord 미적용).
@@ -780,6 +783,8 @@ class MeritzBroker(Broker):
             "_remaining": max(remaining, 0),
             "_is_cancel": is_cancel,
             "_is_rejected": is_rejected,
+            "_rctf_code": rctf_code,
+            "_rctf_name": rctf_name,
             "_plain_oder_no": str(int(self._digits(oder_no))) if self._digits(oder_no) else "",
             "_plain_orgl_oder_no": (
                 str(int(self._digits(orgl_oder_no))) if self._digits(orgl_oder_no) else ""
@@ -839,6 +844,28 @@ class MeritzBroker(Broker):
                 ):
                     target["_is_cancel"] = True
                     target["prcs_stat_name"] = _CANCEL_STATUS_NAME
+                    target["nccs_qty"] = "0"
+                    target["_remaining"] = 0
+                    break
+
+        # 정정행을 원주문에 반영 — 정정된 원주문은 대체되었으므로 잔량 0 으로 표시합니다.
+        # (취소와 달리 정정 행의 rctf 는 1 이며, 원주문은 체결 자체가 취소된 게 아닙니다.
+        #  남은 체결분만 반영되도록 체결 수량은 그대로 보존합니다.)
+        for item in merged.values():
+            if item.get("_rctf_code") != "1" or not item.get("_plain_orgl_oder_no"):
+                continue
+            amend_date = item.get("_oder_date") or item["ord_dt"]
+            for target in merged.values():
+                if target is item or target["_is_cancel"]:
+                    continue
+                if target.get("_rctf_code") == "1":
+                    continue  # 이미 정정된 주문을 다시 대체하지 않습니다
+                target_date = target.get("_oder_date") or target["ord_dt"]
+                if not amend_date or not target_date or target_date != amend_date:
+                    continue
+                if target["_plain_oder_no"] == item["_plain_orgl_oder_no"]:
+                    target["_is_superseded"] = True
+                    target["prcs_stat_name"] = _SUPERSEDED_STATUS_NAME
                     target["nccs_qty"] = "0"
                     target["_remaining"] = 0
                     break
