@@ -61,8 +61,8 @@
 | 항목 | 값 |
 |---|---|
 | 런처 | `~/investment/muhan-v4/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) |
-| cron (현재, 검증용) | `20 17 * * 1-5 FORCE_SYMBOLS=TQQQ:NAS LAUNCH_MODE=DRY .../run_daily.sh` |
-| cron (운영 예정) | `30 17 * * 1-5 .../run_daily.sh` (LIVE, 양종목) — LIVE 1세션 검증 후 교체 |
+| cron (현재) | `20 17 * * 1-5 FORCE_SYMBOLS=TQQQ:NAS LAUNCH_MODE=DRY .../run_daily.sh` (검증용, 주문 없음) |
+| 자동 실행 | **보류** — 사용자 승인 후 `30 17 * * 1-5 .../run_daily.sh` 등록 |
 | 서버 TZ | `Asia/Seoul` → `CRON_TZ` 불필요 (이미 설정돼 있음) |
 | 텔레그램 | `.env` 설정 완료, 발송 테스트 성공 |
 | 로그 | `logs/run-YYYYMMDD-HHMMSS.log` |
@@ -89,6 +89,16 @@
 | 추가 3단계 | LOC(32) | 1 | $36.92 | `20261020:0000759988` |
 
 - **SOXL은 아직 LIVE 미검증** (cron 교체 전 판단 필요).
+
+**수동 실행 (자동 실행 보류 중 — 매 거래일 KST 17:20~17:40)**
+
+```bash
+~/investment/muhan-v4/run_daily.sh
+```
+
+- LOC 주문은 **당일 마감 기준**이라 매 거래일 재제출해야 합니다. 실행을 건너뛰면 그날 전략이 진행되지 않습니다.
+- 결과 확인: `ls -1t ~/investment/muhan-v4/logs/ | head -1` → `vi <로그경로>` (`/주문` 검색, `:q` 종료)
+- 상태 확인: `STATE_DIAGNOSTIC_ONLY=true ~/.local/bin/uv run python trading_bot.py` (저장소 루트에서)
 
 ---
 
