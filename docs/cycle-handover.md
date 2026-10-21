@@ -4,11 +4,11 @@
 >
 > **현재 상태 (2026-10-21)**: 운영 VPS(`ubuntu@140.245.126.43`, `~/investment/muhan-v4`)에서
 > TQQQ·SOXL 자동매매가 **무인运行 중**입니다. 메리츠(real) 계좌, 두 종목 모두 20분할,
-> 시드 $9,696.18 / $9,627.46. 현재 T = 13.375 / 13.6562 (10/20 세션 체결 반영 전 → 17:20 실행에서 반영).
+> 시드 $9,696.18 / $9,627.46. 현재 T = 13.375 / 13.6562.
 >
-> **매일 자동으로 도는 것** (평일 17:20 KST)
+> **매일 자동으로 도는 것** (평일 18:30 KST)
 > 1. `ops/run_daily.sh` — 직전 체결 정산(T·순투입 반영) → 전략 계산 → 주문 12건 접수
-> 2. `ops/verify_run.sh` (17:35) — 결과 대조, **이상일 때만** 텔레그램 알림
+> 2. `ops/verify_run.sh` (18:45) — 결과 대조, **이상일 때만** 텔레그램 알림
 >
 > **알림이 왔을 때**
 > - 🚨 `자동매매 실행 실패` → `logs/run-*.log` 확인 → `ops/status.sh`
@@ -95,10 +95,10 @@
 | 런처 | `~/investment/muhan-v4/ops/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) (저장소 `ops/run_daily.sh` — git 관리)|
 | 상태 확인 | `~/investment/muhan-v4/ops/status.sh` — 마지막 실행 결과·cron·state 진단 (read-only) (저장소 `ops/status.sh` — git 관리) |
 | 실행 검증 | `python ~/investment/muhan-v4/ops/verify_run.py [YYYYMMDD]` — 무인 실행 결과를 로그·브로커·state까지 대조 (저장소 `ops/verify_run.py`) |
-| cron (현재) | `20 17 * * 1-5 LAUNCH_MODE=LIVE .../ops/run_daily.sh` (2026-10-20 자동 운영 전환) |
-| cron (검증) | `35 17 * * 1-5 .../ops/verify_run.sh` — 실행 15분 뒤 결과 검증, **이상 시에만** 텔레그램 알림 |
+| cron (현재) | `30 18 * * 1-5 LAUNCH_MODE=LIVE .../ops/run_daily.sh` (연중 고정 KST 18:30) |
+| cron (검증) | `45 18 * * 1-5 .../ops/verify_run.sh` — 실행 15분 뒤 결과 검증, **이상 시에만** 텔레그램 알림 |
 | 자동 실행 | **LIVE 전환 완료** — 되돌리기: 아래 명령 |
-| 되돌리기 | `(crontab -l \| grep -v muhan-v4/ops/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") \| crontab -` |
+| 되돌리기 | `(crontab -l \| grep -v muhan-v4/ops/run_daily.sh; echo "30 18 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") \| crontab -` |
 | 서버 TZ | `Asia/Seoul` → `CRON_TZ` 불필요 (이미 설정돼 있음) |
 | 텔레그램 | `.env` 설정 완료, 발송 테스트 성공 |
 | 로그 | `logs/run-YYYYMMDD-HHMMSS.log` |
@@ -194,11 +194,11 @@ TQQQ도 **20분할**이므로 `TQQQ_SPLITS=20`으로 바꾸고 기존 주문을 
 - 두 종목 모두 `orders_meta` 6건, fence 없음, T·순투입금 불변.
 
 **런처 락 경합 수정 (2026-10-20)**: `run_daily.sh`가 DRY는 `flock -n`(즉시 종료), **LIVE는 `flock -w 300`**으로
-대기합니다. 이전에는 cron(17:20 DRY)과 수동 LIVE가 겹치면 수동 LIVE가 **exit 0으로 조용히 건너뛰어질**
+대기합니다. 이전에는 cron(DRY)과 수동 LIVE가 겹치면 수동 LIVE가 **exit 0으로 조용히 건너뛰어질**
 위험이 있었습니다. LIVE는 이제 5분까지 기다린 뒤에도 못 얻으면 exit 1로 실패합니다.
 
 **자동 운영 전환 (2026-10-20 20:15 KST)** — cron을 LIVE로 전환했습니다.
-`20 17 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh`
+`30 18 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh`
 
 전환 전에 신규 코드 경로를 LIVE로 1회 검증했습니다 (20:13 KST, 개장 전이라 체결 위험 없음).
 
@@ -222,7 +222,8 @@ TQQQ도 **20분할**이므로 `TQQQ_SPLITS=20`으로 바꾸고 기존 주문을 
   봇이 시작 전에 죽어 알림이 전혀 없던 경우도 여기서 잡힙니다.
   - 결과는 `logs/verify-YYYYMMDD-HHMMSS.log` 에 남습니다.
 
-**첫 무인 실행 결과 (2026-10-21 17:20 KST — 성공)**
+**첫 무인 실행 결과 (2026-10-21 17:20 KST — 성공)**  
+(※ 이후 스케줄은 18:30 로 상향 — 아래 '동절기 대응' 참고)
 
 | 항목 | 결과 |
 |---|---|
@@ -236,9 +237,11 @@ TQQQ도 **20분할**이므로 `TQQQ_SPLITS=20`으로 바꾸고 기존 주문을 
 - **매일 반복 경고 제거**: "이력이 없는데 보유 중" 경고는 체결이 없었을 뿐 정상인 경우에도
   매일 찍혀 실제 경고 신호가 희석되던 것을, **봇 주문이 이력에 보이면 안내로** 바꾸었습니다
   (`4993ae2`). 봇 주문이 이력에 없거나 이력이 비면 기존 경고를 유지합니다. T 보존 동작은 동일합니다.
-- **동절기 주의**: 11월 1일 이후(EST)에는 프리장 개장이 KST 18:00로 늦어집니다.
-  17:20에 실행하면 봇이 **18:00까지 내부에서 대기**한 뒤 주문합니다
-  (대기 중 plan 은 17:20 시세로 계산 — 한계 있음). 연중 고정 시간으로 바꾸려면 `30 18 * * 1-5` 를 사용하세요.
+- **동절기 대응 (2026-10-21 확정)**: 실행 시각을 **18:30 KST 로 고정**했습니다.
+  - 서머타임 프리장 개장 17:00 KST / 동절기 18:00 KST — 18:30 은 두 경우 모두 개장 이후
+  - 봇 내부 프리장 대기에 걸리지 않아 **계획 계산 시세와 주문 시점이 일치**합니다
+  - 11월 1일(EST) 전환 후에도 별도 시간 변경이 필요 없습니다
+  - 검증 크론도 18:45 로 이동했습니다
 
 **추가매수 계단식 재배치 (2026-10-20, `c995412`)**
 
@@ -289,7 +292,7 @@ SOXL 정정 결과 (현재가 $94.89, 상한 $112.91):
 > 떨어집니다 — 수동매매 이력처럼 폴백 규칙(1건→+0.5)으로 계산되므로 값이 달라집니다.**
 > 따라서 정리하지 않고 유지합니다 (연간 수백 KB 규모).
 
-**수동 실행 (자동 실행 보류 중 — 매 거래일 KST 17:20~17:40)**
+**수동 실행 (필요 시 — 평일 18:30 KST 무인 실행)**
 
 ```bash
 ~/investment/muhan-v4/ops/run_daily.sh
