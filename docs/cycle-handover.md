@@ -68,7 +68,8 @@
 | 런처 | `~/investment/muhan-v4/ops/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) (저장소 `ops/run_daily.sh` — git 관리)|
 | 상태 확인 | `~/investment/muhan-v4/ops/status.sh` — 마지막 실행 결과·cron·state 진단 (read-only) (저장소 `ops/status.sh` — git 관리) |
 | 실행 검증 | `python ~/investment/muhan-v4/ops/verify_run.py [YYYYMMDD]` — 무인 실행 결과를 로그·브로커·state까지 대조 (저장소 `ops/verify_run.py`) |
-| cron (현재) | `20 17 * * 1-5 LAUNCH_MODE=LIVE .../run_daily.sh` (2026-10-20 자동 운영 전환) |
+| cron (현재) | `20 17 * * 1-5 LAUNCH_MODE=LIVE .../ops/run_daily.sh` (2026-10-20 자동 운영 전환) |
+| cron (검증) | `35 17 * * 1-5 .../ops/verify_run.sh` — 실행 15분 뒤 결과 검증, **이상 시에만** 텔레그램 알림 |
 | 자동 실행 | **LIVE 전환 완료** — 되돌리기: 아래 명령 |
 | 되돌리기 | `(crontab -l \| grep -v muhan-v4/ops/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") \| crontab -` |
 | 서버 TZ | `Asia/Seoul` → `CRON_TZ` 불필요 (이미 설정돼 있음) |
@@ -178,6 +179,11 @@ TQQQ도 **20분할**이므로 `TQQQ_SPLITS=20`으로 바꾸고 기존 주문을 
   오탐 알림이 반복되면 실제 경고를 못 믿게 되므로 넣지 않았습니다.
   → **일일 확인에서 `status.sh` 의 `합계: 성공 N건` 을 반드시 확인**하시고, 0건이면 원인을 확인하세요.
   (정상 사례는 0건이 아니라 **리버스 모드 진입/종료 안내 로그**가 함께 남습니다.)
+- **자동 검증 크론**: `35 17 * * 1-5 .../ops/verify_run.sh` 가 예약 실행 15분 뒤 결과를 대조합니다
+  (로그 exit code·집계, 브로커 접수 주문, state T·순투입·fence, 매도합계 vs 보유량, 매수 가격 중복).
+  **정상이면 조용히**, 이상이 있으면 텔레그램 긴급 알림을 보냅니다.
+  봇이 시작 전에 죽어 알림이 전혀 없던 경우도 여기서 잡힙니다.
+  - 결과는 `logs/verify-YYYYMMDD-HHMMSS.log` 에 남습니다.
 - **매일 반복 경고 제거**: "이력이 없는데 보유 중" 경고는 체결이 없었을 뿐 정상인 경우에도
   매일 찍혀 실제 경고 신호가 희석되던 것을, **봇 주문이 이력에 보이면 안내로** 바꾸었습니다
   (`4993ae2`). 봇 주문이 이력에 없거나 이력이 비면 기존 경고를 유지합니다. T 보존 동작은 동일합니다.
