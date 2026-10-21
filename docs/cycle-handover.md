@@ -66,7 +66,8 @@
 | 항목 | 값 |
 |---|---|
 | 런처 | `~/investment/muhan-v4/ops/run_daily.sh` (flock + 로그 14일 보관 + 일회성 복구 플래그 unset) (저장소 `ops/run_daily.sh` — git 관리)|
-| 상태 확인 | `~/investment/muhan-v4/ops/status.sh` — 마지막 실행 결과·cron·state 진단 (read-only) (저장소 `ops/status.sh` — git 관리)|
+| 상태 확인 | `~/investment/muhan-v4/ops/status.sh` — 마지막 실행 결과·cron·state 진단 (read-only) (저장소 `ops/status.sh` — git 관리) |
+| 실행 검증 | `python ~/investment/muhan-v4/ops/verify_run.py [YYYYMMDD]` — 무인 실행 결과를 로그·브로커·state까지 대조 (저장소 `ops/verify_run.py`) |
 | cron (현재) | `20 17 * * 1-5 LAUNCH_MODE=LIVE .../run_daily.sh` (2026-10-20 자동 운영 전환) |
 | 자동 실행 | **LIVE 전환 완료** — 되돌리기: 아래 명령 |
 | 되돌리기 | `(crontab -l \| grep -v muhan-v4/ops/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") \| crontab -` |
