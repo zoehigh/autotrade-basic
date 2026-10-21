@@ -22,12 +22,13 @@
 > ```
 >
 > **아직 하지 않은 것** (필요 시 진행)
-> - 동절기(11월 1일 이후) 프리장 개장 18:00 KST 대응 — 현재는 봇이 18:00까지 내부 대기
-> - 수수료 면제 종료 후 `COMMISSION_RATE` 되돌리기 (현재 `0.00`)
+> - 수수료 면제 종료 후 `COMMISSION_RATE` 되돌리기 (현재 `0.00`, 2027-01-01 기준).
+>   런처가 그날부터 로그에 경고를 남깁니다 — 전략 주문에는 영향 없음(리포트 순수익 계산 전용).
+> - ~~동절기 대응~~ — 18:30 KST 고정으로 해소 (11월 1일 이후 별도 변경 불필요)
 >
 > **§2 인계 시딩 절차는 이미 완료된 작업**입니다 — 기록용으로 남아 있습니다.
 
-작성: 2026-10-15 · 갱신: 2026-10-20
+작성: 2026-10-15 · 갱신: 2026-10-21
 대상: TQQQ, SOXL (메리츠 실전)
 코드 근거: `trading_bot.py`, `src/state.py`, `src/strategy.py`
 
@@ -442,13 +443,16 @@ TRADE_MODE=DRY uv run python trading_bot.py
 
 ### Step 9 — cron + flock 활성화
 
-- 실행 시각: **KST 17:30** (`docs/cron-dispatch-guide.md:38`; 프리장 오픈 직후, DST는 코드가 자동 처리)
-- `flock -n`으로 중복 실행 방지
-- run 전 state 백업 + 로그 append/회전
+> **구현은 2026-10-21 에 완료**했습니다. 아래는 당시 설계안이며, 실제 적용 내용은
+> `ops/cron.example` 와 §0 "운영 실행 방식" 을 보세요.
+
+- 실행 시각: **KST 18:30** (연중 고정 — 서머 17:00 / 동절기 18:00 프리장 개장 이후)
+- `ops/run_daily.sh` — DRY 는 `flock -n`, **LIVE 는 `flock -w 300`** (조용히 건너뛰지 않도록 대기)
+- 검증 크론 `ops/verify_run.sh` (18:45) — 이상 시에만 텔레그램 알림
 
 ```cron
-CRON_TZ=Asia/Seoul
-30 17 * * 1-5 cd ~/investment/muhan-v4 && PATH=$HOME/.local/bin:/usr/bin:/bin flock -n /tmp/autotrade.lock $HOME/.local/bin/uv run python trading_bot.py >> run.log 2>&1
+30 18 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+45 18 * * 1-5 /home/ubuntu/investment/muhan-v4/ops/verify_run.sh
 ```
 
 ### 순서 근거 (Step 3 → Step 5)
