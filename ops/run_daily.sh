@@ -46,6 +46,16 @@ set -a
 . ./.env
 set +a
 
+# 수수료 면제 종료 안내 — 2027-01-01 부터는 실제 요율로 되돌려야 합니다.
+# (0 으로 두는 동안 사이클 리포트 순수익이 약 0.25% 과대 표시됩니다)
+if [[ "$(date +%Y%m%d)" -ge "20270101" ]]; then
+    case "${COMMISSION_RATE:-0}" in
+        0|0.0|0.00|0.000|0.0000)
+            echo "[launcher] ⚠️ 수수료 면제 종료 기준(2027-01-01) 을 지났습니다. COMMISSION_RATE 를 실제 요율(예: 0.0025) 로 변경하세요." >> "$LOG"
+            ;;
+    esac
+fi
+
 [[ -n "$OVERRIDE_SYMBOLS" ]] && export SYMBOLS="$OVERRIDE_SYMBOLS"
 export TRADE_MODE="${OVERRIDE_MODE:-LIVE}"
 

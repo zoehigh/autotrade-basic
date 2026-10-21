@@ -5,11 +5,14 @@
 #
 # 서버 TZ가 Asia/Seoul 이므로 CRON_TZ 없이 KST 기준으로 동작합니다.
 #
-# 17:20 KST 실행 → trading_bot.py 가 프리장 시간(서머 17시 / 동절기 18시) 기준 대기를
-# 자체 처리하므로, 별도 시간 분기를 넣지 않아도 됩니다.
-# 동절기(11월~3월)에는 17:20에 시작해 18:00까지 내부 대기 후 주문합니다.
+# 연중 고정 18:30 KST 를 씁니다.
+# - 서머타임 프리장 개장 17:00 KST / 동절기 18:00 KST — 18:30 은 두 경우 모두 프리장 개장 이후입니다.
+# - 봇 내부의 프리장 대기(summer 17시 / winter 18시)에 걸리지 않아,
+#   계획 계산 시세와 실제 주문 시점이 어긋나지 않습니다.
+# - 11월 1일(EST) 전환 후에도 별도 시간 변경이 필요 없습니다.
 #
 # 되돌리기 (DRY 로):
-#   (crontab -l | grep -v muhan-v4/ops/run_daily.sh; echo "20 17 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") | crontab -
+#   (crontab -l | grep -v muhan-v4/ops/run_daily.sh; echo "30 18 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") | crontab -
 #
-20 17 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+30 18 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+45 18 * * 1-5 /home/ubuntu/investment/muhan-v4/ops/verify_run.sh
