@@ -49,7 +49,9 @@ def main():
     if not logs:
         print(f"logs/run-{target}-*.log 없음 — 실행되지 않았습니다.")
         sys.exit(2)
-    log_path = logs[-1]
+    # 같은 날짜에 DRY 도 함께 있으면 LIVE 실행 로그를 우선합니다.
+    live_logs = [p for p in logs if "mode=LIVE" in p.read_text(errors="ignore")]
+    log_path = live_logs[-1] if live_logs else logs[-1]
 
     print(f"=== 실행 로그 검증 ({target}) ===")
     text = log_path.read_text()
