@@ -43,6 +43,82 @@ def ok(msg):
     print(f"  [OK ] {msg}")
 
 
+def _verify_t_transitions(text, symbol, rows, balance_qty):
+    """
+    로그의 T 변화가 실제 체결 내용과 일치하는지 검사합니다.
+
+    2026-10-22 실제로 T 가 13.375 → 3.3438 로 잘못 갱신됐는데 검증은 "이상 없음"을
+    보고했습니다. 로그의 매도 비율을 브로커 잔고로 산출한 실제 분모와 대조해 잡습니다.
+    """
+    problems: list[str] = []
+    m_before = re.search(
+        rf"\[상태\] {re.escape(symbol)} 상태 로드 완료 → T=([0-9.]+), 마지막 갱신: (\S+)", text
+    )
+    m_after = re.search(
+        rf"\[상태\] {re.escape(symbol)} T값 업데이트 완료 → T=([0-9.]+)", text
+    )
+    if not m_before or not m_after:
+        return problems
+    t_before = float(m_before.group(1))
+    t_after = float(m_after.group(1))
+    watermark = m_before.group(2)
+
+    # 로그에 기록된 전이를 따라 T 을 재현합니다 (매수 ΔT / 매도 후 T).
+    logged_ratios: list[float] = []
+    t_running = t_before
+    for line in text.splitlines():
+        m_buy = re.search(r"→ 매수 체결 \(\d+\): .*ΔT=([0-9.]+) → T=([0-9.]+)", line)
+        if m_buy:
+            t_running = float(m_buy.group(2))
+            continue
+        m_sell = re.search(
+            r"→ 매도 체결 \(\d+\): \S+ \(비율=([0-9.]+)(?:, 보유 (\d+)주)?\) → T=([0-9.]+)", line
+        )
+        if m_sell:
+            logged_ratios.append(float(m_sell.group(1)))
+            t_running = float(m_sell.group(3))
+    if abs(t_running - t_after) > 0.0001:
+        problems.append(
+            f"{symbol} 로그 내 T 전이({t_running}) ≠ 최종 T({t_after})"
+        )
+
+    # 실제 분모(보유수량)로 로그의 매도 비율을 대조합니다.
+    if logged_ratios and balance_qty is not None:
+        net = 0
+        for r in rows:
+            ts = r.get("ord_datetime_utc") or ""
+            if not ts or ts <= watermark:
+                continue
+            q = int(float(r.get("ft_ccld_qty", "0") or 0))
+            if r.get("sll_buy_dvsn_cd_name") == "매수":
+                net += q
+            elif r.get("sll_buy_dvsn_cd_name") == "매도":
+                net -= q
+        position = balance_qty - net
+        sells = sorted(
+            [
+                r for r in rows
+                if (r.get("ord_datetime_utc") or "") > watermark
+                and r.get("sll_buy_dvsn_cd_name") == "매도"
+                and int(float(r.get("ft_ccld_qty", "0") or 0)) > 0
+            ],
+            key=lambda x: x.get("ord_datetime_utc", ""),
+        )
+        for idx, r in enumerate(sells):
+            if idx >= len(logged_ratios):
+                break
+            q = int(float(r.get("ft_ccld_qty", "0") or 0))
+            if position > 0:
+                expected = q / position
+                if abs(expected - logged_ratios[idx]) > 0.05:
+                    problems.append(
+                        f"{symbol} 매도 비율 불일치: 로그 {logged_ratios[idx]:.2f} "
+                        f"vs 실제 보유 {position}주 기준 {expected:.2f} — T 분류 오류 가능"
+                    )
+            position = max(0, position - q)
+    return problems
+
+
 def main():
     target = sys.argv[1] if len(sys.argv) > 1 else datetime.now(KST).strftime("%Y%m%d")
     logs = sorted(Path("logs").glob(f"run-{target}-*.log"))
@@ -123,6 +199,8 @@ def main():
             problem(f"{sym} 매도 합계 {sells}주 > 보유 {bal.quantity}주")
         else:
             ok(f"{sym} 매도 합계 {sells}주 ≤ 보유 {bal.quantity}주")
+        for msg in _verify_t_transitions(text, sym, rows, bal.quantity):
+            problem(msg)
         if mode == "LIVE" and executed and len(live) + len(filled) == 0:
             problem(f"{sym} 접수된 주문이 이력에 없습니다")
         print(

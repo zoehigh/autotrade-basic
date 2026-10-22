@@ -392,6 +392,22 @@ def run_one_symbol(broker: Broker, symbol_config):
     if TRADE_MODE == "LIVE":
         save_state(symbol, state)
 
+    # ── 보유수량 기준 미확보 → 신규 주문 보류 ──────────────────────
+    # 매도 분류에 필요한 보유수량을 브로커 잔고나 저장된 보유수량에서 확보하지 못하면
+    # 쿼터매도/목표매도 구분을 신뢰할 수 없습니다 (T 가 과소 계산될 수 있음).
+    # 이 경우 신규 주문은 내지 않고 확인을 요청합니다.
+    if state.pop("_position_basis_unknown", False):
+        msg = (
+            f"[보류] {symbol} 보유수량 기준을 확보하지 못해 신규 주문을 내지 않습니다. "
+            f"(브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
+        )
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(
+            f"{symbol} 보유수량 기준 미확보로 신규 주문을 보류합니다. "
+            f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
+        )
+
     # ── 상태-잔고 교차검증 (conservative reconciliation) ──
     try:
         computed = compute_position_from_history(order_history, cycle_start_date=state.get("cycle_start_date", ""))
@@ -1110,10 +1126,21 @@ def _cancel_open_bot_orders(
     # ── 취소 확정 확인 ────────────────────────────────────────────
     # 메리츠 상세조회에는 잔량 정보가 없고(문서상 ncnt_odqt 항상 0),
     # 취소는 이력에 별도 행으로 남습니다. 따라서 이력 재조회가 유일한 확인 방법입니다.
+    #
+    # 확정 조건 (모두 만족해야 확정):
+    #   - 이력 재조회가 성공했고
+    #   - 해당 주문 행이 이력에 존재하며
+    #   - 취소 전 대비 체결수가 증가하지 않았고
+    #   - 주문이 종료 상태(취소/체결) 또는 잔량 0
+    # 이력 누락·조회 실패는 "확정"이 아니라 "미확정"으로 처리합니다
+    # (조회 누락을 확정으로 보면 중복 주문의 원인이 됩니다).
+    before_filled = {
+        odno: _order_filled_qty(by_odno.get(odno) or {}) for odno, _s, _r in targets
+    }
     confirmed: set[str] = set()
-    still_open: list[str] = []
+    # 조회 실패 시에도 "미확정"으로 남도록 처음부터 모든 대상을 미확정으로 둡니다.
+    still_open: list[str] = [odno for odno, _s, _r in targets]
     filled_during_cancel: list[str] = []
-    history = list(order_history or [])
     for attempt in range(1, 4):
         if attempt > 1:
             time.sleep(2)
@@ -1121,15 +1148,21 @@ def _cancel_open_bot_orders(
             history = broker.get_order_history(symbol, exchange, days=30, verbose=False)
         except Exception as error:
             print(f"  ⚠️ 이력 재조회 실패 (확인 시도 {attempt}): {str(error)[:120]}")
-            history = list(order_history or [])
+            continue
         current = {str(o.get("odno")): o for o in (history or [])}
         still_open = []
         filled_during_cancel = []
         for odno, _status, _remaining in targets:
             row = current.get(odno)
             if row is None:
-                # 이력에서 사라진 주문은 존재하지 않는 것으로 간주
-                confirmed.add(odno)
+                # 이력에서 사라진 주문은 확정할 수 없습니다 (조회 누락 가능)
+                still_open.append(odno)
+                continue
+            filled_now = _order_filled_qty(row)
+            if filled_now > before_filled.get(odno, 0):
+                # 취소 도중 체결 → 포지션이 바뀌므로 기존 계획으로 재주문하면 안 됩니다
+                filled_during_cancel.append(odno)
+                still_open.append(odno)
                 continue
             status = str(row.get("prcs_stat_name", "") or "")
             if status not in ("미체결", "부분체결"):
@@ -1138,8 +1171,6 @@ def _cancel_open_bot_orders(
             if _order_remaining_qty(row) <= 0:
                 confirmed.add(odno)
                 continue
-            if _order_filled_qty(row) > 0:
-                filled_during_cancel.append(odno)
             still_open.append(odno)
         if not still_open:
             break
