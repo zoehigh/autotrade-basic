@@ -14,6 +14,7 @@ export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 TARGET="${1:-$(TZ=Asia/Seoul date +%Y%m%d)}"
 LOG="$APP_DIR/logs/verify-${TARGET}-$(date +%H%M%S).log"
+problems=()
 mkdir -p "$APP_DIR/logs"
 
 set -a
@@ -22,6 +23,17 @@ set +a
 
 uv run python ops/verify_run.py "$TARGET" --expect-live > "$LOG" 2>&1
 rc=$?
+
+# 알림 채널(텔레그램) 생존 확인 — 알림 자체가 죽었는지 확인합니다.
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    tg=$(curl -sS --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1 || true)
+    if echo "$tg" | grep -q '"ok":true'; then
+        echo "[verify] 알림 채널 정상" >> "$LOG"
+    else
+        echo "[verify] ⚠️ 알림 채널 응답 이상 — 위 알림이 전달되지 않을 수 있습니다" >> "$LOG"
+        problems+=("알림 채널(텔레그램) 응답 이상 — 실패 알림이 전달되지 않을 수 있습니다")
+    fi
+fi
 
 if [[ "$rc" != "0" ]]; then
     echo "[verify] 이상 판정 (exit=$rc) → 텔레그램 알림" >> "$LOG"

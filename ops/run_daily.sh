@@ -70,6 +70,17 @@ unset STATE_REPAIR_ONLY STATE_DIAGNOSTIC_ONLY STATE_CLEAR_FENCE_ONLY \
 
 echo "[launcher] start $(date '+%F %T %Z') mode=$TRADE_MODE symbols=$SYMBOLS rev=$(git rev-parse --short HEAD 2>/dev/null)" >> "$LOG"
 
+# 알림 채널(텔레그램) 생존 확인 — 거래는 막지 않고 상태만 기록합니다.
+# (토큰이 죽으면 실패 알림도 함께 사라지므로, 여기서 드러내야 합니다)
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    tg=$(curl -sS --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1 || true)
+    if echo "$tg" | grep -q '"ok":true'; then
+        echo "[launcher] 알림 채널 정상 (telegram getMe ok)" >> "$LOG"
+    else
+        echo "[launcher] ⚠️ 알림 채널 응답 이상 — 실패 알림이 전달되지 않을 수 있습니다: ${tg:0:120}" >> "$LOG"
+    fi
+fi
+
 uv run python trading_bot.py >> "$LOG" 2>&1
 rc=$?
 
