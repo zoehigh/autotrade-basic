@@ -25,6 +25,12 @@ wheels/
 # 런처 잠금 파일 (런타임 생성물)
 .run.lock
 
+# 정산 근거 파일 (자동 검증용 런타임 산출물)
+settlement-*.json
+
+# 운영 백업 디렉터리 (VPS 로컬)
+backup/
+
 # IDE settings
 .vscode/
 .idea/
