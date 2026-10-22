@@ -382,6 +382,7 @@ def run_one_symbol(broker: Broker, symbol_config):
         "watermark_before": watermark_before,
         "sell_ratios": state.get("_settlement_sell_ratios", []),
         "sell_t_effects": state.get("sell_t_effects", {}),
+        "orders": state.get("_settlement_deltas", []),
         "fills": [],
     }
     for row in order_history:

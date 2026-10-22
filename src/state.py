@@ -1607,6 +1607,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     # 시간순, 주문번호순 정렬
     recent_candidates.sort(key=lambda tup: (tup[0], tup[1] or ""))
 
+    # 적용 내역 기록 — 자동 검증이 원시 체결 데이터와 대조합니다.
+    state["_settlement_deltas"] = []
+
     T = state.get("T", 0.0)
     additional_loc_odno = state.get("additional_loc_odno", [])
     net_invested = float(state.get("net_invested", 0.0))
@@ -1670,9 +1673,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 state["_position_basis_unknown"] = True
             cumulative_qty = int(float(order.get("ft_ccld_qty", "0") or 0))
-            basis_note = ""
+            t_before_effect = T
             if net_qty > 0:
-                t_before_effect = T
                 T, effect_applied = _apply_sell_t_effect(
                     state, T, net_qty, odno, cumulative_qty
                 )
@@ -1705,6 +1707,19 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             net_qty = max(0, net_qty - sell_qty)
             if meta is not None:
                 _commit_fill_markers(meta, order, sell_qty, sell_amt)
+            effects_now = state.get("sell_t_effects", {})
+            entry_now = effects_now.get(str(odno)) or {}
+            state["_settlement_deltas"].append({
+                "odno": str(odno),
+                "side": "매도",
+                "qty_delta": sell_qty,
+                "amount_delta": sell_amt,
+                "cumulative_qty": cumulative_qty,
+                "prev_cumulative_qty": max(cumulative_qty - sell_qty, 0),
+                "basis": int(entry_now.get("basis") or 0),
+                "factor": float(entry_now.get("factor", 1.0)),
+                "t_delta": round(T - t_before_effect, 4),
+            })
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
                 last_ordno_processed = odno or last_ordno_processed
@@ -1776,6 +1791,19 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     )
                 net_qty += buy_qty
                 net_invested += buy_amt
+                state["_settlement_deltas"].append({
+                    "odno": str(odno),
+                    "side": "매수",
+                    "qty_delta": buy_qty,
+                    "amount_delta": buy_amt,
+                    "cumulative_qty": buy_qty,
+                    "prev_cumulative_qty": max(buy_qty - buy_qty, 0),
+                    "basis": 0,
+                    "factor": 1.0,
+                    "t_target": float(meta.get("t_target", 1.0)),
+                    "total_qty": total_qty,
+                    "t_delta": delta_T,
+                })
                 if o_dt > last_dt_processed:
                     last_dt_processed = o_dt
                     last_ordno_processed = odno or last_ordno_processed

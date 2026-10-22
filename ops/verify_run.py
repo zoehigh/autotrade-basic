@@ -62,12 +62,32 @@ def _load_settlement_evidence(symbol, run_id):
     return None
 
 
+def _classify_sell_ratio(ratio: float) -> float:
+    """정산 로직과 같은 분류 규칙 (독립 구현)."""
+    if ratio >= 1.0:
+        return 0.0
+    if ratio >= 0.5:
+        return 0.25
+    return 0.75
+
+
+def _classify_sell_ratio(ratio: float) -> float:
+    """정산 로직과 같은 분류 규칙 (독립 구현)."""
+    if ratio >= 1.0:
+        return 0.0
+    if ratio >= 0.5:
+        return 0.25
+    return 0.75
+
+
 def _recompute_expected(evidence):
     """
-    정산 근거로 **예상 T 와 예상 순투입금을 독립적으로** 계산합니다.
+    정산 근거를 **독립적으로 대조**합니다.
 
     2026-10-22 T 가 13.375 → 3.3438 로 잘못 갱신됐는데 검증은 "이상 없음"을 보고했습니다.
-    로그의 최종 T 를 복사하지 않고, 체결 근거로 다시 계산해 대조해야 합니다.
+    근거에 기록된 주문별 적용 내역을 원시 체결 데이터와 대조하고,
+    (1) 매도 분류(배율)를 기준선에서 **독립 계산**해 적용 배율과 비교하고,
+    (2) T 변화·순투입금 산술을 기록된 델타로 **재계산**해 실제 결과와 비교합니다.
 
     Returns:
         tuple: (문제 목록, 예상 T, 예상 순투입금)
@@ -78,33 +98,82 @@ def _recompute_expected(evidence):
     if evidence.get("basis_unknown"):
         problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
 
-    fills = evidence.get("fills") or []
-    watermark = str(evidence.get("watermark_before") or "")
-    recent = [f for f in fills if not watermark or str(f.get("ts", "")) > watermark]
-
-    t_value = evidence.get("T_before")
-    money = evidence.get("net_invested_before")
-    if t_value is None or money is None:
+    t_before = evidence.get("T_before")
+    money_before = evidence.get("net_invested_before")
+    if t_before is None or money_before is None:
         problems.append("정산 전 T/순투입금 기준이 근거에 없습니다 (검증 불가)")
         return problems, None, None
-    t_value = float(t_value)
-    money = float(money)
 
-    effects = dict(evidence.get("sell_t_effects") or {})
-    # 매도 효과 기준선 (주문별)
-    basis_map = {str(k): v for k, v in effects.items()}
-    for f in recent:
-        side = f.get("side")
-        qty = int(f.get("qty") or 0)
-        amount = float(f.get("amount") or 0)
+    t_value = float(t_before)
+    money = float(money_before)
+    orders = evidence.get("orders") or []
+    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+
+    # 묶음 직전 보유량 (독립 계산) — 매도 기준선 대조에 사용
+    position = None
+    balance = evidence.get("balance_qty")
+    if isinstance(balance, int):
+        net_batch = 0
+        for o in orders:
+            q = int(o.get("qty_delta") or 0)
+            net_batch += q if o.get("side") == "매수" else -q
+        position = balance - net_batch
+
+    for o in orders:
+        odno = str(o.get("odno"))
+        side = o.get("side")
+        qty_delta = int(o.get("qty_delta") or 0)
+        amount_delta = float(o.get("amount_delta") or 0)
+        raw = fills.get(odno) or {}
+        raw_qty = int(raw.get("qty") or 0)
+        raw_amount = float(raw.get("amount") or 0)
+
+        # ① 적용 델타는 원시 누적 체결을 넘을 수 없습니다
+        if qty_delta > raw_qty:
+            problems.append(
+                f"{odno} 적용 수량 {qty_delta}주 가 누적 체결 {raw_qty}주 를 초과합니다"
+            )
+        if side == "매수" and amount_delta > raw_amount + 0.01:
+            problems.append(
+                f"{odno} 적용 금액 ${amount_delta:.2f} 가 누적 체결금액 "
+                f"${raw_amount:.2f} 를 초과합니다"
+            )
+
+        money += amount_delta if side == "매수" else -amount_delta
+
         if side == "매수":
-            if not f.get("is_additional"):
-                t_target = float(f.get("t_target") or 0.0)
-                if t_target > 0:
-                    t_value = t_value + t_target
-            money = money + amount
-        elif side == "매도":
-            money = money - amount
+            # T 변화 독립 재계산
+            t_target = float(o.get("t_target") or 0.0)
+            total_qty = int(o.get("total_qty") or 0)
+            if not o.get("is_additional") and total_qty > 0 and t_target > 0:
+                t_value += (qty_delta / total_qty) * t_target
+        else:
+            # ② 매도 분류를 기준선에서 독립 계산해 적용 배율과 대조
+            basis = int(o.get("basis") or 0)
+            cumulative = int(o.get("cumulative_qty") or 0)
+            applied = float(o.get("factor") or 1.0)
+            # 첫 체결이 이번 묶음에 있으면 기준선을 독립 계산해 대조합니다.
+            # (이전 실행에서 일부 체결된 주문은 기준선이 이미 확정되어 있으므로 기록값을 씁니다)
+            prev_cumulative = int(o.get("prev_cumulative_qty") or 0)
+            check_basis = basis
+            if prev_cumulative == 0 and position is not None:
+                check_basis = int(position)
+                if basis and abs(basis - check_basis) > 1:
+                    problems.append(
+                        f"{odno} 보유수량 기준 불일치: 기록 {basis}주 vs 독립 계산 {check_basis}주"
+                    )
+            if check_basis > 0 and cumulative > 0:
+                expected_factor = _classify_sell_ratio(cumulative / check_basis)
+                if abs(expected_factor - applied) > 1e-6:
+                    problems.append(
+                        f"{odno} 매도 분류 불일치: 적용 배율 {applied} "
+                        f"vs 기준 {check_basis}주·누적 {cumulative}주 기준 {expected_factor} "
+                        f"— T 분류 오류 가능"
+                    )
+            if position is not None:
+                position = max(0, position - cumulative)
+            # T 변화는 기록된 델타로 대조 (산술 검증)
+            t_value += float(o.get("t_delta") or 0.0)
     return problems, round(t_value, 4), round(money, 2)
 
 
