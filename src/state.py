@@ -188,6 +188,8 @@ def save_state(symbol, state_dict):
         "pending_order_batch": state_dict.get("pending_order_batch"),
         # 워터마크 시점 보유수량 — 매도 비율 판정 기준선 (잔고 조회 실패 시 대체)
         "position_qty": state_dict.get("position_qty"),
+        # 매도 T 효과 원장 — 주문별 기준선/적용 배율 (일괄·부분 반영 결과 일치)
+        "sell_t_effects": state_dict.get("sell_t_effects", {}),
     }
 
     state_dir = os.path.dirname(_STATE_FILE)
@@ -237,6 +239,7 @@ def canonical_state_hash(state):
         "pending_order_intent": state.get("pending_order_intent"),
         "pending_order_batch": state.get("pending_order_batch"),
         "position_qty": state.get("position_qty"),
+        "sell_t_effects": state.get("sell_t_effects", {}),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -709,8 +712,14 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
 
     # 일반 모드: 리버스 주문은 주문번호 기준으로 먼저 반영한 뒤,
     # 나머지 주문만 last_updated_dt 이후 이력으로 처리합니다.
+    #
+    # 불확실한 정산(보유수량 기준 미확보)은 호출자가 저장하지 않아야 합니다.
+    # 계산은 수행하되 _position_basis_unknown 플래그를 남기고,
+    # 저장 직전에 trading_bot 이 이 플래그를 확인해 저장을 막습니다.
     reconcile_reverse_fills(state, order_history)
-    return _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty)
+    return _apply_recent_history_dt(
+        symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty
+    )
 
 
 def _compute_net_qty_up_to(order_history, cutoff_dt):
@@ -928,17 +937,22 @@ def _infer_T_from_full_history(symbol, state, order_history):
         # 전량매도: 보유량 100% → 비율 >= 1.0 → T = 0 (사이클 종료)
         for order in day_sells:
             sell_qty = int(float(order.get("ft_ccld_qty", "0")))
+            cumulative_qty = sell_qty
             if net_qty > 0:
-                ratio = sell_qty / net_qty
-                if ratio >= 1.0:
-                    if cycle_start_ord_dt and T > 0:
+                t_before_effect = T
+                T, _applied = _apply_sell_t_effect(
+                    state, T, net_qty, str(order.get("odno", "")), cumulative_qty
+                )
+                effects = state.get("sell_t_effects", {})
+                entry = effects.get(str(order.get("odno", ""))) or {}
+                basis = int(entry.get("basis") or net_qty)
+                ratio = (cumulative_qty / basis) if basis else 0.0
+                if _classify_sell_ratio(ratio) == 0.0:
+                    if cycle_start_ord_dt and t_before_effect > 0:
                         state["_completed_cycle_start"] = f"{cycle_start_ord_dt[:4]}-{cycle_start_ord_dt[4:6]}-{cycle_start_ord_dt[6:8]}"
                     T = 0.0
                     cycle_start_ord_dt = ""
-                elif ratio >= 0.5:
-                    T = round(T * 0.25, 4)
-                else:
-                    T = round(T * 0.75, 4)
+                    state["sell_t_effects"] = {}
             else:
                 T = round(T * 0.75, 4)
             net_qty = max(0, net_qty - sell_qty)
@@ -1015,7 +1029,12 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 if total_qty > 0:
                     delta_T = round((qty / total_qty) * float(meta.get("t_target", 1.0)), 4)
                     T = round(T + delta_T, 4)
+                # 수량·금액 마커를 함께 확정해야 이후 증분 정산이 중복 가산하지 않습니다.
                 meta["processed_filled_qty"] = qty
+                meta["processed_filled_amount"] = max(
+                    float(meta.get("processed_filled_amount", 0.0) or 0.0),
+                    _fill_amount(o),
+                )
                 fill_price = float(o.get("ft_ccld_unpr3", "0"))
                 prev_net = net_qty
                 net_qty += qty
@@ -1156,7 +1175,65 @@ def compute_position_from_history(order_history, cycle_start_date=None):
     return {"net_qty": int(net_qty), "avg_price": round(avg_price, 4), "buy_count": buy_count, "sell_count": sell_count}
 
 
-def _fill_delta(meta, order):
+def _classify_sell_ratio(ratio: float) -> float:
+    """
+    매도 비율에 따른 T 배수.
+
+    - 쿼터매도 (보유량의 ~25%, 비율 < 0.5) → 0.75
+    - 목표매도 (보유량의 ~75%, 0.5 <= 비율 < 1.0) → 0.25
+    - 전량매도 (비율 >= 1.0) → 0.0 (사이클 종료)
+    """
+    if ratio >= 1.0:
+        return 0.0
+    if ratio >= 0.5:
+        return 0.25
+    return 0.75
+
+
+def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=None):
+    """
+    매도 주문의 T 효과를 반영하고 **누적 체결 기준**으로 판정합니다.
+
+    일괄 반영(75주 한 번)과 부분 반영(5주 → 75주)이 같은 결과를 내야 하므로
+    주문별 누적 체결량을 기준으로 분류하고, 이미 적용한 배율은 재조정합니다.
+
+    - 첫 반영: 기준선(보유량) 을 저장하고 T × 배율
+    - 이후 반영: 누적 비율이 바뀌면 T × (새 배율 ÷ 기존 배율)
+      (기존 배율이 0 이면 사이클이 이미 종료된 상태이므로 재조정하지 않습니다)
+
+    Returns:
+        tuple: (T, 반영여부)
+    """
+    effects = state.setdefault("sell_t_effects", {})
+    entry = effects.get(str(odno)) or {}
+    try:
+        basis = int(entry.get("basis") or 0)
+    except (TypeError, ValueError):
+        basis = 0
+    if basis <= 0 and basis_hint:
+        basis = int(basis_hint)
+    if basis <= 0:
+        # 이 주문의 첫 체결 시점 보유량을 기준선으로 삼습니다.
+        basis = int(net_qty)
+    if basis <= 0:
+        return T, False
+    ratio = (cumulative_qty / basis) if basis else 0.0
+    factor = _classify_sell_ratio(ratio)
+    try:
+        applied = float(entry.get("factor", 1.0))
+    except (TypeError, ValueError):
+        applied = 1.0
+    if abs(factor - applied) < 1e-12:
+        return T, False
+    if applied > 0:
+        T = round(T * (factor / applied), 4)
+    else:
+        T = 0.0
+    effects[str(odno)] = {"basis": basis, "factor": factor}
+    return T, True
+
+
+def _fill_delta(meta, order, odno_meta=""):
     """
     주문의 체결 증가분(수량·금액)을 계산합니다. **메타를 변경하지 않습니다.**
 
@@ -1181,11 +1258,25 @@ def _fill_delta(meta, order):
     delta_qty = max(filled_now - processed_qty, 0)
     if has_amount_marker:
         delta_amount = amount_now - processed_amount
+        if delta_amount < 0:
+            # 브로커 누적금액이 역행했습니다 (정정 응답 등). 반영할 근거가 없으므로
+            # 차감하지 않습니다 — 반복 차감으로 순투입금이 계속 내려가는 것을 막습니다.
+            print(
+                f"  → [경고] 누적체결금액이 반영분보다 작아 차감하지 않습니다 "
+                f"(누적 ${amount_now:.2f} < 반영 ${processed_amount:.2f})"
+            )
+            delta_amount = 0.0
         estimated = False
     else:
         # 이전 메타: 반영된 수량에 해당하는 금액만 제외하고 신규분만 추정합니다.
+        # (이전 버전이 반영한 금액 = 당시 누적금액 이므로, 동일 단가 가정하��
+        #  반영 수량 비율로 복원하는 것이 기존 동작을 그대로 재현합니다)
         if delta_qty > 0 and filled_now > 0:
             delta_amount = amount_now * (delta_qty / filled_now)
+            print(
+                f"  → [경고] 주문 {odno_meta} 에 반영금액 표식이 없어 신규분 ${delta_amount:.2f} 를 "
+                f"누적금액 비율로 추정했습니다 (1회)"
+            )
         else:
             delta_amount = 0.0
         estimated = delta_qty > 0
@@ -1242,7 +1333,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
             # 워터마크 이전에 있고 반영된 적 없는 주문은 "이미 처리된 범위 밖"이므로
             # 건드리지 않습니다 (워터마크 이전 이력 무시 계약 유지).
             continue
-        dq, da, _est = _fill_delta(meta, row)
+        dq, da, _est = _fill_delta(meta, row, str(odno))
         if dq <= 0 and abs(da) < 1e-9:
             continue
         pending.append((str(odno), meta, row, dq, da))
@@ -1332,7 +1423,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     for _o, odno, order in recent_candidates:
         meta = (state.get("orders_meta") or {}).get(str(odno))
         if meta is not None:
-            dq, da, _est = _fill_delta(meta, order)
+            dq, da, _est = _fill_delta(meta, order, str(odno))
         else:
             try:
                 dq = int(float(order.get("ft_ccld_qty", "0") or 0))
@@ -1430,9 +1521,20 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         total_qty = int(meta.get("total_qty") or dq)
         t_target = float(meta.get("t_target", 0.0) or 0.0)
         if row.get("sll_buy_dvsn_cd_name") == "매도":
-            # 늦게 확인된 매도 — T 효과는 이미 적용됐으면 다시 적용하지 않습니다.
+            # 늦게 확인된 매도 — 누적 체결 기준으로 T 효과를 갱신합니다.
+            # (일괄 반영과 부분 반영의 최종 결과가 같도록)
+            cumulative_qty = int(float(row.get("ft_ccld_qty", "0") or 0))
+            entry = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+            basis = int(entry.get("basis") or 0)
+            if basis > 0:
+                T, _applied = _apply_sell_t_effect(
+                    state, T, basis, odno, cumulative_qty, basis_hint=basis
+                )
             net_invested -= da
-            print(f"  → 지연 체결 반영: odno={odno} 매도 {dq}주 추가 → T 변경 없음")
+            print(
+                f"  → 지연 체결 반영: odno={odno} 매도 {dq}주 추가 "
+                f"(누적 {cumulative_qty}주) → T={T}"
+            )
         elif meta.get("is_additional"):
             net_invested += da
             print(f"  → 지연 체결 반영: odno={odno} 추가매수 {dq}주 → T 변경 없음")
@@ -1567,30 +1669,39 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if not position_anchored:
                 # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 state["_position_basis_unknown"] = True
+            cumulative_qty = int(float(order.get("ft_ccld_qty", "0") or 0))
+            basis_note = ""
             if net_qty > 0:
-                ratio = sell_qty / net_qty
-                if ratio >= 1.0:
+                t_before_effect = T
+                T, effect_applied = _apply_sell_t_effect(
+                    state, T, net_qty, odno, cumulative_qty
+                )
+                effects = state.get("sell_t_effects", {})
+                entry = effects.get(str(odno)) or {}
+                basis = int(entry.get("basis") or net_qty)
+                ratio = (cumulative_qty / basis) if basis else 0.0
+                kind = {0.75: "쿼터매도", 0.25: "목표매도", 0.0: "전량매도"}[
+                    _classify_sell_ratio(ratio)
+                ]
+                if kind == "전량매도":
                     completed_start = state.get("cycle_start_date", "")
-                    if T > 0 and completed_start:
+                    if t_before_effect > 0 and completed_start:
                         state["_completed_cycle_start"] = completed_start
                     T = 0.0
                     state["cycle_start_date"] = ""
                     net_invested = 0.0
-                    print(f"  → 매도 체결 ({ord_dt}): 전량매도 (비율={ratio:.2f}) → T=0")
-                elif ratio >= 0.5:
-                    T = round(T * 0.25, 4)
-                    net_invested -= sell_amt
-                    print(f"  → 매도 체결 ({ord_dt}): 목표매도 (비율={ratio:.2f}, 보유 {net_qty}주) → T={T}")
-                else:
-                    T = round(T * 0.75, 4)
-                    net_invested -= sell_amt
-                    print(f"  → 매도 체결 ({ord_dt}): 쿼터매도 (비율={ratio:.2f}, 보유 {net_qty}주) → T={T}")
+                    state["sell_t_effects"] = {}
+                print(
+                    f"  → 매도 체결 ({ord_dt}): {kind} "
+                    f"(비율={ratio:.2f}, 기준 {basis}주, 누적 {cumulative_qty}주) → T={T}"
+                )
             else:
                 T = round(T * 0.75, 4)
-                net_invested -= sell_amt
                 print(
                     f"  → 매도 체결 ({ord_dt}): 쿼터매도 (보유수량 불명) → T={T}"
                 )
+            # 순투입금 차감은 실제 체결 증가분만 (T 효과와 무관)
+            net_invested -= sell_amt
             net_qty = max(0, net_qty - sell_qty)
             if meta is not None:
                 _commit_fill_markers(meta, order, sell_qty, sell_amt)

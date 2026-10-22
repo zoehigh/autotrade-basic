@@ -9,6 +9,7 @@
 ⑥ 자동 검증이 T 변화를 검증하지 않음
 """
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -285,3 +286,114 @@ def test_cancel_confirmed_with_explicit_terminal_status(monkeypatch):
     state = {"orders_meta": {"OD1": {}}}
 
     assert _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [_crow()]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ⑥ 불변조건 — 일괄/부분 반영 일치 · 반복 멱등 · 재추정 후 중복 없음
+# ═══════════════════════════════════════════════════════════════════
+
+def _sell_row(odno, qty, ts, amount=None, price=10.0):
+    return _row(odno, "매도", qty, ts, price=price) if amount is None else _row(
+        odno, "매도", qty, ts, price=price
+    )
+
+
+def test_batch_and_partial_sell_give_same_final_t():
+    """75주 매도를 한 번에 반영하거나 5주→70주로 나눠 반영해도 최종 T 가 같아야 합니다.
+
+    봇 소유 매도(orders_meta 등록) 기준입니다. 등록되지 않은 수동 매도는
+    "워터마크 이전 이력 무시" 계약 때문에 추가 체결분이 반영되지 않습니다.
+    """
+    old = _row("OLD", "매수", 100, "2026-10-19T08:00:00+00:00", price=10.0)
+    sell_meta = {"S": {"side": "SELL", "total_qty": 75, "t_target": 0.0,
+                       "processed_filled_qty": 0, "processed_filled_amount": 0.0}}
+
+    one_shot = update_T_from_history(
+        "TQQQ", _state(T=8.0, position_qty=100, orders_meta=deepcopy(sell_meta)),
+        [old, _row("S", "매도", 75, "2026-10-21T09:00:00+00:00", price=10.0)],
+        balance_qty=25,
+    )
+
+    staged = _state(T=8.0, position_qty=100, orders_meta=deepcopy(sell_meta))
+    staged = update_T_from_history(
+        "TQQQ", staged,
+        [old, _row("S", "매도", 5, "2026-10-21T09:00:00+00:00", price=10.0)],
+        balance_qty=95,
+    )
+    staged = update_T_from_history(
+        "TQQQ", staged,
+        [old, _row("S", "매도", 75, "2026-10-21T09:00:00+00:00", price=10.0)],
+        balance_qty=25,
+    )
+
+    assert abs(one_shot["T"] - staged["T"]) < 0.001, (
+        f"일괄 T={one_shot['T']} vs 부분 T={staged['T']}"
+    )
+    assert abs(one_shot["net_invested"] - staged["net_invested"]) < 0.01
+
+
+def test_repeated_run_is_idempotent():
+    """같은 이력을 반복 정산해도 T·순투입금이 변하지 않아야 합니다."""
+    state = _state(
+        T=8.0, position_qty=100,
+        orders_meta={"S": {"side": "SELL", "total_qty": 75, "t_target": 0.0,
+                           "processed_filled_qty": 0}},
+    )
+    orders = [
+        _row("OLD", "매수", 100, "2026-10-19T08:00:00+00:00", price=10.0),
+        _row("S", "매도", 75, "2026-10-21T09:00:00+00:00", price=10.0),
+    ]
+    first = update_T_from_history("TQQQ", state, orders, balance_qty=25)
+    second = update_T_from_history("TQQQ", first, orders, balance_qty=25)
+    third = update_T_from_history("TQQQ", second, orders, balance_qty=25)
+
+    assert abs(first["T"] - second["T"]) < 0.0001, f"{first['T']} vs {second['T']}"
+    assert abs(second["T"] - third["T"]) < 0.0001
+    assert abs(first["net_invested"] - third["net_invested"]) < 0.01
+
+
+def test_full_reinference_then_incremental_does_not_double_count():
+    """전체 재추정 후 같은 이력을增量 정산해도 순투입금이 중복 가산되지 않아야 합니다."""
+    from state import _infer_T_from_full_history
+
+    st = _state(
+        T=0.2, last_updated="", net_invested=200.0,
+        orders_meta={"B": {"side": "BUY", "total_qty": 10, "t_target": 1.0,
+                           "is_additional": False, "processed_filled_qty": 2,
+                           "processed_filled_amount": 200.0}},
+    )
+    orders = [_row("B", "매수", 5, "2026-10-21T09:00:00+00:00", price=106.0)]
+    rebuilt = _infer_T_from_full_history("TQQQ", st, orders)
+    assert abs(rebuilt["net_invested"] - 530.0) < 0.01, rebuilt["net_invested"]
+
+    after = update_T_from_history("TQQQ", rebuilt, orders, balance_qty=5)
+    assert abs(after["net_invested"] - 530.0) < 0.01, (
+        f"재추정 후 증분 정산에서 중복 가산: {after['net_invested']}"
+    )
+
+
+def test_cumulative_amount_correction_is_not_applied_twice():
+    """누적체결금액이 역행하면 차감하지 않고 반복 실행해도 값이 변하지 않아야 합니다."""
+    st = _state(
+        T=1.5, last_updated="2026-10-21T10:00:00+00:00", last_processed_ordno="LATER",
+        net_invested=500.0,
+        orders_meta={"B": {"side": "BUY", "total_qty": 10, "t_target": 1.0,
+                           "is_additional": False, "processed_filled_qty": 5,
+                           "processed_filled_amount": 500.0}},
+    )
+    orders = [_row("B", "매수", 5, "2026-10-21T09:00:00+00:00", price=98.0)]
+    first = update_T_from_history("TQQQ", st, orders, balance_qty=5)
+    second = update_T_from_history("TQQQ", first, orders, balance_qty=5)
+
+    assert abs(first["net_invested"] - 500.0) < 0.01, first["net_invested"]
+    assert abs(first["net_invested"] - second["net_invested"]) < 0.01
+
+
+def test_settlement_is_not_saved_when_basis_unknown(monkeypatch):
+    """보유수량 기준이 없으면 정산 결과를 저장하지 않습니다 (reconcile-only 경로 포함)."""
+    from state import load_state as real_load_state
+
+    broker = _CancelBroker(error_all=True)
+    state = {"orders_meta": {"OD1": {}}}
+    with pytest.raises(SymbolScopedError):
+        trading_bot._save_settlement_state("TQQQ", {**state, "_position_basis_unknown": True})

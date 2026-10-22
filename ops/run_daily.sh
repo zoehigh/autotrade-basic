@@ -21,6 +21,9 @@ LOG_DIR="$APP_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S).log"
 
+# 실행 식별자 — 정산 근거 파일과 로그를 묶는 키 (자동 검증이 사용)
+export RUN_ID="$(basename "$LOG" .log)"
+
 # 호출자가 넘긴 오버라이드는 .env보다 우선해야 하므로 먼저 보관합니다.
 OVERRIDE_SYMBOLS="${FORCE_SYMBOLS:-}"
 OVERRIDE_MODE="${LAUNCH_MODE:-}"

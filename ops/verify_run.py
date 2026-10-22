@@ -43,113 +43,87 @@ def ok(msg):
     print(f"  [OK ] {msg}")
 
 
-def _load_settlement_evidence(symbol, target):
-    """해당 종목의 최신 정산 근거 파일을 읽습니다 (없으면 None)."""
-    files = sorted(Path(".").glob(f"settlement-{symbol}-*.json"))
-    if not files:
-        return None
-    try:
-        return json.loads(files[-1].read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _recompute_expected_t(evidence):
+def _load_settlement_evidence(symbol, run_id):
     """
-    정산 근거로 예상 T 를 **독립적으로** 계산합니다.
+    **검증 대상 실행의** 정산 근거 파일을 읽습니다 (없으면 None).
+
+    가장 최신 파일을 쓰면 다른 실행(예: 이후 DRY)의 근거로 잘못 검증할 수 있으므로,
+    실행 식별자(run_id)로 정확히 일치하는 파일만 사용합니다.
+    """
+    if not run_id:
+        return None
+    for path in sorted(Path(".").glob(f"settlement-{symbol}-*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(data.get("run_id") or "") == run_id:
+            return data
+    return None
+
+
+def _recompute_expected(evidence):
+    """
+    정산 근거로 **예상 T 와 예상 순투입금을 독립적으로** 계산합니다.
 
     2026-10-22 T 가 13.375 → 3.3438 로 잘못 갱신됐는데 검증은 "이상 없음"을 보고했습니다.
-    로그의 최종 T 를 복사하지 않고, 체결 근거로 다시 계산해 대조합니다.
+    로그의 최종 T 를 복사하지 않고, 체결 근거로 다시 계산해 대조해야 합니다.
+
+    Returns:
+        tuple: (문제 목록, 예상 T, 예상 순투입금)
     """
     problems: list[str] = []
     if not evidence:
-        return problems, None
+        return ["정산 근거 파일 없음 — 검증 불가"], None, None
     if evidence.get("basis_unknown"):
         problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
 
     fills = evidence.get("fills") or []
-    # **정산 전** 워터마크 이후 체결만 이번 정산 대상입니다.
     watermark = str(evidence.get("watermark_before") or "")
     recent = [f for f in fills if not watermark or str(f.get("ts", "")) > watermark]
 
-    balance = evidence.get("balance_qty")
-    basis = evidence.get("position_basis")
-    position = None
-    if isinstance(balance, int):
-        position = balance
-    elif isinstance(basis, int):
-        position = basis
-    if position is None:
-        problems.append("보유수량 기준을 알 수 없어 예상 T 를 계산할 수 없습니다")
-        return problems, None
+    t_value = evidence.get("T_before")
+    money = evidence.get("net_invested_before")
+    if t_value is None or money is None:
+        problems.append("정산 전 T/순투입금 기준이 근거에 없습니다 (검증 불가)")
+        return problems, None, None
+    t_value = float(t_value)
+    money = float(money)
 
-    t_value = None
-    # 매도 1건당 T 효과 1회, 매수 1건당 t_target 만큼 (정산 근거의 체결 목록 기준).
-    # 정확한 T 효과는 정산 로직과 동일해야 하므로, 여기서는 **비율**만 검증합니다.
+    effects = dict(evidence.get("sell_t_effects") or {})
+    # 매도 효과 기준선 (주문별)
+    basis_map = {str(k): v for k, v in effects.items()}
     for f in recent:
         side = f.get("side")
         qty = int(f.get("qty") or 0)
+        amount = float(f.get("amount") or 0)
         if side == "매수":
             if not f.get("is_additional"):
                 t_target = float(f.get("t_target") or 0.0)
                 if t_target > 0:
-                    t_value = (t_value or 0.0) + t_target
+                    t_value = t_value + t_target
+            money = money + amount
         elif side == "매도":
-            ratio = qty / position if position > 0 else None
-            if ratio is None:
-                problems.append("매도 비율을 계산할 보유수량이 없습니다")
-            else:
-                # 로그가 남긴 비율과 대조 (검증기의 원래 목적)
-                pass
-    return problems, t_value
+            money = money - amount
+    return problems, round(t_value, 4), round(money, 2)
 
 
-def _verify_sell_ratios_from_evidence(evidence):
-    """정산 근거의 체결로 매도 비율을 계산해 로그 값과 대조합니다."""
-    problems: list[str] = []
-    if not evidence:
+def _verify_evidence(evidence):
+    """정산 근거로 예상 T/순투입금을 계산해 실제 값과 대조합니다."""
+    problems, expected_t, expected_money = _recompute_expected(evidence)
+    if expected_t is None:
         return problems
-    fills = evidence.get("fills") or []
-    watermark = str(evidence.get("watermark_before") or evidence.get("last_updated") or "")
-    balance = evidence.get("balance_qty")
-    if not isinstance(balance, int):
-        return problems
-    sells = sorted(
-        [
-            f for f in fills
-            if f.get("side") == "매도"
-            and int(f.get("qty") or 0) > 0
-            and (not watermark or str(f.get("ts", "")) > watermark)
-        ],
-        key=lambda f: str(f.get("ts", "")),
-    )
-    if not sells:
-        return problems
-    # 기준 시점 보유량: 현재 잔고 − 이번 묶음 순변동
-    net = 0
-    for f in fills:
-        if watermark and str(f.get("ts", "")) <= watermark:
-            continue
-        q = int(f.get("qty") or 0)
-        net += q if f.get("side") == "매수" else -q
-    position = balance - net
-    logged_map = {
-        str(r.get("odno")): float(r.get("ratio"))
-        for r in (evidence.get("sell_ratios") or [])
-        if r.get("odno") and r.get("ratio") is not None
-    }
-    for f in sells:
-        q = int(f.get("qty") or 0)
-        if position <= 0:
-            break
-        expected = q / position
-        logged = logged_map.get(str(f.get("odno", "")))
-        if logged is not None and abs(expected - logged) > 0.05:
-            problems.append(
-                f"매도 비율 불일치: 정산 {logged:.2f} "
-                f"vs 실제 보유 {position}주 기준 {expected:.2f} — T 분류 오류 가능"
-            )
-        position = max(0, position - q)
+    actual_t = evidence.get("T_after")
+    actual_money = evidence.get("net_invested_after")
+    if actual_t is not None and abs(float(actual_t) - expected_t) > 0.01:
+        problems.append(
+            f"T 불일치: 정산 결과 {float(actual_t):.4f} vs 근거 재계산 {expected_t:.4f}"
+        )
+    if actual_money is not None and abs(float(actual_money) - expected_money) > 0.05:
+        problems.append(
+            f"순투입금 불일치: 정산 결과 ${float(actual_money):.2f} "
+            f"vs 근거 재계산 ${expected_money:.2f}"
+        )
     return problems
 
 
@@ -253,6 +227,10 @@ def main():
     ok(f"로그: logs/{log_path.name}")
     mode = "DRY" if "mode=DRY" in text else "LIVE"
     exit_code = None
+    m_run = re.search(r"\[launcher\] start .*", text)
+    run_id = ""
+    if m_run:
+        run_id = Path(log_path).stem
     m = re.search(r"\[launcher\] exit=(\d+)", text)
     if m:
         exit_code = int(m.group(1))
@@ -320,14 +298,14 @@ def main():
             ok(f"{sym} 매도 합계 {sells}주 ≤ 보유 {bal.quantity}주")
         for msg in _verify_t_transitions(text, sym, rows, bal.quantity):
             problem(msg)
-        evidence = _load_settlement_evidence(sym, target)
+        evidence = _load_settlement_evidence(sym, run_id)
         if evidence is None:
-            note(f"{sym} 정산 근거 파일 없음 — T 검산은 건너뜁니다 (검증 불가)")
+            problem(
+                f"{sym} 정산 근거 파일 없음 (run_id={run_id or '없음'}) — T 검산 불가"
+            )
         else:
-            for msg in _verify_sell_ratios_from_evidence(evidence):
+            for msg in _verify_evidence(evidence):
                 problem(msg)
-            if evidence.get("basis_unknown"):
-                problem(f"{sym} 보유수량 기준 미확보로 정산이 보류됐습니다")
         if mode == "LIVE" and executed and len(live) + len(filled) == 0:
             problem(f"{sym} 접수된 주문이 이력에 없습니다")
         print(

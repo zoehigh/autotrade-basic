@@ -204,6 +204,34 @@ def format_cycle_report_message(report):
     return "\n".join(lines)
 
 
+def _save_settlement_state(symbol: str, state: dict) -> bool:
+    """
+    정산 결과를 저장합니다. **보유수량 기준이 없으면 저장하지 않습니다.**
+
+    매도 분류에 필요한 보유수량을 브로커 잔고나 저장된 보유수량에서 확보하지 못하면
+    쿼터매도/목표매도 구분을 신뢰할 수 없습니다 (T 가 과소 계산될 수 있음).
+    이 경우 T·워터마크·반영 마커를 먼저 확정하면 다음 실행에서 재처리될 수 없어
+    잘못된 값이 고정됩니다. → 계산 결과를 버리고 확인을 요청합니다.
+
+    Returns:
+        bool: 저장했으면 True
+    Raises:
+        SymbolScopedError: 기준 미확보로 저장하지 못한 경우
+    """
+    if state.pop("_position_basis_unknown", False):
+        msg = (
+            f"[보류] {symbol} 보유수량 기준을 확보하지 못해 정산 결과와 신규 주문을 "
+            f"보류합니다. (브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
+        )
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(
+            f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
+            f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
+        )
+    return True
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -332,6 +360,8 @@ def run_one_symbol(broker: Broker, symbol_config):
             )
     # 정산 전 워터마크 (이번 정산이 처리한 구간의 시작점) — 검증기가 사용합니다.
     watermark_before = str(state.get("last_updated", "") or "")
+    T_before = float(state.get("T", 0.0))
+    net_invested_before = float(state.get("net_invested", 0.0))
 
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
 
@@ -339,14 +369,19 @@ def run_one_symbol(broker: Broker, symbol_config):
     # 이 근거가 없으면 검증기는 "검증 불가"로 판단합니다.
     settlement_evidence = {
         "symbol": symbol,
+        "run_id": os.environ.get("RUN_ID", ""),
+        "mode": TRADE_MODE,
         "balance_qty": live_qty,
         "position_basis": state.get("position_qty"),
         "basis_unknown": bool(state.get("_position_basis_unknown")),
+        "T_before": T_before,
+        "net_invested_before": net_invested_before,
         "T_after": float(state.get("T", 0.0)),
         "net_invested_after": float(state.get("net_invested", 0.0)),
         "last_updated": state.get("last_updated", ""),
         "watermark_before": watermark_before,
         "sell_ratios": state.get("_settlement_sell_ratios", []),
+        "sell_t_effects": state.get("sell_t_effects", {}),
         "fills": [],
     }
     for row in order_history:
@@ -429,22 +464,10 @@ def run_one_symbol(broker: Broker, symbol_config):
         state["net_invested_status"] = "valid"
         state["reverse_mode"] = {}
 
-    # ── 보유수량 기준 미확보 → 저장·신규 주문 보류 ──────────────────
-    # 매도 분류에 필요한 보유수량을 브로커 잔고나 저장된 보유수량에서 확보하지 못하면
-    # 쿼터매도/목표매도 구분을 신뢰할 수 없습니다 (T 가 과소 계산될 수 있음).
-    # 이 경우 **계산 결과를 저장하지 않고** 신규 주문도 내지 않습니다.
+    # ── 정산 결과 저장 ──────────────────────────────────────────
+    # 보유수량 기준을 확보하지 못한 정산은 **저장하지 않고** 신규 주문도 내지 않습니다.
     # (먼저 저장하면 다음 실행에서 재처리될 수 없어 잘못된 값이 고정됩니다)
-    if state.pop("_position_basis_unknown", False):
-        msg = (
-            f"[보류] {symbol} 보유수량 기준을 확보하지 못해 정산 결과와 신규 주문을 "
-            f"보류합니다. (브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
-        )
-        print(msg)
-        notify(msg, urgent=True)
-        raise SymbolScopedError(
-            f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
-            f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
-        )
+    _save_settlement_state(symbol, state)
 
     # [DRY READONLY] T 갱신 후 상태 저장: DRY에서는 절대 저장하지 않습니다.
     if TRADE_MODE == "LIVE":
@@ -1536,6 +1559,8 @@ def _reverse_reconcile_only():
                 live_qty = None
             state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
             # reconcile은 net_invested를 valid로 승격하지 않습니다 (audit/repair가 담당)
+            # 보유수량 기준이 없으면 정산을 확정하지 않고 보류합니다.
+            _save_settlement_state(symbol, state)
             save_state(symbol, state)
             print(
                 f"[reconcile-only] {symbol} 저장 완료 → T={state['T']}, "
