@@ -104,9 +104,10 @@ def test_stored_position_qty_is_not_reduced_by_batch_again():
         _row("S", "매도", 20, "2026-10-21T09:30:16+00:00", price=72.61),
     ]
     result = update_T_from_history("TQQQ", st, orders, balance_qty=None)
-    # 기준선 81주 → 20/81 = 0.25 → 쿼터매도(T×0.75)
+    # 기준선은 저장값 81주 그대로 (61주로 되감으면 안 됨) → 20/81 = 0.25 → 쿼터매도
     assert abs(result["T"] - 10.0312) < 0.001, f"T={result['T']}"
-    assert result["position_qty"] == 81
+    # 저장값은 새 워터마크(매도 이후) 기준 보유량 = 61주
+    assert result["position_qty"] == 61
 
 
 def test_stored_position_full_sell_detected():
