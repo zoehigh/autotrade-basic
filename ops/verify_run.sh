@@ -29,7 +29,7 @@ if [[ "$rc" != "0" ]]; then
         summary=$(grep -E '^\s+\[!! \]' "$LOG" | head -5 | sed 's/^ *//' | tr '\n' ';')
         if [[ -z "$summary" ]]; then
             # [!!] 항목이 없으면 사유를 로그에서 직접 뽑습니다 (예: 실행 로그 자체가 없는 경우)
-            summary=$(grep -E "로그 없음|판정:|Traceback|Error" "$LOG" | head -3 | sed 's/^ *//' | tr '\n' ';')
+            summary=$(grep -E "로그 없음|Traceback|Error" "$LOG" | head -3 | sed 's/^ *//' | tr '\n' ';')
         fi
         [[ -z "$summary" ]] && summary="원인은 로그를 확인하세요"
         curl -sS --max-time 15 -X POST \
