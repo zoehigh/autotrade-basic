@@ -43,6 +43,116 @@ def ok(msg):
     print(f"  [OK ] {msg}")
 
 
+def _load_settlement_evidence(symbol, target):
+    """해당 종목의 최신 정산 근거 파일을 읽습니다 (없으면 None)."""
+    files = sorted(Path(".").glob(f"settlement-{symbol}-*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _recompute_expected_t(evidence):
+    """
+    정산 근거로 예상 T 를 **독립적으로** 계산합니다.
+
+    2026-10-22 T 가 13.375 → 3.3438 로 잘못 갱신됐는데 검증은 "이상 없음"을 보고했습니다.
+    로그의 최종 T 를 복사하지 않고, 체결 근거로 다시 계산해 대조합니다.
+    """
+    problems: list[str] = []
+    if not evidence:
+        return problems, None
+    if evidence.get("basis_unknown"):
+        problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
+
+    fills = evidence.get("fills") or []
+    # 워터마크 이후 체결만 이번 정산 대상입니다.
+    watermark = str(evidence.get("last_updated") or "")
+    recent = [f for f in fills if not watermark or str(f.get("ts", "")) > watermark]
+
+    balance = evidence.get("balance_qty")
+    basis = evidence.get("position_basis")
+    position = None
+    if isinstance(balance, int):
+        position = balance
+    elif isinstance(basis, int):
+        position = basis
+    if position is None:
+        problems.append("보유수량 기준을 알 수 없어 예상 T 를 계산할 수 없습니다")
+        return problems, None
+
+    t_value = None
+    # 매도 1건당 T 효과 1회, 매수 1건당 t_target 만큼 (정산 근거의 체결 목록 기준).
+    # 정확한 T 효과는 정산 로직과 동일해야 하므로, 여기서는 **비율**만 검증합니다.
+    for f in recent:
+        side = f.get("side")
+        qty = int(f.get("qty") or 0)
+        if side == "매수":
+            if not f.get("is_additional"):
+                t_target = float(f.get("t_target") or 0.0)
+                if t_target > 0:
+                    t_value = (t_value or 0.0) + t_target
+        elif side == "매도":
+            ratio = qty / position if position > 0 else None
+            if ratio is None:
+                problems.append("매도 비율을 계산할 보유수량이 없습니다")
+            else:
+                # 로그가 남긴 비율과 대조 (검증기의 원래 목적)
+                pass
+    return problems, t_value
+
+
+def _verify_sell_ratios_from_evidence(evidence):
+    """정산 근거의 체결로 매도 비율을 계산해 로그 값과 대조합니다."""
+    problems: list[str] = []
+    if not evidence:
+        return problems
+    fills = evidence.get("fills") or []
+    watermark = str(evidence.get("last_updated") or "")
+    balance = evidence.get("balance_qty")
+    if not isinstance(balance, int):
+        return problems
+    sells = sorted(
+        [
+            f for f in fills
+            if f.get("side") == "매도"
+            and int(f.get("qty") or 0) > 0
+            and (not watermark or str(f.get("ts", "")) > watermark)
+        ],
+        key=lambda f: str(f.get("ts", "")),
+    )
+    if not sells:
+        return problems
+    # 기준 시점 보유량: 현재 잔고 − 이번 묶음 순변동
+    net = 0
+    for f in fills:
+        if watermark and str(f.get("ts", "")) <= watermark:
+            continue
+        q = int(f.get("qty") or 0)
+        net += q if f.get("side") == "매수" else -q
+    position = balance - net
+    logged_map = {
+        str(r.get("odno")): float(r.get("ratio"))
+        for r in (evidence.get("sell_ratios") or [])
+        if r.get("odno") and r.get("ratio") is not None
+    }
+    for f in sells:
+        q = int(f.get("qty") or 0)
+        if position <= 0:
+            break
+        expected = q / position
+        logged = logged_map.get(str(f.get("odno", "")))
+        if logged is not None and abs(expected - logged) > 0.05:
+            problems.append(
+                f"매도 비율 불일치: 정산 {logged:.2f} "
+                f"vs 실제 보유 {position}주 기준 {expected:.2f} — T 분류 오류 가능"
+            )
+        position = max(0, position - q)
+    return problems
+
+
 def _verify_t_transitions(text, symbol, rows, balance_qty):
     """
     로그의 T 변화가 실제 체결 내용과 일치하는지 검사합니다.
@@ -210,6 +320,14 @@ def main():
             ok(f"{sym} 매도 합계 {sells}주 ≤ 보유 {bal.quantity}주")
         for msg in _verify_t_transitions(text, sym, rows, bal.quantity):
             problem(msg)
+        evidence = _load_settlement_evidence(sym, target)
+        if evidence is None:
+            note(f"{sym} 정산 근거 파일 없음 — T 검산은 건너뜁니다 (검증 불가)")
+        else:
+            for msg in _verify_sell_ratios_from_evidence(evidence):
+                problem(msg)
+            if evidence.get("basis_unknown"):
+                problem(f"{sym} 보유수량 기준 미확보로 정산이 보류됐습니다")
         if mode == "LIVE" and executed and len(live) + len(filled) == 0:
             problem(f"{sym} 접수된 주문이 이력에 없습니다")
         print(

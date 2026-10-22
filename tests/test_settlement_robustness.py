@@ -92,7 +92,32 @@ def test_position_qty_is_saved_for_next_run():
     """보유수량이 state 에 저장되어 다음 실행의 기준선으로 쓰입니다."""
     orders = [_row("B", "매수", 5, "2026-10-21T09:00:00+00:00")]
     result = update_T_from_history("TQQQ", _state(T=1.0), orders, balance_qty=40)
-    assert result["position_qty"] == 40
+    # 저장값은 **이번 묶음 반영 전** 보유량입니다 (다음 실행 기준선)
+    assert result["position_qty"] == 35
+
+
+def test_stored_position_qty_is_not_reduced_by_batch_again():
+    """저장 보유수량은 이번 묶음을 다시 되감지 않습니다 (기준 시점 유지)."""
+    st = _state(position_qty=81)
+    orders = [
+        _row("OLD", "매수", 30, "2026-10-19T08:00:00+00:00"),
+        _row("S", "매도", 20, "2026-10-21T09:30:16+00:00", price=72.61),
+    ]
+    result = update_T_from_history("TQQQ", st, orders, balance_qty=None)
+    # 기준선 81주 → 20/81 = 0.25 → 쿼터매도(T×0.75)
+    assert abs(result["T"] - 10.0312) < 0.001, f"T={result['T']}"
+    assert result["position_qty"] == 81
+
+
+def test_stored_position_full_sell_detected():
+    """저장 보유수량 기준에서도 전량매도가 정확히 판정됩니다."""
+    st = _state(position_qty=81)
+    orders = [
+        _row("OLD", "매수", 81, "2026-10-19T08:00:00+00:00"),
+        _row("S", "매도", 81, "2026-10-21T09:30:16+00:00", price=72.61),
+    ]
+    result = update_T_from_history("TQQQ", st, orders, balance_qty=None)
+    assert result["T"] == 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -127,15 +152,17 @@ def test_late_partial_fill_is_applied_by_order_delta():
         T=1.2,
         last_updated="2026-10-21T10:00:00+00:00",
         last_processed_ordno="LATER",
-        net_invested=20.0,
+        net_invested=200.0,
         orders_meta={"EARLY": {"side": "BUY", "total_qty": 10, "t_target": 1.0,
-                               "is_additional": False, "processed_filled_qty": 2}},
+                               "is_additional": False, "processed_filled_qty": 2,
+                               "processed_filled_amount": 200.0}},
     )
-    orders = [_row("EARLY", "매수", 5, "2026-10-21T09:00:00+00:00", price=10.0)]
+    # 2주 @$100 = $200 이미 반영 → 이후 3주 누적 (누적 $530)
+    orders = [_row("EARLY", "매수", 5, "2026-10-21T09:00:00+00:00", price=106.0)]
     result = update_T_from_history("TQQQ", st, orders, balance_qty=5)
-    # 이미 반영된 2주를 제외한 추가 3주가 반영되어야 합니다
+    # 신규 3주분 $330 만 추가 → $200 + $330 = $530
     assert abs(result["T"] - 1.5) < 0.001, f"T={result['T']}"
-    assert abs(result["net_invested"] - 50.0) < 0.01, f"net_invested={result['net_invested']}"
+    assert abs(result["net_invested"] - 530.0) < 0.01, f"net_invested={result['net_invested']}"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -228,3 +255,32 @@ def test_cancel_confirmed_when_no_new_fill(monkeypatch):
     count = _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [_crow()])
 
     assert count == 1
+
+
+def test_cancel_blocks_when_status_unknown(monkeypatch):
+    """알 수 없는 주문 상태는 종료로 간주하지 않고 미확정으로 남깁니다."""
+    monkeypatch.setattr(trading_bot.time, "sleep", lambda _s: None)
+    broker = _CancelBroker(rows=[_crow(status="UNKNOWN", remaining="18")])
+    state = {"orders_meta": {"OD1": {}}}
+
+    with pytest.raises(SymbolScopedError):
+        _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [_crow()])
+
+
+def test_cancel_blocks_when_remaining_unparsable(monkeypatch):
+    """잔량 값이 파싱 불가하면 미확정으로 남깁니다 (0 으로 간주하지 않음)."""
+    monkeypatch.setattr(trading_bot.time, "sleep", lambda _s: None)
+    broker = _CancelBroker(rows=[_crow(status="미체결", remaining="INVALID")])
+    state = {"orders_meta": {"OD1": {}}}
+
+    with pytest.raises(SymbolScopedError):
+        _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [_crow()])
+
+
+def test_cancel_confirmed_with_explicit_terminal_status(monkeypatch):
+    """명시적인 종료 상태는 확정으로 인정합니다."""
+    monkeypatch.setattr(trading_bot.time, "sleep", lambda _s: None)
+    broker = _CancelBroker(rows=[_crow(status="취소", remaining="0", filled="0")])
+    state = {"orders_meta": {"OD1": {}}}
+
+    assert _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [_crow()]) == 1

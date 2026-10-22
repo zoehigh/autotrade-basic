@@ -1156,66 +1156,104 @@ def compute_position_from_history(order_history, cycle_start_date=None):
     return {"net_qty": int(net_qty), "avg_price": round(avg_price, 4), "buy_count": buy_count, "sell_count": sell_count}
 
 
+def _fill_delta(meta, order):
+    """
+    주문의 체결 증가분(수량·금액)을 계산합니다. **메타를 변경하지 않습니다.**
+
+    - 수량: 누적체결수량 − 반영된 수량 (정확)
+    - 금액: 누적체결금액 − 반영된 금액 (정확)
+      단, 이전 버전에서 만든 메타에는 반영 금액 표식이 없습니다.
+      이 경우 **새로 늘어난 부분만** 누적금액 비율로 추정합니다
+      (이미 반영된 부분을 중복 가산하지 않기 위함) — 한 번 적용 후 표식이 기록되어
+      이후부터는 정확히 계산됩니다.
+
+    Returns:
+        tuple: (신규체결수량, 신규체결금액, 금액추정여부)
+    """
+    try:
+        filled_now = int(float(order.get("ft_ccld_qty", "0") or 0))
+    except (TypeError, ValueError):
+        filled_now = 0
+    amount_now = _fill_amount(order)
+    processed_qty = int((meta or {}).get("processed_filled_qty", 0) or 0)
+    has_amount_marker = "processed_filled_amount" in (meta or {})
+    processed_amount = float((meta or {}).get("processed_filled_amount", 0.0) or 0.0)
+    delta_qty = max(filled_now - processed_qty, 0)
+    if has_amount_marker:
+        delta_amount = amount_now - processed_amount
+        estimated = False
+    else:
+        # 이전 메타: 반영된 수량에 해당하는 금액만 제외하고 신규분만 추정합니다.
+        if delta_qty > 0 and filled_now > 0:
+            delta_amount = amount_now * (delta_qty / filled_now)
+        else:
+            delta_amount = 0.0
+        estimated = delta_qty > 0
+    return delta_qty, delta_amount, estimated
+
+
+def _commit_fill_markers(meta, order, applied_qty, applied_amount):
+    """반영한 체결분�� 메타에 기록합니다 (다음 실행에서 중복 반영 방지)."""
+    if meta is None:
+        return
+    try:
+        filled_now = int(float(order.get("ft_ccld_qty", "0") or 0))
+    except (TypeError, ValueError):
+        filled_now = 0
+    amount_now = _fill_amount(order)
+    meta["processed_filled_qty"] = max(int(meta.get("processed_filled_qty", 0) or 0), filled_now)
+    meta["processed_filled_amount"] = max(
+        float(meta.get("processed_filled_amount", 0.0) or 0.0), amount_now
+    )
+    if applied_qty:
+        meta["processed_filled_qty"] = max(
+            int(meta.get("processed_filled_qty", 0) or 0), filled_now
+        )
+
+
 def _apply_late_fill_deltas(state, order_history, skip_odnos):
     """
-    워터마크보다 오래된 주문의 **누적 체결 증가분**을 반영합니다.
+    워터마크보다 오래된 주문의 **누적 체결 증가분**을 계산합니다 (메타 변경 없음).
 
     전역 워터마크는 마지막으로 처리한 주문 시각입니다. 그 이전에 접수된 주문이
     나중에 추가 체결되면(부분체결 증가) 워터마크 기준으로 걸러내면서 반영분이
-    영구히 사라집니다. 등록된 주문은 주문번호별 누적 체결량으로 델타를 계산해
-    반영합니다.
+    영구히 사라집니다. 등록된 주문은 주문번호별 누적 체결량·금액으로 델타를 계산합니다.
 
     - recent_candidates 에 포함된 주문은 날짜 그룹 처리에서 반영되므로 건너뜁니다.
-    - 추가매수(is_additional)는 T 를 늘리지 않고 순투입만 반영합니다.
+    - 이미 반영된 적 없는 주문(processed=0)은 "처리된 범위 밖"이므로 건드리지 않습니다.
 
     Returns:
-        int: 반영된 주문 수
+        tuple: (반영 대상 목록, 순수량 변화, 순금액 변화)
     """
     orders_meta = state.get("orders_meta", {})
     if not orders_meta:
-        return 0
+        return [], 0, 0.0
     history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
-    applied = 0
+    pending: list[tuple[str, dict, dict, int, float]] = []
+    net_qty = 0
+    net_amount = 0.0
     for odno, meta in list(orders_meta.items()):
         if str(odno) in skip_odnos:
             continue
         row = history_by_odno.get(str(odno))
         if row is None:
             continue
-        try:
-            filled_now = int(float(row.get("ft_ccld_qty", "0") or 0))
-        except (TypeError, ValueError):
-            continue
-        processed = int(meta.get("processed_filled_qty", 0) or 0)
-        if processed <= 0:
+        if int(meta.get("processed_filled_qty", 0) or 0) <= 0:
             # 워터마크 이전에 있고 반영된 적 없는 주문은 "이미 처리된 범위 밖"이므로
             # 건드리지 않습니다 (워터마크 이전 이력 무시 계약 유지).
             continue
-        delta = filled_now - processed
-        if delta <= 0:
+        dq, da, _est = _fill_delta(meta, row)
+        if dq <= 0 and abs(da) < 1e-9:
             continue
-        total_qty = int(meta.get("total_qty") or filled_now)
-        t_target = float(meta.get("t_target", 0.0) or 0.0)
-        amount_delta = _fill_amount(row) * (delta / filled_now) if filled_now else 0.0
-        T = float(state.get("T", 0.0))
-        net_invested = float(state.get("net_invested", 0.0))
-        if meta.get("is_additional"):
-            net_invested += amount_delta
-            print(f"  → 지연 체결 반영: odno={odno} 추가매수 {delta}주 → T 변경 없음")
+        pending.append((str(odno), meta, row, dq, da))
+        if row.get("sll_buy_dvsn_cd_name") == "매도":
+            net_qty -= dq
+            net_amount -= da
         else:
-            if total_qty > 0 and t_target:
-                delta_T = round((delta / total_qty) * t_target, 4)
-                T = round(T + delta_T, 4)
-                print(
-                    f"  → 지연 체결 반영: odno={odno} 추가체결 {delta}주 "
-                    f"→ ΔT={delta_T} → T={T}"
-                )
-            net_invested += amount_delta
-        state["T"] = T
-        state["net_invested"] = round(max(0.0, net_invested), 2)
-        meta["processed_filled_qty"] = filled_now
-        applied += 1
-    return applied
+            net_qty += dq
+            net_amount += da
+    return pending, net_qty, net_amount
+
 
 
 def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty=None):
@@ -1281,11 +1319,133 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                   f"qty={o.get('ft_ccld_qty','0')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
-    # 지연 체결(부분체결 증가) 반영 — 워터마크 이전 주문의 누적 체결 증가분.
-    # (recent_candidates 에 있는 주문은 아래 날짜 그룹 처리에서 반영되므로 제외)
-    late_applied = _apply_late_fill_deltas(
+    # ── 1) 지연 체결 후보 (워터마크 이전 주문의 누적 체결 증가분) — 순수 계산 ──
+    late_pending, late_net_qty, late_net_amount = _apply_late_fill_deltas(
         state, order_history, {odno for _o, odno, _r in recent_candidates}
     )
+
+    # ── 2) 이번 묶음의 반영분(수량·금액) 계산 — 순수 계산 ─────────────
+    # 등록된 주문은 메타의 반영 마커와 비교해 **새로 늘어난 부분만** 계산합니다.
+    # (부분체결이 나중에 늘어나도 중복 가산되지 않습니다)
+    deltas: dict[str, tuple[int, float]] = {}
+    batch_net_qty = 0
+    for _o, odno, order in recent_candidates:
+        meta = (state.get("orders_meta") or {}).get(str(odno))
+        if meta is not None:
+            dq, da, _est = _fill_delta(meta, order)
+        else:
+            try:
+                dq = int(float(order.get("ft_ccld_qty", "0") or 0))
+            except (TypeError, ValueError):
+                dq = 0
+            da = _fill_amount(order)
+        deltas[str(odno)] = (dq, da)
+        side = order.get("sll_buy_dvsn_cd_name", "")
+        if side == "매수":
+            batch_net_qty += dq
+        elif side == "매도":
+            batch_net_qty -= dq
+
+    # ── 3) 매도 분류 기준선(순보유) 산출 ──────────────────────────
+    # 이력 조회 구간이 보유 형성을 모두 담지 못하면(사이클 이전 매수·매도가 구간 밖이면)
+    # 순보유수량이 과소 계산되어 쿼터매도가 목표매도로 잘못 분류됩니다.
+    # (2026-10-21 실측: 실제 81주 → 이력 계산 30주 → 쿼터매도(20주)가 비율 0.67 로 오분류)
+    #
+    # 기준선 우선순위
+    #   1) 브로커 실제 잔고 — **현재 시점** 보유량 → 이번 묶음 순변동을 빼서 기준 시점으로
+    #   2) state.position_qty — **직전 워터마크 시점** 보유량 → 이미 기준 시점(지연체결분만 보정)
+    #   3) 없음 → 기준 확보 실패 (매도 분류 불가 → 신규 주문 보류)
+    position_anchor = None
+    anchor_source = ""
+    if balance_qty is not None:
+        position_anchor = balance_qty - batch_net_qty
+        anchor_source = "브로커 잔고"
+    else:
+        stored_qty = state.get("position_qty")
+        if stored_qty is not None:
+            try:
+                position_anchor = int(stored_qty) + late_net_qty
+                anchor_source = "저장 보유수량"
+            except (TypeError, ValueError):
+                position_anchor = None
+
+    # ── 4) 매도 분류가 필요한데 기준이 없으면 보류 신호를 남깁니다 ──
+    # 계산 자체는 계속 진행하되(기준선 없이 이력값으로), 이 결과는 **저장하면 안 됩니다**.
+    # T·워터마크·반영 마커가 먼저 저장되면 다음 실행에서 재처리될 수 없기 때문입니다.
+    # → trading_bot 이 state._position_basis_unknown 를 보고 저장·주문을 모두 보류합니다.
+    sell_in_batch = any(
+        order.get("sll_buy_dvsn_cd_name") == "매도"
+        for _o, _odno, order in recent_candidates
+    ) or any(
+        row.get("sll_buy_dvsn_cd_name") == "매도" for _od, _m, row, _q, _a in late_pending
+    )
+
+    position_anchored = position_anchor is not None and position_anchor > 0
+    if position_anchored:
+        net_qty = position_anchor
+        if position_anchor != _compute_net_qty_up_to(order_history, last_updated_dt):
+            print(
+                f"  → 보유수량 기준 보정: {anchor_source} 기준 {position_anchor}주 "
+                f"— 매도 비율 판정용"
+            )
+    else:
+        net_qty = _compute_net_qty_up_to(order_history, last_updated_dt)
+        print(
+            f"[경고] {symbol} 보유수량 기준을 확보하지 못했습니다 "
+            f"(잔고 조회 실패 + 저장 보유수량 없음). 이력 계산 {net_qty}주를 기준선으로 "
+            f"분류하되 매도 분류가 걸린 경우 신규 주문과 상태 저장을 보류합니다."
+        )
+
+    if not position_anchored:
+        # 기준선이 없을 때만 이력값에 리버스 체결을 보정합니다.
+        # (기준선이 있으면 브로커 잔고에 리버스 체결이 이미 반영되어 있어 중복 차감하지 않습니다)
+        for order in order_history:
+            odt_iso = order.get("ord_datetime_utc")
+            if not odt_iso or not _is_reverse_order(state, order.get("odno", ""), order):
+                continue
+            try:
+                reverse_dt = datetime.fromisoformat(odt_iso)
+                if reverse_dt.tzinfo is None:
+                    reverse_dt = reverse_dt.replace(tzinfo=ZoneInfo("UTC"))
+                else:
+                    reverse_dt = reverse_dt.astimezone(ZoneInfo("UTC"))
+            except Exception:
+                continue
+            if reverse_dt <= last_updated_dt:
+                continue
+            filled = int(float(order.get("ft_ccld_qty", "0")))
+            if order.get("sll_buy_dvsn_cd_name") == "매도":
+                net_qty = max(0, net_qty - filled)
+            elif order.get("sll_buy_dvsn_cd_name") == "매수":
+                net_qty += filled
+
+    # ── 5) 지연 체결 반영 (T·순투입금) ───────────────────────────
+    T = float(state.get("T", 0.0))
+    net_invested = float(state.get("net_invested", 0.0))
+    for odno, meta, row, dq, da in late_pending:
+        total_qty = int(meta.get("total_qty") or dq)
+        t_target = float(meta.get("t_target", 0.0) or 0.0)
+        if row.get("sll_buy_dvsn_cd_name") == "매도":
+            # 늦게 확인된 매도 — T 효과는 이미 적용됐으면 다시 적용하지 않습니다.
+            net_invested -= da
+            print(f"  → 지연 체결 반영: odno={odno} 매도 {dq}주 추가 → T 변경 없음")
+        elif meta.get("is_additional"):
+            net_invested += da
+            print(f"  → 지연 체결 반영: odno={odno} 추가매수 {dq}주 → T 변경 없음")
+        else:
+            if total_qty > 0 and t_target:
+                delta_T = round((dq / total_qty) * t_target, 4)
+                T = round(T + delta_T, 4)
+                print(
+                    f"  → 지연 체결 반영: odno={odno} 추가체결 {dq}주 "
+                    f"→ ΔT={delta_T} → T={T}"
+                )
+            net_invested += da
+        _commit_fill_markers(meta, row, dq, da)
+
+    state["T"] = T
+    state["net_invested"] = round(max(0.0, net_invested), 2)
+    late_applied = len(late_pending)
 
     if not recent_candidates and not late_applied:
         # 최근 이력이 없을 때의 처리.
@@ -1353,72 +1513,6 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     # 기준선 우선순위
     #   1) 브로커 실제 잔고 — 가장 정확
     #   2) state 에 저장된 보유수량(직전 워터마크 시점) — 잔고 조회 실패 시 대체
-    #   3) 이력 계산값 — 마지막 폴백(과소 계산 위험 → 보수적으로 처리)
-    net_qty = _compute_net_qty_up_to(order_history, last_updated_dt)
-
-    batch_net = 0
-    for _o_dt, _odno, order in recent_candidates:
-        filled = int(float(order.get("ft_ccld_qty", "0") or 0))
-        side = order.get("sll_buy_dvsn_cd_name", "")
-        if side == "매수":
-            batch_net += filled
-        elif side == "매도":
-            batch_net -= filled
-
-    position_anchor = None
-    anchor_source = ""
-    if balance_qty is not None:
-        position_anchor = balance_qty - batch_net
-        anchor_source = "브로커 잔고"
-    else:
-        stored_qty = state.get("position_qty")
-        if stored_qty is not None:
-            try:
-                position_anchor = int(stored_qty) - batch_net
-                anchor_source = "저장 보유수량"
-            except (TypeError, ValueError):
-                position_anchor = None
-
-    position_anchored = position_anchor is not None and position_anchor > 0
-    if position_anchored:
-        if position_anchor != net_qty:
-            print(
-                f"  → 보유수량 기준 보정: {anchor_source} 기준 {position_anchor}주 "
-                f"(이력 계산 {net_qty}주) — 매도 비율 판정용"
-            )
-        net_qty = position_anchor
-    else:
-        # 기준선 확보 실패 — 이력값으로 분류하되, 신규 거래는 보류해야 하므로 표시합니다.
-        # (state._position_basis_unknown → trading_bot 이 해당 종목의 신규 주문을 보류)
-        print(
-            f"[경고] {symbol} 보유수량 기준을 확보하지 못했습니다 "
-            f"(잔고 조회 실패 + 저장 보유수량 없음). 이력 계산 {net_qty}주를 기준선으로 "
-            f"분류하되 매도 분류가 걸린 경우 신규 주문은 보류됩니다."
-        )
-
-    if not position_anchored:
-        # 기준선이 없을 때만 이력값에 리버스 체결을 보정합니다.
-        # (기준선이 있으면 브로커 잔고에 리버스 체결이 이미 반영되어 있어 중복 차감하지 않습니다)
-        for order in order_history:
-            odt_iso = order.get("ord_datetime_utc")
-            if not odt_iso or not _is_reverse_order(state, order.get("odno", ""), order):
-                continue
-            try:
-                reverse_dt = datetime.fromisoformat(odt_iso)
-                if reverse_dt.tzinfo is None:
-                    reverse_dt = reverse_dt.replace(tzinfo=ZoneInfo("UTC"))
-                else:
-                    reverse_dt = reverse_dt.astimezone(ZoneInfo("UTC"))
-            except Exception:
-                continue
-            if reverse_dt <= last_updated_dt:
-                continue
-            filled = int(float(order.get("ft_ccld_qty", "0")))
-            if order.get("sll_buy_dvsn_cd_name") == "매도":
-                net_qty = max(0, net_qty - filled)
-            elif order.get("sll_buy_dvsn_cd_name") == "매수":
-                net_qty += filled
-
     print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 {len(recent_candidates)}건 발견 → T값 업데이트 시작 (현재 T={T})")
 
     last_dt_processed = last_updated_dt
@@ -1461,13 +1555,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         # 목표매도: 보유량의 ~75% → 0.5 <= 비율 < 1.0 → T × 0.25
         # 전량매도: 보유량 100% → 비율 >= 1.0 → T = 0 (사이클 종료)
         for o_dt, odno, order in day_sells:
-            sell_qty = int(float(order.get("ft_ccld_qty", "0")))
-            try:
-                sell_amt = float(order.get("ft_ccld_amt3", "0") or 0)
-            except (TypeError, ValueError):
-                sell_amt = 0.0
+            meta = orders_meta.get(str(odno))
+            sell_qty, sell_amt = deltas.get(str(odno), (0, 0.0))
+            if sell_qty <= 0 and abs(sell_amt) < 1e-9:
+                # 이미 반영된 매도 (부분체결 후 추가 체결 없음) → 재분류하지 않습니다.
+                continue
             if not position_anchored:
-                # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 신규 주문 보류 신호
+                # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 state["_position_basis_unknown"] = True
             if net_qty > 0:
                 ratio = sell_qty / net_qty
@@ -1494,6 +1588,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     f"  → 매도 체결 ({ord_dt}): 쿼터매도 (보유수량 불명) → T={T}"
                 )
             net_qty = max(0, net_qty - sell_qty)
+            if meta is not None:
+                _commit_fill_markers(meta, order, sell_qty, sell_amt)
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
                 last_ordno_processed = odno or last_ordno_processed
@@ -1514,13 +1610,14 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         ]
 
         for o_dt, odno, order in skip_buys:
-            filled = int(float(order.get("ft_ccld_qty", "0") or 0))
             meta = orders_meta.get(str(odno))
+            buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
+            if buy_qty <= 0 and abs(buy_amt) < 1e-9:
+                continue
+            net_qty += buy_qty
+            net_invested += buy_amt
             if meta is not None:
-                # 지연 체결 패스에서 중복 반영되지 않도록 반영분을 기록합니다.
-                meta["processed_filled_qty"] = filled
-            net_qty += filled
-            net_invested += _fill_amount(order)
+                _commit_fill_markers(meta, order, buy_qty, buy_amt)
             print(f"  → 매수 체결 ({ord_dt}): 추가매수(odno={odno}) 제외 → T 변경 없음")
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
@@ -1547,17 +1644,23 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
             for o_dt, odno, order in meta_buys:
                 meta = orders_meta[str(odno)]
-                qty = int(float(order.get("ft_ccld_qty", "0")))
-                total_qty = int(meta.get("total_qty") or qty)
-                processed = int(meta.get("processed_filled_qty", 0))
-                new_filled = max(0, qty - processed)
-                if new_filled > 0 and total_qty > 0:
-                    delta_T = round((new_filled / total_qty) * float(meta.get("t_target", 1.0)), 4)
+                buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
+                if buy_qty <= 0 and abs(buy_amt) < 1e-9:
+                    continue
+                total_qty = int(meta.get("total_qty") or buy_qty)
+                if total_qty > 0:
+                    delta_T = round(
+                        (buy_qty / total_qty) * float(meta.get("t_target", 1.0)), 4
+                    )
                     T = round(T + delta_T, 4)
-                    meta["processed_filled_qty"] = processed + new_filled
-                    print(f"  → 매수 체결 ({ord_dt}): odno={odno} t_target={meta.get('t_target')} 부분체결({new_filled}/{total_qty}) → ΔT={delta_T} → T={T}")
-                net_qty += qty
-                net_invested += _fill_amount(order)
+                    _commit_fill_markers(meta, order, buy_qty, buy_amt)
+                    print(
+                        f"  → 매수 체결 ({ord_dt}): odno={odno} "
+                        f"t_target={meta.get('t_target')} "
+                        f"부분체결({buy_qty}/{total_qty}) → ΔT={delta_T} → T={T}"
+                    )
+                net_qty += buy_qty
+                net_invested += buy_amt
                 if o_dt > last_dt_processed:
                     last_dt_processed = o_dt
                     last_ordno_processed = odno or last_ordno_processed
@@ -1571,8 +1674,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 T = round(T + delta_T, 4)
                 print(f"  → 매수 체결 ({ord_dt}): 미등록매수 {buy_count}건 → T += {delta_T} → T={T}")
                 for o_dt, odno, order in unregistered_buys:
-                    net_qty += int(float(order.get("ft_ccld_qty", "0")))
-                    net_invested += _fill_amount(order)
+                    buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
+                    net_qty += buy_qty
+                    net_invested += buy_amt
                     if o_dt > last_dt_processed:
                         last_dt_processed = o_dt
                         last_ordno_processed = odno or last_ordno_processed
@@ -1582,11 +1686,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     state["T"] = round(T, 4)
     state["net_invested"] = round(max(0.0, net_invested), 2)
     # 워터마크 시점 보유수량 저장 — 다음 실행의 매도 비율 판정 기준선.
-    # (잔고 조회가 실패해도 이 값으로 분류할 수 있게 합니다)
-    if balance_qty is not None:
-        state["position_qty"] = int(balance_qty)
-    elif position_anchored:
-        state["position_qty"] = int(net_qty)
+    # **이번 묶음 반영 전** 보유량이어야 합니다 (다음 실행에서 같은 묶음을 다시 보지 않으므로).
+    if position_anchored:
+        state["position_qty"] = int(position_anchor)
+    elif balance_qty is not None:
+        state["position_qty"] = int(balance_qty - batch_net_qty)
     try:
         state["last_updated"] = last_dt_processed.isoformat()
         state["last_processed_ordno"] = last_ordno_processed or ""

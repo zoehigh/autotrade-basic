@@ -330,8 +330,45 @@ def run_one_symbol(broker: Broker, symbol_config):
                 f"{symbol} 상태 파일을 확인할 수 없어 LIVE 주문을 중단합니다: "
                 f"{state_unavailable}"
             )
-
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
+
+    # ── 정산 근거 기록 (자동 검증이 독립 검산에 사용) ────────────────
+    # 이 근거가 없으면 검증기는 "검증 불가"로 판단합니다.
+    settlement_evidence = {
+        "symbol": symbol,
+        "balance_qty": live_qty,
+        "position_basis": state.get("position_qty"),
+        "basis_unknown": bool(state.get("_position_basis_unknown")),
+        "T_after": float(state.get("T", 0.0)),
+        "net_invested_after": float(state.get("net_invested", 0.0)),
+        "last_updated": state.get("last_updated", ""),
+        "sell_ratios": state.get("_settlement_sell_ratios", []),
+        "fills": [],
+    }
+    for row in order_history:
+        try:
+            filled = int(float(row.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            continue
+        if filled <= 0:
+            continue
+        row_meta = (state.get("orders_meta", {}) or {}).get(str(row.get("odno", ""))) or {}
+        settlement_evidence["fills"].append({
+            "odno": str(row.get("odno", "")),
+            "side": row.get("sll_buy_dvsn_cd_name", ""),
+            "qty": filled,
+            "amount": float(row.get("ft_ccld_amt3", "0") or 0),
+            "ts": row.get("ord_datetime_utc", ""),
+            "t_target": float(row_meta.get("t_target", 0.0) or 0.0),
+            "is_additional": bool(row_meta.get("is_additional", False)),
+        })
+    try:
+        stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+        with open(f"settlement-{symbol}-{stamp}.json", "w", encoding="utf-8") as fh:
+            json.dump(settlement_evidence, fh, ensure_ascii=False, indent=2)
+    except OSError as evidence_error:
+        print(f"[경고] 정산 근거 기록 실패: {str(evidence_error)[:100]}")
+
 
     # ── 포지션 기반 T 추정 진단 (소액 시드 오추정 시 참고용) ──
     infer_diag = state.get("_inference_diagnostic", {})
@@ -388,25 +425,26 @@ def run_one_symbol(broker: Broker, symbol_config):
         state["net_invested_status"] = "valid"
         state["reverse_mode"] = {}
 
-    # [DRY READONLY] T 갱신 후 상태 저장: DRY에서는 절대 저장하지 않습니다.
-    if TRADE_MODE == "LIVE":
-        save_state(symbol, state)
-
-    # ── 보유수량 기준 미확보 → 신규 주문 보류 ──────────────────────
+    # ── 보유수량 기준 미확보 → 저장·신규 주문 보류 ──────────────────
     # 매도 분류에 필요한 보유수량을 브로커 잔고나 저장된 보유수량에서 확보하지 못하면
     # 쿼터매도/목표매도 구분을 신뢰할 수 없습니다 (T 가 과소 계산될 수 있음).
-    # 이 경우 신규 주문은 내지 않고 확인을 요청합니다.
+    # 이 경우 **계산 결과를 저장하지 않고** 신규 주문도 내지 않습니다.
+    # (먼저 저장하면 다음 실행에서 재처리될 수 없어 잘못된 값이 고정됩니다)
     if state.pop("_position_basis_unknown", False):
         msg = (
-            f"[보류] {symbol} 보유수량 기준을 확보하지 못해 신규 주문을 내지 않습니다. "
-            f"(브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
+            f"[보류] {symbol} 보유수량 기준을 확보하지 못해 정산 결과와 신규 주문을 "
+            f"보류합니다. (브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
         )
         print(msg)
         notify(msg, urgent=True)
         raise SymbolScopedError(
-            f"{symbol} 보유수량 기준 미확보로 신규 주문을 보류합니다. "
+            f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
             f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
         )
+
+    # [DRY READONLY] T 갱신 후 상태 저장: DRY에서는 절대 저장하지 않습니다.
+    if TRADE_MODE == "LIVE":
+        save_state(symbol, state)
 
     # ── 상태-잔고 교차검증 (conservative reconciliation) ──
     try:
@@ -1020,20 +1058,38 @@ fence: 유지"""
     }
 
 
-def _order_remaining_qty(row: dict) -> int:
-    """이력 행의 미체결(잔량) 수량을 안전하게 읽습니다."""
+def _order_remaining_qty(row: dict):
+    """이력 행의 미체결(잔량) 수량을 읽습니다. 파싱 불가면 None 을 반환합니다."""
+    raw = row.get("nccs_qty")
+    if raw is None or raw == "":
+        return None
     try:
-        return int(float(row.get("nccs_qty", "0") or 0))
+        return int(float(raw))
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
-def _order_filled_qty(row: dict) -> int:
-    """이력 행의 체결 수량을 안전하게 읽습니다."""
+def _order_filled_qty(row: dict):
+    """이력 행의 체결 수량을 읽습니다. 파싱 불가면 None 을 반환합니다."""
+    raw = row.get("ft_ccld_qty")
+    if raw is None or raw == "":
+        return None
     try:
-        return int(float(row.get("ft_ccld_qty", "0") or 0))
+        return int(float(raw))
     except (TypeError, ValueError):
-        return 0
+        return None
+
+
+# 주문 상태 구분 — 종료 상태와 진행 중 상태를 명시합니다.
+# (알 수 없는 상태는 종료로 간주하지 않습니다)
+_TERMINAL_ORDER_STATUSES = {
+    "취소", "체결", "거부", "만료", "정정됨", "종료", "완료",
+    "CANCELED", "CANCELLED", "FILLED", "REJECTED", "EXPIRED", "CLOSED",
+}
+_OPEN_ORDER_STATUSES = {
+    "미체결", "부분체결", "접수", "대기", "취소거부",
+    "OPEN", "PARTIAL", "PENDING", "NEW",
+}
 
 
 def _cancel_open_bot_orders(
@@ -1079,7 +1135,7 @@ def _cancel_open_bot_orders(
 
     by_odno = {str(o.get("odno")): o for o in (order_history or [])}
     today = get_kst_now().strftime("%Y%m%d")
-    targets: list[tuple[str, str, int]] = []
+    targets: list[tuple[str, str, int | None]] = []
     expired_candidates: list[str] = []
     for odno, meta in list(orders_meta.items()):
         if (meta or {}).get("reverse_action"):
@@ -1090,11 +1146,12 @@ def _cancel_open_bot_orders(
         status = str(row.get("prcs_stat_name", "") or "")
         if status not in ("미체결", "부분체결"):
             continue
-        if _order_remaining_qty(row) <= 0:
+        remaining_row = _order_remaining_qty(row)
+        if remaining_row is not None and remaining_row <= 0:
             continue
         if str(row.get("ord_dt", "") or "") == today:
             # 오늘 세션 주문 — 아직 체결될 수 있으므로 반드시 취소해야 합니다.
-            targets.append((str(odno), status, _order_remaining_qty(row)))
+            targets.append((str(odno), status, remaining_row))
         else:
             # 이전 세션 주문 — 메리츠 주문 API에는 유효기간(GTC) 파라미터가 없어
             # 모든 주문이 당일 주문입니다. 세션이 종료되면 자동으로 만료되므로
@@ -1130,12 +1187,14 @@ def _cancel_open_bot_orders(
     # 확정 조건 (모두 만족해야 확정):
     #   - 이력 재조회가 성공했고
     #   - 해당 주문 행이 이력에 존재하며
+    #   - 체결수량·잔량이 **유효한 숫자로 읽히고**
     #   - 취소 전 대비 체결수가 증가하지 않았고
-    #   - 주문이 종료 상태(취소/체결) 또는 잔량 0
-    # 이력 누락·조회 실패는 "확정"이 아니라 "미확정"으로 처리합니다
-    # (조회 누락을 확정으로 보면 중복 주문의 원인이 됩니다).
+    #   - 주문이 명시적인 종료 상태이거나 잔량이 0
+    # 이력 누락·조회 실패·값 파싱 실패·알 수 없는 상태는 "확정"이 아니라
+    # "미확정"으로 처리합니다 (조회 누락을 확정으로 보면 중복 주문이 됩니다).
     before_filled = {
-        odno: _order_filled_qty(by_odno.get(odno) or {}) for odno, _s, _r in targets
+        odno: (_order_filled_qty(by_odno.get(odno) or {}) or 0)
+        for odno, _s, _r in targets
     }
     confirmed: set[str] = set()
     # 조회 실패 시에도 "미확정"으로 남도록 처음부터 모든 대상을 미확정으로 둡니다.
@@ -1159,16 +1218,25 @@ def _cancel_open_bot_orders(
                 still_open.append(odno)
                 continue
             filled_now = _order_filled_qty(row)
+            remaining_now = _order_remaining_qty(row)
+            if filled_now is None or remaining_now is None:
+                # 체결수량·잔량을 유효한 숫자로 읽지 못했습니다 → 미확정
+                still_open.append(odno)
+                continue
             if filled_now > before_filled.get(odno, 0):
                 # 취소 도중 체결 → 포지션이 바뀌므로 기존 계획으로 재주문하면 안 됩니다
                 filled_during_cancel.append(odno)
                 still_open.append(odno)
                 continue
             status = str(row.get("prcs_stat_name", "") or "")
-            if status not in ("미체결", "부분체결"):
+            if status in _TERMINAL_ORDER_STATUSES:
                 confirmed.add(odno)
                 continue
-            if _order_remaining_qty(row) <= 0:
+            if status not in _OPEN_ORDER_STATUSES:
+                # 알 수 없는 상태는 종료로 간주하지 않습니다
+                still_open.append(odno)
+                continue
+            if remaining_now <= 0:
                 confirmed.add(odno)
                 continue
             still_open.append(odno)
