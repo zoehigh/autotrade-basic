@@ -63,10 +63,19 @@ def _verify_t_transitions(text, symbol, rows, balance_qty):
     t_after = float(m_after.group(1))
     watermark = m_before.group(2)
 
+    # 종목별 섹션만 봅니다 (체결 전이 로그에는 종목명이 없어 섹션으로 구분합니다).
+    section = text
+    marker = f"종목 처리 시작: {symbol} "
+    if marker in text:
+        section = text[text.index(marker):]
+        nxt = section.find("종목 처리 시작: ", len(marker))
+        if nxt != -1:
+            section = section[:nxt]
+
     # 로그에 기록된 전이를 따라 T 을 재현합니다 (매수 ΔT / 매도 후 T).
     logged_ratios: list[float] = []
     t_running = t_before
-    for line in text.splitlines():
+    for line in section.splitlines():
         m_buy = re.search(r"→ 매수 체결 \(\d+\): .*ΔT=([0-9.]+) → T=([0-9.]+)", line)
         if m_buy:
             t_running = float(m_buy.group(2))
