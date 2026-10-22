@@ -92,8 +92,8 @@ def test_position_qty_is_saved_for_next_run():
     """보유수량이 state 에 저장되어 다음 실행의 기준선으로 쓰입니다."""
     orders = [_row("B", "매수", 5, "2026-10-21T09:00:00+00:00")]
     result = update_T_from_history("TQQQ", _state(T=1.0), orders, balance_qty=40)
-    # 저장값은 **이번 묶음 반영 전** 보유량입니다 (다음 실행 기준선)
-    assert result["position_qty"] == 35
+    # 워터마크 기준 보유량 = 현재 잔고 (이번 체결은 워터마크에 포함됨)
+    assert result["position_qty"] == 40
 
 
 def test_stored_position_qty_is_not_reduced_by_batch_again():

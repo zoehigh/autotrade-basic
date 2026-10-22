@@ -1381,6 +1381,10 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     )
 
     position_anchored = position_anchor is not None and position_anchor > 0
+    if balance_qty is not None:
+        # 워터마크 기준 보유량은 현재 잔고와 같습니다 (이번 체결은 곧 워터마크에 포함됨).
+        # 체결이 없는 실행에서도 기준선이 생기도록 여기서 기록합니다.
+        state["position_qty"] = int(balance_qty)
     if position_anchored:
         net_qty = position_anchor
         if position_anchor != _compute_net_qty_up_to(order_history, last_updated_dt):
@@ -1686,11 +1690,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     state["T"] = round(T, 4)
     state["net_invested"] = round(max(0.0, net_invested), 2)
     # 워터마크 시점 보유수량 저장 — 다음 실행의 매도 비율 판정 기준선.
-    # **이번 묶음 반영 전** 보유량이어야 합니다 (다음 실행에서 같은 묶음을 다시 보지 않으므로).
-    if position_anchored:
-        state["position_qty"] = int(position_anchor)
-    elif balance_qty is not None:
-        state["position_qty"] = int(balance_qty - batch_net_qty)
+    # **워터마크 기준 보유량**입니다 (현재 잔고와 같습니다. 이번 묶음의 체결은
+    # 이제 워터마크 안에 포함되므로, 다음 실행에서 다시 되감으면 안 됩니다).
+    # 잔고 조회가 실패했으면 이번 묶음 반영 후 계산된 순보유로 기록합니다.
+    if balance_qty is not None:
+        state["position_qty"] = int(balance_qty)
+    elif position_anchored:
+        state["position_qty"] = int(net_qty)
     try:
         state["last_updated"] = last_dt_processed.isoformat()
         state["last_processed_ordno"] = last_ordno_processed or ""
