@@ -173,9 +173,21 @@ uv run pytest tests/test_broker_preflight.py -v
 **매도 비율 판정의 보유수량 기준 (2026-10-22 수정)**: 쿼터매도/목표매도/전량매도를 구분하는 비율은
 `sell_qty / net_qty` 인데, `net_qty` 를 **주문 이력 조회 구간**에서 계산하면 구간 밖 매수(사이클 이전)가
 빠져 **보유를 과소 계산**합니다 → 쿼터매도(25%)가 목표매도(75%)로 오분류되고 T가 1/4배 됩니다.
-→ **브로커 실제 잔고(`balance_qty`)를 기준선으로 보정**합니다 (`state.py` `_apply_recent_history_dt`).
+→ **보유수량 기준선은 3단계로 확보**합니다 (`state.py` `_apply_recent_history_dt`).
+  1. **브로커 실제 잔고** 기준 (`balance_qty - 이번 묶음 순변동`)
+  2. **state 의 `position_qty`** (직전 워터마크 시점 보유수량, 매 실행마다 저장) — 잔고 조회 실패 시
+  3. 이력 계산값 — 마지막 폴백
+→ 기준선에 브로커 잔고를 쓰면 **리버스 체결이 이미 반영**되어 있으므로 별도로 다시 차감하지 않습니다.
+→ 기준선을 끝내 확보하지 못하면(잔고 조회 실패 + 저장값 없음) 매도 분류 후 **신규 주문을 보류**합니다
+  (`state._position_basis_unknown` → `trading_bot` 이 해당 종목의 주문을 중단).
 실측(2026-10-22): 실제 81주 → 이력 계산 30주 → 20주 매도가 비율 0.67 로 목표매도 오분류 → T 13.375→3.3438.
-잔고 조회 실패(`balance_qty=None`) 시에는 기존 이력 계산값으로 폴백합니다.
+
+**지연 체결(부분체결 증가) 반영**: 전역 워터마크보다 오래된 주문이라도 **이미 반영된 주문**(processed_filled_qty > 0)의
+누적 체결이 늘면 주문번호별 델타로 반영합니다 (`_apply_late_fill_deltas`). 워터마크 이전에 있고 반영된 적 없는
+주문은 "처리된 범위 밖"이므로 건드리지 않습니다.
+
+**전체 재추정과 증분 반영 분리**: `_infer_T_from_full_history` 는 "처음부터" 다시 계산하므로
+`processed_filled_qty` 를 빼지 않고 전체 체결로 T 를 계산합니다 (빼면 T 가 다시 낮아집니다).
 
 **MERITZ 10/12 신청 게이트 (2026-10-02 기준)**: 메리츠 오픈API는 모바일앱 신청이 차단되고 포털도 미개방 상태라 **실검증 보류**. 유동IP 사용 가능 확인됨 (고정IP 불필요, ubuntu-latest 그대로 사용). MAC 사전등록도 별도 절차 없음 (요청 헤더에 12자리 HEX를 넣어 전송하면 됨). 자격증명 발급 전까지 preflight 주문 단계는 `--live-order-probe`로만 실행하고, 기본 실행은 read-only 조회(1~6단계) + skip 출력으로 통과 처리합니다. 신청 개방 확인 후 preflight 1회 통과 + 실전 소액 LIVE 1세션 검증 순서로 진행.
 
@@ -305,6 +317,10 @@ uv run pytest tests/test_broker_preflight.py -v
   - 배경: 수동 주입(REPAIR CAS) 후 `cycle_start_date`가 비면 `generate_cycle_report`가 **전체 이력**을 집계해 B안 시드(`next_cycle_seed = seed + net_profit`)가 틀어짐. `cycle_start_date`는 full-history 추정 경로에서만 자동 설정되므로(현재 T>0인 진행 중 사이클은 미설정), 이 액션으로 정정
 - **LIVE 주문 fence**: 주문 전 `pending_order_batch`/`pending_order_intent`를 캐시에 저장하며, fence가 남아 있어도 **전체 중단하지 않고** 해당 종목만 복구를 시도합니다 (다른 종목은 계속 진행)
 - **이전 세션 잔여 주문 정리** (신규 주문 제출 직전, LIVE 전용): 봇은 매 세션마다 새 주문 전체를 새로 내므로, 이전 주문이 살아 있으면 목표매도 LIMIT 등이 **중복**됩니다. 그래서 `state.orders_meta` 에 있는 봇 소유 주문 중 `미체결`/`부분체결`(잔량>0)만 취소한 뒤 신규 주문을 냅니다. 수동 주문·리버스 주문은 제외하고, 취소 실패 시 신규 주문을 내지 않고 해당 종목만 중단(`SymbolScopedError`)합니다. 취소 미지원 브로커는 건너뜁니다 (`trading_bot.py` `_cancel_open_bot_orders`)
+- **취소 확정 확인 조건** (`_cancel_open_bot_orders`): 이력 재조회가 성공했고, 해당 주문 행이 이력에 존재하며,
+  **취소 전 대비 체결수가 증가하지 않았고**, 주문이 종료 상태(취소/체결) 또는 잔량 0 이어야 확정입니다.
+  이력 누락·조회 실패는 "확정"이 아니라 **미확정**으로 처리합니다 (조회 누락을 확정으로 보면 중복 주문이 됩니다).
+  취소 도중 체결이 발생하면 포지션이 바뀌므로 **재계획 후** 주문해야 합니다.
   - **미접수 확정(`OrderNotAcceptedError`)**: 브로커가 명시적으로 거부(사전검증 실패 또는 거부 응답)해 주문이 접수되지 않았음이 보장되면 fence를 해제하고 해당 종목의 남은 주문만 중단 → 다음 종목 계속 진행
   - **불확실(네트워크 타임아웃/연결 오류, 주문번호 누락)**: fence 유지 → 해당 종목만 중단, 다음 종목은 계속 진행 (`SymbolScopedError`). **다음 RUN에서 자동 복구**를 시도합니다. state 저장 실패(intent/checkpoint)는 공통 장애로 전체 중단 (`GlobalScopedError`, 단일 `.state.json` 공유 때문)
   - **이전 세션 자동 복구** (`_recover_order_fence`, `trading_bot.py`): 주문이력/잔고 reconciliation(Step 1~3)을 정상 통과한 뒤, fence의 `submitted_session`(intent)/`session`(batch)이 오늘 미국(ET) 세션보다 과거면 이력이 정착된 것으로 보고 fence를 해제하고 정상 진행. 잔고 조회 실패(None) 또는 같은 세션/세션 정보 없음이면 보수적으로 fence 유지 + 해당 종목만 중단
