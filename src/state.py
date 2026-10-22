@@ -1272,6 +1272,28 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
     # 매도 분류를 위해 기준 시점의 순보유수량을 미리 계산합니다
     net_qty = _compute_net_qty_up_to(order_history, last_updated_dt)
+
+    # 이력 조회 구간이 보유 형성을 모두 담지 못하면(사이클 이전 매수·매도가 구간 밖이면)
+    # 순보유수량이 과소 계산되어 쿼터매도가 목표매도로 잘못 분류됩니다.
+    # (2026-10-21 실측: 실제 81주 → 이력 계산 30주 → 쿼터매도(20주)가 비율 0.67 로 오분류)
+    # 브로커 실제 잔고를 기준선으로 보정합니다.
+    if balance_qty is not None:
+        batch_net = 0
+        for _o_dt, _odno, order in recent_candidates:
+            filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+            side = order.get("sll_buy_dvsn_cd_name", "")
+            if side == "매수":
+                batch_net += filled
+            elif side == "매도":
+                batch_net -= filled
+        anchored_qty = balance_qty - batch_net
+        if anchored_qty > 0 and anchored_qty != net_qty:
+            print(
+                f"  → 보유수량 기준 보정: 이력 계산 {net_qty}주 → 브로커 잔고 기준 "
+                f"{anchored_qty}주 (매도 비율 판정용)"
+            )
+            net_qty = anchored_qty
+
     for order in order_history:
         odt_iso = order.get("ord_datetime_utc")
         if not odt_iso or not _is_reverse_order(state, order.get("odno", ""), order):

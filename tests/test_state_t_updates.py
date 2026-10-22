@@ -490,3 +490,58 @@ def test_empty_history_keeps_warning(capsys):
     assert result["T"] == 12.375
     out = capsys.readouterr().out
     assert "[경고]" in out
+
+
+# ─────────────────────────────────────────────────────────
+# 테스트: 매도 비율 판정의 보유수량 기준 (2026-10-21 실측 버그)
+# ─────────────────────────────────────────────────────────
+
+def test_sell_ratio_uses_broker_balance_not_windowed_history():
+    """이력 구간이 보유를 못 담으면 쿼터매도가 목표매도로 오분류됩니다.
+
+    2026-10-21 실측: 실제 81주 보유 중 20주(24.7%) 매도 → 쿼터매도(T×0.75).
+    이력 계산값이 30주라 비율 0.67 → 목표매도(T×0.25)로 잘못 분류됐습니다.
+    브로커 잔고(61주)를 기준선으로 보정하면 비율 20/81 = 0.25 → 쿼터매도가 됩니다.
+    """
+    state = _make_state(
+        T=13.375,
+        last_updated="2026-10-20 11:14:03+00:00",
+    )
+    # 사이클 이전 매도/매수가 이력 구간 계산에 섞여 순보유가 과소 계산되는 상황
+    orders = [
+        _make_sell_order("OLD1", "20260922", 23),
+        _make_sell_order("OLD2", "20260918", 12),
+        _make_buy_order("OLD3", "20260924", 2),
+        _make_sell_order("NEWSELL", "20261021", 20),
+    ]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=61)
+
+    # 13.375 × 0.75 = 10.0312 (쿼터매도) — 목표매도(×0.25 = 3.3438) 가 아님
+    assert abs(result["T"] - 10.0312) < 0.001, f"T={result['T']}"
+
+
+def test_sell_ratio_without_balance_falls_back_to_history():
+    """잔고 조회 실패(None)면 이력 계산값으로 폴백하고 예외가 없어야 합니다."""
+    state = _make_state(
+        T=13.375,
+        last_updated="2026-10-20 11:14:03+00:00",
+    )
+    orders = [_make_sell_order("NEWSELL", "20261021", 20)]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=None)
+
+    assert result["T"] is not None
+
+
+def test_full_sell_detected_with_balance_anchor():
+    """보유 전량 매도 시 사이클 종료(T=0)로 판정되어야 합니다."""
+    state = _make_state(
+        T=13.375,
+        last_updated="2026-10-20 11:14:03+00:00",
+    )
+    orders = [_make_sell_order("FULLSELL", "20261021", 61)]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=0)
+
+    assert result["T"] == 0.0
