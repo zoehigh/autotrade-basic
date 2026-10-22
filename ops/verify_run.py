@@ -289,17 +289,19 @@ def main():
     if not logs:
         print(f"logs/run-{target}-*.log 없음 — 실행되지 않았습니다.")
         sys.exit(2)
-    # **가장 최근 로그**를 검사합니다. (이전 LIVE 로그를 대신 검사하면
-    #  이번 예약 실행이 실패했는데 조용히 통과될 수 있습니다)
-    log_path = logs[-1]
+    # 검사 대상은 **해당 날짜의 가장 최근 LIVE 로그**입니다.
+    # (나중에 DRY 가 추가로 돌더라도 LIVE 결과를 계속 검사할 수 있습니다)
+    live_logs = [p for p in logs if "mode=LIVE" in p.read_text(errors="ignore")]
+    log_path = live_logs[-1] if live_logs else logs[-1]
 
     print(f"=== 실행 로그 검증 ({target}) ===")
     text = log_path.read_text()
     ok(f"로그: logs/{log_path.name}")
     mode = "DRY" if "mode=DRY" in text else "LIVE"
-    if expect_live and mode != "LIVE":
+    if expect_live and not live_logs:
+        # 오늘 LIVE 실행 로그가 전혀 없으면 예약 실행이 실패한 것입니다.
         problem(
-            f"예약 LIVE 실행 로그가 없습니다 (가장 최근 로그: {log_path.name}, mode={mode})"
+            f"예약 LIVE 실행 로그가 없습니다 (최근 로그: {log_path.name}, mode={mode})"
         )
     exit_code = None
     m_run = re.search(r"\[launcher\] start .*", text)
