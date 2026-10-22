@@ -330,6 +330,9 @@ def run_one_symbol(broker: Broker, symbol_config):
                 f"{symbol} 상태 파일을 확인할 수 없어 LIVE 주문을 중단합니다: "
                 f"{state_unavailable}"
             )
+    # 정산 전 워터마크 (이번 정산이 처리한 구간의 시작점) — 검증기가 사용합니다.
+    watermark_before = str(state.get("last_updated", "") or "")
+
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
 
     # ── 정산 근거 기록 (자동 검증이 독립 검산에 사용) ────────────────
