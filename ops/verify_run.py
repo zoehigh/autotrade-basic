@@ -68,8 +68,8 @@ def _recompute_expected_t(evidence):
         problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
 
     fills = evidence.get("fills") or []
-    # 워터마크 이후 체결만 이번 정산 대상입니다.
-    watermark = str(evidence.get("last_updated") or "")
+    # **정산 전** 워터마크 이후 체결만 이번 정산 대상입니다.
+    watermark = str(evidence.get("watermark_before") or "")
     recent = [f for f in fills if not watermark or str(f.get("ts", "")) > watermark]
 
     balance = evidence.get("balance_qty")
@@ -110,7 +110,7 @@ def _verify_sell_ratios_from_evidence(evidence):
     if not evidence:
         return problems
     fills = evidence.get("fills") or []
-    watermark = str(evidence.get("last_updated") or "")
+    watermark = str(evidence.get("watermark_before") or evidence.get("last_updated") or "")
     balance = evidence.get("balance_qty")
     if not isinstance(balance, int):
         return problems

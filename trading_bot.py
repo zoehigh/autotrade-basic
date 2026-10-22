@@ -342,6 +342,7 @@ def run_one_symbol(broker: Broker, symbol_config):
         "T_after": float(state.get("T", 0.0)),
         "net_invested_after": float(state.get("net_invested", 0.0)),
         "last_updated": state.get("last_updated", ""),
+        "watermark_before": watermark_before,
         "sell_ratios": state.get("_settlement_sell_ratios", []),
         "fills": [],
     }
