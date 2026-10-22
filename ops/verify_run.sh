@@ -20,7 +20,7 @@ set -a
 . ./.env
 set +a
 
-uv run python ops/verify_run.py "$TARGET" > "$LOG" 2>&1
+uv run python ops/verify_run.py "$TARGET" --expect-live > "$LOG" 2>&1
 rc=$?
 
 if [[ "$rc" != "0" ]]; then

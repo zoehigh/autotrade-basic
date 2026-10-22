@@ -282,19 +282,25 @@ def _verify_t_transitions(text, symbol, rows, balance_qty):
 
 
 def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else datetime.now(KST).strftime("%Y%m%d")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    expect_live = "--expect-live" in sys.argv
+    target = args[0] if args else datetime.now(KST).strftime("%Y%m%d")
     logs = sorted(Path("logs").glob(f"run-{target}-*.log"))
     if not logs:
         print(f"logs/run-{target}-*.log 없음 — 실행되지 않았습니다.")
         sys.exit(2)
-    # 같은 날짜에 DRY 도 함께 있으면 LIVE 실행 로그를 우선합니다.
-    live_logs = [p for p in logs if "mode=LIVE" in p.read_text(errors="ignore")]
-    log_path = live_logs[-1] if live_logs else logs[-1]
+    # **가장 최근 로그**를 검사합니다. (이전 LIVE 로그를 대신 검사하면
+    #  이번 예약 실행이 실패했는데 조용히 통과될 수 있습니다)
+    log_path = logs[-1]
 
     print(f"=== 실행 로그 검증 ({target}) ===")
     text = log_path.read_text()
     ok(f"로그: logs/{log_path.name}")
     mode = "DRY" if "mode=DRY" in text else "LIVE"
+    if expect_live and mode != "LIVE":
+        problem(
+            f"예약 LIVE 실행 로그가 없습니다 (가장 최근 로그: {log_path.name}, mode={mode})"
+        )
     exit_code = None
     m_run = re.search(r"\[launcher\] start .*", text)
     run_id = ""
