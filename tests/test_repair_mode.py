@@ -237,3 +237,19 @@ class TestDryRegression:
         assert not ctx["saved_states"], "DRY는 상태를 저장하지 않아야 합니다"
         assert any("불일치" in m for m in ctx["notify_messages"]), \
             "불일치 경고가 텔레그램으로 1회 전송되어야 합니다"
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-3: 일회성 복구 모드 상호 배타 검사
+# ═══════════════════════════════════════════════════════════════════
+def test_exclusive_once_modes_reject_simultaneous_flags(monkeypatch):
+    monkeypatch.setattr(trading_bot, "STATE_DIAGNOSTIC_ONLY", False)
+    monkeypatch.setattr(trading_bot, "STATE_REPAIR_ONLY", False)
+    monkeypatch.setattr(trading_bot, "STATE_CLEAR_FENCE_ONLY", False)
+    monkeypatch.setattr(trading_bot, "STATE_REVERSE_AUDIT_ONLY", True)
+    monkeypatch.setattr(trading_bot, "STATE_REVERSE_RECONCILE_ONLY", True)
+    monkeypatch.setattr(trading_bot, "STATE_NET_INVESTED_REPAIR_ONLY", False)
+    monkeypatch.setattr(trading_bot, "STATE_ASSUME_REVERSE_EXPIRY_ONLY", False)
+    monkeypatch.setattr(trading_bot, "STATE_SET_CYCLE_START_ONLY", False)
+
+    with pytest.raises(RuntimeError, match="상호 배타"):
+        trading_bot.main()

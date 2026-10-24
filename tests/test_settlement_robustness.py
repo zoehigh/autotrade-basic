@@ -397,3 +397,310 @@ def test_settlement_is_not_saved_when_basis_unknown(monkeypatch):
     state = {"orders_meta": {"OD1": {}}}
     with pytest.raises(SymbolScopedError):
         trading_bot._save_settlement_state("TQQQ", {**state, "_position_basis_unknown": True})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ⑦ P0-2: 금액 미확정 체결 보류 (추정 → 보류)
+# ═══════════════════════════════════════════════════════════════════
+
+def _amount_row(odno="F1", side="매수", qty=10, price=10.0, amount=None,
+                ts="2026-10-21T09:00:00+00:00"):
+    row = {
+        "odno": odno,
+        "sll_buy_dvsn_cd_name": side,
+        "ft_ccld_qty": str(qty),
+        "ft_ccld_unpr3": str(price),
+        "ord_datetime_utc": ts,
+        "ord_dt": ts[:10].replace("-", ""),
+        "prcs_stat_name": "체결",
+        "nccs_qty": "0",
+    }
+    if amount is not None:
+        row["ft_ccld_amt3"] = str(amount)
+    return row
+
+
+def test_fill_amount_returns_confirmed_tuple():
+    from state import _fill_amount, _fill_amount_is_available
+
+    assert _fill_amount(_amount_row(amount=100.0)) == (100.0, False)
+    assert _fill_amount_is_available(_amount_row(amount=100.0)) is True
+
+
+def test_fill_amount_missing_or_zero_is_unconfirmed_without_estimation():
+    from state import _fill_amount, _fill_amount_is_available
+
+    for row in (_amount_row(amount=None), _amount_row(amount=0)):
+        assert _fill_amount(row) == (0.0, True)
+        assert _fill_amount_is_available(row) is False
+
+
+def test_unconfirmed_buy_holds_everything():
+    state = _state(T=10.0, net_invested=1000.0)
+    state["orders_meta"] = {
+        "A": {"total_qty": 10, "t_target": 2.0,
+              "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+    }
+    before = deepcopy(state)
+    orders = [_amount_row("A", qty=10, amount=None)]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=70)
+
+    assert result["T"] == pytest.approx(10.0)
+    assert result["net_invested"] == pytest.approx(1000.0)
+    assert result["last_updated"] == before["last_updated"]
+    assert result["last_processed_ordno"] == before["last_processed_ordno"]
+    assert result["orders_meta"]["A"] == before["orders_meta"]["A"]
+    assert result.get("_settlement_hold") is True
+    assert result.get("_pending_amount_odnos") == ["A"]
+    assert result.get("_settlement_deltas", []) == []
+
+
+def test_unconfirmed_late_sell_holds_without_marker_change():
+    state = _state(
+        T=10.0,
+        last_updated="2026-10-21T10:00:00+00:00",
+        orders_meta={
+            "S": {"total_qty": 20, "t_target": 0.0,
+                  "processed_filled_qty": 5, "processed_filled_amount": 50.0},
+        },
+        position_qty=81,
+    )
+    orders = [_amount_row("S", side="매도", qty=10, price=10.0, amount=None,
+                          ts="2026-10-20T09:00:00+00:00")]
+
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=None)
+
+    assert result["T"] == pytest.approx(10.0)
+    assert result["net_invested"] == pytest.approx(6108.47)
+    assert result["orders_meta"]["S"]["processed_filled_qty"] == 5
+    assert result["orders_meta"]["S"]["processed_filled_amount"] == pytest.approx(50.0)
+    assert result.get("_pending_amount_odnos") == ["S"]
+
+
+def test_unconfirmed_then_confirmed_applies_exactly_once():
+    state = _state(T=10.0, net_invested=1000.0)
+    state["orders_meta"] = {
+        "A": {"total_qty": 10, "t_target": 2.0,
+              "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+    }
+    missing = [_amount_row("A", qty=10, amount=None)]
+    update_T_from_history("TQQQ", state, missing, balance_qty=70)
+    assert state.get("_pending_amount_odnos") == ["A"]
+
+    confirmed = [_amount_row("A", qty=10, amount=120.0)]
+    result = update_T_from_history("TQQQ", state, confirmed, balance_qty=70)
+    assert result["T"] == pytest.approx(12.0)
+    assert result["net_invested"] == pytest.approx(1120.0)
+    assert result.get("_pending_amount_odnos") in (None, [])
+
+    # 같은 이력으로 3회 더 실행해도 중복 반영되지 않습니다.
+    for _ in range(3):
+        result = update_T_from_history("TQQQ", result, confirmed, balance_qty=70)
+        assert result["T"] == pytest.approx(12.0)
+        assert result["net_invested"] == pytest.approx(1120.0)
+
+
+def test_unconfirmed_during_full_reinference_holds(monkeypatch):
+    monkeypatch.delenv("FORCE_T_REINFERENCE", raising=False)
+    state = _state(T=0.0, net_invested=0.0, last_updated="")
+    orders = [_amount_row("A", qty=10, amount=None)]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=70)
+    assert result["T"] == pytest.approx(0.0)
+    assert result.get("_settlement_hold") is True
+    assert result.get("_pending_amount_odnos") == ["A"]
+
+
+def test_force_reinference_allows_exception_estimation(monkeypatch):
+    monkeypatch.setenv("FORCE_T_REINFERENCE", "true")
+    state = _state(T=0.0, net_invested=0.0, last_updated="")
+    orders = [_amount_row("A", qty=10, price=10.0, amount=None)]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=70)
+    assert result.get("_settlement_hold") is not True
+    assert result["net_invested"] == pytest.approx(100.0)
+
+
+def test_reverse_unconfirmed_amount_holds_without_marker_change():
+    from state import reconcile_reverse_fills
+
+    state = _state(
+        T=10.0,
+        reverse_mode={"active": True, "cycle_id": "C1"},
+        orders_meta={
+            "R1": {"reverse_action": "sell", "cycle_id": "C1",
+                   "reverse_t_factor": 0.9, "reverse_base_t": 10.0,
+                   "total_qty": 10, "processed_filled_qty": 0,
+                   "processed_filled_amount": 0.0, "applied_fill_fraction": 0.0,
+                   "submitted_at": "20261021081650", "submitted_session": "2026-10-20"},
+        },
+    )
+    before = deepcopy(state)
+    orders = [_amount_row("R1", side="매도", qty=5, amount=None,
+                          ts="2026-10-21T08:16:50+00:00")]
+    reconcile_reverse_fills(state, orders)
+    assert state.get("_settlement_hold") is True
+    assert state.get("_pending_amount_odnos") == ["R1"]
+    assert state["T"] == before["T"]
+    assert state["orders_meta"]["R1"]["applied_fill_fraction"] == 0.0
+    assert state.get("settlement_ledger", {}).get("entries", []) == []
+
+
+def test_has_unconfirmed_amount_fills_only_new_delta():
+    from state import _has_unconfirmed_amount_fills
+
+    state = {"orders_meta": {"A": {"processed_filled_qty": 10}}}
+    orders = [_amount_row("A", qty=10, amount=None)]
+    assert _has_unconfirmed_amount_fills(state, orders) == []
+    orders = [_amount_row("A", qty=12, amount=None)]
+    assert _has_unconfirmed_amount_fills(state, orders) == ["A"]
+
+
+def test_evidence_records_unconfirmed_amount_as_zero():
+    state = _state(T=10.0)
+    orders = [_amount_row("A", qty=10, amount=None)]
+    evidence = trading_bot.build_settlement_evidence(
+        "TQQQ", state, orders, mode="DRY", run_id="R1",
+    )
+    fill = evidence["fills"][0]
+    assert fill["amount"] == 0.0
+    assert fill["amount_confirmed"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-3: 오프라인 전환 매트릭스 + 브로커별 컨벤션
+# ═══════════════════════════════════════════════════════════════════
+def test_offline_transition_no_ledger_applies_buy():
+    state = _state(T=1.0, settlement_ledger=None)
+    orders = [_row("B", "매수", 5, "2026-10-21T09:00:00+00:00")]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=40)
+    assert result["T"] == pytest.approx(1.5)
+    assert result["settlement_ledger"]["entries"]
+
+
+def test_offline_transition_marker_only_same_class_keeps_t():
+    state = _state(
+        T=7.5,
+        settlement_ledger={"start_T": 10.0, "next_seq": 2,
+                           "entries": [{"seq": 1, "kind": "sell", "odno": "S",
+                                        "factor": 0.75}]},
+        sell_t_effects={"S": {"basis": 80, "factor": 0.75}},
+    )
+    orders = [_row("S", "매도", 20, "2026-10-21T09:30:16+00:00", price=72.61)]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=61)
+    assert result.get("_settlement_hold") is not True
+    assert result["T"] == pytest.approx(7.5)
+
+
+def test_offline_transition_position_basis_unknown_blocks_save():
+    state = _state(T=10.0)
+    orders = [_row("S", "매도", 20, "2026-10-21T09:30:16+00:00", price=72.61)]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=None)
+    assert result.get("_position_basis_unknown") is True
+    with pytest.raises(SymbolScopedError):
+        trading_bot._save_settlement_state("TQQQ", result)
+
+
+def test_order_us_session_date_broker_conventions():
+    from state import _order_us_session_date
+
+    # KIS/LS/키움: ord_dt 자체가 미국(ET) 영업일 — KST 시각은 세션을 바꾸지 않음.
+    kis = {"ord_dt": "20261023", "ord_tmd": "013000",
+           "ord_datetime_utc": "2026-10-22T16:30:00+00:00"}
+    assert _order_us_session_date(kis) == "20261023"
+
+    # TOSS/MERITZ: ord_dt는 KST 날짜 → ET 세션으로 환산.
+    toss = {"ord_dt": "20261024", "ord_tmd": "013000", "_ord_dt_is_kst_date": True}
+    assert _order_us_session_date(toss) == "20261023"
+
+
+def test_order_real_kst_date_broker_conventions():
+    from state import _order_real_kst_date
+
+    # KIS: ord_dt(미국영업일)+ord_tmd(KST) → 실제 KST 날짜 복원.
+    kis = {"ord_dt": "20260731", "ord_tmd": "041046"}
+    assert _order_real_kst_date(kis) == "20260801"
+
+    # TOSS/MERITZ: 이미 KST 날짜 — ET round-trip 하지 않음.
+    toss = {"ord_dt": "20261024", "ord_tmd": "013000", "_ord_dt_is_kst_date": True}
+    assert _order_real_kst_date(toss) == "20261024"
+
+
+def test_event_evidence_has_execution_metadata():
+    evidence = trading_bot.build_settlement_evidence(
+        "TQQQ", _state(T=0.0), [], mode="LIVE", run_id="run-9"
+    )
+    assert evidence["run_id"] == "run-9"
+    assert evidence["broker"]
+    assert evidence["code_version"] is not None
+
+
+def test_nhplug_normalizes_to_standard_fields():
+    """NHPLUG도 state 표준 필드(ord_dt/ft_ccld_qty/ft_ccld_amt3/odno)를 제공합니다."""
+    from broker.nhplug.adapter import NHPlugBroker
+
+    broker = object.__new__(NHPlugBroker)
+    row = broker._normalize_order_item({
+        "ord_dt": "20261021", "ord_tmd": "041000", "odno": "NH1",
+        "sll_buy_dvsn_cd_name": "매수", "ft_ord_qty": "10",
+        "ft_ccld_qty": "10", "ft_ccld_unpr3": "10.0",
+        "ft_ccld_amt3": "100.0", "nccs_qty": "0",
+        "prcs_stat_name": "체결", "prdt_name": "TQQQ",
+        "ovrs_excg_cd": "NASD", "tr_crcy_cd": "USD",
+    })
+    assert row["odno"] == "NH1"
+    assert row["ord_dt"] == "20261021"
+    assert row["ft_ccld_qty"] == "10"
+    assert row["ft_ccld_amt3"] == "100.0"
+    assert row["_ord_dt_is_us_trading_date"] is True
+    assert row["sll_buy_dvsn_cd_name"] == "매수"
+
+
+def test_unconfirmed_fill_pushed_before_watermark_is_recovered_once():
+    """금액 미확정으로 밀린 체결이 워터마크 이전이어도 확정 후 1회 반영됩니다.
+
+    A(금액불명, 워터마크 이전·미반영) + B(확정, 이미 반영) 상태에서
+    A 가 나중에 금액 확정되면 A 만 반영되고 재실행은 멱등이어야 합니다.
+    """
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="B",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+            "B": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                  "processed_filled_qty": 1, "processed_filled_amount": 20.0},
+        },
+    )
+    before = deepcopy(state)
+    missing = [
+        _amount_row("A", qty=1, amount=None, ts="2026-10-22T09:00:00+00:00"),
+        _amount_row("B", qty=1, amount=20.0, ts="2026-10-22T10:00:00+00:00"),
+    ]
+
+    held = update_T_from_history("TQQQ", state, missing, balance_qty=2)
+    # 전량 보류: T·순투입금·마커·워터마크 불변
+    assert held["T"] == pytest.approx(before["T"])
+    assert held["net_invested"] == pytest.approx(before["net_invested"])
+    assert held["orders_meta"]["A"] == before["orders_meta"]["A"]
+    assert held["orders_meta"]["B"] == before["orders_meta"]["B"]
+    assert held["last_updated"] == before["last_updated"]
+    assert held["last_processed_ordno"] == before["last_processed_ordno"]
+    assert held.get("_settlement_hold") is True
+    assert held.get("_pending_amount_odnos") == ["A"]
+
+    confirmed = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T09:00:00+00:00"),
+        _amount_row("B", qty=1, amount=20.0, ts="2026-10-22T10:00:00+00:00"),
+    ]
+    first = update_T_from_history("TQQQ", held, confirmed, balance_qty=2)
+    assert first["T"] == pytest.approx(12.0)
+    assert first["net_invested"] == pytest.approx(1060.0)
+    assert first["orders_meta"]["A"]["processed_filled_qty"] == 1
+    assert first["orders_meta"]["A"]["processed_filled_amount"] == pytest.approx(20.0)
+
+    for _ in range(3):
+        first = update_T_from_history("TQQQ", first, confirmed, balance_qty=2)
+        assert first["T"] == pytest.approx(12.0)
+        assert first["net_invested"] == pytest.approx(1060.0)

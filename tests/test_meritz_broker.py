@@ -1397,3 +1397,30 @@ def test_create_broker_supports_meritz(monkeypatch):
     from broker import create_broker
 
     assert "meritz" in inspect.getsource(create_broker)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-3: 취소 만료/이미취소 판별 코드 (5636 / 4062)
+# ═══════════════════════════════════════════════════════════════════
+def test_cancel_expired_order_5636_is_not_accepted(make_broker):
+    """5636(정정·취소 가능 수량 없음) = 만료 — 취소 미접수로 판정합니다."""
+    broker, session = make_broker(
+        [accepted_response(),
+         ok(rsp_cd="5636", rsp_msg="정정,취소 가능 수량이 없습니다")]
+    )
+    order_id = broker.place_order("TQQQ", "OQ", "BUY", 10, 70.0, "LOC").order_id
+    with pytest.raises(OrderNotAcceptedError):
+        broker.cancel_order(order_id)
+    assert len(session.calls) == 2
+
+
+def test_cancel_already_cancelled_order_4062_is_not_accepted(make_broker):
+    """4062(이미 취소된 주문) = 살아있는 주문 아님 — 취소 미접수로 판정합니다."""
+    broker, session = make_broker(
+        [accepted_response(),
+         ok(rsp_cd="4062", rsp_msg="원주문이 취소주문으로 정정,취소 주문이 불가능합니다")]
+    )
+    order_id = broker.place_order("TQQQ", "OQ", "SELL", 10, 70.0, "LOC").order_id
+    with pytest.raises(OrderNotAcceptedError):
+        broker.cancel_order(order_id)
+    assert len(session.calls) == 2

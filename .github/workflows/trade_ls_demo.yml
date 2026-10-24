@@ -24,6 +24,15 @@ on:
         required: false
         type: string
 
+      run_id:
+        description: '실행 식별자 (repository_dispatch payload run_id)'
+        required: false
+        type: string
+      retry_num:
+        description: '재시도 회차 (repository_dispatch payload retry_num)'
+        required: false
+        type: string
+
 jobs:
   trade_ls_demo:
     uses: ./.github/workflows/trade_base.yml
@@ -32,5 +41,7 @@ jobs:
       broker_mode: demo
       trade_mode: ${{ github.event.inputs.trade_mode || github.event.client_payload.trade_mode || '' }}
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
+      run_id: ${{ github.event.inputs.run_id || github.event.client_payload.run_id || '' }}
+      retry_num: ${{ github.event.inputs.retry_num || github.event.client_payload.retry_num || '' }}
 
     secrets: inherit

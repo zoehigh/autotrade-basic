@@ -33,6 +33,14 @@ on:
         description: '복리 재투자 활성화 (true/false) — 비워두면 환경 변수 REINVEST 사용'
         required: false
         type: string
+      run_id:
+        description: '실행 식별자 (기본: github.run_id)'
+        required: false
+        type: string
+      retry_num:
+        description: '재시도 회차 (기본: 0)'
+        required: false
+        type: string
     secrets:
       # KIS secrets (broker=kis 일 때만 사용됨)
       KIS_APP_KEY:
@@ -88,6 +96,9 @@ jobs:
     concurrency:
       group: trade-${{ inputs.broker }}-${{ inputs.broker_mode }}
       cancel-in-progress: false
+    outputs:
+      # 검증 호출부가 **실제 실행 job 과 동일한** TRADE_MODE 를 쓰도록 전달합니다.
+      trade_mode: ${{ steps.resolve.outputs.trade_mode }}
     steps:
       - name: 코드 체크아웃
         uses: actions/checkout@v4
@@ -119,10 +130,13 @@ jobs:
             ${{ inputs.broker == 'kis' && format('state-{0}-', inputs.broker_mode) || '_no-legacy_' }}
 
       - name: Resolve and log inputs
+        id: resolve
         run: |
+          MODE="${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
+          echo "trade_mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
           echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
-          echo "Resolved TRADE_MODE=${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
+          echo "Resolved TRADE_MODE=$MODE"
           echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}"
           echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
           echo "Runner=${{ ((inputs.broker == 'kiwoom' || inputs.broker == 'toss') && inputs.broker_mode == 'real') && format('{0}-real', inputs.broker) || 'ubuntu-latest' }}"
@@ -132,6 +146,10 @@ jobs:
           # 브로커 설정 (일반화)
           BROKER: ${{ inputs.broker || 'kis' }}
           BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+          # 실행 식별자/재시도 회차 — 정산 evidence 와 검증기가 같은 실행을 가리킵니다.
+          RUN_ID: ${{ inputs.run_id || github.run_id }}
+          RETRY_NUM: ${{ inputs.retry_num || '0' }}
+          CODE_VERSION: ${{ github.sha }}
 
           # KIS 인증정보 (environment에서 주입 — broker=kis 일 때만 값이 있음)
           KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
@@ -167,7 +185,7 @@ jobs:
           # 런타임 설정: inputs -> environment vars -> 모드별 기본값 순으로 폴백
           # real 환경은 기본 DRY (fail-safe: 명시적으로 LIVE 선택해야 실전 주문)
           # demo 환경은 기본 LIVE (모의 계좌에서 실제 주문 흐름 테스트)
-          TRADE_MODE: ${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}
+          TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
           # 복수 종목: inputs -> environment vars -> config.py 기본값
           SYMBOLS: ${{ inputs.symbols || vars.SYMBOLS }}
 
@@ -266,9 +284,64 @@ jobs:
 
         run: uv run python trading_bot.py
 
+      - name: 최종 정산 스냅샷 생성
+        if: always()
+        env:
+          BROKER: ${{ inputs.broker || 'kis' }}
+          BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+          TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
+          RUN_ID: ${{ inputs.run_id || github.run_id }}
+          RETRY_NUM: ${{ inputs.retry_num || '0' }}
+          CODE_VERSION: ${{ github.sha }}
+          SYMBOLS: ${{ inputs.symbols || vars.SYMBOLS || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          from ops.verify_run import write_final_snapshot
+
+          write_final_snapshot(
+              f"final-settlement-{os.environ['RUN_ID']}.json",
+              ".state.json",
+              broker=os.environ.get("BROKER", ""),
+              broker_mode=os.environ.get("BROKER_MODE", ""),
+              trade_mode=os.environ.get("TRADE_MODE", ""),
+              run_id=os.environ.get("RUN_ID", ""),
+              retry_num=os.environ.get("RETRY_NUM", ""),
+              code_version=os.environ.get("CODE_VERSION", ""),
+              symbols=[s for s in os.environ.get("SYMBOLS", "").split(",") if s.strip()],
+          )
+          PY
+
       - name: state 캐시 저장
         uses: actions/cache/save@v4
         if: always()
         with:
           path: .state.json
           key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
+
+      - name: 정산 근거 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: settlement-evidence-${{ github.run_id }}
+          path: |
+            settlement-*.json
+            final-settlement-*.json
+          if-no-files-found: warn
+
+  # 정산 근거 독립 검산 — 브로커 계좌 API 호출 없이 evidence 만 검증합니다.
+  verify-settlement:
+    needs: run-trade
+    # 거래 job 이 실패해도 evidence 가 있으면 검증하고, 없으면 검증 불가로 실패합니다.
+    if: always()
+    uses: ./.github/workflows/verify.yml
+    with:
+      broker: ${{ inputs.broker || 'kis' }}
+      broker_mode: ${{ inputs.broker_mode || 'demo' }}
+      # 실제 실행 job 이 확정한 TRADE_MODE 를 그대로 사용합니다 (env 불일치 방지).
+      mode: ${{ needs.run-trade.outputs.trade_mode }}
+      run_id: ${{ inputs.run_id || github.run_id }}
+      retry_num: ${{ inputs.retry_num || '0' }}
+      code_version: ${{ github.sha }}
+      trade_result: ${{ needs.run-trade.result }}
+      artifact_name: settlement-evidence-${{ github.run_id }}

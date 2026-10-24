@@ -35,6 +35,10 @@ if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
     fi
 fi
 
+if (( ${#problems[@]} > 0 )); then
+    rc=1
+fi
+
 if [[ "$rc" != "0" ]]; then
     echo "[verify] 이상 판정 (exit=$rc) → 텔레그램 알림" >> "$LOG"
     if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then

@@ -7,6 +7,7 @@ generate_cycle_report가 전체 이력을 집계해 B안 시드(next_cycle_seed)
 """
 import os
 import sys
+from copy import deepcopy
 from unittest.mock import patch
 
 import pytest
@@ -166,3 +167,182 @@ class TestRepairActionRegistered:
     def test_REPAIR_ACTION_등록(self):
         assert "CYCLE_START_SET" in _REPAIR_ACTIONS
         assert _REPAIR_LEGACY_MAP["CYCLE_START_SET"] == "_set_cycle_start_only"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P0-1: 종료 사이클 후처리 분리 (finalize_completed_cycle)
+# ═══════════════════════════════════════════════════════════════════
+from trading_bot import (  # noqa: E402
+    finalize_completed_cycle,
+    generate_cycle_report,
+)
+from state import reset_settlement_ledger  # noqa: E402
+
+
+def _settled_state():
+    state = _make_tqqq_state(T=0.0, net_invested=0.0, cycle_start_date="")
+    reset_settlement_ledger(state, 0.0)
+    return state
+
+
+def _fill(odno, side, qty, price, ord_dt, ord_tmd="090000"):
+    return {
+        "odno": odno,
+        "sll_buy_dvsn_cd_name": side,
+        "ft_ccld_qty": str(qty),
+        "ft_ccld_unpr3": str(price),
+        "ft_ccld_amt3": str(qty * price),
+        "ord_dt": ord_dt,
+        "ord_tmd": ord_tmd,
+        "ord_datetime_utc": (
+            f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}T"
+            f"{ord_tmd[:2]}:{ord_tmd[2:4]}:{ord_tmd[4:6]}+00:00"
+        ),
+        "prcs_stat_name": "체결",
+    }
+
+
+def test_finalize_sell_only_report_and_seed():
+    state = _settled_state()
+    history = [
+        _fill("B1", "매수", 10, 10.0, "20260901"),
+        _fill("S1", "매도", 10, 12.0, "20260910"),
+        _fill("B2", "매수", 5, 10.0, "20260911"),  # 구간 밖
+    ]
+    result = finalize_completed_cycle(
+        "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+        report={"cycle_start_date": "2026-09-01"},
+    )
+    report = result["report"]
+    assert report["total_buy_amount"] == pytest.approx(100.0)
+    assert report["total_sell_amount"] == pytest.approx(120.0)
+    assert report["net_profit"] == pytest.approx(20.0)
+    assert report["cycle_start_date"] == "2026-09-01"
+    assert report["cycle_end_date"] == "2026-09-10"
+    assert result["next_cycle_seed"] == pytest.approx(1020.0)
+    # 후처리는 T/net/원장을 건드리지 않는다
+    assert state["T"] == 0.0
+    assert state["net_invested"] == 0.0
+    assert state["settlement_ledger"]["entries"] == []
+    assert state["effective_seed"] == 0.0
+
+
+def test_finalize_same_day_new_buy_excluded_from_closed_cycle():
+    """청산 이벤트 이후 같은 날 재매수는 종료 사이클 리포트에서 제외합니다."""
+    state = _settled_state()
+    history = [
+        _fill("B1", "매수", 10, 10.0, "20260901", "090000"),
+        _fill("S1", "매도", 10, 12.0, "20260910", "100000"),
+        _fill("B2", "매수", 2, 11.0, "20260910", "110000"),  # 청산 후 새 사이클
+    ]
+    result = finalize_completed_cycle(
+        "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+        report={"cycle_start_date": "2026-09-01", "cycle_end_date": "2026-09-10"},
+    )
+    report = result["report"]
+    assert report["buy_count"] == 1
+    assert report["total_buy_amount"] == pytest.approx(100.0)
+    assert report["total_sell_amount"] == pytest.approx(120.0)
+    assert report["net_profit"] == pytest.approx(20.0)
+    assert result["next_cycle_seed"] == pytest.approx(1020.0)
+    assert report["liquidation_event"]["odno"] == "S1"
+    assert report["cycle_end_date"] == "2026-09-10"
+
+
+def test_finalize_multi_day_batch_closed_interval():
+    state = _settled_state()
+    history = [
+        _fill("B1", "매수", 10, 10.0, "20260901"),
+        _fill("B2", "매수", 10, 11.0, "20260905"),
+        _fill("S1", "매도", 20, 12.0, "20260908"),
+        _fill("S2", "매도", 1, 12.0, "20260909"),
+        _fill("B3", "매수", 1, 9.0, "20260920"),  # 구간 밖
+    ]
+    result = finalize_completed_cycle(
+        "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+        report={"cycle_start_date": "2026-09-01", "cycle_end_date": "2026-09-10"},
+    )
+    report = result["report"]
+    # S1(20주)에서 청산 → 이후 S2/B3 는 종료 사이클 집계에서 제외
+    assert report["buy_count"] == 2
+    assert report["sell_count"] == 1
+    assert report["total_buy_amount"] == pytest.approx(210.0)
+    assert report["total_sell_amount"] == pytest.approx(240.0)
+    assert report["net_profit"] == pytest.approx(30.0)
+    assert report["liquidation_event"]["odno"] == "S1"
+
+
+def test_finalize_dry_does_not_save_state(monkeypatch):
+    state = _settled_state()
+    history = [_fill("B1", "매수", 10, 10.0, "20260901"),
+               _fill("S1", "매도", 10, 12.0, "20260910")]
+    with patch("trading_bot.save_state") as mock_save:
+        finalize_completed_cycle(
+            "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+            report={"cycle_start_date": "2026-09-01"},
+        )
+    mock_save.assert_not_called()
+
+
+def test_finalize_reinvest_off_returns_reference_seed_but_no_state_write():
+    state = _settled_state()
+    history = [_fill("B1", "매수", 10, 10.0, "20260901"),
+               _fill("S1", "매도", 10, 12.0, "20260910")]
+    result = finalize_completed_cycle(
+        "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+        report={"cycle_start_date": "2026-09-01"},
+    )
+    # 복리 OFF 판단은 호출자 몫 — finalize 는 참고값만 반환하고 state 를 바꾸지 않는다.
+    assert result["next_cycle_seed"] == pytest.approx(1020.0)
+    assert state["effective_seed"] == 0.0
+
+
+def test_finalize_rejects_non_settled_state():
+    state = _make_tqqq_state(T=5.0, net_invested=100.0, cycle_start_date="2026-09-01")
+    with pytest.raises(ValueError, match="T 가 0이 아닙니다"):
+        finalize_completed_cycle(
+            "TQQQ", state, [], seed=1000.0, commission_rate=0.0,
+            report={"cycle_start_date": "2026-09-01"},
+        )
+
+
+def test_generate_cycle_report_does_not_depend_on_state():
+    history = [
+        _fill("B1", "매수", 10, 10.0, "20260901"),
+        _fill("S1", "매도", 10, 12.0, "20260910"),
+        _fill("B2", "매수", 5, 10.0, "20260911"),
+    ]
+    report = generate_cycle_report(
+        "TQQQ", history, "2026-09-01", "2026-09-10", 1000.0, 0.0
+    )
+    assert report["buy_count"] == 1
+    assert report["sell_count"] == 1
+
+
+def test_finalize_unsettled_new_cycle_preserves_state():
+    """같은 실행에서 시작된 새 사이클 상태(T/순투입/보유)는 보존하고 리포트만 만든다."""
+    state = _make_tqqq_state(T=1.0, net_invested=200.0, cycle_start_date="2026-09-10")
+    state["position_qty"] = 20
+    state["settlement_ledger"] = {"start_T": 0.0, "next_seq": 2,
+                                  "entries": [{"seq": 1, "kind": "buy",
+                                               "odno": "N1", "delta": 1.0}]}
+    before = deepcopy(state)
+    history = [
+        _fill("B1", "매수", 10, 10.0, "20260901", "090000"),
+        _fill("S1", "매도", 10, 12.0, "20260910", "100000"),
+        _fill("N1", "매수", 20, 10.0, "20260910", "110000"),  # 새 사이클 매수
+    ]
+    result = finalize_completed_cycle(
+        "TQQQ", state, history, seed=1000.0, commission_rate=0.0,
+        report={"cycle_start_date": "2026-09-01"}, require_settled=False,
+    )
+    report = result["report"]
+    assert report["cycle_end_date"] == "2026-09-10"
+    assert report["buy_count"] == 1
+    assert report["net_profit"] == pytest.approx(20.0)
+    assert result["next_cycle_seed"] == pytest.approx(1020.0)
+    assert state["T"] == before["T"] == 1.0
+    assert state["net_invested"] == before["net_invested"] == 200.0
+    assert state["position_qty"] == before["position_qty"] == 20
+    assert state["cycle_start_date"] == before["cycle_start_date"]
+    assert state["settlement_ledger"] == before["settlement_ledger"]

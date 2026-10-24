@@ -147,6 +147,27 @@ class Broker(ABC):
         """
         pass
 
+    # 열린 주문 조회 지원 여부 — 기본 False. 지원 브로커(TOSS)만 True 로 재정의합니다.
+    supports_open_orders_query = False
+
+    def get_open_orders(
+        self,
+        symbol: str,
+        exchange: str,
+        days: int = 30,
+        limit: int = 100,
+    ) -> list[dict]:
+        """미체결(열린) 주문만 조회합니다.
+
+        기본 구현은 빈 리스트입니다 — CLOSED 이력만 제공하는 브로커는
+        `_cancel_open_bot_orders` 가 기존 `get_order_history` 경로만 사용합니다.
+        """
+        print(
+            f"[경고] {getattr(self, 'name', type(self).__name__)} 는 "
+            f"get_open_orders 를 지원하지 않습니다 — 빈 목록을 반환합니다."
+        )
+        return []
+
     # ── 일봉 종가 ──────────────────────────────────────────────────────
 
     @abstractmethod
@@ -274,6 +295,14 @@ class DryBroker(Broker):
         days: int = 30, verbose: bool = False, limit: int = 100,
     ) -> list[dict]:
         return self._real.get_order_history(symbol, exchange, days, verbose, limit)
+
+    def get_open_orders(
+        self, symbol: str, exchange: str, days: int = 30, limit: int = 100,
+    ) -> list[dict]:
+        target = getattr(self._real, "get_open_orders", None)
+        if callable(target):
+            return target(symbol, exchange, days=days, limit=limit)
+        return []
 
     # ── 일봉 종가: 실제 브로커에 위임 ──
     def get_daily_closes(

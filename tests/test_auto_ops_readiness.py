@@ -210,3 +210,297 @@ def test_reverse_buy_without_cap_keeps_star_price(monkeypatch):
     assert len(buys) == 1
     # 별지점 50 - 0.01 = 49.99, 상한 45 × 1.19 = 53.55 → 캡 없음
     assert buys[0]["price"] == 49.99
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1-2: evidence 파일 검증 단일 진입점 (계좌 API 호출 없음)
+# ═══════════════════════════════════════════════════════════════════
+import json
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.append(str(_Path(__file__).resolve().parents[1] / "ops"))
+import verify_run  # noqa: E402
+
+
+def _evidence(**overrides):
+    evidence = {
+        "symbol": "TQQQ",
+        "run_id": "run-1",
+        "retry_num": "0",
+        "mode": "LIVE",
+        "broker": "meritz",
+        "broker_mode": "real",
+        "code_version": "abc123",
+        "max_t": None,
+        "evidence_version": 2,
+        "settlement_mode": "full_reinference",
+        "balance_qty": 0,
+        "basis_unknown": False,
+        "hold_reason": "",
+        "T_before": 0.0,
+        "net_invested_before": 0.0,
+        "T_after": 0.0,
+        "net_invested_after": 0.0,
+        "watermark_before": "",
+        "ledger_before": {},
+        "ledger_after": {"start_T": 0.0, "next_seq": 1, "entries": []},
+        "orders_meta_before": {},
+        "orders_meta_after": {},
+        "orders": [],
+        "fills": [],
+        "skipped_fills": [],
+        "last_updated": "",
+        "last_processed_ordno_before": "",
+        "sell_t_effects": {},
+        "sell_t_effects_before": {},
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def _write(tmp_path, evidence, name="settlement-TQQQ-test.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps(evidence))
+    return path
+
+
+def test_verify_evidence_file_passes_clean_evidence(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "meritz", "LIVE", run_id="run-1"
+    )
+    assert ok is True, problems
+    assert problems == []
+
+
+def test_verify_evidence_file_fails_when_missing(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        tmp_path / "missing.json", "meritz", "LIVE"
+    )
+    assert ok is False
+    assert any("없음" in p for p in problems)
+
+
+def test_verify_evidence_file_detects_tamper(tmp_path):
+    evidence = _evidence(T_after=1.0)
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, evidence), "meritz", "LIVE"
+    )
+    assert ok is False
+    assert any("T 불일치" in p for p in problems)
+
+
+def test_verify_evidence_file_detects_run_id_mismatch(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "meritz", "LIVE", run_id="run-2"
+    )
+    assert ok is False
+    assert any("run_id 불일치" in p for p in problems)
+
+
+def test_verify_evidence_file_detects_broker_or_mode_mismatch(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "kis", "DRY"
+    )
+    assert ok is False
+    assert any("broker 불일치" in p for p in problems)
+    assert any("mode 불일치" in p for p in problems)
+
+
+def test_verify_evidence_file_makes_no_network_calls(tmp_path, monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("검증기가 브로커/네트워크를 호출했습니다")
+
+    monkeypatch.setattr(verify_run, "MeritzBroker", _boom)
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "meritz", "LIVE"
+    )
+    assert ok is True, problems
+
+
+def test_hold_evidence_has_reason_and_is_not_saved(monkeypatch):
+    import trading_bot
+    from state import _mark_settlement_hold
+
+    state = {"T": 10.0, "net_invested": 1000.0, "orders_meta": {}}
+    _mark_settlement_hold(state, "금액 미확정")
+    state["pending_order_intent"] = {"id": "I"}
+    state["pending_order_batch"] = {"id": "B"}
+    evidence = trading_bot.build_settlement_evidence(
+        "TQQQ", state, [], mode="LIVE", run_id="run-1"
+    )
+    assert evidence["basis_unknown"] is True
+    assert evidence["hold_reason"] == "금액 미확정"
+
+    monkeypatch.setattr(trading_bot, "save_state", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("hold 상태에서 save_state 호출")
+    ))
+    with pytest.raises(SymbolScopedError):
+        trading_bot._save_settlement_state("TQQQ", state)
+    # fence 는 보존됩니다 (자동 재제출 금지).
+    assert state["pending_order_intent"] == {"id": "I"}
+    assert state["pending_order_batch"] == {"id": "B"}
+
+
+def test_verify_evidence_file_fails_on_missing_metadata(tmp_path):
+    evidence = _evidence()
+    evidence.pop("broker")
+    evidence.pop("mode")
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, evidence), "meritz", "LIVE"
+    )
+    assert ok is False
+    assert any("broker 필드" in p for p in problems)
+    assert any("mode 필드" in p for p in problems)
+
+
+# ── P1-2 보완: 실제 모드/실패 후 검증/최종값 대조 ────────────────────
+def test_verify_evidence_file_detects_missing_code_version(tmp_path):
+    evidence = _evidence()
+    evidence.pop("code_version")
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, evidence), "meritz", "LIVE",
+        code_version="abc123",
+    )
+    assert ok is False
+    assert any("code_version" in p for p in problems)
+
+
+def test_verify_evidence_file_detects_broker_mode_and_retry_mismatch(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "meritz", "LIVE",
+        broker_mode="demo", retry_num="1", code_version="abc123",
+    )
+    assert ok is False
+    assert any("broker_mode 불일치" in p for p in problems)
+    assert any("retry_num 불일치" in p for p in problems)
+
+
+def test_verify_evidence_file_compares_final_state(tmp_path):
+    evidence = _evidence(T_after=2.0, net_invested_after=200.0)
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, evidence), "meritz", "LIVE",
+        final_state={"T": 1.0, "net_invested": 200.0},
+    )
+    assert ok is False
+    assert any("최종 저장 T 불일치" in p for p in problems)
+
+
+def test_verify_evidence_file_allows_max_t_correction(tmp_path):
+    evidence = _evidence(
+        T_before=25.0, net_invested_before=200.0,
+        T_after=25.0, net_invested_after=200.0, max_t=20.0,
+        settlement_mode="incremental",
+        ledger_before={},
+        ledger_after={"start_T": 25.0, "next_seq": 1, "entries": []},
+    )
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, evidence), "meritz", "LIVE",
+        final_state={"T": 20.0, "net_invested": 200.0},
+    )
+    assert ok is True, problems
+
+
+def test_write_final_snapshot_and_dir_completeness(tmp_path):
+    state_file = tmp_path / ".state.json"
+    state_file.write_text(json.dumps({
+        "TQQQ": {"T": 1.0, "net_invested": 100.0, "last_updated": "u1",
+                 "cycle_start_date": "2026-09-01", "position_qty": 10},
+        "SOXL": {"T": 0.0, "net_invested": 0.0, "last_updated": "u2",
+                 "cycle_start_date": "", "position_qty": 0},
+    }))
+    snap_path = tmp_path / "final-settlement-run-1.json"
+    verify_run.write_final_snapshot(
+        snap_path, state_file, broker="meritz", broker_mode="real",
+        trade_mode="LIVE", run_id="run-1", retry_num="0",
+        code_version="abc123", symbols=["TQQQ:NAS", "SOXL:AMS"],
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    _write(evidence_dir, _evidence())  # TQQQ 만 있음
+
+    ok, problems = verify_run.verify_evidence_dir(
+        evidence_dir, "meritz", "LIVE", run_id="run-1",
+        retry_num="0", code_version="abc123", broker_mode="real",
+        snapshot_path=snap_path,
+    )
+    assert ok is False
+    assert any("종목별 evidence 누락" in p and "SOXL" in p for p in problems)
+
+
+def test_verify_evidence_dir_passes_with_snapshot_and_skips_dry_final_state(tmp_path):
+    state_file = tmp_path / ".state.json"
+    state_file.write_text(json.dumps({
+        "TQQQ": {"T": 99.0, "net_invested": 999.0},
+    }))
+    snap_path = tmp_path / "final-settlement-run-1.json"
+    verify_run.write_final_snapshot(
+        snap_path, state_file, broker="meritz", broker_mode="demo",
+        trade_mode="DRY", run_id="run-1", retry_num="0",
+        code_version="abc123", symbols=["TQQQ"],
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    _write(evidence_dir, _evidence(mode="DRY", broker_mode="demo"))
+
+    ok, problems = verify_run.verify_evidence_dir(
+        evidence_dir, "meritz", "DRY", run_id="run-1",
+        retry_num="0", code_version="abc123", broker_mode="demo",
+        snapshot_path=snap_path,
+    )
+    assert ok is True, problems
+
+
+def test_verify_evidence_dir_fails_without_snapshot(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    _write(evidence_dir, _evidence())
+    ok, problems = verify_run.verify_evidence_dir(
+        evidence_dir, "meritz", "LIVE", run_id="run-1"
+    )
+    assert ok is False
+    assert any("최종 저장 스냅샷이 없습니다" in p for p in problems)
+
+
+def test_verify_evidence_file_fails_without_actual_mode(tmp_path):
+    ok, problems = verify_run.verify_evidence_file(
+        _write(tmp_path, _evidence()), "meritz", ""
+    )
+    assert ok is False
+    assert any("실행 모드가 전달되지 않았습니다" in p for p in problems)
+
+
+def test_verify_evidence_dir_uses_latest_retry_file_per_symbol(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    # 이전 회차는 일부러 최종값과 불일치 — 최신 파일만 대조되는지 확인합니다.
+    _write(
+        evidence_dir,
+        _evidence(T_after=99.0),
+        name="settlement-TQQQ-20260101T000000Z.json",
+    )
+    _write(
+        evidence_dir,
+        _evidence(T_after=0.0),
+        name="settlement-TQQQ-20260102T000000Z.json",
+    )
+    state_file = tmp_path / ".state.json"
+    state_file.write_text(json.dumps({"TQQQ": {"T": 0.0, "net_invested": 0.0}}))
+    verify_run.write_final_snapshot(
+        evidence_dir / "final-settlement-run-1.json",
+        state_file, broker="meritz", broker_mode="real", trade_mode="LIVE",
+        run_id="run-1", retry_num="0", code_version="abc123", symbols=["TQQQ"],
+    )
+    ok, problems = verify_run.verify_evidence_dir(
+        evidence_dir, "meritz", "LIVE", run_id="run-1",
+        retry_num="0", code_version="abc123", broker_mode="real",
+    )
+    assert ok is True, problems
+
+
+def test_verify_evidence_dir_fails_without_any_evidence(tmp_path):
+    ok, problems = verify_run.verify_evidence_dir(
+        tmp_path, "meritz", "LIVE", run_id="run-1"
+    )
+    assert ok is False
+    assert any("정산 근거 파일이 없습니다" in p for p in problems)

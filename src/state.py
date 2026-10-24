@@ -3,6 +3,7 @@
 # 프로그램이 종료되어도 T값을 잃지 않도록 JSON 파일에 보관합니다.
 import hashlib
 import json
+import math
 import os
 import tempfile
 from copy import deepcopy
@@ -115,6 +116,12 @@ def load_state(symbol):
     # position_qty: 워터마크 시점의 보유수량. 매도 비율 판정의 기준선으로 쓰이며,
     # 잔고 조회가 실패한 실행에서도 이 값으로 분류할 수 있게 합니다.
     position_qty = state.get("position_qty")
+    # sell_t_effects: 매도 T 효과 요약 (주문별 기준선/적용 배율).
+    # 정본은 settlement_ledger 이며, 이 필드는 기존 상태/도구 호환용입니다.
+    sell_t_effects = state.get("sell_t_effects", {})
+    # settlement_ledger: T 의 덧셈(매수)/곱셈(매도)을 적용 순서대로 담은 원장.
+    # 재시작 후에도 반드시 함께 로드해야 부분체결 재분류가 같은 결과를 냅니다.
+    settlement_ledger = state.get("settlement_ledger", {})
 
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
     return {
@@ -134,6 +141,8 @@ def load_state(symbol):
         "pending_order_intent": pending_order_intent,
         "pending_order_batch": pending_order_batch,
         "position_qty": position_qty,
+        "sell_t_effects": sell_t_effects,
+        "settlement_ledger": settlement_ledger,
         "_net_invested_missing": net_invested_missing,
     }
 
@@ -190,6 +199,8 @@ def save_state(symbol, state_dict):
         "position_qty": state_dict.get("position_qty"),
         # 매도 T 효과 원장 — 주문별 기준선/적용 배율 (일괄·부분 반영 결과 일치)
         "sell_t_effects": state_dict.get("sell_t_effects", {}),
+        # 순서 원장 — 적용 순서(seq)를 가진 T 연산 기록 (정본)
+        "settlement_ledger": state_dict.get("settlement_ledger", {}),
     }
 
     state_dir = os.path.dirname(_STATE_FILE)
@@ -240,6 +251,7 @@ def canonical_state_hash(state):
         "pending_order_batch": state.get("pending_order_batch"),
         "position_qty": state.get("position_qty"),
         "sell_t_effects": state.get("sell_t_effects", {}),
+        "settlement_ledger": state.get("settlement_ledger", {}),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -281,14 +293,54 @@ def _order_real_kst_date(order):
     ord_tmd = str(order.get("ord_tmd", ""))
     if not ord_dt or not ord_tmd:
         return ord_dt
-    # ord_dt가 이미 KST 날짜인 브로커(메리츠)는 ET round-trip 복원을 건너뜁니다.
-    # `_ord_dt_is_kst_date`는 메리츠 어댑터만 설정하므로 다른 브로커는 영향 없음.
+    # ord_dt가 이미 KST 날짜인 브로커(메리츠/TOSS)는 ET round-trip 복원을 건너뜁니다.
+    # `_ord_dt_is_kst_date`는 메리츠/TOSS 어댑터가 설정하므로 다른 브로커는 영향 없음.
     if order.get("_ord_dt_is_kst_date"):
         return ord_dt
     resolved = resolve_real_kst_from_ord(ord_dt, ord_tmd)
     if resolved is None:
         return ord_dt
     return resolved.strftime("%Y%m%d")
+
+
+def _order_us_session_date(order):
+    """주문이 속한 미국(ET) 세션 날짜(YYYYMMDD)를 반환합니다.
+
+    브로커별 ord_dt 컨벤션이 다릅니다 (KIS/LS/키움/NHPLUG=미국 영업일,
+    MERITZ/TOSS=KST 날짜). KST 자정을 넘는 주문도 같은 세션으로 판정해야
+    잔여 주문 취소 대상 선정이 정확합니다.
+
+    - KIS 계열: ord_dt 자체가 미국 영업일 = 세션 날짜입니다.
+      (ord_datetime_utc는 상태 호환상 하루 앞선 규칙을 유지하므로 쓰지 않습니다)
+    - MERITZ/TOSS(`_ord_dt_is_kst_date`): ord_dt+ord_tmd를 KST로 해석해
+      ET 날짜로 환산합니다.
+    - 시각 정보가 부족하면 ord_datetime_utc의 ET 날짜를 씁니다.
+    - 판단 불가하면 None을 반환합니다 (호출 측이 KST 날짜 비교로 대체).
+    """
+    ord_dt = str(order.get("ord_dt", "") or "")
+    ord_tmd = str(order.get("ord_tmd", "") or "")
+    et_tz = ZoneInfo("America/New_York")
+    if order.get("_ord_dt_is_kst_date"):
+        if ord_dt and ord_tmd:
+            try:
+                kst_dt = datetime.strptime(
+                    ord_dt + ord_tmd.zfill(6), "%Y%m%d%H%M%S"
+                ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                return kst_dt.astimezone(et_tz).strftime("%Y%m%d")
+            except Exception:
+                pass
+    elif ord_dt and len(ord_dt) == 8 and ord_dt.isdigit() and "ord_tmd" in order:
+        return ord_dt
+    odt_iso = order.get("ord_datetime_utc")
+    if odt_iso:
+        try:
+            parsed = datetime.fromisoformat(str(odt_iso))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+            return parsed.astimezone(et_tz).strftime("%Y%m%d")
+        except Exception:
+            return None
+    return None
 
 
 def _is_reverse_order(state, odno, order=None):
@@ -364,6 +416,7 @@ def reconcile_reverse_fills(state, order_history):
     누적 체결수량을 비교합니다. 따라서 부분체결이 다음 실행에서 증가해도
     이미 반영한 수량을 다시 반영하지 않습니다.
     """
+    hold_snapshot = deepcopy(state)
     orders_meta = state.get("orders_meta", {})
     history_by_odno = {}
     for order in order_history:
@@ -452,18 +505,20 @@ def reconcile_reverse_fills(state, order_history):
     confirmed_sell_days = []
     confirmed_sell_proceeds = float(reverse_mode.get("cumulative_sell_proceeds", 0.0))
     net_invested = float(state.get("net_invested", 0.0))
-
     def _filled(order):
         try:
             return float(order.get("ft_ccld_qty", "0") or 0)
         except (TypeError, ValueError):
             return 0.0
 
+    pending_amount_odnos = []
     for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=lambda item: (item[0], item[1])):
-        fill_fraction = min(filled_qty / total_qty, 1.0)
         observed_fraction = min(filled_qty / total_qty, 1.0)
-        delta_fraction = 0.0
         action = meta.get("reverse_action")
+        # 금액 미확정 체결은 마커/원장을 진행시키지 않고 전체 reconcile 을 보류합니다.
+        if filled_qty > processed_qty and not _fill_amount_is_available(order):
+            pending_amount_odnos.append(str(odno))
+            continue
         delta_amount = 0.0
         try:
             cumulative_amount = float(order.get("ft_ccld_amt3", "0"))
@@ -474,12 +529,91 @@ def reconcile_reverse_fills(state, order_history):
         if action == "sell":
             factor = float(meta.get("reverse_t_factor", 1.0))
             previous_fraction = min(float(meta.get("applied_fill_fraction", 0.0)), 1.0)
-            delta_fraction = max(0.0, observed_fraction - previous_fraction)
+            # 누적 체결 비율은 **감소하지 않습니다**. 브로커 응답이 일시적으로
+            # 적은 수량을 주더라도 이미 반영한 T를 되돌리지 않습니다.
+            effective_fraction = max(previous_fraction, observed_fraction)
+            delta_fraction = max(0.0, effective_fraction - previous_fraction)
+            if not meta.get("reverse_base_t"):
+                if previous_fraction > 0:
+                    # 이미 일부 반영됐는데 기준선이 없으면 역산하지 않습니다.
+                    _mark_settlement_hold(
+                        state,
+                        f"리버스 매도 {odno} 기준선(reverse_base_t)이 없고 "
+                        f"{previous_fraction:.2f} 비율이 이미 반영됐습니다",
+                    )
+                    continue
+                meta["reverse_base_t"] = float(state.get("T", 0.0))
+                print(
+                    f"  [정보] 리버스 주문 {odno} 에 reverse_base_t가 없습니다 "
+                    f"(미반영 주문) → 현재 T를 기준선으로 사용합니다"
+                )
             base_t = float(meta.get("reverse_base_t", state.get("T", 0.0)))
-            state["T"] = float(state.get("T", 0.0)) - base_t * (1.0 - factor) * delta_fraction
+            # 마커(반영 비율)와 원장 항목이 서로 어긋나면 자동 보정하지 않고 보류합니다.
+            existing_entries = [
+                e for e in (_ensure_settlement_ledger(state).get("entries") or [])
+                if e.get("kind") == "reverse_sell" and str(e.get("odno")) == str(odno)
+            ]
+            last_ledger_fraction = 0.0
+            mismatch = False
+            checked_ledger = False
+            for e in existing_entries:
+                if "applied_before" not in e or "fill_fraction" not in e:
+                    continue
+                checked_ledger = True
+                fb = float(e.get("applied_before", 0.0) or 0.0)
+                ff = float(e.get("fill_fraction", 0.0) or 0.0)
+                last_ledger_fraction = max(last_ledger_fraction, ff)
+                expected_entry_delta = round(
+                    -base_t * (1.0 - factor) * max(0.0, ff - fb), 4
+                )
+                if abs(float(e.get("delta", 0.0) or 0.0) - expected_entry_delta) > 0.01:
+                    mismatch = True
+            if checked_ledger and last_ledger_fraction < previous_fraction - 1e-9:
+                mismatch = True
+            if mismatch:
+                _mark_settlement_hold(
+                    state,
+                    f"리버스 매도 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
+                )
+                continue
+            ledger_entry = None
+            t_delta = 0.0
+            if delta_fraction > 1e-12:
+                # 증가분만 새 seq 항목으로 기록합니다. 기존 항목을 덮어쓰면
+                # 체결이 줄어든 응답에서 T가 역행합니다.
+                delta = round(-base_t * (1.0 - factor) * delta_fraction, 4)
+                _bootstrap_settlement_start(state, float(state.get("T", 0.0)))
+                ledger_entry = _append_settlement_entry(
+                    state, "reverse_sell", odno, delta=delta
+                )
+                ledger_entry["base_t"] = round(base_t, 4)
+                ledger_entry["factor"] = factor
+                ledger_entry["applied_before"] = previous_fraction
+                ledger_entry["fill_fraction"] = effective_fraction
+                state["T"] = max(0.0, _replay_settlement_ledger(state))
+                t_delta = delta
             confirmed_sell_proceeds += delta_amount
             # 리버스 매도 체결 → 순투입 감소 (매도대금 회수)
             net_invested -= delta_amount
+            if filled_qty > processed_qty or delta_amount > 0:
+                state.setdefault("_reverse_settlement_deltas", []).append({
+                    "odno": str(odno),
+                    "side": "매도",
+                    "qty_delta": max(0, filled_qty - processed_qty),
+                    "amount_delta": delta_amount,
+                    "reverse": True,
+                    "reverse_base_t": float(meta.get("reverse_base_t", 0.0) or 0.0),
+                    "reverse_factor": float(
+                        meta.get("reverse_t_factor", 1.0)
+                        if meta.get("reverse_t_factor") is not None else 1.0
+                    ),
+                    "fill_fraction": effective_fraction,
+                    "fill_fraction_delta": delta_fraction,
+                    "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                    "ledger_delta": t_delta,
+                    "t_delta": t_delta,
+                })
             terminal = _is_terminal_reverse_order(order)
             status = str(order.get("prcs_stat_name", ""))
             if filled_qty > 0 and terminal and "거부" not in status:
@@ -488,10 +622,65 @@ def reconcile_reverse_fills(state, order_history):
                 meta["terminal"] = True
         elif action == "buy":
             previous_fraction = min(float(meta.get("applied_fill_fraction", 0.0)), 1.0)
-            delta_fraction = max(0.0, observed_fraction - previous_fraction)
-            state["T"] = float(state.get("T", 0.0)) + float(meta.get("reverse_t_target", 0.0)) * delta_fraction
+            effective_fraction = max(previous_fraction, observed_fraction)
+            delta_fraction = max(0.0, effective_fraction - previous_fraction)
+            target = float(meta.get("reverse_t_target", 0.0) or 0.0)
+            existing_entries = [
+                e for e in (_ensure_settlement_ledger(state).get("entries") or [])
+                if e.get("kind") == "reverse_buy" and str(e.get("odno")) == str(odno)
+            ]
+            last_ledger_fraction = 0.0
+            mismatch = False
+            checked_ledger = False
+            for e in existing_entries:
+                if "applied_before" not in e or "fill_fraction" not in e:
+                    continue
+                checked_ledger = True
+                fb = float(e.get("applied_before", 0.0) or 0.0)
+                ff = float(e.get("fill_fraction", 0.0) or 0.0)
+                last_ledger_fraction = max(last_ledger_fraction, ff)
+                expected_entry_delta = round(target * max(0.0, ff - fb), 4)
+                if abs(float(e.get("delta", 0.0) or 0.0) - expected_entry_delta) > 0.01:
+                    mismatch = True
+            if checked_ledger and last_ledger_fraction < previous_fraction - 1e-9:
+                mismatch = True
+            if mismatch:
+                _mark_settlement_hold(
+                    state,
+                    f"리버스 매수 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
+                )
+                continue
+            ledger_entry = None
+            t_delta = 0.0
+            if target and delta_fraction > 1e-12:
+                delta = round(target * delta_fraction, 4)
+                _bootstrap_settlement_start(state, float(state.get("T", 0.0)))
+                ledger_entry = _append_settlement_entry(
+                    state, "reverse_buy", odno, delta=delta
+                )
+                ledger_entry["target"] = round(target, 4)
+                ledger_entry["applied_before"] = previous_fraction
+                ledger_entry["fill_fraction"] = effective_fraction
+                state["T"] = _replay_settlement_ledger(state)
+                t_delta = delta
             # 리버스 쿼터매수 체결 → 순투입 증가
             net_invested += delta_amount
+            if filled_qty > processed_qty or delta_amount > 0:
+                state.setdefault("_reverse_settlement_deltas", []).append({
+                    "odno": str(odno),
+                    "side": "매수",
+                    "qty_delta": max(0, filled_qty - processed_qty),
+                    "amount_delta": delta_amount,
+                    "reverse": True,
+                    "is_additional": True,
+                    "reverse_t_target": target,
+                    "fill_fraction": effective_fraction,
+                    "fill_fraction_delta": delta_fraction,
+                    "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                    "ledger_delta": t_delta,
+                    "t_delta": t_delta,
+                })
             if _is_terminal_reverse_order(order):
                 meta["terminal"] = True
 
@@ -500,7 +689,10 @@ def reconcile_reverse_fills(state, order_history):
         )
         meta["applied_fill_fraction"] = min(
             1.0,
-            float(meta.get("applied_fill_fraction", 0.0)) + delta_fraction,
+            max(
+                float(meta.get("applied_fill_fraction", 0.0)),
+                observed_fraction,
+            ),
         )
         try:
             meta["processed_filled_amount"] = max(
@@ -574,10 +766,26 @@ def reconcile_reverse_fills(state, order_history):
             reverse_mode.pop("reconciliation_error", None)
         else:
             state["reverse_mode"] = {}
+    if pending_amount_odnos:
+        state.clear()
+        state.update(hold_snapshot)
+        state["_pending_amount_odnos"] = pending_amount_odnos
+        _mark_settlement_hold(
+            state,
+            f"리버스 체결금액 미확정 주문 {len(pending_amount_odnos)}건 "
+            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 후 재실행 필요",
+        )
+        return
+    if state.get("_settlement_hold"):
+        reason = state.get("_settlement_hold_reason", "리버스 정산 근거 부족")
+        state.clear()
+        state.update(hold_snapshot)
+        _mark_settlement_hold(state, reason)
+        return
     print(f"  → 리버스 체결 reconciliation 완료: T={state['T']}, day_count={reverse_mode.get('day_count', 0)}")
 
 
-def update_T_from_history(symbol, state, order_history, balance_qty=None):
+def _update_T_from_history_impl(symbol, state, order_history, balance_qty=None):
     """
     주문 이력을 바탕으로 T값을 업데이트합니다.
 
@@ -609,6 +817,10 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
         dict: 업데이트된 state (입력과 동일한 객체)
     """
     symbol = symbol.upper()
+    state.pop("_settlement_mode", None)
+    state.pop("_pending_amount_odnos", None)
+    state["_reverse_settlement_deltas"] = []
+    state["_settlement_deltas"] = []
     last_updated = state.get("last_updated", "")
     last_processed_ordno = state.get("last_processed_ordno", "")
 
@@ -647,6 +859,19 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
         else:
             state["net_invested"] = 0.0
 
+    # 정산 시작 전 원장 상태를 점검합니다. 불일치하면 자동 adjust 를 만들지 않고
+    # 기존 보류/원상복구 경로로 넘깁니다.
+    # 전체 재추정(T-estimation-suspected-low, last_updated 없음)은 의도적 재구성이므로
+    # 이 점검 대상이 아닙니다.
+    intentional_rebuild = (
+        state.get("balance_mismatch", {}).get("note") == "T-estimation-suspected-low"
+    )
+    if last_updated_dt is not None and not intentional_rebuild:
+        ledger_ok, ledger_reason = _audit_settlement_start(state)
+        if not ledger_ok:
+            _mark_settlement_hold(state, ledger_reason)
+            return state
+
     if last_updated_dt is None:
         # 초기 모드: 전체 이력에서 T를 처음부터 재계산합니다
         reverse_baseline_t = state.get("T", 0.0)
@@ -660,7 +885,14 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
         state = _infer_T_from_full_history(symbol, state, order_history)
         if has_reverse_meta:
             state["T"] = reverse_baseline_t
+            # 리버스 기준 T로 되돌렸으므로 비리버스 재추정 원장은 폐기합니다.
+            reset_settlement_ledger(state, reverse_baseline_t)
         reconcile_reverse_fills(state, order_history)
+        if state.get("_settlement_hold"):
+            return state
+        state["_settlement_deltas"].extend(
+            state.pop("_reverse_settlement_deltas", [])
+        )
         return state
 
     # Safety net: T 오추정 상태에서 orders_meta가 있으면 full 재추정
@@ -696,7 +928,15 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
         candidate_state = _infer_T_from_full_history(symbol, candidate_state, order_history)
         if has_reverse_meta:
             candidate_state["T"] = reverse_baseline_t
+            reset_settlement_ledger(candidate_state, reverse_baseline_t)
         reconcile_reverse_fills(candidate_state, order_history)
+        if candidate_state.get("_settlement_hold"):
+            state.clear()
+            state.update(candidate_state)
+            return state
+        candidate_state["_settlement_deltas"].extend(
+            candidate_state.pop("_reverse_settlement_deltas", [])
+        )
         inferred_T = float(candidate_state.get("T", 0.0) or 0.0)
 
         if inferred_T <= 0 and balance_qty is None:
@@ -717,9 +957,36 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
     # 계산은 수행하되 _position_basis_unknown 플래그를 남기고,
     # 저장 직전에 trading_bot 이 이 플래그를 확인해 저장을 막습니다.
     reconcile_reverse_fills(state, order_history)
-    return _apply_recent_history_dt(
+    if state.get("_settlement_hold"):
+        return state
+    updated_state, pending_amount_odnos = _apply_recent_history_dt(
         symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty
     )
+    if pending_amount_odnos:
+        updated_state["_pending_amount_odnos"] = pending_amount_odnos
+    return updated_state
+
+
+def update_T_from_history(symbol, state, order_history, balance_qty=None):
+    """T 갱신 진입점 — 정산 보류 시 상태를 원상복구합니다.
+
+    적용 순서 근거가 없어 T를 재계산하면 안 되는 경우(`_settlement_hold`)에는
+    T·순투입·마커·워터마크·원장 변경을 **하나도 저장하지 않습니다**.
+    (호출부가 `_save_settlement_state()`로 저장을 막고, 여기서는 메모리도 되돌립니다)
+    """
+    state.pop("_settlement_hold", None)
+    state.pop("_settlement_hold_reason", None)
+    snapshot = deepcopy(state)
+    result = _update_T_from_history_impl(symbol, state, order_history, balance_qty=balance_qty)
+    if isinstance(result, dict) and result.get("_settlement_hold"):
+        reason = result.get("_settlement_hold_reason", "정산 근거 부족")
+        pending = list(result.get("_pending_amount_odnos") or [])
+        result.clear()
+        result.update(snapshot)
+        _mark_settlement_hold(result, reason)
+        if pending:
+            result["_pending_amount_odnos"] = pending
+    return result
 
 
 def _compute_net_qty_up_to(order_history, cutoff_dt):
@@ -745,6 +1012,7 @@ def _compute_net_qty_up_to(order_history, cutoff_dt):
         filled = int(float(o.get("ft_ccld_qty", "0")))
         if filled <= 0:
             continue
+        # 수량 기준 계산에는 금액 확정이 필요 없습니다 (미확정 금액은 0으로 취급).
         side = o.get("sll_buy_dvsn_cd_name", "")
         if side == "매수":
             qty += filled
@@ -754,11 +1022,128 @@ def _compute_net_qty_up_to(order_history, cutoff_dt):
 
 
 def _fill_amount(order):
-    """주문 이력 항목의 체결금액(USD)을 안전하게 파싱합니다."""
+    """주문 이력 항목의 **확정** 체결금액(USD)을 반환합니다.
+
+    Returns:
+        tuple: ``(amount, is_estimated)``
+
+    정책 (2026-10-24, 추정→보류 전환):
+      - ``ft_ccld_amt3`` 가 존재하고 0보다 크면 ``(amount, False)``.
+      - 없거나 0이면 ``(0.0, True)`` — 평균가/현재가로 **추정하지 않습니다**.
+        금액이 확정되지 않은 필수 체결은 정산을 보류하고 다음 실행에서
+        브로커가 금액을 확정해 줄 때 정확히 1회 반영합니다.
+      - 호출부는 반드시 튜플을 풀어 써야 합니다.
+    """
     try:
-        return float(order.get("ft_ccld_amt3", "0") or 0)
+        amount = float(order.get("ft_ccld_amt3", "0") or 0)
     except (TypeError, ValueError):
+        amount = 0.0
+    if amount > 0:
+        return amount, False
+
+    order["_fill_amount_unavailable"] = True
+    print(
+        f"  [경고] 체결금액 미확정(odno={order.get('odno', '')}, "
+        f"qty={order.get('ft_ccld_qty', '0')}) → 정산 보류 대상"
+    )
+    return 0.0, True
+
+
+def _fill_amount_is_available(order):
+    """체결금액이 **확정**됐는지 (미확정을 0원으로 조용히 반영하지 않기 위한 가드)."""
+    try:
+        if float(order.get("ft_ccld_amt3", "0") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(float(order.get("ft_ccld_qty", "0") or 0)) <= 0:
+            return True  # 체결 자체가 없으면 금액 문제도 없음
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _has_unconfirmed_amount_fills(state, order_history):
+    """`orders_meta` 등록 주문 중 **금액 미확정** 체결이 있는 odno 목록.
+
+    - 이번 실행에서 새로 반영할 체결(누적 체결 > 반영 수량)이 금액 미확정이면 포함합니다.
+    - 기존 캐시의 ``processed_filled_amount == 0`` 레거시 표식은 **변경하지 않습니다**
+      (감사 도구가 별도로 식별). 금액이 확정된 체결은 여기에 포함되지 않습니다.
+    """
+    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    pending = []
+    for odno, meta in (state.get("orders_meta") or {}).items():
+        row = history_by_odno.get(str(odno))
+        if row is None:
+            continue
+        if _fill_amount_is_available(row):
+            continue
+        try:
+            filled = int(float(row.get("ft_ccld_qty", "0") or 0))
+            processed = int((meta or {}).get("processed_filled_qty", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if filled > processed:
+            pending.append(str(odno))
+    return pending
+
+
+def _legacy_amount_markers(state, order_history):
+    """감사 전용 — 금액 확정 체결인데 processed_filled_amount=0 인 레거시 메타."""
+    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    legacy = []
+    for odno, meta in (state.get("orders_meta") or {}).items():
+        row = history_by_odno.get(str(odno))
+        if row is None or _is_reverse_order(state, str(odno), row):
+            continue
+        if not _fill_amount_is_available(row):
+            continue
+        if int((meta or {}).get("processed_filled_qty", 0) or 0) <= 0:
+            continue
+        if float((meta or {}).get("processed_filled_amount", 0.0) or 0.0) == 0.0:
+            legacy.append(str(odno))
+    return legacy
+
+
+def _estimate_fill_amount(order):
+    """FORCE_T_REINFERENCE 전용 — 평균가/현재가로 체결금액을 **예외적** 추정합니다."""
+    try:
+        qty = int(float(order.get("ft_ccld_qty", "0") or 0))
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
         return 0.0
+
+    def _positive(value) -> float:
+        try:
+            number = float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return number if number > 0 else 0.0
+
+    price = _positive(order.get("ft_ccld_unpr3"))
+    if price <= 0:
+        price = _positive(
+            order.get("last_price") or order.get("lastPrice") or order.get("last")
+        )
+    if price <= 0:
+        return None
+    return round(qty * price, 2)
+
+
+def _inference_amount(order):
+    """전체 재추정 경로의 금액 — 확정값 우선, FORCE 추정값 허용."""
+    amount, estimated = _fill_amount(order)
+    if not estimated:
+        return amount
+    inferred = order.get("_ft_ccld_amt_inferred")
+    if inferred is not None:
+        try:
+            return float(inferred)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def _compute_non_reverse_net_invested(state, order_history, cutoff_dt=None, last_processed_ordno=""):
@@ -808,6 +1193,7 @@ def _compute_non_reverse_net_invested(state, order_history, cutoff_dt=None, last
             qty = 0
         if qty <= 0 or not o.get("ord_datetime_utc"):
             continue
+        # 금액 미확정 체결도 수량은 포함하고 금액은 0으로 둡니다 (마이그레이션 규칙).
         if cutoff_dt is not None and not _before_cutoff(o):
             continue
         filled_orders.append(o)
@@ -822,10 +1208,7 @@ def _compute_non_reverse_net_invested(state, order_history, cutoff_dt=None, last
             continue
         side = o.get("sll_buy_dvsn_cd_name", "")
         qty = int(float(o.get("ft_ccld_qty", "0")))
-        try:
-            amt = float(o.get("ft_ccld_amt3", "0") or 0)
-        except (TypeError, ValueError):
-            amt = 0.0
+        amt = _inference_amount(o)
         if side == "매수":
             net_qty += qty
             net_invested += amt
@@ -853,12 +1236,68 @@ def _infer_T_from_full_history(symbol, state, order_history):
     이 경우 T가 실제보다 낮게 추정될 수 있습니다.
     함수 실행 후 경고가 출력되면 .state.json 의 "T" 값을 직접 확인하고 수정하세요.
     """
+    # 보류 시 원상복구할 스냅샷 (금액 미확정 체결 발견 시 사용)
+    inference_snapshot = deepcopy(state)
+    # 전체 재추정은 처음부터 다시 계산하므로 이전 실행의 매도 원장을 버립니다.
+    # (낡은 basis/factor가 남으면 새 분류와 섞여 T가 중복 조정됩니다)
+    state["_settlement_mode"] = "full_reinference"
+    state["sell_t_effects"] = {}
+    state.pop("_position_basis_unknown", None)
+    reset_settlement_ledger(state, 0.0)
+    state["_settlement_deltas"] = []
+    # ── 금액 미확정 필수 체결 게이트 ──────────────────────────────
+    # 추정하지 않고 보류합니다. FORCE_T_REINFERENCE=true 인 **명시적 재추정**에서만
+    # 평균가/현재가 기반 추정을 예외적으로 허용합니다.
+    unconfirmed = []
+    for o in order_history:
+        try:
+            qty = int(float(o.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        if qty > 0 and o.get("ord_datetime_utc") and not _fill_amount_is_available(o):
+            unconfirmed.append(str(o.get("odno", "")))
+    force_estimate = os.getenv("FORCE_T_REINFERENCE", "").strip().lower() == "true"
+    if unconfirmed and not force_estimate:
+        state.clear()
+        state.update(inference_snapshot)
+        state["_pending_amount_odnos"] = unconfirmed
+        _mark_settlement_hold(
+            state,
+            f"전체 재추정 중 체결금액 미확정 주문 {len(unconfirmed)}건 "
+            f"({', '.join(unconfirmed[:5])}) — 금액 확정 후 재실행 필요",
+        )
+        return state
+    if unconfirmed and force_estimate:
+        for o in order_history:
+            try:
+                qty = int(float(o.get("ft_ccld_qty", "0") or 0))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or _fill_amount_is_available(o):
+                continue
+            estimated_amount = _estimate_fill_amount(o)
+            if estimated_amount is None:
+                state.clear()
+                state.update(inference_snapshot)
+                state["_pending_amount_odnos"] = unconfirmed
+                _mark_settlement_hold(
+                    state,
+                    f"FORCE_T_REINFERENCE 추정 불가 주문 {o.get('odno', '')}",
+                )
+                return state
+            o["_ft_ccld_amt_inferred"] = estimated_amount
+            print(
+                f"  [경고] FORCE_T_REINFERENCE: odno={o.get('odno', '')} "
+                f"금액 미확정 → ${estimated_amount:.2f} 추정 허용"
+            )
     # 체결 완료된 주문만 추출(타임스탬프가 있는 항목 우선)
     filled_orders = []
     for o in order_history:
         qty = int(float(o.get("ft_ccld_qty", "0")))
         dt_utc = o.get("ord_datetime_utc")
-        if qty > 0 and dt_utc:
+        if qty > 0 and dt_utc and (
+            _fill_amount_is_available(o) or o.get("_ft_ccld_amt_inferred") is not None
+        ):
             filled_orders.append(o)
         else:
             reasons = []
@@ -866,6 +1305,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 reasons.append(f"체결수량={o.get('ft_ccld_qty','0')}")
             if not dt_utc:
                 reasons.append("ord_datetime_utc 없음")
+            if qty > 0 and dt_utc and not _fill_amount_is_available(o):
+                reasons.append("체결금액 계산불가(체결금액/평균가/현재가 없음)")
             print(f"  [디버그] 초기모드 주문 제외: odno={o.get('odno','')}, "
                   f"ord_dt={o.get('ord_dt','')}, ord_tmd={o.get('ord_tmd','')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}, "
@@ -886,6 +1327,26 @@ def _infer_T_from_full_history(symbol, state, order_history):
         filled_orders,
         key=lambda o: (o.get("ord_datetime_utc", ""), o.get("odno", ""))
     )
+
+    # 전체 이력으로 다시 계산하는 체결은 이후 증분 정산의 기준점이 됩니다.
+    # 정상·추가매수와 매도 모두 현재 누적 체결/금액을 반영 완료로 표시합니다.
+    # 리버스 주문은 reconcile_reverse_fills가 별도 관리하므로 건드리지 않습니다.
+    for order in sorted_orders:
+        odno = str(order.get("odno", ""))
+        meta = (state.get("orders_meta") or {}).get(odno)
+        if not meta or meta.get("reverse_action") or not odno:
+            continue
+        try:
+            meta["processed_filled_qty"] = max(
+                int(meta.get("processed_filled_qty", 0) or 0),
+                int(float(order.get("ft_ccld_qty", "0") or 0)),
+            )
+            meta["processed_filled_amount"] = max(
+                float(meta.get("processed_filled_amount", 0.0) or 0.0),
+                _inference_amount(order),
+            )
+        except (TypeError, ValueError):
+            continue
 
     print(f"[상태] {symbol} 초기 상태 감지 → 전체 이력 {len(sorted_orders)}건에서 T 자동 추정 시작")
 
@@ -920,6 +1381,24 @@ def _infer_T_from_full_history(symbol, state, order_history):
             net_qty = max(0, net_qty - int(float(order.get("ft_ccld_qty", "0"))))
         for order in reverse_buys:
             net_qty += int(float(order.get("ft_ccld_qty", "0")))
+        # 일자 내 시간순 보유 궤적 (배율 0과 실제 청산 분리)
+        _post_qty = {}
+        _sim_qty = net_qty
+        for _o in sorted(
+            [
+                o for o in day_orders
+                if not _is_reverse_order(state, o.get("odno", ""), o)
+            ],
+            key=lambda x: (x.get("ord_datetime_utc", ""), str(x.get("odno", ""))),
+        ):
+            _qty = int(float(_o.get("ft_ccld_qty", "0") or 0))
+            _side = _o.get("sll_buy_dvsn_cd_name")
+            if _side == "매수":
+                _sim_qty += _qty
+            elif _side == "매도":
+                _sim_qty = max(0, _sim_qty - _qty)
+            _post_qty[str(_o.get("odno", ""))] = _sim_qty
+
         day_sells = [
             o for o in day_orders
             if o.get("sll_buy_dvsn_cd_name") == "매도"
@@ -938,23 +1417,48 @@ def _infer_T_from_full_history(symbol, state, order_history):
         for order in day_sells:
             sell_qty = int(float(order.get("ft_ccld_qty", "0")))
             cumulative_qty = sell_qty
+            odno = str(order.get("odno", ""))
+            t_before_effect = T
             if net_qty > 0:
-                t_before_effect = T
                 T, _applied = _apply_sell_t_effect(
-                    state, T, net_qty, str(order.get("odno", "")), cumulative_qty
+                    state, T, net_qty, odno, cumulative_qty, allow_adjust=False
                 )
                 effects = state.get("sell_t_effects", {})
-                entry = effects.get(str(order.get("odno", ""))) or {}
+                entry = effects.get(odno) or {}
                 basis = int(entry.get("basis") or net_qty)
+                raw_factor = entry.get("factor", 1.0)
+                factor = 1.0 if raw_factor is None else float(raw_factor)
                 ratio = (cumulative_qty / basis) if basis else 0.0
-                if _classify_sell_ratio(ratio) == 0.0:
+                # 배율 0(누적 100% 매도)과 실제 보유 0은 다릅니다.
+                # 중간 매수가 있으면 누적 매도 100%여도 보유가 남습니다.
+                liquidated = _post_qty.get(odno, max(0, net_qty - sell_qty)) <= 0
+                if _classify_sell_ratio(ratio) == 0.0 and liquidated:
                     if cycle_start_ord_dt and t_before_effect > 0:
                         state["_completed_cycle_start"] = f"{cycle_start_ord_dt[:4]}-{cycle_start_ord_dt[4:6]}-{cycle_start_ord_dt[6:8]}"
                     T = 0.0
                     cycle_start_ord_dt = ""
                     state["sell_t_effects"] = {}
             else:
-                T = round(T * 0.75, 4)
+                # 보유 기준선이 없는 매도 — 기존 동작(쿼터매도)을 원장에 기록합니다.
+                _sync_settlement_ledger(state, T, allow_adjust=False)
+                _append_settlement_entry(state, "sell", odno, basis=0, factor=0.75)
+                T = _replay_settlement_ledger(state)
+                basis = 0
+                factor = 0.75
+            ledger_entry = _find_settlement_entry(state, kind="sell", odno=odno)
+            state["_settlement_deltas"].append({
+                "odno": odno,
+                "side": "매도",
+                "qty_delta": sell_qty,
+                "amount_delta": _inference_amount(order),
+                "cumulative_qty": cumulative_qty,
+                "prev_cumulative_qty": 0,
+                "basis": int(basis),
+                "factor": float(factor),
+                "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                "t_delta": round(T - t_before_effect, 4),
+                "full_reinference": True,
+            })
             net_qty = max(0, net_qty - sell_qty)
 
         def _is_additional_buy(o, avg_price, net_qty_before=0):
@@ -1009,6 +1513,20 @@ def _infer_T_from_full_history(symbol, state, order_history):
             fill_price = float(o.get("ft_ccld_unpr3", "0"))
             prev_net = net_qty
             net_qty += qty
+            # T 효과는 없지만 금액·수량 검산 대상입니다. (검증기가 필수 체결로 확인)
+            state["_settlement_deltas"].append({
+                "odno": str(o.get("odno", "")),
+                "side": "매수",
+                "qty_delta": qty,
+                "amount_delta": _inference_amount(o),
+                "cumulative_qty": qty,
+                "prev_cumulative_qty": 0,
+                "basis": 0,
+                "factor": 1.0,
+                "is_additional": True,
+                "t_delta": 0.0,
+                "full_reinference": True,
+            })
             if fill_price > 0 and prev_net > 0:
                 current_avg_price = (current_avg_price * prev_net + fill_price * qty) / net_qty
             elif fill_price > 0:
@@ -1024,17 +1542,36 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 meta = orders_meta[odno]
                 qty = int(float(o.get("ft_ccld_qty", "0")))
                 total_qty = int(meta.get("total_qty") or qty)
+                delta_T = 0.0
                 # 전체 재추정은 "처음부터" 다시 계산하므로 이미 반영된 분까지 포함합니다.
                 # (processed_filled_qty 를 빼면 T 가 다시 낮아집니다 — 2026-10-22 실측)
                 if total_qty > 0:
                     delta_T = round((qty / total_qty) * float(meta.get("t_target", 1.0)), 4)
-                    T = round(T + delta_T, 4)
+                    T, ledger_entry = _apply_buy_t_effect(state, T, delta_T, odno, allow_adjust=False)
+                else:
+                    ledger_entry = None
                 # 수량·금액 마커를 함께 확정해야 이후 증분 정산이 중복 가산하지 않습니다.
                 meta["processed_filled_qty"] = qty
                 meta["processed_filled_amount"] = max(
                     float(meta.get("processed_filled_amount", 0.0) or 0.0),
-                    _fill_amount(o),
+                    _inference_amount(o),
                 )
+                state["_settlement_deltas"].append({
+                    "odno": odno,
+                    "side": "매수",
+                    "qty_delta": qty,
+                    "amount_delta": _inference_amount(o),
+                    "cumulative_qty": qty,
+                    "prev_cumulative_qty": 0,
+                    "basis": 0,
+                    "factor": 1.0,
+                    "t_target": float(meta.get("t_target", 1.0) or 0.0),
+                    "total_qty": total_qty,
+                    "is_additional": bool(meta.get("is_additional", False)),
+                    "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                    "t_delta": delta_T,
+                    "full_reinference": True,
+                })
                 fill_price = float(o.get("ft_ccld_unpr3", "0"))
                 prev_net = net_qty
                 net_qty += qty
@@ -1045,9 +1582,38 @@ def _infer_T_from_full_history(symbol, state, order_history):
             if unregistered_buys:
                 buy_count = len(unregistered_buys)
                 delta_T = 1.0 if buy_count >= 2 else 0.5
-                T = round(T + delta_T, 4)
-                for o in unregistered_buys:
+                total_buy_qty = sum(
+                    int(float(o.get("ft_ccld_qty", "0"))) for o in unregistered_buys
+                )
+                remaining_delta = delta_T
+                for idx, o in enumerate(unregistered_buys):
                     qty = int(float(o.get("ft_ccld_qty", "0")))
+                    # 수량 비례로 배분하고 마지막 주문이 반올림 잔차를 가집니다.
+                    if idx == len(unregistered_buys) - 1:
+                        share = round(remaining_delta, 4)
+                    else:
+                        share = round((qty / total_buy_qty) * delta_T, 4) if total_buy_qty else 0.0
+                        remaining_delta = round(remaining_delta - share, 4)
+                    odno = str(o.get("odno", ""))
+                    T, ledger_entry = _apply_buy_t_effect(state, T, share, odno, allow_adjust=False)
+                    state["_settlement_deltas"].append({
+                        "odno": odno,
+                        "side": "매수",
+                        "qty_delta": qty,
+                        "amount_delta": _inference_amount(o),
+                        "cumulative_qty": qty,
+                        "prev_cumulative_qty": 0,
+                        "basis": 0,
+                        "factor": 1.0,
+                        "t_target": float(delta_T),
+                        "total_qty": total_buy_qty,
+                        "ord_dt": ord_dt,
+                        "is_additional": False,
+                        "unregistered": True,
+                        "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                        "t_delta": share,
+                        "full_reinference": True,
+                    })
                     fill_price = float(o.get("ft_ccld_unpr3", "0"))
                     prev_net = net_qty
                     net_qty += qty
@@ -1123,7 +1689,11 @@ def compute_position_from_history(order_history, cycle_start_date=None):
     Returns: dict {"net_qty": int, "avg_price": float, "buy_count": int, "sell_count": int}
     """
     # 필터: 체결수량(>0) 있고 ord_datetime_utc가 있는 항목만 사용
-    filled = [o for o in order_history if int(float(o.get("ft_ccld_qty", "0"))) > 0 and o.get("ord_datetime_utc")]
+    filled = [
+        o for o in order_history
+        if int(float(o.get("ft_ccld_qty", "0"))) > 0
+        and o.get("ord_datetime_utc")
+    ]
     if cycle_start_date:
         # YYYY-MM-DD -> YYYYMMDD for comparison
         ymd = cycle_start_date.replace("-", "")
@@ -1190,16 +1760,310 @@ def _classify_sell_ratio(ratio: float) -> float:
     return 0.75
 
 
-def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=None):
+def _ensure_settlement_ledger(state):
+    """순서 원장의 **구조만** 정규화해 반환합니다.
+
+    원장은 T 연산을 **적용 순서(seq)** 대로 보관하는 작은 로그입니다.
+    - buy / reverse_sell / reverse_buy: delta 를 더합니다 (+T)
+    - sell: factor 를 곱합니다 (×T)
+
+    ⚠️ 여기서 현재 T를 start_T 로 채우거나 과거 효과를 원장에 추가하면 안 됩니다.
+    (그렇게 하면 이미 반영된 레거시 마커와 겹쳐 T가 한 번 더 조정됩니다)
+    start_T 는 실제 정산을 시작하는 헬퍼(`_bootstrap_settlement_start`)가
+    "아직 원장에 아무 효과도 없는" 경우에만 명시적으로 설정합니다.
     """
-    매도 주문의 T 효과를 반영하고 **누적 체결 기준**으로 판정합니다.
+    ledger = state.get("settlement_ledger")
+    if not isinstance(ledger, dict):
+        ledger = {}
+        state["settlement_ledger"] = ledger
+    entries = ledger.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+        ledger["entries"] = entries
+    max_seq = 0
+    for entry in entries:
+        try:
+            max_seq = max(max_seq, int(entry.get("seq", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        next_seq = int(ledger.get("next_seq", 0) or 0)
+    except (TypeError, ValueError):
+        next_seq = 0
+    ledger["next_seq"] = max(next_seq, max_seq + 1, 1)
+    return ledger
 
-    일괄 반영(75주 한 번)과 부분 반영(5주 → 75주)이 같은 결과를 내야 하므로
-    주문별 누적 체결량을 기준으로 분류하고, 이미 적용한 배율은 재조정합니다.
 
-    - 첫 반영: 기준선(보유량) 을 저장하고 T × 배율
-    - 이후 반영: 누적 비율이 바뀌면 T × (새 배율 ÷ 기존 배율)
-      (기존 배율이 0 이면 사이클이 이미 종료된 상태이므로 재조정하지 않습니다)
+def _bootstrap_settlement_start(state, T):
+    """원장에 아직 효과가 없을 때만 현재 T를 start_T 로 확정합니다.
+
+    레거시 상태(마커만 있고 원장 없음)에서는 호출부가 보류/보존을 먼저 판정한
+    뒤 이 함수를 호출해야 합니다.
+    """
+    ledger = _ensure_settlement_ledger(state)
+    if not ledger.get("entries") and "start_T" not in ledger:
+        ledger["start_T"] = round(float(T), 4)
+    elif not ledger.get("entries") and ledger.get("start_T") is None:
+        ledger["start_T"] = round(float(T), 4)
+    return ledger
+
+
+_SETTLEMENT_START_TOLERANCE = 0.005
+_SETTLEMENT_ENTRY_KINDS = {"buy", "sell", "reverse_sell", "reverse_buy", "adjust"}
+
+
+def _as_finite_float(value):
+    """유한한 숫자(음수/0 포함)면 float, 그 외(불리언/문자열/NaN/inf)면 None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _as_non_negative_float(value):
+    """숫자(0 포함)면 float, 그 외(불리언/문자열/NaN/inf/음수)면 None."""
+    number = _as_finite_float(value)
+    if number is None or number < 0:
+        return None
+    return number
+
+
+def _settlement_ledger_entry_valid(entry):
+    """원장 항목의 필수 필드 형식을 검사합니다 (0 으로 대체하지 않습니다)."""
+    if not isinstance(entry, dict):
+        return False
+    try:
+        int(entry.get("seq"))
+    except (TypeError, ValueError):
+        return False
+    kind = entry.get("kind")
+    if kind not in _SETTLEMENT_ENTRY_KINDS:
+        return False
+    if kind == "sell":
+        return _as_non_negative_float(entry.get("factor")) is not None
+    # reverse_sell/adjust 는 음수 delta 가 정상입니다 (T 감소).
+    return _as_finite_float(entry.get("delta")) is not None
+
+
+def _audit_settlement_start(state):
+    """정산 시작 전 원장 상태를 분류하고, 필요한 경우에만 새 원장을 시작합니다.
+
+    반환값 ``(ok, reason)``:
+      - 원장 없음 → 기존 전환 규칙(마커/부트스트랩)에 맡깁니다.
+      - 기준 없음 + 항목 없음 → 현재 T 를 start_T 로 새 원장 시작.
+      - 유효한 기준 + 항목 없음 → 기준 T 와 현재 T 비교.
+      - 항목 있음 → 재생값과 비교.
+      - 항목 있지만 기준 없음/형식 오류 → 보류(0 대체 금지).
+    """
+    if "settlement_ledger" not in state or state.get("settlement_ledger") is None:
+        return True, ""
+    ledger = state.get("settlement_ledger")
+    if not isinstance(ledger, dict):
+        return False, "settlement_ledger 형식 오류"
+    entries = ledger.get("entries")
+    if entries is None:
+        entries = []
+    if not isinstance(entries, list):
+        return False, "settlement_ledger.entries 형식 오류"
+    current_t = _as_non_negative_float(state.get("T"))
+    if current_t is None:
+        return False, f"현재 T 형식 오류: {state.get('T')!r}"
+
+    start_raw = ledger.get("start_T")
+    has_start = "start_T" in ledger
+    start_t = _as_non_negative_float(start_raw)
+    if has_start and start_raw is not None and start_t is None:
+        return False, f"원장 start_T 형식 오류: {start_raw!r}"
+
+    if not entries:
+        if start_t is not None:
+            if abs(current_t - start_t) > _SETTLEMENT_START_TOLERANCE:
+                return False, (
+                    f"빈 원장 기준 T={start_t:.4f} 와 현재 T={current_t:.4f} 가 "
+                    f"다릅니다 (허용 오차 {_SETTLEMENT_START_TOLERANCE})"
+                )
+            return True, ""
+        # 기준 T 가 없고 항목도 없을 때만 새 원장을 시작합니다.
+        ledger["start_T"] = round(current_t, 4)
+        ledger["entries"] = []
+        return True, ""
+
+    if start_t is None:
+        return False, "원장에 항목이 있지만 기준 T(start_T)가 없습니다"
+    if not all(_settlement_ledger_entry_valid(entry) for entry in entries):
+        return False, "원장 항목 형식 오류"
+    replay = _replay_settlement_ledger(state)
+    if abs(current_t - replay) > _SETTLEMENT_START_TOLERANCE:
+        return False, (
+            f"현재 T={current_t:.4f} 가 원장 재생값 {replay:.4f} 와 다릅니다 "
+            f"(명시적 adjust 필요)"
+        )
+    return True, ""
+
+
+def _mark_settlement_hold(state, reason):
+    """적용 순서 근거가 없어 T를 재계산하면 안 되는 상태를 표시합니다."""
+    state["_settlement_hold"] = True
+    state["_settlement_hold_reason"] = reason
+    print(f"[경고] 정산 보류: {reason}")
+
+
+def reset_settlement_ledger(state, T=None):
+    """외부에서 T를 확정 변경했을 때 원장을 새 기준(start_T)으로 재설정합니다.
+
+    MAX_T 상한, 사이클 종료, balance_mismatch 자동 0, FORCE_T 처럼
+    정산 로직 밖에서 T를 확정한 경우에는 과거 원장을 그대로 두면
+    다음 재생에서 외부 보정이 덮어써지므로 반드시 호출합니다.
+    """
+    value = float(state.get("T", 0.0) if T is None else T)
+    state["settlement_ledger"] = {
+        "start_T": round(value, 4),
+        "next_seq": 1,
+        "entries": [],
+    }
+    state["sell_t_effects"] = {}
+    return state["settlement_ledger"]
+
+
+def record_settlement_t_adjustment(state, target_t, *, source="", at=None):
+    """정산 밖에서 T를 복구한 경우 **명시적 조정 항목**으로 원장에 기록합니다.
+
+    T-only 복구(예: STATE_REPAIR_TARGET_T)는 기존 원장 재생값을 바꾸지 않으므로
+    다음 정산의 재생에서 조용히 덮어써질 수 있습니다. 복구 전 T·목표 T·조정량·
+    시점·유형을 adjust 항목에 남겨 원장 재생값이 복구 T와 일치하게 합니다.
+    매도/매수 마커(`sell_t_effects`)는 보존합니다.
+    """
+    ledger = _ensure_settlement_ledger(state)
+    before_t = round(float(state.get("T", 0.0) or 0.0), 4)
+    target = round(float(target_t), 4)
+    # 레거시 상태(원장 없음/항목만 있고 start_T 없음)에서도 복구 후 다음 정산이
+    # 보류되지 않도록 기준 T 를 먼저 확정합니다. start_T 가 없으면 재생 기준이
+    # 0 이 되어 adjust delta 가 엉뚱하게 커지고, 다음 정산은 "기준 T 없음"으로
+    # 보류됩니다.
+    if not ledger.get("entries"):
+        _bootstrap_settlement_start(state, before_t)
+    elif ledger.get("start_T") is None:
+        ledger["start_T"] = round(before_t, 4)
+    replay = _replay_settlement_ledger(state)
+    delta = round(target - replay, 4)
+    entry = _append_settlement_entry(
+        state,
+        "adjust",
+        "",
+        delta=delta,
+        before_T=before_t,
+        target_T=target,
+        replay_T=round(replay, 4),
+        applied_at=at or datetime.now(ZoneInfo("UTC")).isoformat(),
+        source=str(source or "explicit_t_recovery"),
+    )
+    state["T"] = target
+    return entry
+
+
+def _append_settlement_entry(state, kind, odno, **fields):
+    """원장 끝에 새 항목을 추가하고 항목을 반환합니다."""
+    ledger = _ensure_settlement_ledger(state)
+    entry = {"seq": int(ledger["next_seq"]), "kind": kind, "odno": str(odno)}
+    entry.update(fields)
+    ledger["next_seq"] = entry["seq"] + 1
+    ledger["entries"].append(entry)
+    return entry
+
+
+def _find_settlement_entry(state, kind=None, odno=None, seq=None):
+    """원장에서 조건에 맞는 항목을 찾습니다 (없으면 None)."""
+    ledger = _ensure_settlement_ledger(state)
+    for entry in ledger.get("entries", []):
+        if seq is not None:
+            try:
+                if int(entry.get("seq", -1)) != int(seq):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if kind is not None and entry.get("kind") != kind:
+            continue
+        if odno is not None and str(entry.get("odno", "")) != str(odno):
+            continue
+        return entry
+    return None
+
+
+def _replay_settlement_ledger(state):
+    """원장을 start_T 부터 적용 순서대로 재생해 T를 계산합니다."""
+    ledger = _ensure_settlement_ledger(state)
+    try:
+        T = float(ledger.get("start_T", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        T = 0.0
+    for entry in sorted(
+        ledger.get("entries", []),
+        key=lambda e: int(e.get("seq", 0) or 0),
+    ):
+        kind = entry.get("kind")
+        try:
+            if kind == "sell":
+                factor = entry.get("factor", 1.0)
+                T *= float(1.0 if factor is None else factor)
+            else:
+                # buy / reverse_sell / reverse_buy / adjust 는 덧셈 항목입니다.
+                T += float(entry.get("delta", 0.0) or 0.0)
+            T = round(T, 4)
+        except (TypeError, ValueError):
+            continue
+    return round(T, 4)
+
+
+def _sync_settlement_ledger(state, T, allow_adjust=True):
+    """정산 시작점을 보장합니다.
+
+    `allow_adjust=True` 는 **명시적 외부 변경 경로**(단위 테스트/수동 보정)에서
+    현재 T와 원장 재생값의 차이를 `adjust` 로 보존합니다.
+    정상 정산 경로는 `allow_adjust=False` 로 호출해 근거 없는 보정이
+    자동으로 검증을 통과하지 않게 합니다.
+    """
+    ledger = _ensure_settlement_ledger(state)
+    if not ledger.get("entries"):
+        _bootstrap_settlement_start(state, T)
+        return ledger
+    if allow_adjust:
+        replay = _replay_settlement_ledger(state)
+        diff = round(float(T) - replay, 4)
+        if abs(diff) > 1e-9:
+            _append_settlement_entry(state, "adjust", "", delta=diff)
+    return ledger
+
+
+def _apply_buy_t_effect(state, T, delta, odno, allow_adjust=True):
+    """매수(+) T 효과를 원장에 **새 항목**으로 기록하고 재생 결과를 반환합니다.
+
+    같은 주문의 지연 체결 증가분을 기존 매수 항목에 누적하면, 그 사이에 적용된
+    매도(×)보다 앞에서 더해져 소급 스케일됩니다. (예: T=10, +0.2, ×0.75 후
+    +0.3 → 7.95 여야 하는데 누적하면 (10+0.5)×0.75=7.875)
+    따라서 증가분마다 현재 순서 위치에 새 seq 항목을 추가합니다.
+    """
+    delta = round(float(delta), 4)
+    if abs(delta) < 1e-12:
+        return T, None
+    _sync_settlement_ledger(state, T, allow_adjust=allow_adjust)
+    entry = _append_settlement_entry(state, "buy", odno, delta=delta)
+    new_T = _replay_settlement_ledger(state)
+    state["T"] = new_T
+    return new_T, entry
+
+
+def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=None, allow_adjust=True):
+    """
+    매도 주문의 T 효과를 순서 원장에 반영하고 **누적 체결 기준**으로 판정합니다.
+
+    - 첫 반영: 기준선(보유량)을 저장하고 원장에 sell 항목(factor)을 추가합니다.
+    - 재분류: 같은 sell 항목의 factor 만 갱신한 뒤 start_T 부터 순서대로 재생합니다.
+      (매수 +와 매도 ×의 순서가 보존되므로 중간 매수가 소급 스케일되지 않습니다)
+    - 레거시 마커만 있고 매도 원장 항목이 없는 경우:
+        * 같은 분류(factor 동일) → 이미 반영된 효과를 다시 곱하지 않고 T를 보존
+        * 분류가 바뀜 → 적용 순서 근거가 없으므로 **보류**(재곱셈/역산 금지)
 
     Returns:
         tuple: (T, 반영여부)
@@ -1219,43 +2083,74 @@ def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=Non
         return T, False
     ratio = (cumulative_qty / basis) if basis else 0.0
     factor = _classify_sell_ratio(ratio)
-    try:
-        applied = float(entry.get("factor", 1.0))
-    except (TypeError, ValueError):
-        applied = 1.0
-    if abs(factor - applied) < 1e-12:
-        return T, False
-    if applied > 0:
-        T = round(T * (factor / applied), 4)
+    marker_factor = entry.get("factor")
+    ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
+    if ledger_entry is not None:
+        try:
+            applied = float(ledger_entry.get("factor", 1.0))
+        except (TypeError, ValueError):
+            applied = 1.0
+        if abs(factor - applied) < 1e-12:
+            ledger_entry["cumulative_qty"] = int(cumulative_qty)
+            effects[str(odno)] = {"basis": basis, "factor": factor}
+            return T, False
     else:
-        T = 0.0
+        if marker_factor is not None:
+            try:
+                previous_factor = float(marker_factor)
+            except (TypeError, ValueError):
+                previous_factor = None
+            if previous_factor is not None:
+                if abs(factor - previous_factor) < 1e-12:
+                    # 이미 반영된 같은 분류 — T를 다시 곱하지 않습니다.
+                    effects[str(odno)] = {"basis": basis, "factor": factor}
+                    return T, False
+                _mark_settlement_hold(
+                    state,
+                    f"매도 {odno} 분류 변경({previous_factor}→{factor})에 대한 "
+                    f"적용 순서 근거(원장)가 없습니다",
+                )
+                return T, False
+    _sync_settlement_ledger(state, T, allow_adjust=allow_adjust)
+    if ledger_entry is None:
+        ledger_entry = _append_settlement_entry(
+            state, "sell", odno, basis=basis, factor=factor,
+            cumulative_qty=int(cumulative_qty),
+        )
+    else:
+        ledger_entry["basis"] = basis
+        ledger_entry["factor"] = factor
+        ledger_entry["cumulative_qty"] = int(cumulative_qty)
     effects[str(odno)] = {"basis": basis, "factor": factor}
-    return T, True
-
+    new_T = _replay_settlement_ledger(state)
+    state["T"] = new_T
+    return new_T, True
 
 def _fill_delta(meta, order, odno_meta=""):
     """
     주문의 체결 증가분(수량·금액)을 계산합니다. **메타를 변경하지 않습니다.**
 
     - 수량: 누적체결수량 − 반영된 수량 (정확)
-    - 금액: 누적체결금액 − 반영된 금액 (정확)
-      단, 이전 버전에서 만든 메타에는 반영 금액 표식이 없습니다.
-      이 경우 **새로 늘어난 부분만** 누적금액 비율로 추정합니다
-      (이미 반영된 부분을 중복 가산하지 않기 위함) — 한 번 적용 후 표식이 기록되어
-      이후부터는 정확히 계산됩니다.
+    - 금액: 누적체결금액 − 반영된 금액 (확정값만)
+      금액이 확정되지 않은 체결은 (수량, 0.0, True) 로 반환되어
+      호출부가 정산을 **보류**합니다 (추정하지 않습니다).
+      이전 버전 메타(반영금액 표식 없음)는 신규분만 비율로 계산해 1회 보정합니다.
 
     Returns:
-        tuple: (신규체결수량, 신규체결금액, 금액추정여부)
+        tuple: (신규체결수량, 신규체결금액, 금액미확정여부)
     """
     try:
         filled_now = int(float(order.get("ft_ccld_qty", "0") or 0))
     except (TypeError, ValueError):
         filled_now = 0
-    amount_now = _fill_amount(order)
+    amount_now, amount_estimated = _fill_amount(order)
     processed_qty = int((meta or {}).get("processed_filled_qty", 0) or 0)
     has_amount_marker = "processed_filled_amount" in (meta or {})
     processed_amount = float((meta or {}).get("processed_filled_amount", 0.0) or 0.0)
     delta_qty = max(filled_now - processed_qty, 0)
+    if amount_estimated and delta_qty > 0:
+        # 금액 미확정 — 호출부가 정산을 보류해야 합니다. 여기서는 반영하지 않습니다.
+        return delta_qty, 0.0, True
     if has_amount_marker:
         delta_amount = amount_now - processed_amount
         if delta_amount < 0:
@@ -1291,7 +2186,11 @@ def _commit_fill_markers(meta, order, applied_qty, applied_amount):
         filled_now = int(float(order.get("ft_ccld_qty", "0") or 0))
     except (TypeError, ValueError):
         filled_now = 0
-    amount_now = _fill_amount(order)
+    amount_now, amount_estimated = _fill_amount(order)
+    if amount_estimated and filled_now > 0:
+        # 금액 미확정 체결은 마커를 진행시키지 않습니다 (다음 실행에서 1회 반영).
+        print(f"  [경고] 금액 미확정 주문 {order.get('odno', '')} 마커 갱신 보류")
+        return
     meta["processed_filled_qty"] = max(int(meta.get("processed_filled_qty", 0) or 0), filled_now)
     meta["processed_filled_amount"] = max(
         float(meta.get("processed_filled_amount", 0.0) or 0.0), amount_now
@@ -1311,7 +2210,9 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
     영구히 사라집니다. 등록된 주문은 주문번호별 누적 체결량·금액으로 델타를 계산합니다.
 
     - recent_candidates 에 포함된 주문은 날짜 그룹 처리에서 반영되므로 건너뜁니다.
-    - 이미 반영된 적 없는 주문(processed=0)은 "처리된 범위 밖"이므로 건드리지 않습니다.
+    - 등록 주문(orders_meta)이 아직 한 번도 반영되지 않았으면(processed=0),
+      금액 미확정 보류로 워터마크가 앞서 나가도 영구 누락되지 않도록 복구합니다.
+      (반영된 주문은 processed_filled_qty > 0 이므로 이 경로로 중복 반영되지 않습니다)
 
     Returns:
         tuple: (반영 대상 목록, 순수량 변화, 순금액 변화)
@@ -1329,10 +2230,31 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
         row = history_by_odno.get(str(odno))
         if row is None:
             continue
-        if int(meta.get("processed_filled_qty", 0) or 0) <= 0:
-            # 워터마크 이전에 있고 반영된 적 없는 주문은 "이미 처리된 범위 밖"이므로
-            # 건드리지 않습니다 (워터마크 이전 이력 무시 계약 유지).
+        if not _fill_amount_is_available(row):
+            print(
+                f"  [경고] 지연 체결 odno={odno} 의 금액을 계산할 수 없어 "
+                f"이번 정산에서 보류합니다 (다음 실행에서 금액 확정 시 반영)"
+            )
             continue
+        if _is_reverse_order(state, str(odno), row):
+            # 리버스 주문은 reconcile_reverse_fills 가 담당합니다 (이중 반영 방지).
+            continue
+        processed_qty = int(meta.get("processed_filled_qty", 0) or 0)
+        if processed_qty <= 0:
+            # 등록된 봇 주문인데 아직 한 번도 반영되지 않은 체결입니다.
+            # 이전 RUN 에서 금액 미확정으로 보류된 사이 워터마크가 뒤로 밀리면
+            # "처리된 범위 밖"으로 영구 제외되므로, 금액이 확정된 지금 복구합니다.
+            # (수량 마커가 0 이면 미반영이 확실 — 반영됐다면 processed_filled_qty > 0)
+            try:
+                filled_for_recovery = int(float(row.get("ft_ccld_qty", "0") or 0))
+            except (TypeError, ValueError):
+                filled_for_recovery = 0
+            if filled_for_recovery <= 0:
+                continue
+            print(
+                f"  [상태] 지연 체결 복구: 워터마크 이전 미반영 등록 주문 "
+                f"odno={odno} ({filled_for_recovery}주) → 이번 실행에서 반영"
+            )
         dq, da, _est = _fill_delta(meta, row, str(odno))
         if dq <= 0 and abs(da) < 1e-9:
             continue
@@ -1353,6 +2275,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     - order_history의 각 항목 `ord_datetime_utc`(ISO)를 파싱하여 UTC datetime으로 비교
     - 포함 조건: o_dt > last_updated_dt 또는 (o_dt == last_updated_dt 및 odno > last_processed_ordno)
     """
+    apply_snapshot = deepcopy(state)
+    pending_amount_odnos: list[str] = []
     recent_candidates = []
 
     for o in order_history:
@@ -1410,9 +2334,45 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                   f"qty={o.get('ft_ccld_qty','0')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
+    # 이번 묶음에 포함된 체결의 금액이 확정됐는지 확인합니다.
+    for _o, odno_pending, order_pending in recent_candidates:
+        if not _fill_amount_is_available(order_pending):
+            if odno_pending and str(odno_pending) not in pending_amount_odnos:
+                pending_amount_odnos.append(str(odno_pending))
+            print(
+                f"  [경고] 최근모드 주문 보류(체결금액 미확정): "
+                f"odno={odno_pending}, qty={order_pending.get('ft_ccld_qty','0')}"
+            )
+
+    # 워터마크 이전 등록 주문의 지연 체결도 금액 확정이 필수입니다.
+    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    for odno, meta in (state.get("orders_meta") or {}).items():
+        row = history_by_odno.get(str(odno))
+        if row is None or not _fill_amount_is_available(row):
+            if row is None:
+                continue
+            try:
+                filled = int(float(row.get("ft_ccld_qty", "0") or 0))
+                processed = int(meta.get("processed_filled_qty", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if filled > processed and str(odno) not in pending_amount_odnos:
+                pending_amount_odnos.append(str(odno))
+
+    if pending_amount_odnos:
+        state.clear()
+        state.update(apply_snapshot)
+        state["_pending_amount_odnos"] = pending_amount_odnos
+        _mark_settlement_hold(
+            state,
+            f"체결금액 미확정 주문 {len(pending_amount_odnos)}건 "
+            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 후 재실행 필요",
+        )
+        return state, pending_amount_odnos
+
     # ── 1) 지연 체결 후보 (워터마크 이전 주문의 누적 체결 증가분) — 순수 계산 ──
     late_pending, late_net_qty, late_net_amount = _apply_late_fill_deltas(
-        state, order_history, {odno for _o, odno, _r in recent_candidates}
+        state, order_history, {str(odno) for _o, odno, _r in recent_candidates}
     )
 
     # ── 2) 이번 묶음의 반영분(수량·금액) 계산 — 순수 계산 ─────────────
@@ -1429,7 +2389,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 dq = int(float(order.get("ft_ccld_qty", "0") or 0))
             except (TypeError, ValueError):
                 dq = 0
-            da = _fill_amount(order)
+            da = _fill_amount(order)[0]
         deltas[str(odno)] = (dq, da)
         side = order.get("sll_buy_dvsn_cd_name", "")
         if side == "매수":
@@ -1515,38 +2475,147 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 net_qty += filled
 
     # ── 5) 지연 체결 반영 (T·순투입금) ───────────────────────────
+    # 적용 내역 기록 — 자동 검증이 원시 체결 데이터와 대조합니다.
+    # 리버스 정산 내역을 **덮어쓰지 않고** 뒤에 이어 붙입니다.
+    state["_settlement_deltas"].extend(state.pop("_reverse_settlement_deltas", []))
+
     T = float(state.get("T", 0.0))
     net_invested = float(state.get("net_invested", 0.0))
+    # 지연 매도도 "배율 0"과 "실제 보유 0"을 구분해야 합니다.
+    # 워터마크 이전 주문의 지연 체결을 시간순으로 재생해 주문 직후 보유량을 구합니다.
+    # (net_qty 는 이미 지연 체결 순변동을 포함하므로 그만큼 되감아 시작합니다)
+    _late_post_qty = {}
+    _late_sim_qty = max(0, int(net_qty) - int(late_net_qty))
+    for _odno, _meta, _row, _dq, _da in sorted(
+        late_pending,
+        key=lambda item: (
+            str(item[2].get("ord_datetime_utc") or ""),
+            str(item[0]),
+        ),
+    ):
+        _side = _row.get("sll_buy_dvsn_cd_name")
+        if _side == "매수":
+            _late_sim_qty += _dq
+        elif _side == "매도":
+            _late_sim_qty = max(0, _late_sim_qty - _dq)
+        _late_post_qty[str(_odno)] = _late_sim_qty
     for odno, meta, row, dq, da in late_pending:
         total_qty = int(meta.get("total_qty") or dq)
         t_target = float(meta.get("t_target", 0.0) or 0.0)
+        t_before_late = T
         if row.get("sll_buy_dvsn_cd_name") == "매도":
             # 늦게 확인된 매도 — 누적 체결 기준으로 T 효과를 갱신합니다.
             # (일괄 반영과 부분 반영의 최종 결과가 같도록)
             cumulative_qty = int(float(row.get("ft_ccld_qty", "0") or 0))
             entry = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
             basis = int(entry.get("basis") or 0)
+            _raw_factor_before = entry.get("factor", 1.0)
+            factor_before = (
+                1.0 if _raw_factor_before is None else float(_raw_factor_before)
+            )
+            ledger_seq = None
             if basis > 0:
                 T, _applied = _apply_sell_t_effect(
-                    state, T, basis, odno, cumulative_qty, basis_hint=basis
+                    state, T, basis, odno, cumulative_qty, basis_hint=basis,
+                    allow_adjust=False,
                 )
-            net_invested -= da
+                entry_now = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+                ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
+                ledger_seq = ledger_entry.get("seq") if ledger_entry else None
+                ratio = cumulative_qty / basis
+                # 배율 0 은 "누적 매도 100%"일 뿐 사이클 종료가 아닙니다.
+                # 주문 직후 실제 보유가 0 인 경우에만 종료합니다 (일반 매도 경로와 동일).
+                _post_after = _late_post_qty.get(str(odno))
+                _liquidated = _post_after is not None and _post_after <= 0
+                if _classify_sell_ratio(ratio) == 0.0 and _liquidated:
+                    completed_start = state.get("cycle_start_date", "")
+                    if t_before_late > 0 and completed_start:
+                        state["_completed_cycle_start"] = completed_start
+                    state["cycle_start_date"] = ""
+                    net_invested = 0.0
+                    state["sell_t_effects"] = {}
+                else:
+                    # 보유가 남아 있으면 T 효과만 반영하고 순투입금만 차감합니다.
+                    net_invested -= da
+                    if _classify_sell_ratio(ratio) == 0.0:
+                        print(
+                            f"  [주의] 지연 매도 odno={odno} 누적 100%지만 "
+                            f"보유 {max(0, int(_post_after or 0))}주가 남아 사이클을 종료하지 않습니다"
+                        )
+            else:
+                # 기준선 없이 분류한 지연 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
+                # (기존 T를 되돌려 최초 기준을 역산하지 않습니다)
+                state["_position_basis_unknown"] = True
+                entry_now = {}
+                print(
+                    f"  [경고] 지연 매도 odno={odno} 의 보유수량 기준을 확보하지 못했습니다 "
+                    f"→ 저장·신규 주문을 보류합니다"
+                )
+                net_invested -= da
             print(
                 f"  → 지연 체결 반영: odno={odno} 매도 {dq}주 추가 "
                 f"(누적 {cumulative_qty}주) → T={T}"
             )
+            entry_now = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+            state["_settlement_deltas"].append({
+                "odno": str(odno),
+                "side": "매도",
+                "qty_delta": dq,
+                "amount_delta": da,
+                "cumulative_qty": cumulative_qty,
+                "prev_cumulative_qty": max(cumulative_qty - dq, 0),
+                "basis": int(entry_now.get("basis") or basis or 0),
+                "factor": float(entry_now.get("factor", 0.0 if basis > 0 and _classify_sell_ratio(cumulative_qty / basis) == 0.0 else 1.0)),
+                "factor_before": factor_before,
+                "t_before": float(t_before_late),
+                "ledger_seq": ledger_seq,
+                "t_delta": round(T - t_before_late, 4),
+                "late": True,
+            })
         elif meta.get("is_additional"):
             net_invested += da
             print(f"  → 지연 체결 반영: odno={odno} 추가매수 {dq}주 → T 변경 없음")
+            state["_settlement_deltas"].append({
+                "odno": str(odno),
+                "side": "매수",
+                "qty_delta": dq,
+                "amount_delta": da,
+                "cumulative_qty": dq,
+                "prev_cumulative_qty": 0,
+                "basis": 0,
+                "factor": 1.0,
+                "is_additional": True,
+                "t_delta": 0.0,
+                "late": True,
+            })
         else:
+            delta_T = 0.0
+            ledger_seq = None
             if total_qty > 0 and t_target:
                 delta_T = round((dq / total_qty) * t_target, 4)
-                T = round(T + delta_T, 4)
+                T, ledger_entry = _apply_buy_t_effect(state, T, delta_T, odno, allow_adjust=False)
+                ledger_seq = ledger_entry.get("seq") if ledger_entry else None
                 print(
                     f"  → 지연 체결 반영: odno={odno} 추가체결 {dq}주 "
                     f"→ ΔT={delta_T} → T={T}"
                 )
             net_invested += da
+            state["_settlement_deltas"].append({
+                "odno": str(odno),
+                "side": "매수",
+                "qty_delta": dq,
+                "amount_delta": da,
+                "cumulative_qty": dq,
+                "prev_cumulative_qty": 0,
+                "basis": 0,
+                "factor": 1.0,
+                "t_target": float(t_target),
+                "total_qty": total_qty,
+                "is_additional": False,
+                "ledger_seq": ledger_seq,
+                "t_delta": delta_T,
+                "late": True,
+            })
         _commit_fill_markers(meta, row, dq, da)
 
     state["T"] = T
@@ -1563,7 +2632,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 # 잔고 조회 실패/미확인 → 보수적으로 리셋 보류 (사고 방지 우선).
                 print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 잔고 미확인 → T={state['T']} 유지 (보수적 보류)")
                 print(f"[경고] {symbol} 이력이 없는데 잔고를 확인할 수 없어 T 리셋을 보류합니다. state.json과 잔고를 확인하세요.")
-                return state
+                return state, []
             if balance_qty > 0:
                 # 보유 중 → 이력 조회 누락/정지 복귀로 보고 T 보존.
                 # 리버스모드 진행 중이면 최근 체결이 전부 리버스 주문(reconciliation에서
@@ -1584,7 +2653,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     else:
                         print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 보유 {balance_qty}주 → T={state['T']} 유지 (이력 조회 누락/정지 복귀 가능)")
                         print(f"[경고] {symbol} 이력이 없는데 보유 중입니다. state.json과 잔고를 확인하세요.")
-                return state
+                return state, []
             # 잔고 0 → 잘못된 state.json(T>0, 잔고0, 이력0) 복구를 위해 전체 재추정.
             # 전체 이력도 비면 _infer_T_from_full_history가 T=0으로 리셋합니다.
             print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 + 잔고 0 → 전체 이력 재추정 시도 (T={state['T']})")
@@ -1599,16 +2668,20 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             state = _infer_T_from_full_history(symbol, state, order_history)
             if has_reverse_meta:
                 state["T"] = reverse_baseline_t
+                reset_settlement_ledger(state, reverse_baseline_t)
             reconcile_reverse_fills(state, order_history)
-            return state
+            state["_settlement_deltas"].extend(
+                state.pop("_reverse_settlement_deltas", [])
+            )
+            return state, []
         print(f"[상태] {symbol} {last_updated_dt.date()} 이후 체결 내역 없음 → T=0 유지")
-        return state
+        return state, []
 
     # 시간순, 주문번호순 정렬
     recent_candidates.sort(key=lambda tup: (tup[0], tup[1] or ""))
 
-    # 적용 내역 기록 — 자동 검증이 원시 체결 데이터와 대조합니다.
-    state["_settlement_deltas"] = []
+    # 적용 내역 기록 — 지연 체결분은 위에서 이미 기록했으므로 유지합니다.
+    state.setdefault("_settlement_deltas", [])
 
     T = state.get("T", 0.0)
     additional_loc_odno = state.get("additional_loc_odno", [])
@@ -1648,6 +2721,19 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             elif order.get("sll_buy_dvsn_cd_name") == "매수":
                 net_qty += filled
 
+        # 일자 내 체결을 **시간순**으로 시뮬레이션해 각 주문 직후 보유량을 구합니다.
+        # (매도/매수 처리 순서와 무관하게 실제 보유 궤적을 반영)
+        _post_qty = {}
+        _sim_qty = net_qty
+        for _o_dt, _odno, _row in sorted(day_items, key=lambda x: (x[0], x[1] or "")):
+            _delta = deltas.get(str(_odno), (0, 0.0))[0]
+            _side = _row.get("sll_buy_dvsn_cd_name")
+            if _side == "매수":
+                _sim_qty += _delta
+            elif _side == "매도":
+                _sim_qty = max(0, _sim_qty - _delta)
+            _post_qty[str(_odno)] = _sim_qty
+
         day_sells = [
             (o_dt, odno, o) for o_dt, odno, o in day_items
             if o.get("sll_buy_dvsn_cd_name") == "매도"
@@ -1673,10 +2759,19 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 state["_position_basis_unknown"] = True
             cumulative_qty = int(float(order.get("ft_ccld_qty", "0") or 0))
+            kind = "쿼터매도"
             t_before_effect = T
+            _old_entry = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+            try:
+                _factor_before = float(_old_entry.get("factor", 1.0))
+            except (TypeError, ValueError):
+                _factor_before = 1.0
+            # 표시용 t_before 는 이번 적용 직전 T 입니다 (역산하지 않습니다).
+            _t_before_base = t_before_effect
+            liquidated = False
             if net_qty > 0:
                 T, effect_applied = _apply_sell_t_effect(
-                    state, T, net_qty, odno, cumulative_qty
+                    state, T, net_qty, odno, cumulative_qty, allow_adjust=False
                 )
                 effects = state.get("sell_t_effects", {})
                 entry = effects.get(str(odno)) or {}
@@ -1685,30 +2780,40 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 kind = {0.75: "쿼터매도", 0.25: "목표매도", 0.0: "전량매도"}[
                     _classify_sell_ratio(ratio)
                 ]
-                if kind == "전량매도":
+                # 배율 0 은 "누적 매도 100%"일 뿐 사이클 종료가 아닙니다.
+                # 이번 신규 체결 후 실제 보유가 0인 경우에만 종료합니다.
+                liquidated = _post_qty.get(str(odno), max(0, net_qty - sell_qty)) <= 0
+                if kind == "전량매도" and liquidated:
                     completed_start = state.get("cycle_start_date", "")
                     if t_before_effect > 0 and completed_start:
                         state["_completed_cycle_start"] = completed_start
+                    # 실제 전량매도 → 사이클 종료 (T·순투입금 0, 사이클 시작일 정리)
                     T = 0.0
                     state["cycle_start_date"] = ""
                     net_invested = 0.0
-                    state["sell_t_effects"] = {}
                 print(
                     f"  → 매도 체결 ({ord_dt}): {kind} "
-                    f"(비율={ratio:.2f}, 기준 {basis}주, 누적 {cumulative_qty}주) → T={T}"
+                    f"(비율={ratio:.2f}, 기준 {basis}주, 누적 {cumulative_qty}주, "
+                    f"보유 {max(0, net_qty - sell_qty)}주) → T={T}"
                 )
             else:
-                T = round(T * 0.75, 4)
+                # 보유 기준선이 없는 매도 — 기존 동작(쿼터매도)을 원장에 기록합니다.
+                _sync_settlement_ledger(state, T, allow_adjust=False)
+                _append_settlement_entry(state, "sell", odno, basis=0, factor=0.75)
+                T = _replay_settlement_ledger(state)
                 print(
                     f"  → 매도 체결 ({ord_dt}): 쿼터매도 (보유수량 불명) → T={T}"
                 )
             # 순투입금 차감은 실제 체결 증가분만 (T 효과와 무관)
-            net_invested -= sell_amt
+            # 실제 청산이면 위에서 0으로 확정했으므로 다시 차감하지 않습니다.
+            if not (kind == "전량매도" and liquidated):
+                net_invested -= sell_amt
             net_qty = max(0, net_qty - sell_qty)
             if meta is not None:
                 _commit_fill_markers(meta, order, sell_qty, sell_amt)
             effects_now = state.get("sell_t_effects", {})
             entry_now = effects_now.get(str(odno)) or {}
+            ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
             state["_settlement_deltas"].append({
                 "odno": str(odno),
                 "side": "매도",
@@ -1716,10 +2821,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 "amount_delta": sell_amt,
                 "cumulative_qty": cumulative_qty,
                 "prev_cumulative_qty": max(cumulative_qty - sell_qty, 0),
-                "basis": int(entry_now.get("basis") or 0),
-                "factor": float(entry_now.get("factor", 1.0)),
+                "basis": int(entry_now.get("basis") or net_qty + sell_qty),
+                "factor": 0.0 if kind == "전량매도" else float(entry_now.get("factor", 1.0)),
+                "factor_before": float(_factor_before),
+                "t_before": float(_t_before_base),
+                "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
                 "t_delta": round(T - t_before_effect, 4),
             })
+            if kind == "전량매도" and liquidated:
+                state["sell_t_effects"] = {}
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
                 last_ordno_processed = odno or last_ordno_processed
@@ -1748,6 +2858,18 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             net_invested += buy_amt
             if meta is not None:
                 _commit_fill_markers(meta, order, buy_qty, buy_amt)
+            state["_settlement_deltas"].append({
+                "odno": str(odno),
+                "side": "매수",
+                "qty_delta": buy_qty,
+                "amount_delta": buy_amt,
+                "cumulative_qty": buy_qty,
+                "prev_cumulative_qty": 0,
+                "basis": 0,
+                "factor": 1.0,
+                "is_additional": True,
+                "t_delta": 0.0,
+            })
             print(f"  → 매수 체결 ({ord_dt}): 추가매수(odno={odno}) 제외 → T 변경 없음")
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
@@ -1778,11 +2900,14 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 if buy_qty <= 0 and abs(buy_amt) < 1e-9:
                     continue
                 total_qty = int(meta.get("total_qty") or buy_qty)
+                delta_T = 0.0
+                ledger_seq = None
                 if total_qty > 0:
                     delta_T = round(
                         (buy_qty / total_qty) * float(meta.get("t_target", 1.0)), 4
                     )
-                    T = round(T + delta_T, 4)
+                    T, ledger_entry = _apply_buy_t_effect(state, T, delta_T, odno, allow_adjust=False)
+                    ledger_seq = ledger_entry.get("seq") if ledger_entry else None
                     _commit_fill_markers(meta, order, buy_qty, buy_amt)
                     print(
                         f"  → 매수 체결 ({ord_dt}): odno={odno} "
@@ -1797,11 +2922,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     "qty_delta": buy_qty,
                     "amount_delta": buy_amt,
                     "cumulative_qty": buy_qty,
-                    "prev_cumulative_qty": max(buy_qty - buy_qty, 0),
+                    "prev_cumulative_qty": 0,
                     "basis": 0,
                     "factor": 1.0,
                     "t_target": float(meta.get("t_target", 1.0)),
                     "total_qty": total_qty,
+                    "is_additional": False,
+                    "ledger_seq": ledger_seq,
                     "t_delta": delta_T,
                 })
                 if o_dt > last_dt_processed:
@@ -1814,12 +2941,42 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if unregistered_buys:
                 buy_count = len(unregistered_buys)
                 delta_T = 1.0 if buy_count >= 2 else 0.5
-                T = round(T + delta_T, 4)
+                # 검증기가 T를 독립 재계산할 수 있게 주문별 기여분을 기록합니다.
+                # (합계 수량 기준 비례 배분 — 합이 delta_T와 일치)
+                _unreg_total = sum(
+                    deltas.get(str(odno), (0, 0.0))[0] for _o, odno, _r in unregistered_buys
+                )
                 print(f"  → 매수 체결 ({ord_dt}): 미등록매수 {buy_count}건 → T += {delta_T} → T={T}")
-                for o_dt, odno, order in unregistered_buys:
+                remaining_delta = delta_T
+                for idx, (o_dt, odno, order) in enumerate(unregistered_buys):
                     buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
                     net_qty += buy_qty
                     net_invested += buy_amt
+                    if idx == len(unregistered_buys) - 1:
+                        _share = round(remaining_delta, 4)
+                    else:
+                        _share = round(
+                            (buy_qty / _unreg_total) * delta_T, 4
+                        ) if _unreg_total > 0 else 0.0
+                        remaining_delta = round(remaining_delta - _share, 4)
+                    T, ledger_entry = _apply_buy_t_effect(state, T, _share, odno, allow_adjust=False)
+                    state["_settlement_deltas"].append({
+                        "odno": str(odno),
+                        "side": "매수",
+                        "qty_delta": buy_qty,
+                        "amount_delta": buy_amt,
+                        "cumulative_qty": buy_qty,
+                        "prev_cumulative_qty": 0,
+                        "basis": 0,
+                        "factor": 1.0,
+                        "t_target": float(delta_T),
+                        "total_qty": int(_unreg_total),
+                        "ord_dt": ord_dt,
+                        "is_additional": False,
+                        "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,
+                        "t_delta": _share,
+                        "unregistered": True,
+                    })
                     if o_dt > last_dt_processed:
                         last_dt_processed = o_dt
                         last_ordno_processed = odno or last_ordno_processed
@@ -1843,4 +3000,4 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         pass
 
     print(f"[상태] {symbol} T값 업데이트 완료 → T={state['T']}, 순투입 ${state['net_invested']:.2f}")
-    return state
+    return state, []

@@ -43,6 +43,8 @@ def _make_buy_order(odno, ord_dt, qty, utc_dt=None):
         "ord_dt": ord_dt,
         "sll_buy_dvsn_cd_name": "매수",
         "ft_ccld_qty": str(qty),
+        "ft_ccld_amt3": str(qty * 10.0),
+        "ft_ccld_unpr3": "10.0",
         "ord_datetime_utc": utc_dt,
     }
 
@@ -56,6 +58,8 @@ def _make_sell_order(odno, ord_dt, qty, utc_dt=None):
         "ord_dt": ord_dt,
         "sll_buy_dvsn_cd_name": "매도",
         "ft_ccld_qty": str(qty),
+        "ft_ccld_amt3": str(qty * 10.0),
+        "ft_ccld_unpr3": "10.0",
         "ord_datetime_utc": utc_dt,
     }
 
@@ -265,8 +269,13 @@ class TestApplyRecentHistory:
         assert result["T"] == 1.0
         assert result.get("balance_mismatch") is None
 
-    def test_last_updated_이전_이력_무시(self):
-        """last_updated(2026-05-27) 이전 주문(20260526)은 무시."""
+    def test_미반영_등록주문은_워터마크_이전이어도_복구(self):
+        """등록된 봇 주문이 미반영(processed=0)이면 워터마크 이전이어도 복구합니다.
+
+        2026-10-24 수정: 금액 미확정으로 보류된 체결이 워터마크 뒤로 밀려
+        영구 누락되던 문제를 막기 위해, **등록 주문**의 미반영 체결은
+        지연 체결 경로에서 1회 반영합니다. (미등록 수동 이력은 계속 무시)
+        """
         state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
         register_order_meta_in_state(state, "ORD012", {
             "side": "BUY", "total_qty": 3, "t_target": 1.0,
@@ -275,7 +284,8 @@ class TestApplyRecentHistory:
         orders = [_make_buy_order("ORD012", "20260526", qty=3,
                                   utc_dt="2026-05-26T10:00:00+00:00")]
         result = update_T_from_history("TQQQ", state, orders)
-        assert result["T"] == 1.0, f"T={result['T']} (expected 1.0)"
+        assert result["T"] == 2.0, f"T={result['T']} (expected 2.0)"
+        assert result["orders_meta"]["ORD012"]["processed_filled_qty"] == 3
 
     def test_odno_int_타입_메타_t1_정상반영(self):
         """int odno로 API 응답이 와도 str() 변환으로 orders_meta 조회 성공 → T=1.0"""

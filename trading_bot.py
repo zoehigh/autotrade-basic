@@ -25,7 +25,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash
+from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 from notifier import notify
 
 
@@ -56,51 +56,68 @@ STATE_ASSUME_REVERSE_EXPIRY_ONLY = os.getenv("STATE_ASSUME_REVERSE_EXPIRY_ONLY",
 STATE_SET_CYCLE_START_ONLY = os.getenv("STATE_SET_CYCLE_START_ONLY", "").strip().lower() == "true"
 
 
-def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
+def generate_cycle_report(
+    symbol,
+    order_history,
+    cycle_start_date,
+    cycle_end_date,
+    seed,
+    commission_rate,
+    cycle_orders=None,
+    liquidation_event=None,
+):
     """
-    한 사이클이 종료되었을 때 수익 리포트를 생성합니다.
+    **종료된 한 사이클 구간**의 수익 리포트를 생성합니다.
 
-    사이클 시작일(cycle_start_date)부터 오늘까지의 체결 내역을 집계하여
-    총 매수금액, 총 매도금액, 추정 수수료, 순수익금, 수익률을 계산합니다.
+    전체 이력이 아니라 `[cycle_start_date, cycle_end_date]` **닫힌 구간**의
+    체결만 집계합니다 (ord_dt 기준, 양 끝 포함). 사이클 종료 후처리에서
+    호출되며 state 에 의존하지 않습니다 — 구간은 호출자가 명시합니다.
 
     Parameters:
         symbol (str): 종목 코드
         order_history (list): get_overseas_order_history()의 반환값
-        state (dict): 현재 상태 (cycle_start_date, effective_seed 포함)
+        cycle_start_date (str): 사이클 시작일 (YYYY-MM-DD 또는 YYYYMMDD)
+        cycle_end_date (str): 사이클 종료일 (YYYY-MM-DD 또는 YYYYMMDD)
         seed (float): 이번 사이클에 사용된 시드 금액 (달러)
         commission_rate (float): 매매 수수료율 (예: 0.0025 = 0.25%)
 
     Returns:
         dict: 리포트 결과
-            - total_buy_amount: 총 매수금액
-            - total_sell_amount: 총 매도금액
-            - estimated_commission: 추정 수수료 (매수 + 매도)
-            - net_profit: 순수익금 (수수료 차감)
-            - operational_return_pct: 운용 수익률 (%)
-            - seed_return_pct: 시드 대비 수익률 (%, seed > 0 인 경우)
-            - buy_count: 매수 체결 건수
-            - sell_count: 매도 체결 건수
-            - cycle_start_date: 사이클 시작일
-            - cycle_end_date: 사이클 종료일 (오늘)
-            - next_cycle_seed: 복리 재투자 시 다음 사이클 시드
     """
-    cycle_start_date = state.get("cycle_start_date", "")
-    cycle_end_date = datetime.now().strftime("%Y-%m-%d")
+    start_yyyymmdd = str(cycle_start_date or "").replace("-", "")
+    end_yyyymmdd = str(cycle_end_date or "").replace("-", "")
+    if not end_yyyymmdd:
+        end_yyyymmdd = datetime.now().strftime("%Y%m%d")
 
-    # cycle_start_date를 YYYYMMDD 형식으로 변환하여 필터링에 사용
-    if cycle_start_date:
-        start_yyyymmdd = cycle_start_date.replace("-", "")
-        cycle_orders = [
-            o for o in order_history
-            if o.get("ord_dt", "") >= start_yyyymmdd
-            and int(float(o.get("ft_ccld_qty", "0"))) > 0
-        ]
+    if cycle_orders is not None:
+        # 청산 이벤트 경계로 이미 잘라낸 체결 목록입니다. 같은 날 새 사이클
+        # 매수가 섞이지 않도록 날짜 필터를 다시 적용하지 않습니다.
+        selected_orders = []
+        for order in cycle_orders:
+            try:
+                filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+            except (TypeError, ValueError):
+                continue
+            if filled > 0:
+                selected_orders.append(order)
+        cycle_orders = selected_orders
     else:
-        # 사이클 시작일 정보가 없으면 체결된 전체 이력을 사용합니다
-        cycle_orders = [
-            o for o in order_history
-            if int(float(o.get("ft_ccld_qty", "0"))) > 0
-        ]
+        cycle_orders = []
+        for order in order_history or []:
+            try:
+                filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+            except (TypeError, ValueError):
+                continue
+            if filled <= 0:
+                continue
+            ord_dt = str(order.get("ord_dt", "") or "").replace("-", "")[:8]
+            if not ord_dt:
+                continue
+            if start_yyyymmdd and ord_dt < start_yyyymmdd:
+                continue
+            if ord_dt > end_yyyymmdd:
+                continue
+            cycle_orders.append(order)
 
     total_buy_amount = 0.0
     total_sell_amount = 0.0
@@ -133,10 +150,17 @@ def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
 
     next_cycle_seed = (seed + net_profit) if seed > 0 else None
 
+    def _display_date(value, fallback):
+        value = str(value or "")
+        if len(value.replace("-", "")) == 8:
+            ymd = value.replace("-", "")
+            return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+        return value or fallback
+
     return {
         "symbol": symbol,
-        "cycle_start_date": cycle_start_date if cycle_start_date else "(기록 없음)",
-        "cycle_end_date": cycle_end_date,
+        "cycle_start_date": _display_date(cycle_start_date, "(기록 없음)"),
+        "cycle_end_date": _display_date(end_yyyymmdd, datetime.now().strftime("%Y-%m-%d")),
         "total_buy_amount": total_buy_amount,
         "total_sell_amount": total_sell_amount,
         "estimated_commission": estimated_commission,
@@ -148,6 +172,150 @@ def generate_cycle_report(symbol, order_history, state, seed, commission_rate):
         "sell_count": sell_count,
         "seed": seed,
         "next_cycle_seed": next_cycle_seed,
+        # 청산 이벤트 경계 (같은 날 재매수 제외 근거)
+        "liquidation_event": liquidation_event,
+    }
+
+
+def _order_event_key(order):
+    """정렬·경계 식별용 (시각, 주문번호) 키. 시각이 없으면 ord_dt+ord_tmd."""
+    odno = str(order.get("odno", "") or "")
+    ts = str(order.get("ord_datetime_utc", "") or "")
+    if not ts:
+        ord_dt = str(order.get("ord_dt", "") or "").replace("-", "")[:8]
+        ord_tmd = str(order.get("ord_tmd", "") or "").zfill(6)
+        ts = f"{ord_dt}{ord_tmd}"
+    return (ts, odno)
+
+
+def _liquidation_boundary_orders(order_history, cycle_start_date):
+    """사이클 시작 이후 **첫 전량매도(청산) 이벤트**까지의 체결 목록을 반환합니다.
+
+    날짜 구간이 아니라 청산 체결의 시각·주문번호를 경계로 사용하므로,
+    청산 후 같은 날 발생한 새 사이클 매수는 리포트에서 제외됩니다.
+
+    Returns:
+        tuple: (cycle_orders, event) — event 는 청산 주문 dict 또는 None
+    """
+    start = str(cycle_start_date or "").replace("-", "")
+    rows = []
+    for index, order in enumerate(order_history or []):
+        try:
+            filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            continue
+        if filled <= 0:
+            continue
+        ord_dt = str(order.get("ord_dt", "") or "").replace("-", "")[:8]
+        if not ord_dt or (start and ord_dt < start):
+            continue
+        side = order.get("sll_buy_dvsn_cd_name", "")
+        if side not in ("매수", "매도"):
+            continue
+        rows.append((_order_event_key(order), index, side, filled, order))
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+    net_qty = 0
+    selected = []
+    for _key, _index, side, qty, order in rows:
+        selected.append(order)
+        if side == "매수":
+            net_qty += qty
+        else:
+            before = net_qty
+            net_qty = max(0, net_qty - qty)
+            if before > 0 and net_qty == 0:
+                # 이 체결이 청산 이벤트입니다. 이후 행(같은 날 재매수 포함)은 제외.
+                return selected, order
+    return selected, None
+
+
+def _cycle_end_date_from_history(order_history, cycle_start_date):
+    """청산 이벤트의 ord_dt(표시용)를 반환합니다. 없으면 마지막 체결일 폴백."""
+    selected, event = _liquidation_boundary_orders(order_history, cycle_start_date)
+    chosen = ""
+    if event is not None:
+        chosen = str(event.get("ord_dt", "") or "").replace("-", "")[:8]
+    if not chosen and selected:
+        chosen = str(selected[-1].get("ord_dt", "") or "").replace("-", "")[:8]
+    if chosen:
+        return f"{chosen[:4]}-{chosen[4:6]}-{chosen[6:8]}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def finalize_completed_cycle(
+    symbol,
+    state,
+    order_history,
+    seed,
+    commission_rate,
+    report=None,
+    require_settled=True,
+):
+    """**이미 정산이 끝난** 사이클의 후처리만 수행합니다 (종료 전용 상태머신).
+
+    호출 시점 불변조건:
+      - T == 0, net_invested == 0, cycle_start_date == ""
+      - settlement_ledger.entries == [] (reset_settlement_ledger(state, 0.0) 선행)
+
+    이 함수는 리포트를 만들고 `next_cycle_seed` 만 반환합니다.
+    T / net_invested / ledger / apply marker / position_qty 는 건드리지 않습니다.
+
+    Parameters:
+        report (dict|None): 사이클 구간 힌트. `cycle_start_date`/`cycle_end_date` 를
+            담을 수 있습니다. 없으면 state 의 `_completed_cycle_start` 를 사용합니다.
+
+    Returns:
+        dict: {"next_cycle_seed": float, "report": dict}
+    """
+    hint = report if isinstance(report, dict) else {}
+    cycle_start = (
+        hint.get("cycle_start_date")
+        or state.pop("_completed_cycle_start", "")
+        or ""
+    )
+    boundary_orders, liquidation_event = _liquidation_boundary_orders(
+        order_history, cycle_start
+    )
+    if liquidation_event is not None:
+        raw_end = str(liquidation_event.get("ord_dt", "") or "").replace("-", "")[:8]
+        cycle_end = (
+            f"{raw_end[:4]}-{raw_end[4:6]}-{raw_end[6:8]}"
+            if raw_end else hint.get("cycle_end_date")
+        )
+    else:
+        cycle_end = hint.get("cycle_end_date") or _cycle_end_date_from_history(
+            order_history, cycle_start
+        )
+
+    # 불변조건 — 위반된 상태로 후처리하면 다른 사이클의 리포트/시드를 만듭니다.
+    # (같은 실행에서 새 사이클 매수가 시작된 경우에는 require_settled=False 로
+    #  리포트만 만들고 새 사이클 상태는 그대로 보존합니다)
+    if require_settled:
+        if float(state.get("T", 0.0) or 0.0) != 0.0:
+            raise ValueError("finalize_completed_cycle: T 가 0이 아닙니다")
+        if float(state.get("net_invested", 0.0) or 0.0) != 0.0:
+            raise ValueError("finalize_completed_cycle: net_invested 가 0이 아닙니다")
+        if state.get("cycle_start_date", ""):
+            raise ValueError("finalize_completed_cycle: cycle_start_date 가 비어있지 않습니다")
+        ledger = state.get("settlement_ledger") or {}
+        if ledger.get("entries"):
+            raise ValueError("finalize_completed_cycle: settlement_ledger.entries 가 비어있지 않습니다")
+
+    cycle_report = generate_cycle_report(
+        symbol=symbol,
+        order_history=order_history,
+        cycle_start_date=cycle_start,
+        cycle_end_date=cycle_end,
+        seed=seed,
+        commission_rate=commission_rate,
+        cycle_orders=boundary_orders,
+        liquidation_event=liquidation_event,
+    )
+    next_seed = cycle_report.get("next_cycle_seed")
+    return {
+        "next_cycle_seed": float(next_seed) if next_seed is not None else 0.0,
+        "report": cycle_report,
     }
 
 
@@ -229,7 +397,147 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
             f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
             f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
         )
+    pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
+    if pending_amount_odnos:
+        msg = (
+            f"[보류] {symbol} 체결금액이 확정되지 않은 주문 "
+            f"{len(pending_amount_odnos)}건({', '.join(pending_amount_odnos[:5])})이 있어 "
+            f"T/순투입/마커 저장과 신규 주문을 보류합니다. 금액 확정 후 재실행하세요."
+        )
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(msg)
+    if state.get("_settlement_hold"):
+        reason = state.get("_settlement_hold_reason", "적용 순서 근거 부족")
+        msg = (
+            f"[보류] {symbol} 정산 근거가 부족해 T/순투입/마커 저장과 신규 주문을 "
+            f"보류합니다: {reason}"
+        )
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(msg)
     return True
+
+
+def build_settlement_evidence(
+    symbol,
+    state,
+    order_history,
+    *,
+    mode,
+    run_id="",
+    balance_qty=None,
+    before=None,
+    settlement_mode=None,
+    max_t=None,
+):
+    """정산 근거(evidence v2)를 만듭니다 — 운영/검증/테스트가 **같은 함수**를 씁니다.
+
+    `before` 는 정산 직전 스냅샷입니다:
+        T, net_invested, ledger, sell_t_effects, position_qty, watermark,
+        orders_meta, applied markers
+    검증기는 이 스냅샷 + 원시 체결만으로 기대 원장을 독립 재구성합니다.
+    """
+    before = before or {}
+    ledger_before = deepcopy(before.get("settlement_ledger", {}) or {})
+    effects_before = deepcopy(before.get("sell_t_effects", {}) or {})
+    meta_before = deepcopy(before.get("orders_meta", {}) or {})
+    evidence = {
+        "symbol": symbol,
+        "run_id": run_id,
+        "retry_num": os.environ.get("RETRY_NUM", ""),
+        "mode": mode,
+        "broker": os.environ.get("BROKER", BROKER),
+        "broker_mode": os.environ.get("BROKER_MODE", BROKER_MODE),
+        "code_version": os.environ.get("CODE_VERSION") or os.environ.get("GIT_SHA", ""),
+        "max_t": max_t,
+        "evidence_version": 2,
+        "settlement_mode": (
+            settlement_mode
+            or state.get("_settlement_mode")
+            or ("full_reinference" if not before.get("last_updated") else "incremental")
+        ),
+        "balance_qty": balance_qty,
+        "position_basis": state.get("position_qty"),
+        "position_qty_before": before.get("position_qty"),
+        "basis_unknown": bool(
+            state.get("_position_basis_unknown") or state.get("_settlement_hold")
+        ),
+        "hold_reason": state.get("_settlement_hold_reason", ""),
+        "pending_amount_odnos": list(state.get("_pending_amount_odnos") or []),
+        "T_before": before.get("T", 0.0),
+        "net_invested_before": before.get("net_invested", 0.0),
+        "T_after": float(state.get("T", 0.0)),
+        "net_invested_after": float(state.get("net_invested", 0.0)),
+        "last_updated": state.get("last_updated", ""),
+        "watermark_before": before.get("last_updated", ""),
+        "last_processed_ordno_before": before.get("last_processed_ordno", ""),
+        "sell_ratios": state.get("_settlement_sell_ratios", []),
+        "sell_t_effects_before": effects_before,
+        "sell_t_effects": deepcopy(state.get("sell_t_effects", {}) or {}),
+        "orders_meta_before": meta_before,
+        "orders_meta_after": deepcopy(state.get("orders_meta", {}) or {}),
+        "ledger_before": ledger_before,
+        "ledger_after": deepcopy(state.get("settlement_ledger", {}) or {}),
+        "applied_seq": [
+            o.get("ledger_seq")
+            for o in state.get("_settlement_deltas", [])
+            if o.get("ledger_seq") is not None
+        ],
+        "orders": deepcopy(state.get("_settlement_deltas", [])),
+        "fills": [],
+        "skipped_fills": [],
+    }
+    for row in order_history or []:
+        try:
+            filled = int(float(row.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            continue
+        if filled <= 0:
+            # 금액 계산 불가로 브로커 경계에서 제외된 체결도 근거에 남깁니다.
+            skipped_qty = 0
+            try:
+                skipped_qty = int(float(row.get("_skipped_fill_qty", "0") or 0))
+            except (TypeError, ValueError):
+                skipped_qty = 0
+            if skipped_qty > 0:
+                evidence["skipped_fills"].append({
+                    "odno": str(row.get("odno", "")),
+                    "qty": skipped_qty,
+                    "reason": "amount_unavailable",
+                })
+            continue
+        odno = str(row.get("odno", ""))
+        row_meta = meta_before.get(odno) or {}
+        fill_amount, amount_estimated = _fill_amount(row)
+        evidence["fills"].append({
+            "odno": odno,
+            "side": row.get("sll_buy_dvsn_cd_name", ""),
+            "qty": filled,
+            "amount": fill_amount,
+            "amount_confirmed": not bool(amount_estimated),
+            "amount_source": row.get("_ft_ccld_amt_source", ""),
+            "amount_estimated": bool(row.get("_ft_ccld_amt_estimated", False)),
+            "ts": row.get("ord_datetime_utc", ""),
+            "t_target": float(row_meta.get("t_target", 0.0) or 0.0),
+            "total_qty": int(row_meta.get("total_qty", 0) or 0),
+            "is_additional": bool(row_meta.get("is_additional", False)),
+            "reverse_action": row_meta.get("reverse_action", ""),
+            "reverse_base_t": float(row_meta.get("reverse_base_t", 0.0) or 0.0),
+            "reverse_t_factor": float(
+                row_meta.get("reverse_t_factor", 1.0)
+                if row_meta.get("reverse_t_factor") is not None else 1.0
+            ),
+            "reverse_t_target": float(row_meta.get("reverse_t_target", 0.0) or 0.0),
+            "processed_filled_qty": int(row_meta.get("processed_filled_qty", 0) or 0),
+            "processed_filled_amount": float(
+                row_meta.get("processed_filled_amount", 0.0) or 0.0
+            ),
+            "applied_fill_fraction": min(
+                1.0, float(row_meta.get("applied_fill_fraction", 0.0) or 0.0)
+            ),
+        })
+    return evidence
 
 
 def run_one_symbol(broker: Broker, symbol_config):
@@ -362,46 +670,48 @@ def run_one_symbol(broker: Broker, symbol_config):
     watermark_before = str(state.get("last_updated", "") or "")
     T_before = float(state.get("T", 0.0))
     net_invested_before = float(state.get("net_invested", 0.0))
+    # 정산 전 원장 스냅샷 — 검증기가 "적용 전/후"를 독립 재생할 수 있게 남깁니다.
+    ledger_before = deepcopy(state.get("settlement_ledger", {}))
+    sell_t_effects_before = deepcopy(state.get("sell_t_effects", {}))
+    position_qty_before = state.get("position_qty")
+    orders_meta_before = deepcopy(state.get("orders_meta", {}))
+    before_snapshot = {
+        "T": T_before,
+        "net_invested": net_invested_before,
+        "settlement_ledger": ledger_before,
+        "sell_t_effects": sell_t_effects_before,
+        "position_qty": position_qty_before,
+        "last_updated": watermark_before,
+        "last_processed_ordno": state.get("last_processed_ordno", ""),
+        "orders_meta": orders_meta_before,
+    }
 
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
 
+    # 금액 미확정 체결 게이트 — update 경로가 놓친 경우에도 저장/주문을 막습니다.
+    pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
+    if not pending_amount_odnos:
+        pending_amount_odnos = _has_unconfirmed_amount_fills(state, order_history)
+    if pending_amount_odnos:
+        state["_pending_amount_odnos"] = pending_amount_odnos
+        state.setdefault("_settlement_hold", True)
+        state.setdefault(
+            "_settlement_hold_reason",
+            f"체결금액 미확정 주문 {len(pending_amount_odnos)}건",
+        )
+
     # ── 정산 근거 기록 (자동 검증이 독립 검산에 사용) ────────────────
     # 이 근거가 없으면 검증기는 "검증 불가"로 판단합니다.
-    settlement_evidence = {
-        "symbol": symbol,
-        "run_id": os.environ.get("RUN_ID", ""),
-        "mode": TRADE_MODE,
-        "balance_qty": live_qty,
-        "position_basis": state.get("position_qty"),
-        "basis_unknown": bool(state.get("_position_basis_unknown")),
-        "T_before": T_before,
-        "net_invested_before": net_invested_before,
-        "T_after": float(state.get("T", 0.0)),
-        "net_invested_after": float(state.get("net_invested", 0.0)),
-        "last_updated": state.get("last_updated", ""),
-        "watermark_before": watermark_before,
-        "sell_ratios": state.get("_settlement_sell_ratios", []),
-        "sell_t_effects": state.get("sell_t_effects", {}),
-        "orders": state.get("_settlement_deltas", []),
-        "fills": [],
-    }
-    for row in order_history:
-        try:
-            filled = int(float(row.get("ft_ccld_qty", "0") or 0))
-        except (TypeError, ValueError):
-            continue
-        if filled <= 0:
-            continue
-        row_meta = (state.get("orders_meta", {}) or {}).get(str(row.get("odno", ""))) or {}
-        settlement_evidence["fills"].append({
-            "odno": str(row.get("odno", "")),
-            "side": row.get("sll_buy_dvsn_cd_name", ""),
-            "qty": filled,
-            "amount": float(row.get("ft_ccld_amt3", "0") or 0),
-            "ts": row.get("ord_datetime_utc", ""),
-            "t_target": float(row_meta.get("t_target", 0.0) or 0.0),
-            "is_additional": bool(row_meta.get("is_additional", False)),
-        })
+    settlement_evidence = build_settlement_evidence(
+        symbol,
+        state,
+        order_history,
+        mode=TRADE_MODE,
+        run_id=os.environ.get("RUN_ID", ""),
+        balance_qty=live_qty,
+        before=before_snapshot,
+        max_t=max_t,
+    )
     try:
         stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
         with open(f"settlement-{symbol}-{stamp}.json", "w", encoding="utf-8") as fh:
@@ -409,6 +719,9 @@ def run_one_symbol(broker: Broker, symbol_config):
     except OSError as evidence_error:
         print(f"[경고] 정산 근거 기록 실패: {str(evidence_error)[:100]}")
 
+    # 금액 미확정/정산 근거 부족은 evidence 를 남긴 뒤 **즉시** 저장·주문을 보류합니다.
+    if state.get("_pending_amount_odnos") or state.get("_settlement_hold"):
+        _save_settlement_state(symbol, state)
 
     # ── 포지션 기반 T 추정 진단 (소액 시드 오추정 시 참고용) ──
     infer_diag = state.get("_inference_diagnostic", {})
@@ -424,6 +737,7 @@ def run_one_symbol(broker: Broker, symbol_config):
     if max_t is not None and state["T"] > max_t:
         print(f"[T 보정] {symbol} T={state['T']} > MAX_T={max_t} → T={max_t}로 조정")
         state["T"] = max_t
+        reset_settlement_ledger(state, max_t)
 
     # ── 사이클 종료 감지 (전체 재추정 경로) ──
     # _infer_T_from_full_history가 전량매도를 감지해 T=0으로 리셋한 경우,
@@ -443,27 +757,48 @@ def run_one_symbol(broker: Broker, symbol_config):
         _used_seed = state.get("effective_seed", 0.0)
         if not (REINVEST and _used_seed > 0):
             _used_seed = seed
-        state["cycle_start_date"] = completed_cycle_start
-        report = generate_cycle_report(
-            symbol=symbol,
-            order_history=order_history,
-            state=state,
-            seed=_used_seed,
-            commission_rate=COMMISSION_RATE,
+        # 같은 실행에서 새 사이클 매수가 시작됐는지 판별합니다.
+        # (T>0 또는 cycle_start_date 설정 = 새 사이클 진행 중)
+        new_cycle_started = bool(
+            float(state.get("T", 0.0) or 0.0) != 0.0
+            or float(state.get("net_invested", 0.0) or 0.0) != 0.0
+            or state.get("cycle_start_date", "")
         )
+        if new_cycle_started:
+            # 새 사이클 상태는 보존하고, 종료된 사이클의 리포트/시드만 갱신합니다.
+            state.pop("_completed_cycle_start", None)
+            finalized = finalize_completed_cycle(
+                symbol=symbol,
+                state=state,
+                order_history=order_history,
+                seed=_used_seed,
+                commission_rate=COMMISSION_RATE,
+                report={"cycle_start_date": completed_cycle_start},
+                require_settled=False,
+            )
+        else:
+            # 정산은 이미 완료된 상태(T=0/net=0)입니다. 원장만 0 기준으로 확정한 뒤
+            # **후처리(리포트/시드)** 만 수행합니다.
+            state["cycle_start_date"] = ""
+            reset_settlement_ledger(state, 0.0)
+            finalized = finalize_completed_cycle(
+                symbol=symbol,
+                state=state,
+                order_history=order_history,
+                seed=_used_seed,
+                commission_rate=COMMISSION_RATE,
+                report={"cycle_start_date": completed_cycle_start},
+            )
+        report = finalized["report"]
         report_message = format_cycle_report_message(report)
         print(f"\n{report_message}")
         notify(report_message)
-        if REINVEST and report["next_cycle_seed"] is not None:
-            state["effective_seed"] = round(report["next_cycle_seed"], 2)
+        # effective_seed 갱신은 리포트 후 **단 1회**.
+        if REINVEST and finalized["next_cycle_seed"] > 0:
+            state["effective_seed"] = round(finalized["next_cycle_seed"], 2)
             print(f"  복리 재투자: 다음 사이클 시드 = ${state['effective_seed']:.2f}")
         else:
             state["effective_seed"] = 0.0
-        state["T"] = 0.0
-        state["cycle_start_date"] = ""
-        state["net_invested"] = 0.0
-        state["net_invested_status"] = "valid"
-        state["reverse_mode"] = {}
 
     # ── 정산 결과 저장 ──────────────────────────────────────────
     # 보유수량 기준을 확보하지 못한 정산은 **저장하지 않고** 신규 주문도 내지 않습니다.
@@ -515,6 +850,7 @@ def run_one_symbol(broker: Broker, symbol_config):
                 state["net_invested"] = 0.0
                 state["net_invested_status"] = "valid"
                 state["reverse_mode"] = {}
+                reset_settlement_ledger(state, 0.0)
                 save_state(symbol, state)
                 raise RuntimeError(
                     f"{symbol} 이력 포지션과 브로커 잔고가 불일치하여 주문을 중단합니다. "
@@ -601,6 +937,7 @@ def run_one_symbol(broker: Broker, symbol_config):
         state["orders_meta"] = {}
         state["additional_loc_odno"] = []
         state["reverse_mode"] = {}
+        reset_settlement_ledger(state, force_t)
         # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
         # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
         # 주문 시각으로 last_updated를 갱신합니다. 이력이 없으면 현재 UTC를 사용합니다.
@@ -654,12 +991,20 @@ def run_one_symbol(broker: Broker, symbol_config):
         _used_seed = state.get("effective_seed", 0.0)
         if not (REINVEST and _used_seed > 0):
             _used_seed = seed
+        _cycle_start = state.get("cycle_start_date", "")
+        _cycle_orders, _liquidation_event = _liquidation_boundary_orders(
+            order_history, _cycle_start
+        )
+        _cycle_end = _cycle_end_date_from_history(order_history, _cycle_start)
         report = generate_cycle_report(
             symbol=symbol,
             order_history=order_history,
-            state=state,
+            cycle_start_date=_cycle_start,
+            cycle_end_date=_cycle_end,
             seed=_used_seed,
             commission_rate=COMMISSION_RATE,
+            cycle_orders=_cycle_orders,
+            liquidation_event=_liquidation_event,
         )
 
         report_message = format_cycle_report_message(report)
@@ -675,6 +1020,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["net_invested"] = 0.0
             state["net_invested_status"] = "valid"
             state["reverse_mode"] = {}
+            reset_settlement_ledger(state, 0.0)
             T = 0.0
             print("  [DRY] 사이클 종료 리포트 표시. 캐시 저장은 생략합니다. (LIVE 실행 시 실제 리셋/시드 갱신)")
         else:
@@ -698,6 +1044,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["net_invested"] = 0.0
             state["net_invested_status"] = "valid"
             state["reverse_mode"] = {}
+            reset_settlement_ledger(state, 0.0)
             save_state(symbol, state)
 
             print("  T값 초기화 완료. 새 사이클을 즉시 시작합니다.")
@@ -1120,6 +1467,82 @@ _OPEN_ORDER_STATUSES = {
 }
 
 
+def _is_terminal_order_status(status) -> bool:
+    """종료 상태(취소/체결/거부/만료 등)인지 — 대소문자 무관."""
+    token = str(status or "").strip().upper()
+    return token in {s.upper() for s in _TERMINAL_ORDER_STATUSES}
+
+
+def _is_open_order_status(status) -> bool:
+    """진행 중(미체결/부분체결) 상태인지 — TOSS 영어 상태 포함."""
+    token = str(status or "").strip().upper()
+    return token in {s.upper() for s in _OPEN_ORDER_STATUSES}
+
+
+def _open_orders_query_target(broker):
+    """`get_open_orders` 를 실제로 지원하는 브로커 객체인지 판별합니다.
+
+    Broker 기본 구현(빈 목록 + 경고)은 지원으로 보지 않습니다.
+    DryBroker 는 내부 real 브로커를 기준으로 판단합니다.
+    """
+    target = getattr(broker, "_real", None)
+    if not isinstance(target, Broker):
+        target = broker
+    if getattr(target, "supports_open_orders_query", False):
+        return target
+    owner = getattr(type(target), "get_open_orders", None)
+    if owner is not None and owner is not Broker.get_open_orders:
+        return target
+    return None
+
+
+def _load_open_orders_for_cancel(broker, symbol, exchange):
+    """열린 주문 조회 — (rows, error) 3상태.
+
+    Returns:
+        tuple: (list[dict], Exception|None)
+          - 지원하지 않는 브로커/정상 0건: ([], None) → 기존 경로로 진행
+          - 404/405(엔드포인트 미지원): ([], None) + 경고 → CLOSED 만으로 진행
+          - 그 외 실패: ([], error) → 호출부가 신규 주문을 보류
+    """
+    target = _open_orders_query_target(broker)
+    if target is None:
+        return [], None
+    fetch = getattr(target, "get_open_orders", None)
+    if not callable(fetch):
+        return [], None
+    try:
+        try:
+            rows = fetch(symbol, exchange)
+        except TypeError:
+            rows = fetch(symbol, exchange, days=30)
+        return list(rows or []), None
+    except Exception as error:
+        text = str(error)
+        if "404" in text or "405" in text:
+            print(
+                f"  ⚠️ 열린 주문 조회 미지원(HTTP 404/405) — CLOSED 이력만 사용합니다: "
+                f"{text[:120]}"
+            )
+            return [], None
+        print(f"  ⚠️ 열린 주문 조회 실패 — 신규 주문을 보류합니다: {text[:160]}")
+        return [], error
+
+
+def _merge_open_orders_into_history(broker, symbol, exchange, history):
+    """열린 주문을 이력에 합칩니다 (조회 실패 시 기존 이력 유지 — 하위호환)."""
+    open_rows, _error = _load_open_orders_for_cancel(broker, symbol, exchange)
+    if not open_rows:
+        return history
+    merged = {str(row.get("odno")): row for row in (history or [])}
+    for row in open_rows:
+        odno = str(row.get("odno") or "")
+        if odno:
+            # 열린 주문의 현재 상태/잔량이 CLOSED 스냅샷보다 최신입니다.
+            merged[odno] = row
+    return list(merged.values())
+
+
 def _cancel_open_bot_orders(
     broker,
     symbol: str,
@@ -1148,6 +1571,15 @@ def _cancel_open_bot_orders(
     Returns:
         int: 취소하고 확정한 주문 수
     """
+    # ── OPEN 조회는 대상 선정보다 **먼저** 항상 시도합니다. ──────────
+    # 메타가 비었거나 리버스모드여도 조회 실패 자체는 신규 주문 보류 사유입니다.
+    # (취소 대상 필터링만 메타/리버스 여부에 따라 달라집니다)
+    open_rows, open_error = _load_open_orders_for_cancel(broker, symbol, exchange)
+    if open_error is not None:
+        raise SymbolScopedError(
+            f"{symbol} 열린 주문 조회에 실패해 신규 주문을 보류합니다: {str(open_error)[:160]}"
+        )
+
     orders_meta = state.get("orders_meta") or {}
     if not orders_meta:
         return 0
@@ -1161,8 +1593,18 @@ def _cancel_open_bot_orders(
         print("[잔여 주문 정리] 리버스모드 활성 — 주문을 건드리지 않습니다.")
         return 0
 
+    # CLOSED 이력만 넘어온 경우에도 열린 주문을 취소 대상에 포함합니다.
+    # 3상태: 정상(0건 포함)→진행 / 조회 실패→신규 주문 보류 / 404·405→CLOSED만 진행.
+    if open_rows:
+        merged = {str(row.get("odno")): row for row in (order_history or [])}
+        for row in open_rows:
+            odno = str(row.get("odno") or "")
+            if odno:
+                merged[odno] = row
+        order_history = list(merged.values())
     by_odno = {str(o.get("odno")): o for o in (order_history or [])}
-    today = get_kst_now().strftime("%Y%m%d")
+    today_kst = get_kst_now().strftime("%Y%m%d")
+    today_session = datetime.now(ZoneInfo("America/New_York")).date().strftime("%Y%m%d")
     targets: list[tuple[str, str, int | None]] = []
     expired_candidates: list[str] = []
     for odno, meta in list(orders_meta.items()):
@@ -1172,12 +1614,23 @@ def _cancel_open_bot_orders(
         if row is None:
             continue
         status = str(row.get("prcs_stat_name", "") or "")
-        if status not in ("미체결", "부분체결"):
+        # 토스는 OPEN/PARTIAL 같은 영어 상태를 반환하고, 어댑터가 한국어로
+        # 매핑하지 못한 경우에도 취소 대상에서 누락되지 않도록 함께 판정합니다.
+        if not _is_open_order_status(status):
             continue
         remaining_row = _order_remaining_qty(row)
         if remaining_row is not None and remaining_row <= 0:
             continue
-        if str(row.get("ord_dt", "") or "") == today:
+        # 브로커별 ord_dt 컨벤션과 무관하게 실제 미국(ET) 세션으로 비교합니다
+        # (KST 자정 경계에서도 올바른 세션 판정).
+        order_session = _order_us_session_date(row)
+        if order_session is not None:
+            is_today_session = (order_session == today_session)
+        else:
+            # 시각 정보가 없는 행은 KST 날짜 비교로 호환합니다.
+            order_day = _order_real_kst_date(row) or str(row.get("ord_dt", "") or "")
+            is_today_session = (order_day == today_kst)
+        if is_today_session:
             # 오늘 세션 주문 — 아직 체결될 수 있으므로 반드시 취소해야 합니다.
             targets.append((str(odno), status, remaining_row))
         else:
@@ -1257,10 +1710,10 @@ def _cancel_open_bot_orders(
                 still_open.append(odno)
                 continue
             status = str(row.get("prcs_stat_name", "") or "")
-            if status in _TERMINAL_ORDER_STATUSES:
+            if _is_terminal_order_status(status):
                 confirmed.add(odno)
                 continue
-            if status not in _OPEN_ORDER_STATUSES:
+            if not _is_open_order_status(status):
                 # 알 수 없는 상태는 종료로 간주하지 않습니다
                 still_open.append(odno)
                 continue
@@ -1442,12 +1895,17 @@ def _repair_state_only():
         raise RuntimeError(f"복구 fingerprint 불일치: actual={actual}, expected={expected}")
 
     if target_t:
-        # T만 보정하고 리버스 cycle/orders_meta를 보존 → 다음 RUN의
-        # reconcile_reverse_fills가 체결 이력 기준으로 T/day_count를 재계산합니다.
-        print(f"[상태 복구] {symbol} T 보정: {state['T']} → {float(target_t)} (리버스 cycle 유지, reconciliation 재계산 예정)")
-        state["T"] = float(target_t)
+        # T만 보정하고 리버스 cycle/orders_meta를 보존합니다.
+        # 단순 T 대입은 다음 정산의 원장 재생에서 덮어써지므로, 복구 전/목표/조정량을
+        # adjust 항목으로 기록해 원장 재생값을 복구 T와 일치시킵니다.
+        print(f"[상태 복구] {symbol} T 보정: {state['T']} → {float(target_t)} (리버스 cycle 유지)")
+        record_settlement_t_adjustment(
+            state, float(target_t),
+            source="STATE_REPAIR_TARGET_T",
+            at=datetime.now(ZoneInfo("UTC")).isoformat(),
+        )
         save_state(symbol, state)
-        print(f"[상태 복구] {symbol} T={target_t}로 보정 완료. 다음 RUN에서 reconciliation이 체결 기반으로 재계산합니다.")
+        print(f"[상태 복구] {symbol} T={target_t}로 보정 완료. 다음 RUN의 reconciliation이 체결 기반으로 재계산합니다.")
         return
 
     print(f"[상태 복구] {symbol} reverse_mode 초기화: {reverse_mode}")
@@ -1926,6 +2384,7 @@ def _repair_force_t():
             state["orders_meta"] = {}
             state["additional_loc_odno"] = []
             state["reverse_mode"] = {}
+            reset_settlement_ledger(state, force_t)
 
             # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
             # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신

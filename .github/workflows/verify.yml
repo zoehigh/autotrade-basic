@@ -1,0 +1,119 @@
+name: 정산 근거 검증 (read-only)
+
+# trading 실행 완료 후 `needs`로 호출됩니다 (trade_base.yml).
+# 브로커 계좌 API를 호출하지 않고 settlement-*.json 만 독립 검산합니다.
+on:
+  workflow_call:
+    inputs:
+      broker:
+        description: '증권사 (kis, kiwoom, ls, toss, nhplug, meritz)'
+        required: true
+        type: string
+      mode:
+        description: '거래 모드 (DRY/LIVE) — 실행 job 이 확정한 값 (실패 시 빈 값)'
+        required: false
+        type: string
+        default: ''
+      broker_mode:
+        description: '브로커 모드 (demo/real)'
+        required: false
+        type: string
+        default: ''
+      run_id:
+        description: '실행 식별자'
+        required: true
+        type: string
+      retry_num:
+        description: '재시도 회차'
+        required: false
+        type: string
+        default: ''
+      code_version:
+        description: '코드 버전 (github.sha)'
+        required: false
+        type: string
+        default: ''
+      trade_result:
+        description: '거래 job 결과 (success/failure/cancelled)'
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: '정산 근거 artifact 이름'
+        required: false
+        type: string
+        default: settlement-evidence
+
+jobs:
+  verify:
+    # 거래 job 실패 후에도 실행 — evidence 가 없으면 검증 불가로 실패합니다.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: uv 설치
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Python 설정
+        run: uv python install
+
+      - name: 의존성 설치
+        run: uv sync
+
+      - name: 거래 job 결과 확인
+        run: echo "trade_result=${{ inputs.trade_result || 'unknown' }}"
+
+      - name: 정산 근거 다운로드
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: evidence
+
+      - name: 정산 근거 독립 검산
+        env:
+          BROKER: ${{ inputs.broker }}
+          MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.run_id }}
+          RETRY_NUM: ${{ inputs.retry_num }}
+          CODE_VERSION: ${{ inputs.code_version }}
+          BROKER_MODE: ${{ inputs.broker_mode }}
+        run: |
+          uv run python - <<'PY'
+          import glob
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "ops")
+          import verify_run
+
+          files = sorted(glob.glob("evidence/settlement-*.json"))
+          if not files:
+              print("[실패] 정산 근거 파일이 없습니다 — 검증 불가")
+              sys.exit(1)
+
+          broker = os.environ.get("BROKER", "")
+          mode = os.environ.get("MODE", "")
+          run_id = os.environ.get("RUN_ID", "")
+          ok, problems = verify_run.verify_evidence_dir(
+              "evidence",
+              broker,
+              mode,
+              run_id=run_id or None,
+              retry_num=os.environ.get("RETRY_NUM") or None,
+              code_version=os.environ.get("CODE_VERSION") or None,
+              broker_mode=os.environ.get("BROKER_MODE") or None,
+          )
+          if ok:
+              print(f"[OK ] evidence {len(files)}건 + 최종 스냅샷 검증 통과")
+          else:
+              print("[!! ] 정산 검증 실패")
+              for problem in problems:
+                  print(f"       - {problem}")
+              sys.exit(1)
+          PY

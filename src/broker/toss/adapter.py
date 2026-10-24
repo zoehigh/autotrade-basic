@@ -43,6 +43,59 @@ from broker.toss.exchange import get_api_exchange_code
 # ── 주문 방향 매핑 (Toss API "BUY"/"SELL" → state.py "매수"/"매도") ──
 _SIDE_MAP = {"BUY": "매수", "SELL": "매도"}
 
+# ── 주문 상태 매핑 (Toss API 영어 상태 → state.py 표준 한국어 상태) ──
+# 토스는 OPEN/PARTIAL/FILLED/CANCELED/REJECTED 같은 영어 상태를 반환합니다.
+# state.py 와 취소 대상 선정 로직은 한국어 상태를 기준으로 하므로
+# 브로커 경계에서 표준 상태로 변환합니다. (원본은 prcs_stat_name_raw 에 보존)
+_TOSS_STATUS_TO_KOREAN = {
+    "OPEN": "미체결",
+    "PENDING": "미체결",
+    "NEW": "미체결",
+    "ACTIVE": "미체결",
+    "SCHEDULED": "미체결",
+    "PARTIAL": "부분체결",
+    "PARTIALLY_FILLED": "부분체결",
+    "FILLED": "체결",
+    "CANCELED": "취소",
+    "CANCELLED": "취소",
+    "REJECTED": "거부",
+    "EXPIRED": "만료",
+    "CLOSED": "종료",
+    "DELISTED": "종료",
+}
+_TOSS_TERMINAL_STATUSES = {
+    "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "CLOSED", "DELISTED",
+}
+
+
+def map_order_status(status: str) -> str:
+    """토스 주문 상태(영어)를 state.py 표준 한국어 상태로 변환합니다.
+
+    알 수 없는 상태는 원본을 그대로 반환합니다 (종료로 간주하지 않음).
+    """
+    raw = str(status or "").strip()
+    if not raw:
+        return ""
+    return _TOSS_STATUS_TO_KOREAN.get(raw.upper(), raw)
+
+
+def _raw_order_needs_last_price(raw: dict) -> bool:
+    """체결수량은 있는데 체결금액·평균가가 모두 없어 현재가 폴백이 필요한지."""
+    def _num(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    execution = (raw or {}).get("execution") or {}
+    qty = _num(execution.get("filledQuantity"))
+    amount = _num(execution.get("filledAmount"))
+    avg = _num(execution.get("averageFilledPrice"))
+    if avg <= 0:
+        avg = _num(execution.get("averagePrice"))
+    return qty > 0 and amount <= 0 and avg <= 0
+
+
 # ── 주문 유형 매핑 ──
 # timeInForce=DAY + orderType=LIMIT = 일반 지정가 (LIMIT)
 # timeInForce=CLS + orderType=LIMIT = 장마감지정가 (LOC)
@@ -62,6 +115,8 @@ _MOC_SELL_PROXY_PRICE = 0.01
 
 
 class TossBroker(Broker):
+    # TOSS 는 status=OPEN 조회를 지원합니다 (실측 2026-10-23).
+    supports_open_orders_query = True
     """
     토스증권 미국주식 REST API Broker 구현체.
 
@@ -215,15 +270,22 @@ class TossBroker(Broker):
 
         raise BrokerError("API 호출 실패: 재시도 한도 초과")
 
-    def _normalize_order_item(self, raw: dict) -> dict:
+    def _normalize_order_item(self, raw: dict, last_price: float | None = None) -> dict:
         """
         토스 주문 응답(Order 모델)을 state.py 표준 필드로 변환.
 
         핵심 변환:
         - side: "BUY"/"SELL" → "매수"/"매도"
-        - orderedAt: ISO 8601 → ord_dt(YYYYMMDD), ord_tmd(HHMMSS)
+        - status: OPEN/PARTIAL/FILLED... → 미체결/부분체결/체결...
+        - orderedAt: ISO 8601 KST → ord_dt(YYYYMMDD), ord_tmd(HHMMSS)
         - execution.filledQuantity → ft_ccld_qty
-        - execution.averagePrice → ft_ccld_unpr3
+        - execution.averageFilledPrice → ft_ccld_unpr3
+        - execution.filledAmount → ft_ccld_amt3
+
+        체결금액 방어:
+          filledAmount 가 0/누락인데 체결수량이 있으면
+          `수량 × 평균체결가` → `수량 × 현재가(last_price)` 순으로 재계산합니다.
+          둘 다 없으면 경고 후 해당 체결을 제외(qty=0)합니다 — 조용히 0원 반영 금지.
         """
         # 주문 방향 정규화
         side_raw = raw.get("side", "")
@@ -246,12 +308,47 @@ class TossBroker(Broker):
             except (ValueError, TypeError):
                 pass
 
-        # 체결 정보 추출
+        # 체결 정보 추출 (토스 실제 필드명: averageFilledPrice / filledAmount)
         execution = raw.get("execution", {}) or {}
-        filled_qty = int(float(execution.get("filledQuantity", 0)))
-        avg_price = float(execution.get("averagePrice", 0)) if execution.get("averagePrice") else 0.0
-        quantity = int(float(raw.get("quantity", 0)))
-        filled_amt = str(filled_qty * avg_price) if filled_qty > 0 and avg_price > 0 else "0"
+
+        def _num(value) -> float:
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        filled_qty = int(_num(execution.get("filledQuantity")))
+        avg_price = _num(execution.get("averageFilledPrice"))
+        if avg_price <= 0:
+            # 구버전/문서 표기 호환
+            avg_price = _num(execution.get("averagePrice"))
+        quantity = int(_num(raw.get("quantity")))
+
+        filled_amount = _num(execution.get("filledAmount"))
+        amount_source = "broker" if filled_amount > 0 else ""
+        amount_estimated = False
+        amount_unavailable = filled_qty > 0 and filled_amount <= 0
+        average_price_for_row = avg_price
+
+        # 체결수량은 **그대로 보존**합니다. 금액이 없으면 현재가/평균가로 추정하지 않고
+        # 금액 미확정 상태로 넘겨, 공통 보류 로직(_fill_amount_is_available →
+        # _pending_amount_odnos → SymbolScopedError)이 정산을 멈추게 합니다.
+        # (수량을 0으로 바꾸면 보류 대상에서 사라져 워터마크 뒤로 밀린 체결이 영구 누락됩니다)
+        if amount_unavailable:
+            print(
+                f"[경고] 토스 주문 {raw.get('orderId', '')} 체결 {filled_qty}주 "
+                f"금액 미확정(filledAmount 없음) → 정산 보류 대상으로 전달합니다"
+            )
+
+        # 평균가가 없어도 체결금액이 있으면 단가를 역산해 표시합니다.
+        effective_price = average_price_for_row if filled_qty > 0 else 0.0
+        if effective_price <= 0 and filled_amount > 0 and filled_qty > 0:
+            effective_price = round(filled_amount / filled_qty, 4)
+
+        status_raw = str(raw.get("status", "") or "")
+        status = map_order_status(status_raw)
+        is_terminal = status_raw.upper() in _TOSS_TERMINAL_STATUSES
+        remaining = 0 if is_terminal else max(quantity - filled_qty, 0)
 
         return {
             "ord_dt": ord_dt,
@@ -262,14 +359,22 @@ class TossBroker(Broker):
             "sll_buy_dvsn_cd_name": sll_buy_dvsn_cd_name,
             "ft_ord_qty": str(quantity),
             "ft_ccld_qty": str(filled_qty),
-            "ft_ccld_unpr3": str(avg_price),
-            "ft_ccld_amt3": filled_amt,
-            "nccs_qty": str(quantity - filled_qty),
-            "prcs_stat_name": raw.get("status", ""),
+            "ft_ccld_unpr3": str(effective_price),
+            "ft_ccld_amt3": str(filled_amount) if filled_amount > 0 else "0",
+            "nccs_qty": str(remaining),
+            "prcs_stat_name": status or status_raw,
+            "prcs_stat_name_raw": status_raw,
             "tr_mket_name": "",
             "tr_crcy_cd": "USD",
             "odno": raw.get("orderId", ""),
             "ovrs_excg_cd": "",
+            # 체결금액 확정/미확정 근거 (로그·evidence 추적용)
+            "_ft_ccld_amt_source": amount_source,
+            "_ft_ccld_amt_estimated": amount_estimated,
+            "_skipped_fill_qty": "0",
+            "_fill_amount_unavailable": amount_unavailable,
+            # orderedAt 기반 ord_dt는 KST 날짜 (미국영업일 아님)
+            "_ord_dt_is_kst_date": True,
         }
 
     # ═══════════════════════════════════════════════════════════════════
@@ -489,47 +594,41 @@ class TossBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
-    def get_order_history(
+    def _fetch_orders(
         self,
         symbol: str,
         exchange: str,
+        status: str,
         days: int = 30,
-        verbose: bool = False,
         limit: int = 100,
+        verbose: bool = False,
     ) -> list[dict]:
-        """
-        주문 체결 내역을 조회합니다 → list[dict].
+        """지정한 status(CLOSED/OPEN)의 주문을 페이지네이션으로 조회합니다.
 
-        토스 API: GET /api/v1/orders?status=CLOSED&symbol={ticker}&from={date}&to={date}
-        커서 기반 페이지네이션으로 전체 체결 이력을 수집합니다.
+        GET /api/v1/orders?status={status}&symbol={ticker}&from={date}&to={date}
 
-        각 dict는 state.py가 기대하는 표준 필드를 포함합니다:
-            ord_dt, ord_tmd, ord_datetime_kst, ord_datetime_utc,
-            prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
-            ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
-            tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
+        토스 API는 status=OPEN 을 지원합니다 (실측 2026-10-23: HTTP 200).
+        status=ALL 은 지원하지 않으므로 CLOSED/OPEN 을 각각 조회해 합칩니다.
         """
         token = self._get_token()
         now_kst = get_kst_now()
         start_date = now_kst - timedelta(days=days)
-
         ticker = symbol.upper()
-
-        # 토스 API 날짜 형식: YYYY-MM-DD
         from_date = start_date.strftime("%Y-%m-%d")
         to_date = now_kst.strftime("%Y-%m-%d")
 
+        label = "미체결" if status == "OPEN" else "체결내역"
         order_history: list[dict] = []
         cursor = None
         page_no = 1
         MAX_PAGES = 20
 
-        print(f"[주문이력] {symbol} 체결내역 조회: {from_date} ~ {to_date}")
+        print(f"[주문이력] {symbol} {label} 조회: {from_date} ~ {to_date}")
 
         try:
             while page_no <= MAX_PAGES:
                 params: dict = {
-                    "status": "CLOSED",
+                    "status": status,
                     "symbol": ticker,
                     "from": from_date,
                     "to": to_date,
@@ -548,10 +647,23 @@ class TossBroker(Broker):
                 orders = result.get("orders", [])
                 next_cursor = result.get("nextCursor")
 
-                print(f"[주문이력] {symbol} 페이지 {page_no} 조회 성공: {len(orders)}건")
+                print(f"[주문이력] {symbol} {label} 페이지 {page_no}: {len(orders)}건")
+
+                # 평균가·체결금액이 모두 없는 행이 있으면 현재가 1회 조회로 폴백합니다.
+                last_price = None
+                if any(_raw_order_needs_last_price(item) for item in orders):
+                    try:
+                        last_price = self.get_stock_price(symbol, exchange).last
+                    except Exception as price_error:
+                        print(
+                            f"[경고] 토스 체결금액 폴백용 현재가 조회 실패: "
+                            f"{str(price_error)[:100]}"
+                        )
 
                 for item in orders:
-                    normalized = self._normalize_order_item(item)
+                    normalized = self._normalize_order_item(
+                        item, last_price=last_price
+                    )
                     order_history.append(normalized)
 
                 if not next_cursor:
@@ -566,7 +678,75 @@ class TossBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"주문체결내역 조회 실패: {str(e)}")
 
-        print(f"[주문이력] {symbol} 총 {len(order_history)}건 조회 완료")
+        print(f"[주문이력] {symbol} {label} 총 {len(order_history)}건 조회 완료")
+        return order_history
+
+    def get_open_orders(
+        self,
+        symbol: str,
+        exchange: str,
+        days: int = 30,
+        limit: int = 100,
+    ) -> list[dict]:
+        """미체결(열린) 주문만 조회합니다 → list[dict] (state.py 표준 필드).
+
+        토스 `GET /api/v1/orders?status=OPEN` 은 실측으로 지원됩니다.
+        열린 주문은 CLOSED 이력에 나타나지 않으므로, 신규 주문 전 중복 방지를
+        위해 반드시 이 경로로 조회해야 합니다.
+        """
+        return self._fetch_orders(
+            symbol, exchange, "OPEN", days=days, limit=limit, verbose=False
+        )
+
+    def get_order_history(
+        self,
+        symbol: str,
+        exchange: str,
+        days: int = 30,
+        verbose: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        주문 체결 내역 + 열린 주문을 조회합니다 → list[dict].
+
+        토스 API: GET /api/v1/orders?status=CLOSED / status=OPEN
+        커서 기반 페이지네이션으로 전체 이력을 수집합니다.
+
+        중요: CLOSED 만 조회하면 아직 살아있는 OPEN/PARTIAL 주문이 이력에
+        나타나지 않아 `_cancel_open_bot_orders` 가 취소 대상을 찾지 못합니다.
+        그래서 CLOSED 와 OPEN 을 모두 조회해 주문번호 기준으로 합칩니다.
+        (OPEN 조회가 실패하면 CLOSED 만으로 계속 진행 — 중복 주문 방지는
+         다음 실행의 OPEN 조회와 잔여 주문 취소 확인에 맡깁니다)
+
+        각 dict는 state.py가 기대하는 표준 필드를 포함합니다:
+            ord_dt, ord_tmd, ord_datetime_kst, ord_datetime_utc,
+            prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
+            ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
+            tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
+        """
+        closed_orders = self._fetch_orders(
+            symbol, exchange, "CLOSED", days=days, limit=limit, verbose=verbose
+        )
+        try:
+            open_orders = self._fetch_orders(
+                symbol, exchange, "OPEN", days=days, limit=limit, verbose=False
+            )
+        except BrokerError as open_error:
+            # OPEN 조회가 일시적으로 거부/실패해도 CLOSED 정산은 계속합니다.
+            print(
+                f"[경고] 토스 미체결 주문 조회 실패 — CLOSED 이력만 사용합니다: "
+                f"{str(open_error)[:120]}"
+            )
+            open_orders = []
+
+        order_history = list(closed_orders)
+        seen_odnos = {str(item.get("odno", "")) for item in order_history}
+        for item in open_orders:
+            odno = str(item.get("odno", ""))
+            if odno and odno in seen_odnos:
+                continue
+            order_history.append(item)
+            seen_odnos.add(odno)
 
         # Human-friendly summary (verbose 모드)
         if verbose and order_history:
@@ -588,6 +768,7 @@ class TossBroker(Broker):
                 qty = item.get("ft_ccld_qty", "0")
                 price = item.get("ft_ccld_unpr3", "0")
                 amt = item.get("ft_ccld_amt3", "0")
+                status = item.get("prcs_stat_name", "")
                 try:
                     price_s = f"{float(price):.2f}"
                 except Exception:
@@ -597,7 +778,10 @@ class TossBroker(Broker):
                 except Exception:
                     amt_s = amt
 
-                print(f"{kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+                print(
+                    f"{kst_str} | odno={odno} | {side} | status={status} | "
+                    f"qty={qty} | price={price_s} | amt={amt_s}"
+                )
 
         return order_history
 
