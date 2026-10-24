@@ -458,7 +458,8 @@ def test_bot_orders_visible_no_warning(capsys):
     state = _make_state(
         T=12.375,
         last_updated="2026-10-19 08:06:49+00:00",
-        orders_meta={"OD1": {"side": "BUY", "total_qty": 7, "t_target": 1.0}},
+        orders_meta={"OD1": {"side": "BUY", "total_qty": 7, "t_target": 1.0,
+                           "processed_filled_qty": 0}},
     )
     orders = [_make_unfilled_order("OD1", "20261020", 7)]
 

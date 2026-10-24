@@ -425,6 +425,7 @@ def reconcile_reverse_fills(state, order_history):
             continue
         history_by_odno.setdefault(odno, []).append(order)
     events = []
+    marker_held_odnos: list[str] = []
     reverse_mode = state.setdefault("reverse_mode", {})
     active_cycle_id = reverse_mode.get("cycle_id", "")
     if not active_cycle_id:
@@ -480,11 +481,20 @@ def reconcile_reverse_fills(state, order_history):
                 print(f"[경고] 전일 리버스 주문이 종결되지 않음: odno={odno} → 신규 주문을 보류합니다.")
         try:
             filled_qty = max(0, int(float(order.get("ft_ccld_qty", "0"))))
-            processed_qty = max(0, int(meta.get("processed_filled_qty", 0)))
             total_qty = max(0, int(meta.get("total_qty", 0)))
         except (TypeError, ValueError):
             continue
         if total_qty <= 0:
+            continue
+        qty_marker_ok, processed_qty = _parse_processed_qty_marker(meta)
+        if filled_qty > 0 and not qty_marker_ok and _fill_amount_is_available(order):
+            # 마커 누락·무효 리버스 메타는 이미 반영된 체결인지 판단할 수 없으므로
+            # 자동 증분 반영하지 않고 reconciliation을 보류합니다.
+            marker_held_odnos.append(str(odno))
+            print(
+                f"  [경고] 리버스 주문 보류(마커 누락·무효): "
+                f"odno={odno}, qty={order.get('ft_ccld_qty','0')}"
+            )
             continue
         events.append((
             order.get("ord_datetime_utc", ""),
@@ -495,6 +505,19 @@ def reconcile_reverse_fills(state, order_history):
             processed_qty,
             total_qty,
         ))
+
+    if marker_held_odnos and not events:
+        # 마커 누락·무효 주문만 있고 반영할 정상 이벤트가 없으면 여기서 보류합니다.
+        state.clear()
+        state.update(hold_snapshot)
+        state["_pending_amount_odnos"] = [str(odno) for odno in marker_held_odnos]
+        state["_pending_marker_odnos"] = [str(odno) for odno in marker_held_odnos]
+        _mark_settlement_hold(
+            state,
+            f"리버스 마커 누락·무효 주문 {len(marker_held_odnos)}건 "
+            f"({', '.join([str(o) for o in marker_held_odnos[:5]])}) — 마커 보정 후 재실행 필요",
+        )
+        return
 
     if not events:
         return
@@ -512,6 +535,9 @@ def reconcile_reverse_fills(state, order_history):
             return 0.0
 
     pending_amount_odnos = []
+    for odno in marker_held_odnos:
+        if str(odno) not in pending_amount_odnos:
+            pending_amount_odnos.append(str(odno))
     for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=lambda item: (item[0], item[1])):
         observed_fraction = min(filled_qty / total_qty, 1.0)
         action = meta.get("reverse_action")
@@ -770,10 +796,13 @@ def reconcile_reverse_fills(state, order_history):
         state.clear()
         state.update(hold_snapshot)
         state["_pending_amount_odnos"] = pending_amount_odnos
+        marker_only = [str(o) for o in marker_held_odnos if str(o) in pending_amount_odnos]
+        if marker_only:
+            state["_pending_marker_odnos"] = marker_only
         _mark_settlement_hold(
             state,
-            f"리버스 체결금액 미확정 주문 {len(pending_amount_odnos)}건 "
-            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 후 재실행 필요",
+            f"리버스 체결금액 미확정 또는 마커 누락·무효 주문 {len(pending_amount_odnos)}건 "
+            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return
     if state.get("_settlement_hold"):
@@ -819,6 +848,7 @@ def _update_T_from_history_impl(symbol, state, order_history, balance_qty=None):
     symbol = symbol.upper()
     state.pop("_settlement_mode", None)
     state.pop("_pending_amount_odnos", None)
+    state.pop("_pending_marker_odnos", None)
     state["_reverse_settlement_deltas"] = []
     state["_settlement_deltas"] = []
     last_updated = state.get("last_updated", "")
@@ -976,16 +1006,20 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
     """
     state.pop("_settlement_hold", None)
     state.pop("_settlement_hold_reason", None)
+    state.pop("_pending_marker_odnos", None)
     snapshot = deepcopy(state)
     result = _update_T_from_history_impl(symbol, state, order_history, balance_qty=balance_qty)
     if isinstance(result, dict) and result.get("_settlement_hold"):
         reason = result.get("_settlement_hold_reason", "정산 근거 부족")
         pending = list(result.get("_pending_amount_odnos") or [])
+        marker_pending = list(result.get("_pending_marker_odnos") or [])
         result.clear()
         result.update(snapshot)
         _mark_settlement_hold(result, reason)
         if pending:
             result["_pending_amount_odnos"] = pending
+        if marker_pending:
+            result["_pending_marker_odnos"] = marker_pending
     return result
 
 
@@ -2201,6 +2235,49 @@ def _commit_fill_markers(meta, order, applied_qty, applied_amount):
         )
 
 
+def _parse_processed_qty_marker(meta):
+    """
+    processed_filled_qty 마커를 엄격히 판정합니다.
+
+    - 키 누락, None, bool, 파싱 불가 값, 음수는 모두 무효로 분류합니다.
+      (0으로 취급하면 이미 반영된 체결인지 판단할 수 없어 이중 반영 위험이 있습니다)
+    - 명시적이고 유효한 0 이상 정수만 유효 마커로 인정합니다.
+      (등록 직후 미반영 주문의 정상 상태)
+
+    Returns:
+        tuple: (유효 여부, 반영 수량 — 무효면 0)
+    """
+    if meta is None or "processed_filled_qty" not in meta:
+        return False, 0
+    raw = meta.get("processed_filled_qty")
+    if raw is None or isinstance(raw, bool):
+        return False, 0
+    try:
+        if isinstance(raw, float):
+            # 소수 마커는 정수 마커로 절삭되면 안 됩니다 (예: 0.5 → 0 오인).
+            if not raw.is_integer():
+                return False, 0
+            value = int(raw)
+        else:
+            value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return False, 0
+    if value < 0:
+        return False, 0
+    return True, value
+
+
+def _has_processed_qty_marker(meta):
+    """
+    processed_filled_qty 필드가 메타에 명시적이고 유효하게 존재하는지 확인합니다.
+
+    필드가 누락되거나 무효한 경우(레거시/수동 편집 state.json)는 이미 반영된
+    체결인지 여부를 판단할 수 없으므로 자동 복구 대상이 아님을 구분합니다.
+    """
+    valid, _ = _parse_processed_qty_marker(meta)
+    return valid
+
+
 def _apply_late_fill_deltas(state, order_history, skip_odnos):
     """
     워터마크보다 오래된 주문의 **누적 체결 증가분**을 계산합니다 (메타 변경 없음).
@@ -2213,15 +2290,18 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
     - 등록 주문(orders_meta)이 아직 한 번도 반영되지 않았으면(processed=0),
       금액 미확정 보류로 워터마크가 앞서 나가도 영구 누락되지 않도록 복구합니다.
       (반영된 주문은 processed_filled_qty > 0 이므로 이 경로로 중복 반영되지 않습니다)
+    - processed_filled_qty 필드가 누락된 레거시 메타는 이미 반영된 체결인지
+      여부를 판단할 수 없으므로 자동 복구하지 않고 정산 보류 대상으로 반환합니다.
 
     Returns:
-        tuple: (반영 대상 목록, 순수량 변화, 순금액 변화)
+        tuple: (반영 대상 목록, 순수량 변화, 순금액 변화, 보류 대상 odno 목록)
     """
     orders_meta = state.get("orders_meta", {})
     if not orders_meta:
-        return [], 0, 0.0
+        return [], 0, 0.0, []
     history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
     pending: list[tuple[str, dict, dict, int, float]] = []
+    held_odnos: list[str] = []
     net_qty = 0
     net_amount = 0.0
     for odno, meta in list(orders_meta.items()):
@@ -2239,18 +2319,28 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
         if _is_reverse_order(state, str(odno), row):
             # 리버스 주문은 reconcile_reverse_fills 가 담당합니다 (이중 반영 방지).
             continue
-        processed_qty = int(meta.get("processed_filled_qty", 0) or 0)
+        has_marker, processed_qty = _parse_processed_qty_marker(meta)
         if processed_qty <= 0:
-            # 등록된 봇 주문인데 아직 한 번도 반영되지 않은 체결입니다.
-            # 이전 RUN 에서 금액 미확정으로 보류된 사이 워터마크가 뒤로 밀리면
-            # "처리된 범위 밖"으로 영구 제외되므로, 금액이 확정된 지금 복구합니다.
-            # (수량 마커가 0 이면 미반영이 확실 — 반영됐다면 processed_filled_qty > 0)
             try:
                 filled_for_recovery = int(float(row.get("ft_ccld_qty", "0") or 0))
             except (TypeError, ValueError):
                 filled_for_recovery = 0
             if filled_for_recovery <= 0:
                 continue
+            if not has_marker:
+                # processed_filled_qty 필드가 누락된 레거시 메타는
+                # 이미 반영된 체결인지 여부를 판단할 수 없으므로 자동 복구하지 않습니다.
+                # 정산 보류 대상으로 남겨 다음 실행에서 감사/수동 확인을 받습니다.
+                held_odnos.append(str(odno))
+                print(
+                    f"  [경고] 지연 체결 odno={odno} 는 processed_filled_qty 마커가 누락된 "
+                    f"레거시 메타입니다. 자동 복구하지 않고 정산을 보류합니다."
+                )
+                continue
+            # 등록된 봇 주문인데 아직 한 번도 반영되지 않은 체결입니다.
+            # 이전 RUN 에서 금액 미확정으로 보류된 사이 워터마크가 뒤로 밀리면
+            # "처리된 범위 밖"으로 영구 제외되므로, 금액이 확정된 지금 복구합니다.
+            # (수량 마커가 0 이면 미반영이 확실 — 반영됐다면 processed_filled_qty > 0)
             print(
                 f"  [상태] 지연 체결 복구: 워터마크 이전 미반영 등록 주문 "
                 f"odno={odno} ({filled_for_recovery}주) → 이번 실행에서 반영"
@@ -2265,7 +2355,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
         else:
             net_qty += dq
             net_amount += da
-    return pending, net_qty, net_amount
+    return pending, net_qty, net_amount, held_odnos
 
 
 
@@ -2277,6 +2367,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     """
     apply_snapshot = deepcopy(state)
     pending_amount_odnos: list[str] = []
+    pending_marker_odnos: list[str] = []
     recent_candidates = []
 
     for o in order_history:
@@ -2335,6 +2426,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
     # 이번 묶음에 포함된 체결의 금액이 확정됐는지 확인합니다.
+    # processed_filled_qty 마커가 누락·무효인 등록 주문도 자동 반영하지 않고 보류합니다.
     for _o, odno_pending, order_pending in recent_candidates:
         if not _fill_amount_is_available(order_pending):
             if odno_pending and str(odno_pending) not in pending_amount_odnos:
@@ -2343,8 +2435,21 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 f"  [경고] 최근모드 주문 보류(체결금액 미확정): "
                 f"odno={odno_pending}, qty={order_pending.get('ft_ccld_qty','0')}"
             )
+            continue
+        pending_meta = (state.get("orders_meta") or {}).get(str(odno_pending))
+        if pending_meta is not None and not _has_processed_qty_marker(pending_meta):
+            if odno_pending and str(odno_pending) not in pending_amount_odnos:
+                pending_amount_odnos.append(str(odno_pending))
+            if odno_pending and str(odno_pending) not in pending_marker_odnos:
+                pending_marker_odnos.append(str(odno_pending))
+            print(
+                f"  [경고] 최근모드 주문 보류(마커 누락·무효): "
+                f"odno={odno_pending}, qty={order_pending.get('ft_ccld_qty','0')}"
+            )
 
     # 워터마크 이전 등록 주문의 지연 체결도 금액 확정이 필수입니다.
+    # 마커 누락·무효 주문도 자동 반영하지 않고 보류합니다 (리버스 주문은 제외 —
+    # 리버스 reconciliation이 별도 가드로 담당합니다).
     history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
     for odno, meta in (state.get("orders_meta") or {}).items():
         row = history_by_odno.get(str(odno))
@@ -2353,27 +2458,66 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 continue
             try:
                 filled = int(float(row.get("ft_ccld_qty", "0") or 0))
-                processed = int(meta.get("processed_filled_qty", 0) or 0)
+                _, processed = _parse_processed_qty_marker(meta)
             except (TypeError, ValueError):
                 continue
             if filled > processed and str(odno) not in pending_amount_odnos:
                 pending_amount_odnos.append(str(odno))
+            continue
+        if _is_reverse_order(state, str(odno), row):
+            continue
+        try:
+            filled = int(float(row.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            continue
+        if filled > 0 and not _has_processed_qty_marker(meta):
+            if str(odno) not in pending_amount_odnos:
+                pending_amount_odnos.append(str(odno))
+            if str(odno) not in pending_marker_odnos:
+                pending_marker_odnos.append(str(odno))
+            print(
+                f"  [경고] 지연 체결 주문 보류(마커 누락·무효): "
+                f"odno={odno}, qty={row.get('ft_ccld_qty','0')}"
+            )
 
     if pending_amount_odnos:
         state.clear()
         state.update(apply_snapshot)
         state["_pending_amount_odnos"] = pending_amount_odnos
+        if pending_marker_odnos:
+            state["_pending_marker_odnos"] = pending_marker_odnos
         _mark_settlement_hold(
             state,
-            f"체결금액 미확정 주문 {len(pending_amount_odnos)}건 "
-            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 후 재실행 필요",
+            f"체결금액 미확정 또는 마커 누락·무효 주문 {len(pending_amount_odnos)}건 "
+            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return state, pending_amount_odnos
 
     # ── 1) 지연 체결 후보 (워터마크 이전 주문의 누적 체결 증가분) — 순수 계산 ──
-    late_pending, late_net_qty, late_net_amount = _apply_late_fill_deltas(
+    late_pending, late_net_qty, late_net_amount, late_held_odnos = _apply_late_fill_deltas(
         state, order_history, {str(odno) for _o, odno, _r in recent_candidates}
     )
+
+    # processed_filled_qty 마커가 누락된 레거시 주문도 정산 보류 대상으로 처리합니다.
+    if late_held_odnos:
+        for odno in late_held_odnos:
+            if odno not in pending_amount_odnos:
+                pending_amount_odnos.append(odno)
+            if odno not in pending_marker_odnos:
+                pending_marker_odnos.append(odno)
+
+    if pending_amount_odnos:
+        state.clear()
+        state.update(apply_snapshot)
+        state["_pending_amount_odnos"] = pending_amount_odnos
+        if pending_marker_odnos:
+            state["_pending_marker_odnos"] = pending_marker_odnos
+        _mark_settlement_hold(
+            state,
+            f"체결금액 미확정 또는 마커 누락 주문 {len(pending_amount_odnos)}건 "
+            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
+        )
+        return state, pending_amount_odnos
 
     # ── 2) 이번 묶음의 반영분(수량·금액) 계산 — 순수 계산 ─────────────
     # 등록된 주문은 메타의 반영 마커와 비교해 **새로 늘어난 부분만** 계산합니다.

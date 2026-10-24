@@ -906,3 +906,117 @@ def test_reverse_non_exhaustion_loc_sell_and_loc_buy(monkeypatch):
     assert sell_order["order_type"] == "LOC", "비소진 시 LOC 매도여야 합니다"
     assert buy_order["order_type"] == "LOC", "비소진 시 LOC 매수여야 합니다"
     assert "쿼터매수" in buy_order["comment"]
+
+
+def test_reverse_marker_missing_with_confirmed_amount_is_held():
+    """마커 누락 리버스 주문은 금액이 확정돼도 자동 증분 반영하지 않고 보류한다."""
+    state = {
+        "T": 20.0,
+        "net_invested": 1000.0,
+        "last_updated": "2026-07-31T20:00:00+00:00",
+        "last_processed_ordno": "OLD9",
+        "reverse_mode": {"active": True, "day_count": 0, "cycle_id": "C9"},
+        "orders_meta": {
+            "RSELL9": {
+                "side": "SELL",
+                "total_qty": 32,
+                # processed_filled_qty 필드 누락 (레거시)
+                "reverse_action": "sell",
+                "reverse_day": 1,
+                "reverse_base_t": 20.0,
+                "reverse_t_factor": 0.9,
+                "cycle_id": "C9",
+            }
+        },
+    }
+    history = [{
+        "odno": "RSELL9",
+        "ord_datetime_utc": "2026-08-01T20:00:00+00:00",
+        "ft_ccld_qty": "32",
+        "ft_ccld_unpr3": "124.00",
+        "ft_ccld_amt3": "3968.00",
+        "nccs_qty": "0",
+    }]
+
+    reconcile_reverse_fills(state, history)
+
+    assert state.get("_settlement_hold") is True
+    assert "RSELL9" in (state.get("_pending_amount_odnos") or [])
+    assert "RSELL9" in (state.get("_pending_marker_odnos") or [])
+    assert state["T"] == 20.0
+    # 롤백 검증: 순투입금·proceeds·원장·마커·워터마크가 그대로여야 한다.
+    assert state["net_invested"] == 1000.0
+    assert state["reverse_mode"].get("cumulative_sell_proceeds", 0.0) == 0.0
+    assert (state.get("settlement_ledger") or {}).get("entries", []) == []
+    assert "processed_filled_qty" not in state["orders_meta"]["RSELL9"]
+    assert state.get("_reverse_settlement_deltas", []) == []
+    assert state["last_updated"] == "2026-07-31T20:00:00+00:00"
+    assert state["last_processed_ordno"] == "OLD9"
+    assert state["orders_meta"]["RSELL9"].get("terminal") is not True
+
+
+def test_reverse_marker_hold_rolls_back_sibling_order():
+    """마커 누락 주문과 정상 주문이 함께 있으면 정상 주문의 임시 반영분도 롤백된다."""
+    state = {
+        "T": 20.0,
+        "net_invested": 1000.0,
+        "last_updated": "2026-07-31T20:00:00+00:00",
+        "last_processed_ordno": "OLD10",
+        "reverse_mode": {"active": True, "day_count": 0, "cycle_id": "C10"},
+        "orders_meta": {
+            "RSELL_BAD": {
+                "side": "SELL",
+                "total_qty": 32,
+                # processed_filled_qty 필드 누락 (레거시)
+                "reverse_action": "sell",
+                "reverse_day": 1,
+                "reverse_base_t": 20.0,
+                "reverse_t_factor": 0.9,
+                "cycle_id": "C10",
+            },
+            "RSELL_OK": {
+                "side": "SELL",
+                "total_qty": 16,
+                "processed_filled_qty": 0,
+                "reverse_action": "sell",
+                "reverse_day": 1,
+                "reverse_base_t": 20.0,
+                "reverse_t_factor": 0.9,
+                "cycle_id": "C10",
+            },
+        },
+    }
+    history = [
+        {
+            "odno": "RSELL_BAD",
+            "ord_datetime_utc": "2026-08-01T20:00:00+00:00",
+            "ft_ccld_qty": "32",
+            "ft_ccld_unpr3": "124.00",
+            "ft_ccld_amt3": "3968.00",
+            "nccs_qty": "0",
+        },
+        {
+            "odno": "RSELL_OK",
+            "ord_datetime_utc": "2026-08-01T20:00:00+00:00",
+            "ft_ccld_qty": "16",
+            "ft_ccld_unpr3": "124.00",
+            "ft_ccld_amt3": "1984.00",
+            "nccs_qty": "0",
+        },
+    ]
+
+    reconcile_reverse_fills(state, history)
+
+    assert state.get("_settlement_hold") is True
+    pending = state.get("_pending_amount_odnos") or []
+    assert "RSELL_BAD" in pending
+    assert "RSELL_BAD" in (state.get("_pending_marker_odnos") or [])
+    # 전체 rollback: 정상 주문의 마커·T·순투입금도 그대로여야 한다.
+    assert state["T"] == 20.0
+    assert state["net_invested"] == 1000.0
+    assert state["reverse_mode"].get("cumulative_sell_proceeds", 0.0) == 0.0
+    assert (state.get("settlement_ledger") or {}).get("entries", []) == []
+    assert state["orders_meta"]["RSELL_OK"]["processed_filled_qty"] == 0
+    assert state.get("_reverse_settlement_deltas", []) == []
+    assert state["last_updated"] == "2026-07-31T20:00:00+00:00"
+    assert state["last_processed_ordno"] == "OLD10"

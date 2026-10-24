@@ -566,6 +566,20 @@ def test_evidence_records_unconfirmed_amount_as_zero():
     assert fill["amount_confirmed"] is False
 
 
+def test_evidence_records_marker_hold_odnos_separately():
+    """증거 파일에서 마커 누락 주문과 금액 미확정 주문을 구분할 수 있어야 한다."""
+    state = _state(T=11.0)
+    state["_settlement_hold"] = True
+    state["_settlement_hold_reason"] = "마커 누락"
+    state["_pending_amount_odnos"] = ["A", "B"]
+    state["_pending_marker_odnos"] = ["A"]
+    evidence = trading_bot.build_settlement_evidence(
+        "TQQQ", state, [], mode="DRY", run_id="R2",
+    )
+    assert evidence["pending_amount_odnos"] == ["A", "B"]
+    assert evidence["pending_marker_odnos"] == ["A"]
+
+
 # ═══════════════════════════════════════════════════════════════════
 # P1-3: 오프라인 전환 매트릭스 + 브로커별 컨벤션
 # ═══════════════════════════════════════════════════════════════════
@@ -704,3 +718,227 @@ def test_unconfirmed_fill_pushed_before_watermark_is_recovered_once():
         first = update_T_from_history("TQQQ", first, confirmed, balance_qty=2)
         assert first["T"] == pytest.approx(12.0)
         assert first["net_invested"] == pytest.approx(1060.0)
+
+
+def test_legacy_meta_missing_processed_qty_marker_is_held_not_recovered():
+    """processed_filled_qty 필드가 누락된 레거시 메타는 자동 복구하지 않고 정산을 보류한다.
+
+    필드 누락 상태는 이미 반영된 체결인지 여부를 판단할 수 없으므로,
+    명시적 0(미반영)과 구분해 자동 재가산을 방지한다.
+    """
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="B",
+        orders_meta={
+            # processed_filled_qty 필드 누락 (레거시/수동 편집 state.json)
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0},
+            # 명시적 0 (정상 등록 후 미반영) — 복구 대상
+            "B": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+        },
+    )
+    before = deepcopy(state)
+    # A: 금액 확정 + 마커 누락 → 마커 보류 경로를 검증한다.
+    # B: 금액 미확정 → 금액 보류 경로를 검증한다.
+    missing = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T09:00:00+00:00"),
+        _amount_row("B", qty=1, amount=None, ts="2026-10-22T09:30:00+00:00"),
+    ]
+
+    held = update_T_from_history("TQQQ", state, missing, balance_qty=2)
+    # A(마커 누락)와 B(금액 미확정) 모두 보류
+    assert held.get("_settlement_hold") is True
+    pending = held.get("_pending_amount_odnos") or []
+    assert "A" in pending, f"A(마커 누락)가 보류 대상에 포함되어야 함: {pending}"
+    assert "B" in pending, f"B(금액 미확정)가 보류 대상에 포함되어야 함: {pending}"
+    # 마커 누락 사유가 별도 키로 구분되어야 한다.
+    assert "A" in (held.get("_pending_marker_odnos") or [])
+    assert "B" not in (held.get("_pending_marker_odnos") or [])
+    # T·순투입금·마커·워터마크 불변
+    assert held["T"] == pytest.approx(before["T"])
+    assert held["net_invested"] == pytest.approx(before["net_invested"])
+    assert held["orders_meta"]["A"] == before["orders_meta"]["A"]
+    assert held["orders_meta"]["B"] == before["orders_meta"]["B"]
+    assert held["last_updated"] == before["last_updated"]
+    assert held["last_processed_ordno"] == before["last_processed_ordno"]
+
+
+def test_explicit_zero_processed_qty_is_recovered_after_amount_confirmed():
+    """processed_filled_qty가 명시적 0인 주문은 금액 확정 후 1회 복구된다.
+
+    레거시 마커 누락과 구분해 정상 등록 후 미반영 주문은 복구 경로를 유지한다.
+    """
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="B",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+        },
+    )
+    before = deepcopy(state)
+    missing = [
+        _amount_row("A", qty=1, amount=None, ts="2026-10-22T09:00:00+00:00"),
+    ]
+
+    held = update_T_from_history("TQQQ", state, missing, balance_qty=2)
+    assert held.get("_settlement_hold") is True
+    assert held.get("_pending_amount_odnos") == ["A"]
+    assert held["T"] == pytest.approx(before["T"])
+
+    confirmed = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T09:00:00+00:00"),
+    ]
+    first = update_T_from_history("TQQQ", held, confirmed, balance_qty=2)
+    assert first["T"] == pytest.approx(12.0)
+    assert first["net_invested"] == pytest.approx(1060.0)
+    assert first["orders_meta"]["A"]["processed_filled_qty"] == 1
+    assert first["orders_meta"]["A"]["processed_filled_amount"] == pytest.approx(20.0)
+
+    # 재실행 멱등
+    for _ in range(3):
+        first = update_T_from_history("TQQQ", first, confirmed, balance_qty=2)
+        assert first["T"] == pytest.approx(12.0)
+        assert first["net_invested"] == pytest.approx(1060.0)
+
+
+def test_recent_marker_missing_with_confirmed_amount_is_held():
+    """워터마크 이후 최근 주문도 마커 누락 시 자동 반영하지 않고 보류한다.
+
+    금액이 확정되어 있어도 processed_filled_qty 마커가 없으면
+    전체 체결량을 신규분으로 계산할 수 없으므로 정산을 보류한다.
+    """
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="OLD",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0},
+        },
+    )
+    before = deepcopy(state)
+    rows = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T11:00:00+00:00"),
+    ]
+
+    held = update_T_from_history("TQQQ", state, rows, balance_qty=2)
+    assert held.get("_settlement_hold") is True
+    assert "A" in (held.get("_pending_amount_odnos") or [])
+    assert "A" in (held.get("_pending_marker_odnos") or [])
+    assert held["T"] == pytest.approx(before["T"])
+    assert held["net_invested"] == pytest.approx(before["net_invested"])
+    assert held["orders_meta"]["A"] == before["orders_meta"]["A"]
+    assert held["last_updated"] == before["last_updated"]
+
+
+def test_invalid_marker_values_are_held_like_missing():
+    """None·파싱 불가·음수 마커도 누락과 동일하게 보류한다."""
+    for bad in (None, "bad", -1):
+        state = _state(
+            T=11.0,
+            net_invested=1040.0,
+            last_updated="2026-10-22T10:00:00+00:00",
+            last_processed_ordno="OLD",
+            orders_meta={
+                "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                      "processed_filled_qty": bad},
+            },
+        )
+        rows = [
+            _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T11:00:00+00:00"),
+        ]
+        held = update_T_from_history("TQQQ", state, rows, balance_qty=2)
+        assert held.get("_settlement_hold") is True, f"bad={bad!r}"
+        assert "A" in (held.get("_pending_amount_odnos") or []), f"bad={bad!r}"
+        assert held["T"] == pytest.approx(11.0)
+
+
+def test_zero_fill_with_missing_marker_does_not_hold():
+    """체결 수량이 0이면 마커가 누락돼도 불필요하게 보류하지 않는다."""
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="OLD",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0},
+        },
+    )
+    rows = [
+        {
+            "odno": "A",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "0",
+            "ft_ccld_unpr3": "10.0",
+            "ord_datetime_utc": "2026-10-22T11:00:00+00:00",
+            "ord_dt": "20261022",
+            "prcs_stat_name": "미체결",
+            "nccs_qty": "1",
+        },
+    ]
+    result = update_T_from_history("TQQQ", state, rows, balance_qty=2)
+    assert result.get("_settlement_hold") is not True
+    assert "A" not in (result.get("_pending_amount_odnos") or [])
+    assert result["T"] == pytest.approx(11.0)
+
+
+def test_late_fill_delta_marks_legacy_marker_missing_directly():
+    """지연 체결 계산 경로 자체가 마커 누락 주문을 보류 대상으로 반환한다."""
+    from state import _apply_late_fill_deltas
+
+    state = _state(
+        T=11.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0},
+        },
+    )
+    history = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T09:00:00+00:00"),
+    ]
+
+    pending, net_qty, net_amount, held = _apply_late_fill_deltas(state, history, set())
+
+    assert held == ["A"]
+    assert pending == []
+    assert net_qty == 0
+    assert net_amount == 0.0
+
+
+def test_fractional_qty_marker_is_invalid_and_held():
+    """소수 마커(0.5 등)는 정수 마커로 절삭하지 않고 무효로 보류한다."""
+    from state import _parse_processed_qty_marker
+
+    assert _parse_processed_qty_marker({"processed_filled_qty": 0}) == (True, 0)
+    assert _parse_processed_qty_marker({"processed_filled_qty": 5}) == (True, 5)
+    assert _parse_processed_qty_marker({"processed_filled_qty": "3"}) == (True, 3)
+    for bad in (None, "bad", -1, True, 0.5, 1.9):
+        valid, qty = _parse_processed_qty_marker({"processed_filled_qty": bad})
+        assert valid is False, f"bad={bad!r}"
+        assert qty == 0
+    assert _parse_processed_qty_marker({}) == (False, 0)
+    assert _parse_processed_qty_marker(None) == (False, 0)
+
+    state = _state(
+        T=11.0,
+        net_invested=1040.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="OLD",
+        orders_meta={
+            "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
+                  "processed_filled_qty": 0.5},
+        },
+    )
+    rows = [
+        _amount_row("A", qty=1, amount=20.0, ts="2026-10-22T11:00:00+00:00"),
+    ]
+    held = update_T_from_history("TQQQ", state, rows, balance_qty=2)
+    assert held.get("_settlement_hold") is True
+    assert "A" in (held.get("_pending_amount_odnos") or [])
+    assert "A" in (held.get("_pending_marker_odnos") or [])
+    assert held["T"] == pytest.approx(11.0)

@@ -399,10 +399,26 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
         )
     pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
     if pending_amount_odnos:
+        pending_marker_odnos = [str(o) for o in (state.get("_pending_marker_odnos") or [])]
+        amount_only = [o for o in pending_amount_odnos if o not in pending_marker_odnos]
+        parts = []
+        if amount_only:
+            parts.append(
+                f"체결금액 미확정 주문 {len(amount_only)}건({', '.join(amount_only[:5])})"
+            )
+        if pending_marker_odnos:
+            parts.append(
+                f"마커 누락·무효 주문 {len(pending_marker_odnos)}건({', '.join(pending_marker_odnos[:5])})"
+            )
+        hold_detail = " + ".join(parts) if parts else f"주문 {len(pending_amount_odnos)}건"
+        followup = []
+        if amount_only:
+            followup.append("금액 확정 후 재실행하세요")
+        if pending_marker_odnos:
+            followup.append("마커 보정 후 재실행하세요")
         msg = (
-            f"[보류] {symbol} 체결금액이 확정되지 않은 주문 "
-            f"{len(pending_amount_odnos)}건({', '.join(pending_amount_odnos[:5])})이 있어 "
-            f"T/순투입/마커 저장과 신규 주문을 보류합니다. 금액 확정 후 재실행하세요."
+            f"[보류] {symbol} {hold_detail}이 있어 "
+            f"T/순투입/마커 저장과 신규 주문을 보류합니다. {' / '.join(followup)}."
         )
         print(msg)
         notify(msg, urgent=True)
@@ -465,6 +481,7 @@ def build_settlement_evidence(
         ),
         "hold_reason": state.get("_settlement_hold_reason", ""),
         "pending_amount_odnos": list(state.get("_pending_amount_odnos") or []),
+        "pending_marker_odnos": list(state.get("_pending_marker_odnos") or []),
         "T_before": before.get("T", 0.0),
         "net_invested_before": before.get("net_invested", 0.0),
         "T_after": float(state.get("T", 0.0)),
