@@ -14,5 +14,34 @@
 # 되돌리기 (DRY 로):
 #   (crontab -l | grep -v muhan-v4/ops/run_daily.sh; echo "30 18 * * 1-5 LAUNCH_MODE=DRY /home/ubuntu/investment/muhan-v4/ops/run_daily.sh") | crontab -
 #
-30 18 * * 1-5 LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-45 18 * * 1-5 /home/ubuntu/investment/muhan-v4/ops/verify_run.sh
+# ── LIVE 는 RUN_PHASE 단계 실행이 필수입니다 ──
+# RUN_PHASE 없는 LIVE 는 브로커 생성 전에 SystemExit(1) 로 차단됩니다.
+# 아래 시간은 예시이며, APPROVE 의 PLAN_ID 는 PREVIEW 로그에서 확인해 넣습니다.
+#
+# ⚠️ PLAN_ID / APPROVAL_PLAN_ID 는 **RUN 마다 새로 생성되는 값**이라 crontab 에
+#    고정할 수 없습니다. 운영자가 PREVIEW 로그에서 복사해 수동으로 전달합니다:
+#
+#      1) RUN_PHASE=PREVIEW 실행 → 로그 마지막 줄의 plan_id 확인
+#         "[PREVIEW] TQQQ — plan_id=TQQQ-2026-10-24-20261024T093000Z, orders=2, ..."
+#      2) 그 값을 APPROVE 의 PLAN_ID, EXECUTE/VERIFY 의 APPROVAL_PLAN_ID 로 복사
+#         (who: 당일 운영 담당자 / 값이 실행마다 달라 자동 cron 으로는 불가)
+#
+#      수동 실행 예:
+#        RUN_PHASE=APPROVE PLAN_ID=TQQQ-2026-10-24-20261024T093000Z LAUNCH_MODE=LIVE ops/run_daily.sh
+#        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=TQQQ-2026-10-24-20261024T093000Z LAUNCH_MODE=LIVE ops/run_daily.sh
+#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=TQQQ-2026-10-24-20261024T093000Z LAUNCH_MODE=LIVE ops/run_daily.sh
+#
+# ⚠️ LIVE 에서 계좌 지문을 쓰는 브로커(KIS/NHPLUG 등 account_no 설정)는 서버 환경변수
+#    ACCOUNT_FINGERPRINT_SECRET 이 **필수**입니다. 없으면 승인/실행이 fail-closed 로
+#    중단됩니다 (승인 파일 계좌 바인딩 무차별 대입 방지).
+#
+# 30 18 * * 1-5 RUN_PHASE=SETTLE   LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+# 40 18 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+# 45 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+# 50 18 * * 1-5 RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+#
+# VERIFY 는 ops/verify_run.py 를 직접 부르지 않습니다. run_daily.sh 가
+# trading_bot.py 를 RUN_PHASE=VERIFY 로 실행해, 승인 파일 + 커밋된 SETTLE evidence
+# 독립 재계산 + 브로커 read-only 주문/잔고 대조를 한 번에 수행합니다.
+# (ops/verify_run.sh 는 과거 로그 검증용 레거시 경로입니다)
+# 55 18 * * 1-5 RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh

@@ -267,6 +267,33 @@ if _trade_mode not in ("DRY", "LIVE", "REPAIR"):
 else:
 	TRADE_MODE = _trade_mode
 
+# 파이프라인 단계 (SETTLE | PREVIEW | APPROVE | EXECUTE | VERIFY)
+# 미설정("")이면 기존 통합 실행(정산→계획→주문)으로 동작합니다.
+# 조합 검증은 broker.create_broker() / validate_run_phase() 가 브로커 생성 전에 수행합니다.
+RUN_PHASE = os.getenv("RUN_PHASE", "").strip().upper()
+
+# 승인 파일이 유효한 시간(초) — APPROVE 후 EXECUTE 전까지의 최대 지연
+# 운영 스케줄(SETTLE→PREVIEW→APPROVE→EXECUTE) 간격(약 7.5h)을 덮도록 기본 9h.
+APPROVAL_TTL_SECONDS = int(os.getenv("APPROVAL_TTL_SECONDS", "32400"))
+# 너무 짧은 TTL 은 운영 간격을 못 덮으므로 승인 생성 시 거부합니다.
+APPROVAL_MIN_TTL_SECONDS = int(os.getenv("APPROVAL_MIN_TTL_SECONDS", "28800"))
+
+# 승인 계획 파일 저장 위치 (PREVIEW 산출물)
+PLAN_DIR = os.getenv("PLAN_DIR", "plans")
+
+# EXECUTE 재확인 허용 오차 (승인 시점 대비 현재 재계산 계획)
+# 가격: max(절대값, 승인가 × 비율) / 수량: 절대값(기본 0 = 정확히 일치)
+EXECUTION_PRICE_TOLERANCE_ABS = float(os.getenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.02"))
+EXECUTION_PRICE_TOLERANCE_PCT = float(os.getenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.005"))
+EXECUTION_QTY_TOLERANCE = int(os.getenv("EXECUTION_QTY_TOLERANCE", "0"))
+
+# 지연 이력(메리츠 등) 정착성 확인 — 반복 조회로 이력이 바뀌면 정산을 보류합니다.
+HISTORY_SETTLEDNESS_CHECK = os.getenv("HISTORY_SETTLEDNESS_CHECK", "").strip().lower()
+HISTORY_SETTLEDNESS_DELAY_SECONDS = float(
+    os.getenv("HISTORY_SETTLEDNESS_DELAY_SECONDS", "1.0")
+)
+RECENT_ORDER_GUARD_MINUTES = int(os.getenv("RECENT_ORDER_GUARD_MINUTES", "15"))
+
 # 매매 수수료율
 # 한국투자증권 해외주식 기본 수수료: 0.25% (계좌/이벤트에 따라 다를 수 있음)
 # .env 예: COMMISSION_RATE=0.0025

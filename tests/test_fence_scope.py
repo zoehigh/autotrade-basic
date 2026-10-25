@@ -28,6 +28,10 @@ import trading_bot
 from trading_bot import GlobalScopedError, SymbolScopedError
 from broker.base import Balance, OrderError, OrderResult
 
+# 테스트 전용 승인 파일 헬퍼 (주문 루프 직접 호출 금지 — execute_approved_plan 경유)
+sys.path.insert(0, os.path.dirname(__file__))
+import pipeline_flow  # noqa: E402
+
 
 def _make_state(**overrides):
     state = {
@@ -110,12 +114,14 @@ class TestExceptionHierarchy:
 # ─────────────────────────────────────────────────────────
 
 @pytest.fixture
-def order_loop_env(monkeypatch):
-    """run_one_symbol을 LIVE로 직접 호출해 주문 루프까지 도달시킵니다."""
+def order_loop_env(monkeypatch, tmp_path):
+    """LIVE 승인 실행 경로(execute_approved_plan)로 주문 루프까지 도달시킵니다."""
     saved_states = []
     notify_messages = []
     loaded = {}
 
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: loaded[symbol])
     monkeypatch.setattr(
         trading_bot, "save_state",
@@ -133,12 +139,26 @@ def order_loop_env(monkeypatch):
         "saved_states": saved_states,
         "notify_messages": notify_messages,
         "load": lambda symbol, state: loaded.__setitem__(symbol, state),
+        "loaded": loaded,
         "set_save": lambda fn: monkeypatch.setattr(trading_bot, "save_state", fn),
     }
 
 
+def _execute_order_loop(ctx, broker, tmp_path):
+    """실제 승인 파일을 만들어 execute_approved_plan() 으로 주문을 실행합니다.
+
+    주문 루프를 직접 호출할 수 있는 공개 경로는 없습니다 (P0 회귀 방지).
+    """
+    return pipeline_flow.run_approved(
+        tmp_path,
+        broker,
+        ctx["loaded"]["TQQQ"],
+        list(_fake_strategy(None)["orders"]),
+    )
+
+
 class TestOrderLoopScope:
-    def test_network_order_error_raises_symbol_scoped(self, order_loop_env):
+    def test_network_order_error_raises_symbol_scoped(self, order_loop_env, tmp_path):
         """네트워크 OrderError(불확실) → SymbolScopedError + fence 유지 문구."""
         ctx = order_loop_env
         ctx["load"]("TQQQ", _make_state())
@@ -146,9 +166,9 @@ class TestOrderLoopScope:
         broker.place_order.side_effect = OrderError("timed out")
 
         with pytest.raises(SymbolScopedError, match="fence를 유지"):
-            trading_bot.run_one_symbol(broker, _symbol_config())
+            _execute_order_loop(ctx, broker, tmp_path)
 
-    def test_missing_order_id_raises_symbol_scoped(self, order_loop_env):
+    def test_missing_order_id_raises_symbol_scoped(self, order_loop_env, tmp_path):
         """주문번호 누락(불확실) → SymbolScopedError."""
         ctx = order_loop_env
         ctx["load"]("TQQQ", _make_state())
@@ -158,9 +178,9 @@ class TestOrderLoopScope:
         )
 
         with pytest.raises(SymbolScopedError, match="유효한 주문번호가 없습니다"):
-            trading_bot.run_one_symbol(broker, _symbol_config())
+            _execute_order_loop(ctx, broker, tmp_path)
 
-    def test_no_order_response_raises_symbol_scoped(self, order_loop_env):
+    def test_no_order_response_raises_symbol_scoped(self, order_loop_env, tmp_path):
         """접수 응답 없음(불확실) → SymbolScopedError."""
         ctx = order_loop_env
         ctx["load"]("TQQQ", _make_state())
@@ -168,9 +188,9 @@ class TestOrderLoopScope:
         broker.place_order.return_value = None
 
         with pytest.raises(SymbolScopedError, match="주문 접수 응답이 없어"):
-            trading_bot.run_one_symbol(broker, _symbol_config())
+            _execute_order_loop(ctx, broker, tmp_path)
 
-    def test_intent_save_failure_raises_global_scoped(self, order_loop_env):
+    def test_intent_save_failure_raises_global_scoped(self, order_loop_env, tmp_path):
         """주문 전 intent 저장 실패(공통 장애) → GlobalScopedError."""
         ctx = order_loop_env
         ctx["load"]("TQQQ", _make_state())
@@ -187,9 +207,9 @@ class TestOrderLoopScope:
         )
 
         with pytest.raises(GlobalScopedError, match="intent checkpoint 실패"):
-            trading_bot.run_one_symbol(broker, _symbol_config())
+            _execute_order_loop(ctx, broker, tmp_path)
 
-    def test_checkpoint_save_failure_raises_global_scoped(self, order_loop_env):
+    def test_checkpoint_save_failure_raises_global_scoped(self, order_loop_env, tmp_path):
         """주문 수락 후 checkpoint 저장 실패(공통 장애) → GlobalScopedError."""
         ctx = order_loop_env
         ctx["load"]("TQQQ", _make_state())
@@ -206,7 +226,7 @@ class TestOrderLoopScope:
         )
 
         with pytest.raises(GlobalScopedError, match="checkpoint에 실패했습니다"):
-            trading_bot.run_one_symbol(broker, _symbol_config())
+            _execute_order_loop(ctx, broker, tmp_path)
 
 
 # ─────────────────────────────────────────────────────────
@@ -227,7 +247,7 @@ class TestMainScope:
             trading_bot, "SYMBOLS",
             [_symbol_config("TQQQ"), _symbol_config("SOXL")],
         )
-        monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+        monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
         monkeypatch.setattr(trading_bot, "create_broker", lambda: MagicMock())
         monkeypatch.setattr(trading_bot, "load_state", lambda symbol: {})
         monkeypatch.setattr(
