@@ -127,6 +127,23 @@ def test_normalize_open_order_maps_to_unfilled_and_keeps_remaining():
     assert row["ft_ccld_qty"] == "0"
 
 
+def test_normalize_missing_quantity_omits_ft_ord_qty():
+    """원주문 수량(quantity)이 없으면 "0"을 합성하지 않고 키를 생략합니다."""
+    raw = _raw()
+    raw.pop("quantity")
+
+    row = _broker()._normalize_order_item(raw)
+
+    assert "ft_ord_qty" not in row
+
+
+def test_normalize_present_zero_quantity_keeps_ft_ord_qty():
+    """필드가 있으면 값이 "0"이어도 기존처럼 전달합니다."""
+    row = _broker()._normalize_order_item(_raw(quantity="0"))
+
+    assert row["ft_ord_qty"] == "0"
+
+
 def _mock_broker(status_orders, calls=None):
     broker = _broker()
     broker._get_token = lambda: "token"

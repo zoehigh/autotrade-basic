@@ -13,7 +13,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1756,6 +1756,244 @@ def _verify_t_transitions(text, symbol, rows, balance_qty):
     return problems
 
 
+def _cycle_ymd(value):
+    """사이클 경계 날짜를 YYYYMMDD 로 정규화합니다 (형식 불명이면 "")."""
+    raw = str(value or "").replace("-", "").strip()
+    if len(raw) >= 8 and raw[:8].isdigit():
+        return raw[:8]
+    return ""
+
+
+def _cycle_event_sort_key(fill, index):
+    """사이클 체결 정렬 키 `(시각, 주문번호)` 를 만듭니다.
+
+    `trading_bot._liquidation_boundary_orders` 와 **같은 의미**의 키입니다.
+    시각은 ISO/compact 를 모두 UTC epoch 로 정규화하고, 같은 초(같은 시각)는
+    주문번호(odno)로 결정합니다. 시각/주문번호를 해석할 수 없으면 None 을
+    반환해 호출 측이 "검증 불가"로 처리하게 합니다.
+
+    Returns:
+        tuple[float, str, int] | None
+    """
+    raw_ts = str(fill.get("ts") or "").strip()
+    if not raw_ts:
+        # evidence 에 ts 가 없으면 ord_dt+ord_tmd 로 보완합니다.
+        ord_dt = _cycle_ymd(fill.get("ord_dt"))
+        ord_tmd = str(fill.get("ord_tmd") or "").strip()
+        if ord_dt and ord_tmd:
+            raw_ts = f"{ord_dt}{ord_tmd.zfill(6)}"
+    if not raw_ts:
+        return None
+    epoch = _event_epoch_seconds(raw_ts)
+    if epoch is None:
+        return None
+    odno = str(fill.get("odno") or "").strip()
+    if not odno:
+        return None
+    return (epoch, odno, index)
+
+
+def _event_epoch_seconds(raw_ts):
+    """시각 문자열(ISO8601 또는 YYYYMMDDHHMMSS)을 UTC epoch 초로 변환합니다."""
+    text = str(raw_ts or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) >= 14 and text[:14].isdigit():
+            parsed = datetime.strptime(text[:14], "%Y%m%d%H%M%S").replace(
+                tzinfo=timezone.utc
+            )
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_cycle_fills(fills, cycle_start, cycle_end):
+    """원시 체결 목록에서 **한 사이클 구간**의 체결을 독립적으로 골라냅니다.
+
+    `trading_bot._liquidation_boundary_orders` 와 같은 규칙(시각/주문번호 순,
+    첫 전량매도까지)을 검증기에서 **다시 구현**합니다. 리포트 생성 코드를
+    재사용하지 않으므로, evidence 가 조작되면 경계 선택에서 드러납니다.
+
+    정렬은 `(시각, 주문번호)` 로 **의미를 맞춥니다**. 같은 시각에 청산/재매수가
+    섞여 있고 주문번호로도 순서를 확정할 수 없으면 "검증 불가" 문제를 남깁니다.
+    매도가 매수 누적을 초과하면(매수 이력 누락) 0 으로 clamp 하지 않고 실패로
+    처리합니다. 청산 이벤트가 없으면 `event=None` 으로 반환합니다.
+
+    Returns:
+        tuple[list[dict], list[str], dict | None]:
+            (선택된 체결, 문제 목록, 청산 이벤트 fill 또는 None)
+    """
+    problems = []
+    rows = []
+    seen_keys = {}
+    for index, fill in enumerate(fills or []):
+        if not isinstance(fill, dict):
+            continue
+        side = str(fill.get("side") or "")
+        if side not in ("매수", "매도"):
+            continue
+        ord_dt = _cycle_ymd(fill.get("ord_dt"))
+        if not ord_dt:
+            problems.append(
+                f"사이클 체결 {fill.get('odno') or '(odno 없음)'} 에 ord_dt 가 없습니다 "
+                "(검증 불가)"
+            )
+            continue
+        if cycle_start and ord_dt < cycle_start:
+            continue
+        if cycle_end and ord_dt > cycle_end:
+            continue
+        try:
+            qty = float(fill.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        sort_key = _cycle_event_sort_key(fill, index)
+        if sort_key is None:
+            problems.append(
+                f"사이클 체결 {fill.get('odno') or '(odno 없음)'} 의 시각/주문번호를 "
+                "해석할 수 없습니다 (정렬 순서 확정 불가 — 검증 불가)"
+            )
+            continue
+        # 같은 (시각, 주문번호)가 서로 다른 행으로 중복되면 경계를 확정할 수 없습니다.
+        identity = (sort_key[0], sort_key[1])
+        if identity in seen_keys:
+            problems.append(
+                f"사이클 체결 {sort_key[1]} 가 같은 시각에 중복되어 순서를 확정할 수 "
+                "없습니다 (검증 불가)"
+            )
+            continue
+        seen_keys[identity] = index
+        rows.append((sort_key, side, qty, fill))
+    rows.sort(key=lambda item: item[0])
+    selected = []
+    net_qty = 0.0
+    for _sort_key, side, qty, fill in rows:
+        selected.append(fill)
+        if side == "매수":
+            net_qty += qty
+            continue
+        before = net_qty
+        if before <= 0:
+            problems.append(
+                f"사이클 체결 {fill.get('odno') or '(odno 없음)'} 매도 {qty:g}주에 "
+                "대응할 매수 이력이 없습니다 (검증 불가)"
+            )
+            return selected, problems, None
+        if qty > before + 1e-9:
+            problems.append(
+                f"사이클 체결 {fill.get('odno') or '(odno 없음)'} 매도 {qty:g}주가 "
+                f"매수 누적 {before:g}주를 초과합니다 (매수 이력 누락 — 검증 불가)"
+            )
+            return selected, problems, None
+        net_qty = before - qty
+        if net_qty <= 1e-9:
+            # 첫 전량매도(청산) 까지만 — 같은 날 재매수는 제외.
+            return selected, problems, fill
+    return selected, problems, None
+
+
+def _expected_cycle_seed(evidence, step):
+    """evidence 의 **원시 체결**로 next_cycle_seed 를 독립 재계산합니다.
+
+    입력은 사이클 경계(cycle_start/cycle_end), 체결 원시값(qty/price/ord_dt),
+    수수료율, 직전 시드뿐입니다. evidence 가 기록한 next_cycle_seed 는
+    **대조 대상**일 뿐 기대값으로 신뢰하지 않습니다.
+
+    사이클 구간이 불완전하면(시작일 없음/매수 이력 부족/청산 이벤트 없음/
+    정렬 순서 불확정) 숫자를 만들어 내지 않고 `None`(검증 불가)을 반환합니다.
+
+    Returns:
+        tuple[float | None, list[str]]: (기대 next_cycle_seed, 문제 목록)
+        None 은 입력 부족/형식 오류로 검증 불가를 뜻합니다.
+    """
+    problems = []
+    cycle_start = _cycle_ymd(step.get("cycle_start"))
+    cycle_end = _cycle_ymd(step.get("cycle_end"))
+    if not cycle_start:
+        problems.append(
+            "cycle_end.cycle_start 가 없습니다 (사이클 시작을 확인할 수 없어 검증 불가)"
+        )
+    if not cycle_end:
+        problems.append("cycle_end.cycle_end 가 없습니다 (사이클 시드 검증 불가)")
+    try:
+        seed = float(step.get("seed"))
+    except (TypeError, ValueError):
+        problems.append("cycle_end.seed(직전 시드)가 없습니다 (사이클 시드 검증 불가)")
+        seed = 0.0
+    try:
+        commission_rate = float(step.get("commission_rate"))
+    except (TypeError, ValueError):
+        problems.append(
+            "cycle_end.commission_rate 가 없습니다 (사이클 시드 검증 불가)"
+        )
+        commission_rate = 0.0
+    try:
+        recorded = float(step.get("next_cycle_seed"))
+    except (TypeError, ValueError):
+        problems.append("cycle_end.next_cycle_seed 가 숫자가 아닙니다")
+        recorded = None
+    if problems:
+        return None, problems
+
+    selected, selection_problems, liquidation_event = _select_cycle_fills(
+        evidence.get("fills") or [], cycle_start, cycle_end
+    )
+    problems.extend(selection_problems)
+    if selection_problems:
+        return None, problems
+    if not selected:
+        problems.append("사이클 구간에 체결이 없습니다 (사이클 시드 검증 불가)")
+        return None, problems
+    buys = [f for f in selected if str(f.get("side")) == "매수"]
+    if not buys:
+        problems.append(
+            "사이클 구간에 매수 체결이 없습니다 (매수 이력 누락 — 검증 불가)"
+        )
+        return None, problems
+    if liquidation_event is None:
+        problems.append(
+            "사이클 구간에 청산(전량매도) 이벤트가 없습니다 "
+            "(사이클 종료가 아니므로 next_cycle_seed 를 검증할 수 없습니다)"
+        )
+        return None, problems
+
+    total_buy = 0.0
+    total_sell = 0.0
+    for fill in selected:
+        try:
+            qty = float(fill.get("qty") or 0)
+            price = float(fill.get("price") or 0)
+        except (TypeError, ValueError):
+            problems.append(
+                f"사이클 체결 {fill.get('odno') or '(odno 없음)'} 수량/단가 형식 오류"
+            )
+            continue
+        amount = qty * price
+        if str(fill.get("side")) == "매수":
+            total_buy += amount
+        elif str(fill.get("side")) == "매도":
+            total_sell += amount
+    estimated_commission = (total_buy + total_sell) * commission_rate
+    net_profit = total_sell - total_buy - estimated_commission
+    expected_raw = (seed + net_profit) if seed > 0 else 0.0
+    expected = round(expected_raw, 2)
+    if recorded is not None and abs(round(recorded, 2) - expected) > 0.01:
+        problems.append(
+            "cycle_end.next_cycle_seed 불일치: evidence="
+            f"{recorded:.2f}, 독립 재계산={expected:.2f} "
+            f"(seed={seed:.2f}, buy={total_buy:.2f}, sell={total_sell:.2f}, "
+            f"commission={estimated_commission:.2f})"
+        )
+    return expected, problems
+
+
 def verify_evidence_file(
     evidence_path,
     broker,
@@ -1843,6 +2081,53 @@ def verify_evidence_file(
                 expected_T = min(expected_T, float(limit))
             except (TypeError, ValueError):
                 problems.append("evidence max_t 값이 숫자가 아닙니다")
+        expected_net = _as_float(evidence.get("net_invested_after"), 0.0)
+        expected_cycle_start = None
+        expected_seed = None
+
+        # 후처리(MAX_T/사이클 종료/FORCE_T)를 **기록된 순서대로 재생**해 기대
+        # 최종값을 독립 계산합니다. evidence 의 T_after/net_invested_after 만
+        # 믿으면 후처리로 달라진 저장값을 검증 없이 통과시키게 됩니다.
+        post = evidence.get("post_processing") or {}
+        steps = post.get("steps") if isinstance(post, dict) else None
+        for step in steps or []:
+            if not isinstance(step, dict):
+                problems.append("post_processing.steps 항목이 dict 가 아닙니다")
+                continue
+            name = str(step.get("step") or "")
+            if name == "max_t":
+                expected_T = min(expected_T, _as_float(step.get("after"), expected_T))
+            elif name == "force_t":
+                expected_T = _as_float(step.get("force_t"), expected_T)
+                if abs(expected_T) <= 1e-9:
+                    expected_net = 0.0
+                    expected_cycle_start = ""
+            elif name == "cycle_end":
+                if not bool(step.get("new_cycle_started")):
+                    expected_T = 0.0
+                    expected_net = 0.0
+                    expected_cycle_start = ""
+                # next_cycle_seed 는 evidence 값을 **기대값으로 신뢰하지 않습니다**.
+                # 원시 체결 + 사이클 경계 + 수수료 + 직전 시드로 독립 재계산합니다.
+                # (FORCE_T 는 운영자 입력이므로 별도 단계로만 반영)
+                expected_cycle_seed, cycle_seed_problems = _expected_cycle_seed(
+                    evidence, step
+                )
+                problems.extend(cycle_seed_problems)
+                if bool(step.get("dry")):
+                    expected_seed = 0.0
+                elif bool(step.get("reinvest")):
+                    if expected_cycle_seed is None:
+                        expected_seed = None
+                    else:
+                        expected_seed = (
+                            expected_cycle_seed if expected_cycle_seed > 0 else 0.0
+                        )
+                else:
+                    expected_seed = 0.0
+            else:
+                problems.append(f"알 수 없는 후처리 단계: {name or '(없음)'}")
+
         final_T = _as_float(final_state.get("T"), 0.0)
         if abs(final_T - expected_T) > 1e-6:
             problems.append(
@@ -1850,12 +2135,48 @@ def verify_evidence_file(
                 f"state={final_T:.4f} (MAX_T/후처리 반영)"
             )
         final_net = _as_float(final_state.get("net_invested"), 0.0)
-        expected_net = _as_float(evidence.get("net_invested_after"), 0.0)
         if abs(final_net - expected_net) > 0.01:
             problems.append(
                 f"최종 저장 순투입금 불일치: evidence={expected_net:.2f}, "
                 f"state={final_net:.2f}"
             )
+        if expected_cycle_start is not None:
+            actual_start = str(final_state.get("cycle_start_date") or "")
+            if actual_start != expected_cycle_start:
+                problems.append(
+                    "최종 저장 cycle_start_date 불일치: "
+                    f"evidence 기대={expected_cycle_start!r}, state={actual_start!r}"
+                )
+        if expected_seed is not None:
+            actual_seed = _as_float(final_state.get("effective_seed"), 0.0)
+            if abs(actual_seed - expected_seed) > 0.01:
+                problems.append(
+                    "최종 저장 effective_seed 불일치: "
+                    f"evidence 기대={expected_seed:.2f}, state={actual_seed:.2f}"
+                )
+
+        # evidence 가 기록한 최종 후보 스냅샷과 실제 저장 후보가 같은지도 확인합니다.
+        candidate = post.get("final_candidate") if isinstance(post, dict) else None
+        if isinstance(candidate, dict) and candidate:
+            for key, tolerance in (("T", 1e-6), ("net_invested", 0.01),
+                                   ("effective_seed", 0.01)):
+                if key not in candidate:
+                    continue
+                if abs(_as_float(candidate.get(key), 0.0)
+                       - _as_float(final_state.get(key), 0.0)) > tolerance:
+                    problems.append(
+                        f"최종 후보 스냅샷 {key} 불일치: "
+                        f"evidence={candidate.get(key)}, state={final_state.get(key)}"
+                    )
+            if "cycle_start_date" in candidate:
+                if str(candidate.get("cycle_start_date") or "") != str(
+                    final_state.get("cycle_start_date") or ""
+                ):
+                    problems.append(
+                        "최종 후보 스냅샷 cycle_start_date 불일치: "
+                        f"evidence={candidate.get('cycle_start_date')!r}, "
+                        f"state={final_state.get('cycle_start_date')!r}"
+                    )
 
     settlement_mode = evidence.get("settlement_mode")
     if settlement_mode not in ("incremental", "full_reinference"):

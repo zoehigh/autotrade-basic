@@ -13,6 +13,8 @@
 실제 주문/네트워크/운영 state 파일은 사용하지 않습니다.
 """
 import json
+import os
+import subprocess
 import sys
 import threading
 from copy import deepcopy
@@ -33,7 +35,7 @@ import trading_bot
 import pipeline
 import pipeline_execute
 from broker import create_broker, validate_run_phase
-from broker.base import Balance, PurchaseAmount, ReadOnlyBroker
+from broker.base import Balance, OrderResult, PurchaseAmount, ReadOnlyBroker
 from state import canonical_state_hash
 
 
@@ -62,6 +64,10 @@ def _base_state(**overrides):
         # SETTLE 이 저장한 마지막 커밋 정산 id (P1-E 바인딩)
         "last_settlement_id": "run-test",
         "last_settlement_evidence": "",
+        # 세션 분리: 정산 대상(금요일 마감) / 실행 대상(월요일 세션).
+        # _fixed_now()=2026-10-26(월) 05:30 ET(프리장) 기준과 일치시킵니다.
+        "settled_session": "2026-10-23",
+        "execution_session": "2026-10-26",
     }
     state.update(overrides)
     return state
@@ -103,6 +109,43 @@ def _fake_strategy(broker, **kwargs):
     }
 
 
+def _seed_cap_strategy(price=50.0):
+    """state.net_invested 를 실제로 읽어 시드 캡을 적용하는 테스트 전략.
+
+    `build_order_plan` 이 전략에 넘긴 state 의 net_invested 가 그대로
+    주문 여부를 좌우하므로, EXECUTE 오버레이(P1)가 동작하는지 검증할 수 있습니다.
+    """
+
+    def _strategy(broker, **kwargs):
+        result = _fake_strategy(broker, **kwargs)
+        state = kwargs.get("state") or {}
+        seed = float(kwargs.get("seed", 0.0) or 0.0)
+        net_invested = float(state.get("net_invested", 0.0) or 0.0)
+        remaining = max(seed - net_invested, 0.0)
+        result["orderable_cash"] = remaining
+        result["orders"] = _orders_buy(price) if remaining >= price else []
+        return result
+
+    return _strategy
+
+
+def _deferred_fill(odno="DEF1", side="매수", qty="1", amount="100", **extra):
+    row = {
+        "odno": odno,
+        "ord_dt": "20261026",
+        "ord_tmd": "040000",
+        "ord_datetime_utc": "2026-10-26T08:00:00+00:00",
+        "sll_buy_dvsn_cd_name": side,
+        "ft_ccld_qty": qty,
+        "ft_ccld_amt3": amount,
+        "ft_ccld_unpr3": "100",
+        "nccs_qty": "0",
+        "prcs_stat_name": "체결",
+    }
+    row.update(extra)
+    return row
+
+
 def _make_broker(balance_qty=0, history=None):
     broker = MagicMock()
     broker.name = "mock"
@@ -128,6 +171,13 @@ def io(monkeypatch, tmp_path):
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("RUN_ID", "run-test")
+    # EXECUTE 경계 게이트(LIVE+RUN_PHASE)를 통과하는 기본 실행 위상입니다.
+    # 위상 거부 자체를 검증하는 테스트는 이 값을 덮어씁니다.
+    monkeypatch.setenv("RUN_PHASE", "EXECUTE")
+    # 전역 잠금도 테스트별로 격리합니다 (저장소 루트 .run.lock 공유 방지).
+    monkeypatch.setenv("RUN_LOCK_PATH", str(tmp_path / ".run.lock"))
+    monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+    monkeypatch.delenv("RUN_LOCK_FD", raising=False)
     monkeypatch.setenv("APPROVALS_DIR", str(tmp_path / "approvals"))
     monkeypatch.setenv("PLAN_DIR", str(tmp_path / "plans"))
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: loaded[symbol])
@@ -152,13 +202,14 @@ def io(monkeypatch, tmp_path):
 
 
 def _fixed_now():
-    return datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+    # 2026-10-26(월) 09:30 UTC = 05:30 ET (프리장, 실행 세션 당일).
+    return datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc)
 
 
 class _FixedDateTime(datetime):
     @classmethod
     def now(cls, tz=None):
-        fixed = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        fixed = datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc)
         return fixed.astimezone(tz) if tz else fixed
 
 
@@ -205,24 +256,28 @@ def _plan_hash(approval):
         approval.get("account_id"),
         approval.get("created_at_utc"),
         approval.get("expires_at_utc"),
+        approval.get("account_display"),
+        approval.get("tolerance_policy"),
     )
 
 
 def _write_evidence(
-    tmp_path, symbol="TQQQ", run_id="run-test", committed=True, balance_qty=0
+    tmp_path, symbol="TQQQ", run_id="run-test", committed=True, balance_qty=0,
+    deferred_fills=None,
 ):
+    payload = {
+        "symbol": symbol,
+        "run_id": run_id,
+        "evidence_version": 2,
+        "mode": "LIVE",
+        "committed": committed,
+        "balance_qty": balance_qty,
+    }
+    if deferred_fills is not None:
+        payload["deferred_fills"] = deferred_fills
     path = tmp_path / f"settlement-{symbol}-20261024T120000Z.json"
     path.write_text(
-        json.dumps(
-            {
-                "symbol": symbol,
-                "run_id": run_id,
-                "evidence_version": 2,
-                "mode": "LIVE",
-                "committed": committed,
-                "balance_qty": balance_qty,
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
     return path
@@ -456,7 +511,9 @@ class TestApprovalFile:
         approval = pipeline.load_approval(str(path))
         assert approval["schema_version"] == pipeline.APPROVAL_SCHEMA_VERSION
         assert approval["plan_id"] == plan.plan_id
-        assert approval["session"] == "2026-10-24"
+        # 세션은 "실행 대상 세션"입니다. _fixed_now()=2026-10-26(월) 05:30 ET 의
+        # 직전 마감 세션은 2026-10-23(금), 실행 대상은 2026-10-26(월) 입니다.
+        assert approval["session"] == "2026-10-26"
         assert approval["state_hash"] == canonical_state_hash(state)
         assert approval["settlement_run_id"] == "run-test"
         assert approval["evidence_id"] == "run-test"
@@ -614,7 +671,15 @@ class TestPhaseDispatcher:
 
     def test_verify_phase_accepts_consumed_approval(self, io, monkeypatch, tmp_path):
         state, plan, path = _approve(tmp_path)
-        pipeline.claim_approval(pipeline.load_approval(str(path)), now=_fixed_now())
+        approval = pipeline.load_approval(str(path))
+        pipeline.claim_approval(approval, now=_fixed_now())
+        # 소비된 승인은 실제 전송 기록 + EXECUTE 의 명시적 executed 기록이 필요합니다.
+        pipeline_execute._write_transmitted_plan(path, plan, approval, now=_fixed_now())
+        # 소비된 승인은 EXECUTE 의 명시적 executed 기록이 있어야 성공 판정됩니다.
+        Path(str(path) + ".recovery.json").write_text(
+            json.dumps({"plan_id": plan.plan_id, "outcome": "executed"}),
+            encoding="utf-8",
+        )
         _write_evidence(tmp_path)
         io["load"]("TQQQ", state)
         monkeypatch.chdir(tmp_path)
@@ -745,13 +810,202 @@ class TestExecute:
         assert broker.place_order.call_count == 0
         assert pipeline.load_approval(str(path))["consumed"] is False
 
+    def test_execute_allows_deferred_execution_session_fill(self, io, tmp_path):
+        """SETTLE 이 실행 세션으로 미룬 체결은 잔고 교차검증을 통과하면 허용됩니다.
+
+        이 체결은 state 워터마크 앞이라 재정산 비교에서는 '새 체결'로 보입니다.
+        구현은 `allowed_fill_odnos` 로 넘기되, `position_qty` + 미룬 순변동이
+        브로커 잔고와 **정확히 일치**할 때만 허용합니다 (조용한 통과 금지).
+        """
+        state = _base_state(position_qty=0)
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        fill = {
+            "odno": "DEF1",
+            "ord_dt": "20261026",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-26T08:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+            "ft_ccld_amt3": "50",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+        broker = _make_broker(balance_qty=1, history=[fill])
+
+        result = pipeline_execute.execute_approved_plan(
+            broker, str(path), now=_fixed_now()
+        )
+
+        assert result["outcome"] == "executed"
+        assert broker.place_order.call_count == 1
+
+    def test_execute_deferred_fill_balance_mismatch_fails_closed(self, io, tmp_path):
+        """미룬 체결로 설명되지 않는 잔고 차이는 EXECUTE 를 중단해야 합니다."""
+        state = _base_state(position_qty=0)
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        fill = {
+            "odno": "DEF1",
+            "ord_dt": "20261026",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-26T08:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+            "ft_ccld_amt3": "50",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+        # 잔고 2주인데 미룬 체결은 1주 → 설명되지 않는 +1주가 있음.
+        broker = _make_broker(balance_qty=2, history=[fill])
+        with pytest.raises(trading_bot.SymbolScopedError, match="보류 체결 검증 실패"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_deferred_buy_spend_counts_against_dollar_seed_cap(
+        self, io, monkeypatch, tmp_path
+    ):
+        """P1: 미룬 매수 $100 이 시드 캡에 반영되어 추가 매수를 허용하지 않습니다.
+
+        seed=$10,000 / state.net_invested=$9,900 / 미룬 매수 $100 →
+        재계산 시 남은 시드는 $0 이므로 승인된 매수 주문을 낼 수 없습니다.
+        수량 reconciliation 만으로는 이 달러 초과를 막지 못합니다.
+        """
+        state = _base_state(T=10.0, net_invested=9900.0, position_qty=198)
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(
+            trading_bot, "무한매수법_V4", _seed_cap_strategy(price=50.0)
+        )
+        fill = _deferred_fill(odno="DEF1", amount="100")
+        broker = _make_broker(balance_qty=199, history=[fill])
+
+        spend, pending = pipeline._deferred_buy_spend(state, [fill])
+        assert (spend, pending) == (100.0, [])
+
+        with pytest.raises(RuntimeError, match="주문 개수 불일치|허용 오차"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_deferred_buy_without_confirmed_amount_blocks_execute(
+        self, io, monkeypatch, tmp_path
+    ):
+        """P1: 금액 미확정 미룬 매수는 추정하지 않고 EXECUTE 를 차단합니다."""
+        state = _base_state(T=10.0, net_invested=9900.0, position_qty=198)
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(
+            trading_bot, "무한매수법_V4", _seed_cap_strategy(price=50.0)
+        )
+        fill = _deferred_fill(odno="DEF1", amount="0")
+        broker = _make_broker(balance_qty=199, history=[fill])
+
+        with pytest.raises(
+            trading_bot.SymbolScopedError,
+            match="금액이 확정되지 않았|금액 미확정|재정산 보류",
+        ):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_deferred_sell_does_not_loosen_seed_cap(
+        self, io, monkeypatch, tmp_path
+    ):
+        """P1: 미룬 매도는 시드 캡에서 제외됩니다 (보수적 비대칭).
+
+        남은 시드 $40 에 미룬 매도 $100 을 더해 $140 으로 인정하면
+        $50 매수가 허용되어 버립니다. 매도 회수액은 인정하지 않아야 합니다.
+        """
+        state = _base_state(T=10.0, net_invested=9960.0, position_qty=10)
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(
+            trading_bot, "무한매수법_V4", _seed_cap_strategy(price=50.0)
+        )
+        fill = _deferred_fill(odno="DEFSELL", side="매도", amount="100")
+        broker = _make_broker(balance_qty=9, history=[fill])
+
+        assert pipeline._deferred_buy_spend(state, [fill]) == (0.0, [])
+
+        with pytest.raises(RuntimeError, match="주문 개수 불일치|허용 오차"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+
     def test_rebuild_tolerance_enforced(self):
         approved = _orders_buy(50.0)
         rebuilt_close = _orders_buy(50.01)
         rebuilt_far = _orders_buy(52.0)
-        assert pipeline_execute.compare_order_plans(approved, rebuilt_close) == []
-        problems = pipeline_execute.compare_order_plans(approved, rebuilt_far)
+        policy = pipeline.execution_tolerance_policy()
+        assert pipeline_execute.compare_order_plans(
+            approved, rebuilt_close, policy=policy
+        ) == []
+        problems = pipeline_execute.compare_order_plans(
+            approved, rebuilt_far, policy=policy
+        )
         assert any("가격 불일치" in p for p in problems), problems
+        # 정책 없이 비교하면(승인 바인딩 없음) 통과시키지 않습니다 (fail-closed).
+        assert pipeline_execute.compare_order_plans(approved, rebuilt_close)
+
+    def test_live_refresh_false_fails_closed_before_side_effects(self, io, tmp_path):
+        """LIVE 에서는 계획 재계산 생략을 승인/브로커/주문 부수효과 전에 거부합니다."""
+        state, _plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker()
+
+        with pytest.raises(RuntimeError, match="refresh=False"):
+            pipeline_execute.execute_approved_plan(
+                broker,
+                str(path),
+                now=_fixed_now(),
+                refresh=False,
+                state_override=deepcopy(state),
+            )
+
+        assert broker.place_order.call_count == 0
+        # 승인 로드/세션/만료 검증 전에 거부되므로 브로커 조회도 없습니다.
+        assert broker.get_order_history.call_count == 0
+        assert broker.get_balance.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False, (
+            "재계산 거부 시 승인을 소비하면 안 됩니다"
+        )
+        assert not Path(pipeline.transmitted_plan_path(str(path))).exists()
+        assert io["saved"] == []
+
+    def test_flow_helper_rejects_live_refresh_false(self, io, tmp_path):
+        """테스트 헬퍼도 LIVE 에서 refresh=False 를 전달하지 못합니다."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import pipeline_flow
+
+        state = _base_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker()
+
+        with pytest.raises(RuntimeError, match="refresh=False"):
+            pipeline_flow.run_approved(
+                tmp_path,
+                broker,
+                state,
+                _orders_buy(),
+                refresh=False,
+                now=_fixed_now(),
+            )
+
+        assert broker.place_order.call_count == 0
+        assert not (tmp_path / "approvals").exists(), (
+            "거부 시 승인 파일을 만들면 안 됩니다"
+        )
 
     def test_sell_total_over_holdings_blocks(self, io, monkeypatch, tmp_path):
         sell_orders = [
@@ -831,6 +1085,9 @@ class TestExecute:
         recovery = Path(str(path) + ".recovery.json")
         assert recovery.exists()
         assert '"outcome": "approval-skipped"' in recovery.read_text(encoding="utf-8")
+        assert not Path(str(path) + ".deferred.json").exists(), (
+            "선점 전(approval-skipped) 중단은 보류 체결 sidecar 를 남기면 안 됩니다"
+        )
 
         # 조건이 해소되면 같은 승인으로 재시도할 수 있고, 결과 기록은 executed 로
         # 승격됩니다 (approval-skipped 는 소진이 아님).
@@ -842,6 +1099,65 @@ class TestExecute:
         )
         assert retried["outcome"] == "executed"
         assert '"outcome": "executed"' in recovery.read_text(encoding="utf-8")
+
+
+# ── EXECUTE 경계 게이트 (함수 자체 방어) ──────────────────────────
+
+
+class TestExecutePhaseBoundaryGate:
+    """직접 호출도 LIVE+RUN_PHASE=EXECUTE 가 아니면 주문 경로에 도달하지 못합니다."""
+
+    @pytest.mark.parametrize(
+        "mode,phase",
+        [
+            ("DRY", "EXECUTE"),   # DRY + 유효한 승인 + 실제(모의) 브로커
+            ("LIVE", "PREVIEW"),  # 잘못된 위상
+        ],
+    )
+    def test_non_live_or_wrong_phase_refused_without_side_effects(
+        self, io, monkeypatch, tmp_path, mode, phase
+    ):
+        state, _plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(trading_bot, "TRADE_MODE", mode)
+        monkeypatch.setenv("RUN_PHASE", phase)
+        broker = _make_broker()
+
+        with pytest.raises(RuntimeError, match="LIVE.*EXECUTE"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+
+        assert broker.place_order.call_count == 0
+        # 게이트는 승인 로드/브로커 조회 이전이어야 합니다.
+        assert broker.get_order_history.call_count == 0
+        assert broker.get_balance.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False, (
+            "위상 거부 시 승인을 소비하면 안 됩니다"
+        )
+        assert not Path(pipeline.transmitted_plan_path(str(path))).exists()
+        assert not Path(str(path) + ".executed.json").exists()
+        assert io["saved"] == []
+
+    def test_private_entry_point_also_refuses_dry(
+        self, io, monkeypatch, tmp_path
+    ):
+        """`_execute_approved_plan` 직접 호출도 같은 경계 게이트를 통과해야 합니다."""
+        state, _plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+        monkeypatch.setenv("RUN_PHASE", "EXECUTE")
+        broker = _make_broker()
+
+        with pytest.raises(RuntimeError, match="LIVE.*EXECUTE"):
+            pipeline_execute._execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+        assert not Path(pipeline.transmitted_plan_path(str(path))).exists()
+        assert io["saved"] == []
 
 
 # ── Round-2 HOLD 회귀 테스트 ─────────────────────────────────────
@@ -968,37 +1284,26 @@ class TestSettlementEvidenceBinding:
             )
 
 
-class TestForceTSingleSave:
-    """P1-D: FORCE_T 는 검증 후 1회만 저장 (조기 저장 금지)."""
+class TestForceTSettleRefusal:
+    """P2: SETTLE 경로에서는 FORCE_T 를 적용하지 않습니다 (REPAIR 단독 경로)."""
 
-    def test_force_t_saves_once_after_validations(self, io):
+    def test_force_t_is_refused_in_settle_without_apply_or_save(self, io):
         state, buyer = TestSettle()._processed_state()
         io["load"]("TQQQ", deepcopy(state))
         config = _symbol_config()
         config["force_t"] = 5.0
-        settled = pipeline.settle_positions(
-            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])), config
-        )
-        assert settled.T == pytest.approx(5.0)
-        assert len(io["saved"]) == 1, "FORCE_T 포함 정산은 정확히 1회 저장해야 합니다"
-        assert io["saved"][0]["T"] == pytest.approx(5.0)
+        broker = _make_broker(balance_qty=10, history=[buyer])
 
-    def test_force_t_not_saved_when_later_validation_fails(self, io, monkeypatch):
-        """P1-D: FORCE_T 이후 검증이 실패하면 보정값을 저장하지 않습니다."""
-        state, buyer = TestSettle()._processed_state()
-        io["load"]("TQQQ", deepcopy(state))
-        monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-        config = _symbol_config()
-        config["force_t"] = 5.0
-
-        def _boom(**kwargs):
-            raise RuntimeError("cycle report failure")
-
-        monkeypatch.setattr(trading_bot, "generate_cycle_report", _boom)
-        broker = _make_broker(balance_qty=0, history=[buyer])
-        with pytest.raises(RuntimeError, match="cycle report failure"):
+        # 상태/브로커/근거에 손대기 전에 거부되어야 합니다.
+        with pytest.raises(RuntimeError, match="REPAIR.*FORCE_T|FORCE_T.*REPAIR"):
             pipeline.settle_positions(ReadOnlyBroker(broker), config)
-        assert io["saved"] == [], "검증 실패 시 FORCE_T 를 조기 저장하면 안 됩니다"
+
+        assert io["saved"] == [], "SETTLE 은 FORCE_T 를 적용/저장하면 안 됩니다"
+        assert broker.get_order_history.call_count == 0
+        assert broker.get_balance.call_count == 0
+        assert list(Path(".").glob("settlement-*.json")) == [], (
+            "거부된 SETTLE 은 정산 근거도 남기지 않아야 합니다"
+        )
 
 
 class TestRepairForceTValidation:
@@ -1461,7 +1766,7 @@ class TestVerifyOrderAcceptance:
     PLAN_ID = "TQQQ-2026-10-24-run-test"
 
     def _setup(self, monkeypatch, tmp_path, *, meta_session, history, balance_qty,
-               orders=None, order_metas=None):
+               orders=None, order_metas=None, tolerance_policy=None):
         evidence = _write_evidence(tmp_path, balance_qty=0)
         approval = {
             "plan_id": self.PLAN_ID,
@@ -1469,6 +1774,9 @@ class TestVerifyOrderAcceptance:
             "exchange": "NAS",
             "consumed": True,
             "orders": orders or _orders_buy(),
+            # 승인 시점에 고정된 허용오차 — VERIFY 가 env 대신 이 값을 씁니다.
+            "tolerance_policy": tolerance_policy
+            or {"price_pct": 0.005, "price_abs": 0.02, "qty": 0},
             "_evidence_path": str(evidence),
         }
         state = _base_state(
@@ -1803,6 +2111,39 @@ class TestVerifyOrderAcceptance:
         out = capsys.readouterr().out
         assert "원주문 수량 필드 없음" in out
 
+    def test_original_order_qty_missing_key_lenient_but_zero_value_fails(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """필드 부재는 관대, 0으로 존재하면 "읽을 수 없음" 실패로 구분합니다.
+
+        어댑터가 누락된 원주문 수량을 "0"으로 합성하면 이 구분이 사라지므로
+        (필드 부재 → 실패) 회귀를 막는 테스트입니다.
+        """
+        assert trading_bot._row_original_qty(self._filled_row()) == (None, False)
+        assert trading_bot._row_original_qty(
+            self._filled_row(ft_ord_qty="0")
+        ) == (None, True)
+
+        # 필드 부재 → lenient 통과
+        approval, state, broker = self._setup(
+            monkeypatch, tmp_path,
+            meta_session="2026-10-24",
+            history=[self._filled_row()],
+            balance_qty=1,
+        )
+        assert trading_bot._verify_broker_readonly(approval, state, broker) == []
+        assert "원주문 수량 필드 없음" in capsys.readouterr().out
+
+        # 0으로 존재 → 실패 (합성 "0"이면 이 경로로 빠짐)
+        approval, state, broker = self._setup(
+            monkeypatch, tmp_path,
+            meta_session="2026-10-24",
+            history=[self._filled_row(ft_ord_qty="0")],
+            balance_qty=1,
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("원주문 수량을 읽을 수 없습니다" in p for p in problems), problems
+
     def test_original_order_qty_present_but_side_mismatch_fails(
         self, monkeypatch, tmp_path
     ):
@@ -1940,6 +2281,423 @@ class TestVerifyOrderAcceptance:
         problems = trading_bot._verify_broker_readonly(approval, state, broker)
         assert any("미실행 승인" in p for p in problems), problems
 
+    def test_widened_env_after_approval_does_not_widen_broker_price_check(
+        self, monkeypatch, tmp_path
+    ):
+        """승인 후 env 를 넓혀도 브로커 이력 주문가 대조는 승인 정책을 넘지 못합니다."""
+        approval, state, broker = self._setup(
+            monkeypatch, tmp_path,
+            meta_session="2026-10-24",
+            history=[self._filled_row(price=55.0)],
+            balance_qty=1,
+        )
+        # 승인 정책은 ±$0.25 (50 * 0.005 / abs 0.02) — $55 는 승인 범위 밖입니다.
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "10")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.50")
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("주문가 불일치" in p for p in problems), problems
+
+    def test_widened_env_after_approval_still_passes_in_tolerance_history(
+        self, monkeypatch, tmp_path
+    ):
+        approval, state, broker = self._setup(
+            monkeypatch, tmp_path,
+            meta_session="2026-10-24",
+            history=[self._filled_row(price=50.2)],
+            balance_qty=1,
+        )
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "10")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.50")
+        assert trading_bot._verify_broker_readonly(approval, state, broker) == []
+
+    def test_missing_approved_tolerance_policy_fails_closed(
+        self, monkeypatch, tmp_path
+    ):
+        approval, state, broker = self._setup(
+            monkeypatch, tmp_path,
+            meta_session="2026-10-24",
+            history=[self._filled_row(price=50.0)],
+            balance_qty=1,
+        )
+        approval.pop("tolerance_policy", None)
+        # env 를 넓혀도 승인 정책이 없으면 대조 자체를 거부합니다.
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "10")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.50")
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("허용오차 정책" in p for p in problems), problems
+
+
+class TestVerifyDeferredBaseline:
+    """P2: SETTLE 이 미룬 체결 근거를 VERIFY 가 live 이력과 대조하고 기대 잔고에 반영."""
+
+    PLAN_ID = "TQQQ-2026-10-24-run-test"
+
+    def _setup(
+        self, tmp_path, *, history, balance_qty, deferred_fills,
+        evidence_balance_qty=0,
+    ):
+        evidence = _write_evidence(
+            tmp_path,
+            balance_qty=evidence_balance_qty,
+            deferred_fills=deferred_fills,
+        )
+        approval = {
+            "plan_id": self.PLAN_ID,
+            "symbol": "TQQQ",
+            "exchange": "NAS",
+            "consumed": True,
+            "orders": _orders_buy(),
+            "tolerance_policy": {"price_pct": 0.005, "price_abs": 0.02, "qty": 0},
+            "_evidence_path": str(evidence),
+        }
+        state = _base_state(
+            orders_meta={
+                "NEW1": {
+                    "side": "BUY",
+                    "total_qty": 1,
+                    "plan_id": self.PLAN_ID,
+                    "plan_order_index": 1,
+                    "submitted_session": "2026-10-24",
+                    "processed_filled_qty": 0,
+                }
+            }
+        )
+        broker = _make_broker(balance_qty=balance_qty, history=history)
+        return approval, state, broker
+
+    def _approved_fill(self):
+        return {
+            "odno": "NEW1",
+            "ord_dt": "20261024",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-24T02:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+            "ft_ccld_amt3": "50",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+
+    def _deferred_row(self):
+        return _deferred_fill(odno="DEF1", side="매수", qty="1", amount="100")
+
+    def _deferred_evidence(self, qty=1):
+        return [
+            {
+                "odno": "DEF1",
+                "side": "매수",
+                "qty": qty,
+                "session": "20261026",
+                "amount": 100.0,
+                "amount_confirmed": True,
+            }
+        ]
+
+    def test_deferred_baseline_present_passes(self, tmp_path):
+        approval, state, broker = self._setup(
+            tmp_path,
+            history=[self._deferred_row(), self._approved_fill()],
+            balance_qty=2,
+            deferred_fills=self._deferred_evidence(),
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert problems == [], problems
+
+    def test_tampered_deferred_row_fails(self, tmp_path):
+        approval, state, broker = self._setup(
+            tmp_path,
+            history=[self._deferred_row(), self._approved_fill()],
+            balance_qty=2,
+            deferred_fills=self._deferred_evidence(qty=2),
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("보류 체결" in p and "수량 불일치" in p for p in problems), problems
+
+    def test_missing_deferred_row_fails(self, tmp_path):
+        approval, state, broker = self._setup(
+            tmp_path,
+            history=[self._approved_fill()],
+            balance_qty=1,
+            deferred_fills=self._deferred_evidence(),
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "보류 체결" in p and "브로커 주문이력에 없습니다" in p
+            for p in problems
+        ), problems
+
+    def test_old_evidence_without_baseline_keeps_strict_behavior(self, tmp_path):
+        """deferred_fills 키가 없는 구버전 근거는 기존 엄격 동작 그대로입니다."""
+        approval, state, broker = self._setup(
+            tmp_path,
+            history=[self._deferred_row(), self._approved_fill()],
+            balance_qty=2,
+            deferred_fills=None,
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("재정산 불일치" in p for p in problems), problems
+        assert any("브로커 잔고가 기대 결과와 다릅니다" in p for p in problems), problems
+
+
+class TestVerifyExecuteDeferredRecord:
+    """EXECUTE 가 동결한 보류 체결 기록으로 VERIFY 기준선을 고정합니다."""
+
+    def _execute_with_deferred_fill(
+        self, io, tmp_path, *, deferred_qty=1, evidence_qty=None
+    ):
+        """SETTLE 이후·EXECUTE 이전에 도착한 실행 세션 체결을 포함해 EXECUTE 합니다.
+
+        `evidence_qty` 를 주면 SETTLE 근거를 그 수량으로 먼저 기록합니다. EXECUTE
+        시점 누적(`deferred_qty`)이 더 크면 "SETTLE 스냅샷 → EXECUTE 수용" 증가
+        흐름이 됩니다.
+        """
+        state = _base_state(position_qty=0)
+        state, _plan, path = _approve(tmp_path, state=state)
+        evidence_path = tmp_path / "settlement-TQQQ-20261024T120000Z.json"
+        if evidence_qty is not None:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["balance_qty"] = 0
+            evidence["deferred_fills"] = [
+                {
+                    "odno": "DEF1",
+                    "side": "매수",
+                    "qty": evidence_qty,
+                    "session": "20261026",
+                    "amount": 50.0 * evidence_qty,
+                    "amount_confirmed": True,
+                }
+            ]
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+        io["load"]("TQQQ", deepcopy(state))
+        deferred = _deferred_fill(
+            odno="DEF1",
+            side="매수",
+            qty=str(deferred_qty),
+            amount=str(50 * deferred_qty),
+        )
+        broker = _make_broker(balance_qty=deferred_qty, history=[deferred])
+        broker.place_order.return_value = OrderResult(
+            order_id="EXEC1",
+            order_time="2026-10-26T09:30:00+09:00",
+            is_reservation=False,
+        )
+        result = pipeline_execute.execute_approved_plan(
+            broker, str(path), now=_fixed_now()
+        )
+        assert result["outcome"] == "executed"
+        assert broker.place_order.call_count == 1
+
+        approval = pipeline.load_approval(str(path))
+        approval["_evidence_path"] = str(evidence_path)
+        verification_state = deepcopy(io["saved"][-1])
+        verification_history = [deferred, self._approved_fill()]
+        verification_broker = _make_broker(
+            balance_qty=deferred_qty + 1, history=verification_history
+        )
+        return approval, verification_state, verification_broker, path
+
+    def _approved_fill(self):
+        return {
+            "odno": "EXEC1",
+            "ord_dt": "20261026",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-26T08:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+            "ft_ccld_amt3": "50",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+
+    def test_pre_execute_fill_recorded_and_verify_passes(self, io, tmp_path):
+        approval, state, broker, path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        record_path = Path(str(path) + ".deferred.json")
+        assert record_path.exists(), "EXECUTE 는 수용한 보류 체결 집합을 동결해야 합니다"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["deferred_fills"] == [
+            {
+                "odno": "DEF1",
+                "side": "매수",
+                "qty": 1,
+                "session": "20261026",
+                "amount": 50.0,
+                "amount_confirmed": True,
+            }
+        ]
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert problems == [], problems
+
+    def test_settle_to_execute_growth_uses_frozen_baseline(self, io, tmp_path):
+        """SETTLE 근거 1주 → EXECUTE 동결 2주. VERIFY 는 동결 수량을 기준선으로 씁니다."""
+        approval, state, broker, path = self._execute_with_deferred_fill(
+            io, tmp_path, deferred_qty=2, evidence_qty=1
+        )
+        record = json.loads(
+            Path(str(path) + ".deferred.json").read_text(encoding="utf-8")
+        )
+        assert record["deferred_fills"][0]["qty"] == 2, (
+            "EXECUTE 는 SETTLE 이후 늘어난 누적 체결을 동결해야 합니다"
+        )
+
+        # 기대잔고 = SETTLE 0 + 동결 2 + 승인주문 체결 1 = 3.
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert problems == [], problems
+
+    def test_growth_after_execute_fails(self, io, tmp_path):
+        """EXECUTE 동결 이후 누적이 3주로 늘면 소급 허용하지 않고 실패합니다."""
+        approval, state, _broker, _path = self._execute_with_deferred_fill(
+            io, tmp_path, deferred_qty=2, evidence_qty=1
+        )
+        grown = _deferred_fill(odno="DEF1", side="매수", qty="3", amount="150")
+        broker = _make_broker(
+            balance_qty=4, history=[grown, self._approved_fill()]
+        )
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "EXECUTE 보류 체결" in p and "수량 불일치" in p for p in problems
+        ), problems
+
+    def test_frozen_live_mismatch_fails(self, io, tmp_path):
+        """동결 기록은 2주인데 live 이력이 1주면 (되돌림/변조) 실패합니다."""
+        approval, state, _broker, _path = self._execute_with_deferred_fill(
+            io, tmp_path, deferred_qty=2, evidence_qty=1
+        )
+        rolled_back = _deferred_fill(
+            odno="DEF1", side="매수", qty="1", amount="50"
+        )
+        broker = _make_broker(
+            balance_qty=2, history=[rolled_back, self._approved_fill()]
+        )
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "EXECUTE 보류 체결" in p and "수량 불일치" in p for p in problems
+        ), problems
+
+    def test_execute_record_live_session_mismatch_fails(self, io, tmp_path):
+        """동결 기록 세션(20261026)과 live 이력 세션(20261027)이 다르면 실패합니다."""
+        approval, state, _broker, path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        record = json.loads(
+            Path(str(path) + ".deferred.json").read_text(encoding="utf-8")
+        )
+        assert record["deferred_fills"][0]["session"] == "20261026"
+
+        moved = _deferred_fill(
+            odno="DEF1", side="매수", qty="1", amount="50", ord_dt="20261027"
+        )
+        broker = _make_broker(
+            balance_qty=2, history=[moved, self._approved_fill()]
+        )
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "EXECUTE 보류 체결" in p
+            and "세션 불일치" in p
+            and "기록=20261026" in p
+            and "이력=20261027" in p
+            for p in problems
+        ), problems
+
+    def test_execute_record_live_session_match_passes(self, io, tmp_path):
+        """live 이력 세션이 동결 기록/실행 세션과 같으면 통과합니다."""
+        approval, state, broker, _path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert problems == [], problems
+
+    def test_execute_record_live_session_unparseable_fails(self, io, tmp_path):
+        """live 이력 행의 세션을 해석할 수 없으면 fail-closed 입니다."""
+        approval, state, _broker, _path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        undated = _deferred_fill(
+            odno="DEF1", side="매수", qty="1", amount="50"
+        )
+        for key in ("ord_dt", "ord_tmd", "ord_datetime_utc"):
+            undated.pop(key, None)
+        broker = _make_broker(
+            balance_qty=2, history=[undated, self._approved_fill()]
+        )
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "EXECUTE 보류 체결" in p and "이력 세션을 해석할 수 없습니다" in p
+            for p in problems
+        ), problems
+
+    def test_evidence_and_execute_record_overlap_not_double_counted(
+        self, io, tmp_path
+    ):
+        """같은 odno 가 SETTLE 근거와 EXECUTE 기록에 모두 있어도 1회만 계산합니다."""
+        approval, state, broker, _path = self._execute_with_deferred_fill(io, tmp_path)
+        evidence_path = Path(str(approval["_evidence_path"]))
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["deferred_fills"] = [
+            {
+                "odno": "DEF1",
+                "side": "매수",
+                "qty": 1,
+                "session": "20261026",
+                "amount": 50.0,
+                "amount_confirmed": True,
+            }
+        ]
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert problems == [], problems
+
+    def test_tampered_execute_record_fails(self, io, tmp_path):
+        approval, state, broker, path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        record_path = Path(str(path) + ".deferred.json")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["deferred_fills"][0]["qty"] = 2
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any(
+            "EXECUTE 보류 체결" in p and "수량 불일치" in p
+            for p in problems
+        ), problems
+
+    def test_missing_execute_record_keeps_legacy_strictness(self, io, tmp_path):
+        approval, state, broker, path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        Path(str(path) + ".deferred.json").unlink()
+
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("재정산 불일치" in p for p in problems), problems
+        assert any("브로커 잔고가 기대 결과와 다릅니다" in p for p in problems), problems
+
+    def test_fill_after_execute_fails(self, io, tmp_path):
+        approval, state, _broker, path = self._execute_with_deferred_fill(
+            io, tmp_path
+        )
+        # EXECUTE 기록에도 승인 계획에도 없는, EXECUTE 이후 도착한 체결.
+        late_fill = _deferred_fill(odno="LATE1", side="매수", qty="1", amount="50")
+        broker = _make_broker(
+            balance_qty=3,
+            history=[
+                _deferred_fill(odno="DEF1", side="매수", qty="1", amount="50"),
+                self._approved_fill(),
+                late_fill,
+            ],
+        )
+        problems = trading_bot._verify_broker_readonly(approval, state, broker)
+        assert any("재정산 불일치" in p for p in problems), problems
+
 
 class TestVerifyExecutedOutcome:
     """P1-C: 정상 실행은 명시적 executed 기록을 남겨 VERIFY 가 성공 판정합니다."""
@@ -1985,9 +2743,10 @@ class TestVerifyExecutedOutcome:
         )
         assert record["outcome"] == "execution-failed"
 
-    def test_consumed_without_record_still_reports_execution_failed(
+    def test_consumed_without_record_is_verification_failure(
         self, io, monkeypatch, tmp_path, capsys
     ):
+        """소비됐지만 결과 기록이 없으면 성공(exit 0)이 아니라 검증 실패(exit 1)."""
         state, _plan, path = _approve(tmp_path)
         pipeline.claim_approval(pipeline.load_approval(str(path)), now=_fixed_now())
         io["load"]("TQQQ", state)
@@ -1997,8 +2756,10 @@ class TestVerifyExecutedOutcome:
             trading_bot, "verify_evidence_file_with_ops", lambda *a, **k: (True, [])
         )
         monkeypatch.setenv("APPROVAL_FILE", str(path))
-        assert trading_bot._run_verify_phase() == 0
-        assert "outcome=execution-failed" in capsys.readouterr().out
+        assert trading_bot._run_verify_phase() == 1
+        out = capsys.readouterr().out
+        assert "execution-failed" in out
+        assert "실행 결과 기록" in out
 
 
 class TestOpsCronHandoff:
@@ -2015,3 +2776,1753 @@ class TestOpsCronHandoff:
             stripped = line.strip()
             if "RUN_PHASE=" in stripped:
                 assert stripped.startswith("#"), line
+
+    def test_cron_documents_morning_settle_and_1830_execute(self):
+        cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
+        assert "5 10  * * 1-5 RUN_PHASE=SETTLE" in cron
+        assert "30 18 * * 1-5 RUN_PHASE=EXECUTE" in cron
+        assert "45 18 * * 1-5 RUN_PHASE=VERIFY" in cron
+        # 세션 분리(아침 정산 대상 ≠ 실행 대상)와 계좌 없는 브로커 바인딩 문서화
+        assert "다음 세션" in cron
+        assert "MERITZ_ACCOUNT_BINDING" in cron
+        assert "ACCOUNT_FINGERPRINT_SECRET" in cron
+        assert "RUN_LOCK_HELD" in cron
+        assert "AFTER_HOURS_END_ET_HOUR" in cron
+
+    def test_launcher_distinguishes_approval_skipped_alert(self):
+        """HOLD 6: exit 2(승인만 됨)와 exit 1(실행 실패) 알림 문구를 구분."""
+        launcher = (_repo_root / "ops" / "run_daily.sh").read_text(encoding="utf-8")
+        cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
+        assert 'if [[ "$rc" == "2" ]]' in launcher
+        assert "승인만 됨" in launcher
+        assert "실행 실패 아님" in launcher
+        assert "자동매매 실행 실패" in launcher
+        assert "2=승인만 되고 미실행" in cron
+        assert "실행 실패(exit 1)와 다른 문구" in cron
+
+
+# ── Round-4 HOLD 회귀 테스트 ─────────────────────────────────────
+
+
+class TestExecuteTransmitsRebuiltPlan:
+    """HOLD 1: EXECUTE 는 승인 계획(게이트)이 아니라 **재계산 계획**을 전송합니다."""
+
+    def _price_strategy(self, price):
+        def _strategy(broker, **kwargs):
+            result = _fake_strategy(broker, **kwargs)
+            result["orders"] = _orders_buy(price)
+            return result
+
+        return _strategy
+
+    def test_place_order_receives_rebuilt_values(self, io, monkeypatch, tmp_path):
+        state, _plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        assert approval["orders"][0]["price"] == 50.0
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.chdir(tmp_path)
+        # 승인 후 시세가 살짝 움직여 허용오차(±$0.25) 안에서 드리프트합니다.
+        monkeypatch.setattr(trading_bot, "무한매수법_V4", self._price_strategy(50.01))
+
+        broker = _make_broker()
+        result = pipeline_execute.execute_approved_plan(
+            broker, str(path), now=_fixed_now()
+        )
+
+        assert result["outcome"] == "executed"
+        assert broker.place_order.call_count == 1
+        sent_price = float(broker.place_order.call_args.args[4])
+        assert sent_price == pytest.approx(50.01), (
+            "place_order 는 stale 승인값(50.0)이 아니라 재계산값(50.01)을 받아야 합니다"
+        )
+
+        transmitted_path = Path(str(path) + ".transmitted.json")
+        assert transmitted_path.exists()
+        transmitted = json.loads(transmitted_path.read_text(encoding="utf-8"))
+        assert transmitted["orders"][0]["price"] == pytest.approx(50.01)
+        assert transmitted["approval_plan_hash"] == approval["plan_hash"]
+        assert transmitted["source"] == "rebuilt"
+
+    def test_drift_beyond_tolerance_blocks_transmission(self, io, monkeypatch, tmp_path):
+        state, _plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(trading_bot, "무한매수법_V4", self._price_strategy(60.0))
+        broker = _make_broker()
+        with pytest.raises(RuntimeError, match="허용 오차"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+        assert not Path(str(path) + ".transmitted.json").exists()
+
+
+class TestPreviewImmutableIds:
+    """HOLD 2: PREVIEW 1회당 고유 계획 파일. APPROVE 는 확인한 id+내용만 승인."""
+
+    def test_second_preview_does_not_overwrite_first(self, io, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        state = _base_state()
+        io["load"]("TQQQ", state)
+        _write_evidence(tmp_path)
+        settled = trading_bot._settled_from_state(_symbol_config())
+        broker = ReadOnlyBroker(_make_broker())
+
+        plan1 = pipeline.build_order_plan(settled, broker)
+        path1 = pipeline.write_order_plan(plan1, plans_dir=str(tmp_path / "plans"))
+        first_content = Path(path1).read_text(encoding="utf-8")
+
+        plan2 = pipeline.build_order_plan(settled, broker)
+        path2 = pipeline.write_order_plan(plan2, plans_dir=str(tmp_path / "plans"))
+
+        assert path1 != path2, "두 번째 PREVIEW 가 첫 계획 파일을 덮어쓰면 안 됩니다"
+        assert plan1.plan_id != plan2.plan_id
+        assert Path(path1).read_text(encoding="utf-8") == first_content
+        assert Path(path2).exists()
+
+    def test_approve_of_id_a_approves_a_content(self, io, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        state = _base_state()
+        io["load"]("TQQQ", state)
+        _write_evidence(tmp_path)
+        plans_dir = str(tmp_path / "plans")
+        plan_a = _make_plan(state, orders=_orders_buy(50.0))
+        plan_b = _make_plan(state, orders=_orders_buy(51.0))
+        pipeline.write_order_plan(plan_a, plans_dir=plans_dir)
+        pipeline.write_order_plan(plan_b, plans_dir=plans_dir)
+
+        approval_path = pipeline.approve_plan_file(
+            plan_a.plan_id,
+            approvals_dir=str(tmp_path / "approvals"),
+            plans_dir=plans_dir,
+            now=_fixed_now(),
+        )
+        approval = pipeline.load_approval(str(approval_path))
+        assert approval["plan_id"] == plan_a.plan_id
+        assert approval["orders"][0]["price"] == 50.0
+
+    def test_write_order_plan_refuses_overwrite(self, io, tmp_path):
+        state = _base_state()
+        plan = _make_plan(state)
+        pipeline.write_order_plan(plan, plans_dir=str(tmp_path))
+        with pytest.raises(RuntimeError, match="덮어쓰기 금지"):
+            pipeline.write_order_plan(plan, plans_dir=str(tmp_path))
+
+
+class TestSessionSeparation:
+    """HOLD 3: 정산 대상(settled) 세션과 실행 대상(execution) 세션을 분리."""
+
+    KST = ZoneInfo("Asia/Seoul")
+
+    def test_kst_morning_preview_and_evening_execute_share_session(self):
+        preview_now = datetime(2026, 10, 27, 11, 0, tzinfo=self.KST)  # ET 월요일 22:00
+        execute_now = datetime(2026, 10, 27, 18, 30, tzinfo=self.KST)  # ET 화요일 05:30
+        assert pipeline._et_today(preview_now) == "2026-10-26"
+        assert pipeline._et_today(execute_now) == "2026-10-27"
+        # 두 시각의 세션 계산이 동일해야 합니다 (ET 날짜가 달라도).
+        assert pipeline.settlement_sessions(preview_now) == ("2026-10-26", "2026-10-27")
+        assert pipeline.settlement_sessions(execute_now) == ("2026-10-26", "2026-10-27")
+
+        state = _base_state(
+            settled_session="2026-10-26", execution_session="2026-10-27"
+        )
+        plan = pipeline.OrderPlan(
+            plan_id="",
+            symbol="TQQQ",
+            exchange="NAS",
+            session="",
+            orders=_orders_buy(),
+            state_hash=canonical_state_hash(state),
+            plan_hash="",
+            settlement_run_id="run-test",
+            created_at_utc="",
+            expires_at_utc="",
+        )
+        pipeline._prepare_plan_identity(plan, now=preview_now)
+        assert plan.session == "2026-10-27", "계획 세션은 실행 대상 세션이어야 합니다"
+        assert pipeline.verify_approval(plan.to_approval(), state, now=execute_now) == []
+
+    def test_weekend_settles_friday_and_executes_monday(self):
+        # KST 일요일 11:00 = ET 토요일 22:00 → _et_today 는 토요일이지만,
+        # 정산 대상은 금요일 마감 세션이고 실행 대상은 월요일입니다.
+        sunday_morning = datetime(2026, 10, 25, 11, 0, tzinfo=self.KST)
+        assert pipeline._et_today(sunday_morning) == "2026-10-24"
+        assert pipeline.settlement_sessions(sunday_morning) == (
+            "2026-10-23",
+            "2026-10-26",
+        )
+
+    def test_holiday_is_skipped(self):
+        # 2026-11-26 은 추수감사절 휴장 → 다음 세션은 11-27(금).
+        after_thanksgiving = datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)
+        assert pipeline.settlement_sessions(after_thanksgiving) == (
+            "2026-11-25",
+            "2026-11-27",
+        )
+        # 2026-12-25(금) 크리스마스 → 다음 세션은 12-28(월).
+        christmas_evening = datetime(2026, 12, 26, 1, 0, tzinfo=timezone.utc)
+        assert pipeline.settlement_sessions(christmas_evening) == (
+            "2026-12-24",
+            "2026-12-28",
+        )
+
+    def test_dst_boundaries(self):
+        # 2026-11-01 서머타임 종료(EDT→EST). 금요일 마감 → 월요일 세션.
+        after_fall_back = datetime(2026, 11, 2, 2, 0, tzinfo=timezone.utc)
+        assert pipeline.settlement_sessions(after_fall_back) == (
+            "2026-10-30",
+            "2026-11-02",
+        )
+        # 2026-03-08 서머타임 시작(EST→EDT). 금요일 마감 → 월요일 세션.
+        after_spring_forward = datetime(2026, 3, 9, 1, 0, tzinfo=timezone.utc)
+        assert pipeline.settlement_sessions(after_spring_forward) == (
+            "2026-03-06",
+            "2026-03-09",
+        )
+
+    def test_stale_approval_session_is_rejected(self):
+        state = _base_state(
+            settled_session="2026-10-23", execution_session="2026-10-26"
+        )
+        plan = pipeline.OrderPlan(
+            plan_id="",
+            symbol="TQQQ",
+            exchange="NAS",
+            session="2026-10-23",  # 이전 세션 승인
+            orders=_orders_buy(),
+            state_hash=canonical_state_hash(state),
+            plan_hash="",
+            settlement_run_id="run-test",
+            created_at_utc="",
+            expires_at_utc="",
+        )
+        pipeline._prepare_plan_identity(
+            plan, now=datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+        )
+        approval = plan.to_approval()
+        problems = pipeline.verify_approval(
+            approval,
+            state,
+            now=datetime(2026, 10, 27, 18, 30, tzinfo=self.KST),
+        )
+        assert any("세션 불일치" in p for p in problems), problems
+
+
+class TestSettleGates:
+    """HOLD 4: SETTLE 은 대상 세션 마감 + 실잔고 조회 성공이 필수, 보류=실패."""
+
+    def test_balance_failure_halts_and_does_not_save(self, io):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=10, history=[buyer])
+        broker.get_balance.side_effect = RuntimeError("balance api down")
+
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+        )
+
+        assert settled.halt_reason == "balance_unavailable"
+        assert io["saved"] == [], "잔고 미확인 SETTLE 은 저장하면 안 됩니다"
+
+    def test_dispatch_settle_counts_halt_as_failure(self, io, monkeypatch):
+        monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+        monkeypatch.setattr(
+            trading_bot,
+            "settle_positions",
+            lambda broker, config: pipeline.SettledState(
+                state={},
+                symbol=config["symbol"],
+                exchange=config["exchange"],
+                splits=config["splits"],
+                symbol_type=config["symbol_type"],
+                seed=config["seed"],
+                effective_seed=0.0,
+                T=0.0,
+                halt_reason="history_not_settled",
+            ),
+        )
+        assert trading_bot._dispatch_pipeline_phase("SETTLE", _make_broker()) == 1
+
+    def test_settle_uses_closed_session_not_today(self, io):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=10, history=[buyer])
+        broker.is_trading_day.return_value = False  # 오늘(ET 토요일)은 휴장
+
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+        )
+
+        assert settled.halt_reason is None, (
+            "휴장일이어도 직전 마감 세션을 정산해야 합니다 (오늘 영업일 여부와 무관)"
+        )
+        assert settled.settled_session == "2026-10-23"
+        assert settled.session == "2026-10-26"
+        assert len(io["saved"]) == 1
+        assert io["saved"][0]["settled_session"] == "2026-10-23"
+        assert io["saved"][0]["execution_session"] == "2026-10-26"
+
+
+class TestEvidenceFinalConsistency:
+    """HOLD 5: 후처리(MAX_T/사이클 종료)를 기록하고 최종 후보를 검증."""
+
+    def test_max_t_records_post_processing(self, io):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        config = _symbol_config()
+        config["max_t"] = 1.0
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])), config
+        )
+        assert settled.T == pytest.approx(1.0)
+        evidence = json.loads(Path(settled.evidence_path).read_text(encoding="utf-8"))
+        post = evidence["post_processing"]
+        assert post["applied"] is True
+        assert any(step["step"] == "max_t" for step in post["steps"])
+        assert post["final_candidate"]["T"] == pytest.approx(1.0)
+
+    def test_final_candidate_verification_blocks_save(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.setattr(
+            pipeline,
+            "verify_evidence_file_with_ops",
+            lambda *a, **k: (False, ["강제 최종 후보 불일치"]),
+        )
+        with pytest.raises(trading_bot.SymbolScopedError, match="최종 저장 후보"):
+            pipeline.settle_positions(
+                ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+                _symbol_config(),
+            )
+        assert io["saved"] == [], "최종 후보 검증 실패 시 저장하면 안 됩니다"
+
+    def test_cycle_end_seed_change_is_verified(self, tmp_path):
+        ops = pipeline._load_verify_run_module()
+        evidence = {
+            "symbol": "TQQQ",
+            "run_id": "run-cycle",
+            "mode": "LIVE",
+            "broker": "mockbroker",
+            "broker_mode": "demo",
+            "evidence_version": 2,
+            "settlement_mode": "incremental",
+            "T_before": 2.0,
+            "net_invested_before": 500.0,
+            "T_after": 2.0,
+            "net_invested_after": 500.0,
+            "ledger_before": {"start_T": 2.0, "entries": []},
+            "ledger_after": {"start_T": 2.0, "entries": []},
+            "orders": [],
+            # 사이클 시드는 원시 체결로 독립 재계산됩니다.
+            # buy 10 @ $50, sell 10 @ $60, commission 0 → +$100 → 1100.
+            "fills": [
+                {
+                    "odno": "B1",
+                    "side": "매수",
+                    "qty": 10,
+                    "price": 50.0,
+                    "ord_dt": "20260105",
+                    "ts": "2026-01-05T15:00:00+00:00",
+                },
+                {
+                    "odno": "S1",
+                    "side": "매도",
+                    "qty": 10,
+                    "price": 60.0,
+                    "ord_dt": "20260120",
+                    "ts": "2026-01-20T15:00:00+00:00",
+                },
+            ],
+            "max_t": 20,
+            "post_processing": {
+                "applied": True,
+                "steps": [
+                    {
+                        "step": "cycle_end",
+                        "cycle_start": "2026-01-01",
+                        "cycle_end": "2026-01-20",
+                        "seed": 1000.0,
+                        "commission_rate": 0.0,
+                        "new_cycle_started": False,
+                        "reinvest": True,
+                        "next_cycle_seed": 1100.0,
+                    }
+                ],
+                "final_candidate": {
+                    "T": 0.0,
+                    "net_invested": 0.0,
+                    "effective_seed": 1100.0,
+                    "cycle_start_date": "",
+                },
+            },
+        }
+        path = tmp_path / "settlement-TQQQ-cycle.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+
+        good_state = {
+            "T": 0.0,
+            "net_invested": 0.0,
+            "effective_seed": 1100.0,
+            "cycle_start_date": "",
+        }
+        _ok, problems = ops.verify_evidence_file(
+            path,
+            broker="mockbroker",
+            mode="LIVE",
+            run_id="run-cycle",
+            broker_mode="demo",
+            final_state=good_state,
+        )
+        assert not any("최종 저장" in p or "effective_seed 불일치" in p for p in problems), problems
+        assert not any("최종 후보 스냅샷" in p for p in problems), problems
+
+        bad_state = dict(good_state, effective_seed=999.0)
+        _ok, problems = ops.verify_evidence_file(
+            path,
+            broker="mockbroker",
+            mode="LIVE",
+            run_id="run-cycle",
+            broker_mode="demo",
+            final_state=bad_state,
+        )
+        assert any("effective_seed 불일치" in p for p in problems), problems
+
+
+class TestGlobalLock:
+    """HOLD 6: 셸/파이썬이 같은 .run.lock 으로 state 변경을 직렬화."""
+
+    def test_reentrant_same_process(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+        monkeypatch.setenv("RUN_LOCK_PATH", str(tmp_path / ".run.lock"))
+        with pipeline.global_lock(timeout_seconds=1):
+            with pipeline.global_lock(timeout_seconds=1):
+                pass  # 같은 프로세스 재진입은 교착하지 않아야 합니다
+
+    def test_cross_process_exclusion(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+        lock_path = tmp_path / ".run.lock"
+        monkeypatch.setenv("RUN_LOCK_PATH", str(lock_path))
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(_src_path)!r})\n"
+            "import pipeline\n"
+            "try:\n"
+            "    with pipeline.global_lock(timeout_seconds=0.3):\n"
+            "        print('acquired')\n"
+            "except TimeoutError:\n"
+            "    print('busy')\n"
+            "    sys.exit(7)\n"
+        )
+        env = dict(os.environ)
+        env.pop("RUN_LOCK_HELD", None)
+        env["RUN_LOCK_PATH"] = str(lock_path)
+
+        with pipeline.global_lock(timeout_seconds=2):
+            busy = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=str(tmp_path),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        assert busy.returncode == 7, busy.stdout + busy.stderr
+        assert "busy" in busy.stdout
+
+        free = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert free.returncode == 0, free.stdout + free.stderr
+        assert "acquired" in free.stdout
+
+    def test_run_lock_held_env_bypasses(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUN_LOCK_HELD", "1")
+        monkeypatch.setenv("RUN_LOCK_PATH", str(tmp_path / ".run.lock"))
+        with pipeline.global_lock(timeout_seconds=1):
+            pass
+
+
+class TestVerifyExitCodes:
+    """HOLD 7: 실행 실패/기록 누락은 검증 실패(nonzero), 승인만 됨은 별도 코드."""
+
+    def test_approval_skipped_without_problems_returns_2(
+        self, io, monkeypatch, tmp_path
+    ):
+        state, _plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", state)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(trading_bot, "datetime", _FixedDateTime)
+        monkeypatch.setattr(
+            trading_bot, "verify_evidence_file_with_ops", lambda *a, **k: (True, [])
+        )
+        monkeypatch.setenv("APPROVAL_FILE", str(path))
+        assert trading_bot._run_verify_phase() == 2
+
+
+class TestMeritzAccountBinding:
+    """HOLD 8: 계좌번호 없는 브로커도 승인에 계좌 바인딩(비민감)을 남깁니다."""
+
+    def _as_meritz(self, monkeypatch, cfg=None):
+        import config as runtime_config
+
+        monkeypatch.setattr(trading_bot, "BROKER", "meritz")
+        monkeypatch.setattr(trading_bot, "BROKER_MODE", "real")
+        monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+        monkeypatch.setattr(runtime_config, "BROKER_CONFIG", cfg or {})
+        for name in (
+            "MERITZ_ACCOUNT_BINDING",
+            pipeline.ACCOUNT_BINDING_ENV,
+            pipeline.ACCOUNT_FINGERPRINT_SECRET_ENV,
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_meritz_without_binding_is_rejected(self, io, monkeypatch):
+        self._as_meritz(monkeypatch, cfg={})
+        with pytest.raises(RuntimeError, match="계좌 바인딩"):
+            pipeline._broker_identity()
+
+    def test_meritz_explicit_binding_is_hashed(self, io, monkeypatch):
+        self._as_meritz(monkeypatch, cfg={})
+        monkeypatch.setenv("MERITZ_ACCOUNT_BINDING", "meritz-main")
+        monkeypatch.setenv(pipeline.ACCOUNT_FINGERPRINT_SECRET_ENV, "server-secret")
+        identity = pipeline._broker_identity()
+        assert identity["account_id"].startswith("hmac-sha256:")
+        assert identity["account_display"] == "****main"
+        assert "meritz-main" not in identity["account_id"]
+
+    def test_meritz_credential_fingerprint_never_leaks_secret(self, io, monkeypatch):
+        self._as_meritz(
+            monkeypatch,
+            cfg={"app_key": "AK-123", "app_secret": "SUPER-SECRET-VALUE"},
+        )
+        monkeypatch.setenv(pipeline.ACCOUNT_FINGERPRINT_SECRET_ENV, "server-secret")
+        identity = pipeline._broker_identity()
+        assert identity["account_id"].startswith("hmac-sha256:")
+        assert identity["account_display"] == "meritz/real"
+        dumped = json.dumps(identity)
+        assert "SUPER-SECRET-VALUE" not in dumped
+        assert "AK-123" not in dumped
+
+    def test_other_accountless_broker_keeps_legacy_empty_binding(
+        self, io, monkeypatch
+    ):
+        import config as runtime_config
+
+        monkeypatch.setattr(trading_bot, "BROKER", "ls")
+        monkeypatch.setattr(trading_bot, "BROKER_MODE", "real")
+        monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+        monkeypatch.setattr(
+            runtime_config, "BROKER_CONFIG", {"app_key": "K", "app_secret": "S"}
+        )
+        monkeypatch.delenv(pipeline.ACCOUNT_FINGERPRINT_SECRET_ENV, raising=False)
+        monkeypatch.delenv(pipeline.ACCOUNT_BINDING_ENV, raising=False)
+        monkeypatch.delenv("LS_ACCOUNT_BINDING", raising=False)
+        assert pipeline._broker_identity()["account_id"] == ""
+
+
+# ── Round-5 HOLD 회귀 테스트 ─────────────────────────────────────
+
+
+class TestAfterHoursSettlementGate:
+    """HOLD 1: 정규장 마감과 애프터아워 종료를 분리해 정산 시각을 검증."""
+
+    KST = ZoneInfo("Asia/Seoul")
+
+    def test_winter_kst_0930_is_before_after_hours_end(self):
+        # 2026-12-01 09:30 KST = 2026-11-30 19:30 EST (정규장 마감 후, 애프터아워 전).
+        from broker.market_utils import (
+            us_session_after_hours_end,
+            us_session_last_closed_date,
+        )
+
+        now = datetime(2026, 12, 1, 9, 30, tzinfo=self.KST)
+        assert us_session_last_closed_date(now) == "2026-11-30"
+        assert us_session_after_hours_end("2026-11-30", now) is False
+        # 정산 대상은 직전 정규장 마감 세션이고 실행 대상은 다음 세션입니다.
+        assert pipeline.settlement_sessions(now) == ("2026-11-30", "2026-12-01")
+
+    def test_et_1601_is_regular_closed_but_after_hours_running(self):
+        from broker.market_utils import (
+            us_session_after_hours_end,
+            us_session_closed,
+        )
+
+        et = ZoneInfo("America/New_York")
+        now = datetime(2026, 11, 30, 16, 1, tzinfo=et)
+        assert us_session_closed("2026-11-30", now) is True
+        assert us_session_after_hours_end("2026-11-30", now) is False
+
+    def test_just_before_and_after_after_hours_end(self, monkeypatch):
+        from broker.market_utils import us_session_after_hours_end
+
+        monkeypatch.delenv("AFTER_HOURS_END_ET_HOUR", raising=False)
+        et = ZoneInfo("America/New_York")
+        before = datetime(2026, 11, 30, 19, 59, tzinfo=et)
+        after = datetime(2026, 11, 30, 20, 0, tzinfo=et)
+        assert us_session_after_hours_end("2026-11-30", before) is False
+        assert us_session_after_hours_end("2026-11-30", after) is True
+
+        monkeypatch.setenv("AFTER_HOURS_END_ET_HOUR", "17")
+        at_17 = datetime(2026, 11, 30, 17, 0, tzinfo=et)
+        assert us_session_after_hours_end("2026-11-30", at_17) is True
+
+    def test_settle_halts_before_after_hours_end(self, io):
+        state, _buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=10, history=[])
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 12, 1, 9, 30, tzinfo=self.KST),
+        )
+        assert settled.halt_reason == "after_hours_not_ended"
+        assert io["saved"] == [], "애프터아워 종료 전 SETTLE 은 저장하면 안 됩니다"
+
+    def test_in_progress_session_fills_are_never_finalized(self, io):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        in_progress_fill = dict(buyer)
+        in_progress_fill.update(
+            {
+                "odno": "TODAY1",
+                "ord_dt": "20261201",
+                "ord_datetime_utc": "2026-12-01T16:00:00+00:00",
+                "ft_ccld_qty": "1",
+                "ft_ccld_amt3": "60",
+                "ft_ccld_unpr3": "60",
+            }
+        )
+        broker = _make_broker(balance_qty=11, history=[buyer, in_progress_fill])
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 12, 1, 11, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+        assert settled.halt_reason == "in_progress_session_fills"
+        assert io["saved"] == []
+
+    def test_in_progress_session_is_never_the_settle_target(self):
+        from broker.market_utils import us_session_in_progress
+
+        et = ZoneInfo("America/New_York")
+        # 2026-12-01(화) 11:00 ET — 정규장 진행 중.
+        now = datetime(2026, 12, 1, 11, 0, tzinfo=et)
+        assert us_session_in_progress(now) == "2026-12-01"
+        settled, execution = pipeline.settlement_sessions(now)
+        assert settled == "2026-11-30", "진행 중 세션의 체결을 정산 대상으로 삼으면 안 됩니다"
+        assert execution == "2026-12-01"
+        assert settled != us_session_in_progress(now)
+
+    @pytest.mark.parametrize("hour", [5, 8])
+    def test_execution_session_premarket_fills_are_deferred_then_settled(
+        self, io, hour
+    ):
+        """실행 세션 프리마켓(ET 05:00/08:00) 체결은 SETTLE 을 막지 않고 **미룹니다**.
+
+        실행 세션은 아직 마감되지 않았으므로, 그 체결을 직전 세션 정산에 확정하면
+        안 됩니다. 대신 T/순투입/원장에서 제외하고 워터마크를 그 앞에 멈춘 뒤,
+        그 세션의 **다음 SETTLE** 에서 다시 반영해야 합니다.
+        """
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        premarket_fill = dict(buyer)
+        premarket_fill.update(
+            {
+                "odno": f"PREMARKET{hour}",
+                "ord_dt": "20261202",
+                "ord_tmd": f"{hour:02d}0500",
+                "ord_datetime_utc": "2026-12-02T10:05:00+00:00",
+                "ft_ccld_qty": "1",
+                "ft_ccld_amt3": "60",
+                "ft_ccld_unpr3": "60",
+            }
+        )
+        now = datetime(
+            2026, 12, 2, hour, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        # 전제 확인: 이 시각의 정산 대상은 12/1, 실행 대상은 12/2, 정규장 진행 중 아님.
+        from broker.market_utils import us_session_in_progress
+
+        assert pipeline.settlement_sessions(now) == ("2026-12-01", "2026-12-02")
+        assert us_session_in_progress(now) is None
+        broker = _make_broker(balance_qty=11, history=[buyer, premarket_fill])
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker), _symbol_config(), now=now
+        )
+
+        # 1) SETTLE 은 진행되고, 미룬 체결은 T/순투입/원장에 반영되지 않습니다.
+        assert settled.halt_reason is None
+        assert settled.T == pytest.approx(2.0)
+        assert settled.state["net_invested"] == pytest.approx(500.0)
+        assert settled.state["last_updated"] == state["last_updated"], (
+            "미룬 체결 너머로 워터마크가 전진하면 다음 정산에서 누락됩니다"
+        )
+        assert settled.state["position_qty"] == 10, (
+            "잔고(11주)에서 미룬 순변동(+1주)을 되감아 정산 세션 시점 보유량이어야 합니다"
+        )
+        assert len(io["saved"]) == 1
+        evidence = json.loads(Path(settled.evidence_path).read_text(encoding="utf-8"))
+        assert f"PREMARKET{hour}" not in {
+            fill["odno"] for fill in evidence["fills"]
+        }, "미룬 체결은 이번 정산 근거에 포함되면 안 됩니다"
+        assert evidence["deferred_fills"] == [
+            {
+                "odno": f"PREMARKET{hour}",
+                "side": "매수",
+                "qty": 1,
+                "session": "20261202",
+                "amount": 60.0,
+                "amount_confirmed": True,
+            }
+        ], "미룬 체결은 근거(deferred_fills)에 남아 VERIFY 기준선으로 쓰여야 합니다"
+
+        # 2) 그 세션의 다음 SETTLE 이 미룬 체결을 정상적으로 집어갑니다.
+        io["load"]("TQQQ", deepcopy(settled.state))
+        next_settle_now = datetime(
+            2026, 12, 3, 5, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        assert pipeline.settlement_sessions(next_settle_now)[0] == "2026-12-02"
+        settled_next = pipeline.settle_positions(
+            ReadOnlyBroker(
+                _make_broker(balance_qty=11, history=[buyer, premarket_fill])
+            ),
+            _symbol_config(),
+            now=next_settle_now,
+        )
+        assert settled_next.halt_reason is None
+        assert settled_next.state["net_invested"] == pytest.approx(560.0)
+        assert settled_next.T == pytest.approx(2.5)
+        assert settled_next.state["last_updated"] == premarket_fill["ord_datetime_utc"]
+        evidence_next = json.loads(
+            Path(settled_next.evidence_path).read_text(encoding="utf-8")
+        )
+        assert f"PREMARKET{hour}" in {
+            fill["odno"] for fill in evidence_next["fills"]
+        }, "다음 SETTLE 이 미룬 체결을 반영해야 합니다"
+        assert evidence_next["deferred_fills"] == [], (
+            "반영된 체결은 더 이상 보류 목록에 남으면 안 됩니다"
+        )
+
+    def test_fills_after_execution_session_halt_without_saving(self, io):
+        """**실행 세션보다 뒤인** 세션 체결은 미래/범위 밖이므로 저장 없이 보류."""
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        future_fill = dict(buyer)
+        future_fill.update(
+            {
+                "odno": "FUTURE1",
+                "ord_dt": "20261203",
+                "ord_tmd": "050000",
+                "ord_datetime_utc": "2026-12-03T10:05:00+00:00",
+                "ft_ccld_qty": "1",
+                "ft_ccld_amt3": "60",
+                "ft_ccld_unpr3": "60",
+            }
+        )
+        now = datetime(2026, 12, 2, 5, 0, tzinfo=ZoneInfo("America/New_York"))
+        assert pipeline.settlement_sessions(now) == ("2026-12-01", "2026-12-02")
+        broker = _make_broker(balance_qty=11, history=[buyer, future_fill])
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker), _symbol_config(), now=now
+        )
+        assert settled.halt_reason == "post_settled_session_fills"
+        assert io["saved"] == [], "실행 세션 이후 체결이 있으면 SETTLE 은 저장하면 안 됩니다"
+
+
+class TestReVerifyAfterWait:
+    """HOLD 2: 대기가 필요하면 **먼저** 대기하고 전체 게이트를 다시 통과."""
+
+    def _price_strategy(self, price):
+        def _strategy(broker, **kwargs):
+            result = _fake_strategy(broker, **kwargs)
+            result["orders"] = _orders_buy(price)
+            return result
+
+        return _strategy
+
+    def _prepare(self, io, monkeypatch, tmp_path):
+        state, plan, path = _approve(tmp_path)
+        io["load"]("TQQQ", deepcopy(state))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(trading_bot, "datetime", _FixedDateTime)
+        return path
+
+    def test_wait_happens_before_claim_and_transmit(self, io, monkeypatch, tmp_path):
+        path = self._prepare(io, monkeypatch, tmp_path)
+        observed = {}
+
+        def fake_wait(tb, now=None):
+            observed["consumed"] = pipeline.load_approval(str(path)).get("consumed")
+            observed["transmitted"] = Path(str(path) + ".transmitted.json").exists()
+            observed["orders"] = 0
+            return _fixed_now()
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        broker = _make_broker()
+        result = pipeline_execute.execute_approved_plan(
+            broker, str(path), now=_fixed_now()
+        )
+        assert result["outcome"] == "executed"
+        assert observed["consumed"] is False, "대기 전에 승인을 소비하면 안 됩니다"
+        assert observed["transmitted"] is False, "대기 전에 전송 계획을 쓰면 안 됩니다"
+
+    def test_approval_claimed_during_wait_is_reloaded_and_rejected(
+        self, io, monkeypatch, tmp_path
+    ):
+        path = self._prepare(io, monkeypatch, tmp_path)
+
+        def fake_wait(tb, now=None):
+            pipeline.claim_approval(
+                pipeline.load_approval(str(path)), now=_fixed_now()
+            )
+            return _fixed_now()
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        broker = _make_broker()
+        with pytest.raises(RuntimeError, match="이미 사용된 승인"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+
+    def test_ttl_expiry_during_wait_blocks_execution(self, io, monkeypatch, tmp_path):
+        path = self._prepare(io, monkeypatch, tmp_path)
+
+        def fake_wait(tb, now=None):
+            return _fixed_now() + timedelta(hours=10)
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        broker = _make_broker()
+        with pytest.raises(RuntimeError, match="만료"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+        assert not Path(str(path) + ".transmitted.json").exists()
+
+    def test_fill_increase_during_wait_blocks_execution(self, io, monkeypatch, tmp_path):
+        path = self._prepare(io, monkeypatch, tmp_path)
+        broker = _make_broker()
+        new_fill = {
+            "odno": "LATE1",
+            "ord_dt": "20261021",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-21T00:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+            "ft_ccld_amt3": "50",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+
+        def fake_wait(tb, now=None):
+            broker.get_order_history.return_value = [new_fill]
+            return _fixed_now()
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        with pytest.raises(trading_bot.SymbolScopedError, match="새 체결"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_price_jump_during_wait_blocks_execution(self, io, monkeypatch, tmp_path):
+        path = self._prepare(io, monkeypatch, tmp_path)
+        broker = _make_broker()
+
+        def fake_wait(tb, now=None):
+            monkeypatch.setattr(
+                trading_bot, "무한매수법_V4", self._price_strategy(60.0)
+            )
+            return _fixed_now()
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        with pytest.raises(RuntimeError, match="허용 오차"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_widened_env_after_approval_cannot_widen_risk(
+        self, io, monkeypatch, tmp_path
+    ):
+        """승인 후 env 를 넓혀도 승인 범위 밖 주문은 실행하지 않습니다."""
+        path = self._prepare(io, monkeypatch, tmp_path)
+        broker = _make_broker()
+        # 승인 허용오차(±$0.25)보다 넓게 env 를 바꿉니다.
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "10")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.50")
+
+        def fake_wait(tb, now=None):
+            # ±$0.5 드리프트: 넓힌 env 에서는 통과하지만 승인 범위 밖입니다.
+            monkeypatch.setattr(
+                trading_bot, "무한매수법_V4", self._price_strategy(50.5)
+            )
+            return _fixed_now()
+
+        monkeypatch.setattr(pipeline_execute, "_wait_until_pre_market", fake_wait)
+        with pytest.raises(RuntimeError, match="허용 오차"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+        assert not Path(str(path) + ".transmitted.json").exists()
+
+    def test_early_execute_on_wrong_trading_day_is_rejected(
+        self, io, monkeypatch, tmp_path
+    ):
+        path = self._prepare(io, monkeypatch, tmp_path)
+        broker = _make_broker()
+        # 2026-10-25(일) 23:00 UTC = 19:00 ET — 실행 세션(월) 전날 밤.
+        wrong_day = datetime(2026, 10, 25, 23, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="아직 시작되지 않았습니다"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=wrong_day
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+
+class TestTransmittedPlanIntegrity:
+    """HOLD 3: VERIFY 가 실제 전송 계획의 해시/바인딩/허용오차를 독립 검증."""
+
+    def _consumed_with_record(self, tmp_path):
+        state, plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        approval["consumed"] = True
+        pipeline_execute._write_transmitted_plan(
+            path, plan, approval, now=_fixed_now()
+        )
+        return approval, path, plan
+
+    def _write_record(self, path, data):
+        Path(str(path) + ".transmitted.json").write_text(
+            json.dumps(data), encoding="utf-8"
+        )
+
+    def test_valid_transmitted_record_passes(self, tmp_path):
+        approval, _path, _plan = self._consumed_with_record(tmp_path)
+        assert pipeline.transmitted_plan_problems(approval) == []
+        assert trading_bot._verify_transmitted_plan(approval) == []
+
+    def test_tampered_orders_hash_mismatch_detected(self, tmp_path):
+        approval, path, _plan = self._consumed_with_record(tmp_path)
+        data = json.loads(
+            Path(str(path) + ".transmitted.json").read_text(encoding="utf-8")
+        )
+        data["orders"][0]["quantity"] = 999
+        self._write_record(path, data)
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("transmitted_plan_hash" in p for p in problems), problems
+
+    def test_foreign_plan_record_detected(self, tmp_path):
+        approval, path, _plan = self._consumed_with_record(tmp_path)
+        data = json.loads(
+            Path(str(path) + ".transmitted.json").read_text(encoding="utf-8")
+        )
+        data["plan_id"] = "TQQQ-OTHER-PLAN"
+        self._write_record(path, data)
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("plan_id 불일치" in p for p in problems), problems
+
+    def test_wrong_approval_binding_detected(self, tmp_path):
+        approval, path, _plan = self._consumed_with_record(tmp_path)
+        data = json.loads(
+            Path(str(path) + ".transmitted.json").read_text(encoding="utf-8")
+        )
+        data["approval_plan_hash"] = "deadbeef"
+        self._write_record(path, data)
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("다른 승인" in p for p in problems), problems
+
+    def test_missing_record_detected(self, tmp_path):
+        approval, path, _plan = self._consumed_with_record(tmp_path)
+        Path(str(path) + ".transmitted.json").unlink()
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("없습니다" in p for p in problems), problems
+
+    def test_corrupt_record_detected(self, tmp_path):
+        approval, path, _plan = self._consumed_with_record(tmp_path)
+        Path(str(path) + ".transmitted.json").write_text("{", encoding="utf-8")
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("읽을 수 없습니다" in p for p in problems), problems
+
+    def test_transmitted_orders_outside_approval_tolerance_detected(self, tmp_path):
+        approval, path, plan = self._consumed_with_record(tmp_path)
+        # 허용오차(기본 ±$0.25)를 크게 벗어난 가격이지만, 해시/바인딩은 유효하게
+        # 다시 기록해 **허용오차 검사**가 잡아내는지 확인합니다.
+        plan.orders = [dict(_orders_buy(60.0)[0])]
+        pipeline_execute._write_transmitted_plan(
+            path, plan, approval, now=_fixed_now()
+        )
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("가격 불일치" in p for p in problems), problems
+        assert not any("transmitted_plan_hash" in p for p in problems), problems
+        assert any("가격 불일치" in p for p in trading_bot._verify_transmitted_plan(approval))
+
+    def test_verify_requires_record_for_consumed_approval(
+        self, io, monkeypatch, tmp_path, capsys
+    ):
+        state, plan, path = _approve(tmp_path)
+        pipeline.claim_approval(pipeline.load_approval(str(path)), now=_fixed_now())
+        Path(str(path) + ".recovery.json").write_text(
+            json.dumps({"plan_id": plan.plan_id, "outcome": "executed"}),
+            encoding="utf-8",
+        )
+        io["load"]("TQQQ", state)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(trading_bot, "datetime", _FixedDateTime)
+        monkeypatch.setattr(
+            trading_bot, "verify_evidence_file_with_ops", lambda *a, **k: (True, [])
+        )
+        monkeypatch.setenv("APPROVAL_FILE", str(path))
+        assert trading_bot._run_verify_phase() == 1
+        assert "전송 계획 기록" in capsys.readouterr().out
+
+
+class TestLockPathUnification:
+    """HOLD 4: 셸/파이썬이 같은 절대 잠금 경로를 사용하고 플래그를 검증."""
+
+    def _child_script(self, lock_path):
+        return (
+            "import sys\n"
+            f"sys.path.insert(0, {str(_src_path)!r})\n"
+            "import pipeline\n"
+            "try:\n"
+            "    with pipeline.global_lock(timeout_seconds=0.3):\n"
+            "        print('acquired')\n"
+            "except TimeoutError:\n"
+            "    print('busy')\n"
+            "    sys.exit(7)\n"
+        )
+
+    def _run_child(self, script, lock_path, *, flag=False, pass_fds=(), lock_fd=None):
+        env = dict(os.environ)
+        env.pop("RUN_LOCK_HELD", None)
+        env.pop("RUN_LOCK_FD", None)
+        env["RUN_LOCK_PATH"] = str(lock_path)
+        if flag:
+            env["RUN_LOCK_HELD"] = "1"
+        if lock_fd is not None:
+            env["RUN_LOCK_FD"] = str(lock_fd)
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(Path(lock_path).parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            pass_fds=tuple(pass_fds),
+        )
+
+    def test_run_lock_path_is_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUN_LOCK_PATH", "nested/.run.lock")
+        resolved = pipeline.run_lock_path()
+        assert os.path.isabs(resolved)
+        assert resolved.endswith(os.path.join("nested", ".run.lock"))
+
+    def test_launcher_exports_resolved_lock_path(self):
+        launcher = (_repo_root / "ops" / "run_daily.sh").read_text(encoding="utf-8")
+        # `.env` 를 먼저 읽은 뒤 잠금 경로를 확정해야 .env 전용 경로가 셸/파이썬에
+        # 같은 값으로 전달됩니다 (경로 분리 방지).
+        env_pos = launcher.index(". ./.env")
+        lock_pos = launcher.index('LOCK_PATH="${OVERRIDE_LOCK_PATH:-${RUN_LOCK_PATH:-$APP_DIR/.run.lock}}"')
+        assert env_pos < lock_pos
+        assert 'export RUN_LOCK_PATH="$LOCK_PATH"' in launcher
+        assert 'exec 9>"$LOCK_PATH"' in launcher
+        assert 'export RUN_LOCK_FD=9' in launcher
+        assert 'export RUN_LOCK_HELD=1' in launcher
+
+    def test_shell_holder_blocks_python_lock(self, tmp_path):
+        lock = tmp_path / "shared.run.lock"
+        holder = subprocess.Popen(
+            ["bash", "-c", f'exec 9>"{lock}"; flock 9; echo ready; sleep 30'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "ready"
+            child = self._run_child(self._child_script(lock), lock)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+
+    def test_run_lock_held_without_actual_lock_still_takes_lock(
+        self, tmp_path, monkeypatch
+    ):
+        lock = tmp_path / "custom.run.lock"
+        monkeypatch.setenv("RUN_LOCK_PATH", str(lock))
+        monkeypatch.setenv("RUN_LOCK_HELD", "1")  # 런처 없이 남은 플래그
+        with pipeline.global_lock(timeout_seconds=1):
+            child = self._run_child(self._child_script(lock), lock, flag=False)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+
+    def test_run_lock_held_with_actual_lock_bypasses(self, tmp_path, monkeypatch):
+        lock = tmp_path / "held.run.lock"
+        monkeypatch.setenv("RUN_LOCK_PATH", str(lock))
+        monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+        with pipeline.global_lock(timeout_seconds=1):
+            monkeypatch.setenv("RUN_LOCK_HELD", "1")
+            # 실제 잠금이 잡혀 있으므로 우회해야 합니다 (교착 금지).
+            with pipeline.global_lock(timeout_seconds=0.2):
+                pass
+
+    # ── P1: 플래그만으로는 우회 금지 ────────────────────────────────
+    def test_stale_flag_with_foreign_holder_blocks(self, tmp_path):
+        """플래그만 남은 직접 CLI 는 다른 실행과 **동시 진행하면 안 됩니다**."""
+        lock = tmp_path / "stale.run.lock"
+        holder = subprocess.Popen(
+            ["bash", "-c", f'exec 9>"{lock}"; flock 9; echo ready; sleep 30'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "ready"
+            # RUN_LOCK_HELD=1 이지만 런처 fd(9)를 물려받지 않은 자식.
+            child = self._run_child(
+                self._child_script(lock), lock, flag=True
+            )
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+        assert "직접 잠급니다" in child.stdout
+
+    def test_inherited_fd_hold_is_reentrant_without_deadlock(self, tmp_path):
+        """런처가 물려준 fd 가 같은 파일을 가리키면 재진입으로 인정합니다."""
+        lock = tmp_path / "inherited.run.lock"
+        lock.touch()
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            child = self._run_child(
+                self._child_script(lock),
+                lock,
+                flag=True,
+                pass_fds=(fd,),
+                lock_fd=fd,
+            )
+        finally:
+            os.close(fd)
+        assert child.returncode == 0, child.stdout + child.stderr
+        assert "acquired" in child.stdout
+
+    def test_inherited_fd_mismatch_does_not_bypass(self, tmp_path):
+        """fd 번호만 맞고 **다른 파일**이면 상속으로 인정하지 않습니다."""
+        lock = tmp_path / "target.run.lock"
+        other = tmp_path / "other.run.lock"
+        lock.touch()
+        other.touch()
+        other_fd = os.open(str(other), os.O_RDWR | os.O_CREAT, 0o600)
+        holder = subprocess.Popen(
+            ["bash", "-c", f'exec 9>"{lock}"; flock 9; echo ready; sleep 30'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "ready"
+            # 자식의 fd 는 other 를 가리키므로 잠금 증거가 아닙니다 → 대기/차단.
+            child = self._run_child(
+                self._child_script(lock),
+                lock,
+                flag=True,
+                pass_fds=(other_fd,),
+                lock_fd=other_fd,
+            )
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+            os.close(other_fd)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+
+    def test_fd_to_same_file_but_not_holder_does_not_bypass(self, tmp_path):
+        """같은 파일 fd 라도 **그 fd 가 잠금 보유자가 아니면** 상속이 아닙니다."""
+        import fcntl
+
+        lock = tmp_path / "not-holder.run.lock"
+        lock.touch()
+        inherited = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        holder_fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            child = self._run_child(
+                self._child_script(lock),
+                lock,
+                flag=True,
+                pass_fds=(inherited,),
+                lock_fd=inherited,
+            )
+        finally:
+            os.close(holder_fd)
+            os.close(inherited)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+
+    def test_env_only_lock_path_resolved_before_locking(self, tmp_path):
+        """`.env` 에만 있는 RUN_LOCK_PATH 도 셸이 먼저 해석해 잠급니다."""
+        home = tmp_path / "home"
+        app_dir = home / "investment" / "muhan-v4"
+        app_dir.mkdir(parents=True)
+        (home / ".local" / "bin").mkdir(parents=True)
+        (app_dir / ".env").write_text(
+            "RUN_LOCK_PATH=.locks/env-only.run.lock\n", encoding="utf-8"
+        )
+        record = tmp_path / "launcher-env.txt"
+        fake_uv = home / ".local" / "bin" / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'env > "$RECORD"\n'
+            'readlink /dev/fd/9 >> "$RECORD" 2>/dev/null '
+            '|| readlink /proc/self/fd/9 >> "$RECORD"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_uv.chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["RECORD"] = str(record)
+        env["PATH"] = str(home / ".local" / "bin") + ":" + env.get("PATH", "")
+        for key in ("RUN_LOCK_PATH", "RUN_LOCK_FD", "RUN_LOCK_HELD",
+                    "TELEGRAM_BOT_TOKEN", "RUN_PHASE"):
+            env.pop(key, None)
+        result = subprocess.run(
+            ["bash", str(_repo_root / "ops" / "run_daily.sh")],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        lines = record.read_text(encoding="utf-8").splitlines()
+        expected = str(app_dir / ".locks" / "env-only.run.lock")
+        assert f"RUN_LOCK_PATH={expected}" in lines
+        assert "RUN_LOCK_FD=9" in lines
+        assert "RUN_LOCK_HELD=1" in lines
+        # fd 9 가 실제로 .env 경로를 가리켜야 자식이 상속을 인정합니다.
+        assert lines[-1] == expected
+        assert Path(expected).exists()
+        assert not (app_dir / ".run.lock").exists(), (
+            "기본 경로가 따로 잠기면 셸/파이썬 잠금 도메인이 갈라집니다"
+        )
+        # 이 경로를 직접 CLI(플래그 없음)가 잡으려 하면 같은 도메인이라 차단됩니다.
+        holder = subprocess.Popen(
+            ["bash", "-c", f'exec 9>"{expected}"; flock 9; echo ready; sleep 30'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout.readline().strip() == "ready"
+            child = self._run_child(self._child_script(expected), expected)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+        assert child.returncode == 7, child.stdout + child.stderr
+        assert "busy" in child.stdout
+
+
+class TestCycleSeedIndependentRecompute:
+    """HOLD 5: 사이클 시드를 원시 체결/경계/수수료/직전 시드로 독립 재계산."""
+
+    def _evidence(self, next_seed=1100.0, extra_fills=None):
+        fills = [
+            {
+                "odno": "B1",
+                "side": "매수",
+                "qty": 10,
+                "price": 50.0,
+                "ord_dt": "20260105",
+                "ts": "2026-01-05T15:00:00+00:00",
+            },
+            {
+                "odno": "S1",
+                "side": "매도",
+                "qty": 10,
+                "price": 60.0,
+                "ord_dt": "20260120",
+                "ts": "2026-01-20T15:00:00+00:00",
+            },
+        ]
+        fills.extend(extra_fills or [])
+        return {
+            "symbol": "TQQQ",
+            "run_id": "run-cycle",
+            "mode": "LIVE",
+            "broker": "mockbroker",
+            "broker_mode": "demo",
+            "evidence_version": 2,
+            "settlement_mode": "incremental",
+            "T_before": 2.0,
+            "net_invested_before": 500.0,
+            "T_after": 2.0,
+            "net_invested_after": 500.0,
+            "ledger_before": {"start_T": 2.0, "entries": []},
+            "ledger_after": {"start_T": 2.0, "entries": []},
+            "orders": [],
+            "fills": fills,
+            "max_t": 20,
+            "post_processing": {
+                "applied": True,
+                "steps": [
+                    {
+                        "step": "cycle_end",
+                        "cycle_start": "2026-01-01",
+                        "cycle_end": "2026-01-20",
+                        "seed": 1000.0,
+                        "commission_rate": 0.0,
+                        "new_cycle_started": False,
+                        "reinvest": True,
+                        "next_cycle_seed": next_seed,
+                    }
+                ],
+                "final_candidate": {
+                    "T": 0.0,
+                    "net_invested": 0.0,
+                    "effective_seed": next_seed,
+                    "cycle_start_date": "",
+                },
+            },
+        }
+
+    def _verify(self, tmp_path, evidence, final_seed):
+        ops = pipeline._load_verify_run_module()
+        path = tmp_path / "settlement-TQQQ-cycle.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+        return ops.verify_evidence_file(
+            path,
+            broker="mockbroker",
+            mode="LIVE",
+            run_id="run-cycle",
+            broker_mode="demo",
+            final_state={
+                "T": 0.0,
+                "net_invested": 0.0,
+                "effective_seed": final_seed,
+                "cycle_start_date": "",
+            },
+        )
+
+    def test_correct_seed_passes_independent_check(self, tmp_path):
+        _ok, problems = self._verify(tmp_path, self._evidence(), 1100.0)
+        assert not any("next_cycle_seed 불일치" in p for p in problems), problems
+        assert not any("effective_seed 불일치" in p for p in problems), problems
+
+    def test_evidence_and_state_agreeing_on_wrong_seed_fails(self, tmp_path):
+        # evidence 와 state 가 **둘 다** 9999 로 조작되어도 독립 재계산이 잡아냅니다.
+        evidence = self._evidence(next_seed=9999.0)
+        ok, problems = self._verify(tmp_path, evidence, 9999.0)
+        assert ok is False
+        assert any("next_cycle_seed 불일치" in p for p in problems), problems
+        assert any("effective_seed 불일치" in p for p in problems), problems
+
+    def test_same_day_rebuy_after_liquidation_is_excluded(self, tmp_path):
+        rebuy = {
+            "odno": "B2",
+            "side": "매수",
+            "qty": 10,
+            "price": 70.0,
+            "ord_dt": "20260120",
+            "ts": "2026-01-20T15:05:00+00:00",
+        }
+        # 청산 이후 같은 날 재매수를 포함해 계산한(잘못된) 시드.
+        evidence = self._evidence(next_seed=400.0, extra_fills=[rebuy])
+        ok, problems = self._verify(tmp_path, evidence, 400.0)
+        assert ok is False
+        assert any("next_cycle_seed 불일치" in p for p in problems), problems
+
+    def test_real_cycle_end_save_then_rerun_is_idempotent(self, io):
+        buyer = {
+            "odno": "B1",
+            "ord_dt": "20261010",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-10T00:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "10",
+            "ft_ccld_amt3": "500",
+            "ft_ccld_unpr3": "50",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+        seller = {
+            "odno": "S1",
+            "ord_dt": "20261021",
+            "ord_tmd": "040000",
+            "ord_datetime_utc": "2026-10-21T00:00:00+00:00",
+            "sll_buy_dvsn_cd_name": "매도",
+            "ft_ccld_qty": "10",
+            "ft_ccld_amt3": "600",
+            "ft_ccld_unpr3": "60",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+        state = _base_state(
+            T=2.0,
+            net_invested=500.0,
+            position_qty=10,
+            cycle_start_date="2026-10-01",
+            orders_meta={
+                "B1": {
+                    "side": "BUY",
+                    "total_qty": 10,
+                    "t_target": 1.0,
+                    "processed_filled_qty": 10,
+                    "processed_filled_amount": 500.0,
+                },
+                "S1": {
+                    "side": "SELL",
+                    "total_qty": 10,
+                    "t_target": 1.0,
+                    "processed_filled_qty": 0,
+                    "processed_filled_amount": 0.0,
+                },
+            },
+        )
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=0, history=[buyer, seller])
+        first = pipeline.settle_positions(ReadOnlyBroker(broker), _symbol_config())
+        assert first.halt_reason is None, first.halt_reason
+        assert first.effective_seed and first.effective_seed > 0
+        saved = io["saved"][-1]
+        assert saved["effective_seed"] == pytest.approx(first.effective_seed)
+
+        # 저장된 상태로 재실행 — 사이클 종료를 다시 처리하지 않고 시드가 유지됩니다.
+        io["load"]("TQQQ", deepcopy(saved))
+        second = pipeline.settle_positions(ReadOnlyBroker(broker), _symbol_config())
+        assert second.halt_reason is None, second.halt_reason
+        assert second.effective_seed == pytest.approx(first.effective_seed)
+        assert io["saved"][-1]["effective_seed"] == pytest.approx(first.effective_seed)
+        second_evidence = json.loads(
+            Path(second.evidence_path).read_text(encoding="utf-8")
+        )
+        steps = [
+            step.get("step")
+            for step in (second_evidence.get("post_processing") or {}).get("steps", [])
+        ]
+        assert "cycle_end" not in steps, "재실행에서 사이클 종료를 또 처리하면 안 됩니다"
+
+
+# ── P1: 사이클 이력 완전성/정렬 ────────────────────────────────────
+
+
+class TestCycleCompleteness:
+    """사이클 시드 검증은 **완전한 이력**에서만 계산합니다 (불완전 = 검증 불가)."""
+
+    def _evidence(self):
+        return TestCycleSeedIndependentRecompute()._evidence()
+
+    def _step(self, evidence):
+        return evidence["post_processing"]["steps"][0]
+
+    def test_missing_cycle_start_is_unverifiable(self, tmp_path):
+        ops = pipeline._load_verify_run_module()
+        evidence = self._evidence()
+        step = dict(self._step(evidence), cycle_start="")
+        expected, problems = ops._expected_cycle_seed(evidence, step)
+        assert expected is None
+        assert any("cycle_start" in p for p in problems), problems
+
+    def test_sells_only_history_is_unverifiable(self):
+        ops = pipeline._load_verify_run_module()
+        evidence = self._evidence()
+        evidence["fills"] = [
+            {
+                "odno": "S1",
+                "side": "매도",
+                "qty": 10,
+                "price": 60.0,
+                "ord_dt": "20260120",
+                "ts": "2026-01-20T15:00:00+00:00",
+            }
+        ]
+        expected, problems = ops._expected_cycle_seed(evidence, self._step(evidence))
+        assert expected is None
+        assert any("매수 이력" in p for p in problems), problems
+
+    def test_buys_missing_overdraw_is_unverifiable(self):
+        """매도가 매수 누적을 넘으면 0 으로 clamp 하지 않고 실패합니다."""
+        ops = pipeline._load_verify_run_module()
+        evidence = self._evidence()
+        evidence["fills"] = [
+            {
+                "odno": "B1",
+                "side": "매수",
+                "qty": 5,
+                "price": 50.0,
+                "ord_dt": "20260105",
+                "ts": "2026-01-05T15:00:00+00:00",
+            },
+            {
+                "odno": "S1",
+                "side": "매도",
+                "qty": 10,
+                "price": 60.0,
+                "ord_dt": "20260120",
+                "ts": "2026-01-20T15:00:00+00:00",
+            },
+        ]
+        expected, problems = ops._expected_cycle_seed(evidence, self._step(evidence))
+        assert expected is None
+        assert any("초과" in p or "매수 이력" in p for p in problems), problems
+
+    def test_no_liquidation_event_is_unverifiable(self):
+        ops = pipeline._load_verify_run_module()
+        evidence = self._evidence()
+        evidence["fills"] = [
+            {
+                "odno": "B1",
+                "side": "매수",
+                "qty": 10,
+                "price": 50.0,
+                "ord_dt": "20260105",
+                "ts": "2026-01-05T15:00:00+00:00",
+            },
+            {
+                "odno": "S1",
+                "side": "매도",
+                "qty": 3,
+                "price": 55.0,
+                "ord_dt": "20260110",
+                "ts": "2026-01-10T15:00:00+00:00",
+            },
+        ]
+        expected, problems = ops._expected_cycle_seed(evidence, self._step(evidence))
+        assert expected is None
+        assert any("청산" in p for p in problems), problems
+
+    def test_same_second_liquidation_rebuy_order_is_input_independent(self):
+        """같은 초 청산/재매수는 (시각, odno) 로 경계가 고정되어야 합니다."""
+        ops = pipeline._load_verify_run_module()
+        base = self._evidence()
+        buy = {
+            "odno": "B1",
+            "side": "매수",
+            "qty": 10,
+            "price": 50.0,
+            "ord_dt": "20260120",
+            "ts": "2026-01-20T15:00:00+00:00",
+        }
+        liquidate = {
+            "odno": "S1",
+            "side": "매도",
+            "qty": 10,
+            "price": 60.0,
+            "ord_dt": "20260120",
+            "ts": "2026-01-20T15:00:00+00:00",
+        }
+        rebuy = {
+            "odno": "T2",
+            "side": "매수",
+            "qty": 5,
+            "price": 70.0,
+            "ord_dt": "20260120",
+            "ts": "2026-01-20T15:00:00+00:00",
+        }
+        results = []
+        for order in ([buy, rebuy, liquidate], [buy, liquidate, rebuy]):
+            evidence = dict(base, fills=order)
+            expected, problems = ops._expected_cycle_seed(
+                evidence, self._step(evidence)
+            )
+            assert not problems, problems
+            selected, _problems, event = ops._select_cycle_fills(
+                order, "20260101", "20260120"
+            )
+            results.append(
+                (
+                    expected,
+                    [fill["odno"] for fill in selected],
+                    event["odno"] if event else None,
+                )
+            )
+        assert results[0] == results[1] == (1100.0, ["B1", "S1"], "S1")
+
+    def test_duplicate_same_second_odno_is_indeterminate(self):
+        ops = pipeline._load_verify_run_module()
+        fill = {
+            "odno": "B1",
+            "side": "매수",
+            "qty": 10,
+            "price": 50.0,
+            "ord_dt": "20260105",
+            "ts": "2026-01-05T15:00:00+00:00",
+        }
+        selected, problems, event = ops._select_cycle_fills(
+            [fill, dict(fill, qty=9)], "20260101", "20260120"
+        )
+        assert any("중복" in p for p in problems), problems
+        assert event is None
+
+    def test_verify_evidence_file_fails_for_incomplete_cycle(self, tmp_path):
+        ops = pipeline._load_verify_run_module()
+        evidence = self._evidence()
+        evidence["fills"] = [
+            {
+                "odno": "S1",
+                "side": "매도",
+                "qty": 10,
+                "price": 60.0,
+                "ord_dt": "20260120",
+                "ts": "2026-01-20T15:00:00+00:00",
+            }
+        ]
+        path = tmp_path / "settlement-TQQQ-incomplete.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+        ok, problems = ops.verify_evidence_file(
+            path,
+            broker="mockbroker",
+            mode="LIVE",
+            run_id="run-cycle",
+            broker_mode="demo",
+            final_state={
+                "T": 0.0,
+                "net_invested": 0.0,
+                "effective_seed": 1100.0,
+                "cycle_start_date": "",
+            },
+        )
+        assert ok is False
+        assert any("매수 이력" in p for p in problems), problems
+
+
+# ── P1: 승인 허용오차 바인딩 ───────────────────────────────────────
+
+
+class TestToleranceBinding:
+    """허용오차는 승인 시점에 고정되고, 이후 env 는 좁히는 것만 허용."""
+
+    def test_approval_records_and_hashes_tolerance_policy(self, tmp_path):
+        _state, plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        assert approval["tolerance_policy"] == pipeline.execution_tolerance_policy()
+        assert plan.tolerance_policy == approval["tolerance_policy"]
+        assert approval["plan_hash"] == _plan_hash(approval)
+
+    def test_tampered_tolerance_policy_breaks_plan_hash(self, tmp_path):
+        state, _plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        approval["tolerance_policy"] = dict(
+            approval["tolerance_policy"], price_abs=99.0
+        )
+        problems = pipeline.verify_approval(approval, state, now=_fixed_now())
+        assert any("plan_hash" in p for p in problems), problems
+
+    def test_widened_env_after_approval_still_rejects_out_of_range(self, tmp_path,
+                                                                  monkeypatch):
+        _state, plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        approved_policy = dict(approval["tolerance_policy"])
+        # 승인 후 env 를 크게 넓힙니다 (±$10, 50%).
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "10")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.50")
+        # 승인 허용오차(±$0.25)는 넘지만 넓힌 env 안에는 들어오는 가격.
+        plan.orders = [dict(_orders_buy(50.5)[0])]
+        pipeline_execute._write_transmitted_plan(
+            path, plan, approval, now=_fixed_now()
+        )
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("가격 불일치" in p for p in problems), problems
+        # 유효 정책은 승인 정책을 넘지 않습니다.
+        effective = pipeline.effective_tolerance_policy(approved_policy)
+        assert effective["price_abs"] == approved_policy["price_abs"]
+        assert effective["price_pct"] == approved_policy["price_pct"]
+        # EXECUTE 경로도 같은 정책으로 비교합니다.
+        drift = pipeline_execute.compare_order_plans(
+            approval["orders"], plan.orders, policy=effective
+        )
+        assert any("가격 불일치" in p for p in drift), drift
+
+    def test_narrowed_env_after_approval_is_applied(self, tmp_path, monkeypatch):
+        _state, plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.001")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "0")
+        plan.orders = [dict(_orders_buy(50.01)[0])]
+        pipeline_execute._write_transmitted_plan(
+            path, plan, approval, now=_fixed_now()
+        )
+        problems = pipeline.transmitted_plan_problems(approval)
+        assert any("가격 불일치" in p for p in problems), problems
+
+    def test_missing_bound_policy_is_rejected(self, tmp_path):
+        state, _plan, path = _approve(tmp_path)
+        approval = pipeline.load_approval(str(path))
+        approval.pop("tolerance_policy", None)
+        problems = pipeline.verify_approval(approval, state, now=_fixed_now())
+        assert any("허용오차 정책" in p for p in problems), problems
+        assert pipeline_execute.compare_order_plans(
+            approval["orders"], _orders_buy(50.0)
+        ), "정책 없는 비교는 fail-closed 여야 합니다"
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            {"price_pct": float("nan"), "price_abs": 0.02, "qty": 0},
+            {"price_pct": 0.005, "price_abs": float("nan"), "qty": 0},
+            {"price_pct": float("inf"), "price_abs": 0.02, "qty": 0},
+            {"price_pct": 0.005, "price_abs": float("-inf"), "qty": 0},
+            {"price_pct": -0.001, "price_abs": 0.02, "qty": 0},
+            {"price_pct": 0.005, "price_abs": -1.0, "qty": 0},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": -1},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": True},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": 1.0},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": float("nan")},
+            {"price_pct": 0.005, "price_abs": 0.02},  # qty 키 없음
+            {"price_pct": 0.005, "qty": 0},  # price_abs 키 없음
+            "not-a-dict",
+        ],
+    )
+    def test_invalid_policy_is_rejected(self, policy):
+        assert pipeline.normalize_tolerance_policy(policy) is None
+
+    def test_valid_policy_is_normalized(self):
+        normalized = pipeline.normalize_tolerance_policy(
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": 0}
+        )
+        assert normalized == {"price_pct": 0.005, "price_abs": 0.02, "qty": 0}
+
+    @pytest.mark.parametrize(
+        "approved",
+        [
+            {"price_pct": float("nan"), "price_abs": 0.02, "qty": 0},
+            {"price_pct": float("inf"), "price_abs": 0.02, "qty": 0},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": True},
+            {"price_pct": 0.005, "price_abs": 0.02, "qty": 1.5},
+            {"price_pct": 0.005, "price_abs": 0.02},
+        ],
+    )
+    def test_effective_policy_with_bad_approved_policy_is_none(self, approved):
+        """승인 정책이 손상되면 유효 정책은 None (호출 측 fail-closed)."""
+        assert pipeline.effective_tolerance_policy(approved) is None
+
+    def test_non_finite_env_value_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_ABS", "inf")
+        monkeypatch.setenv("EXECUTION_PRICE_TOLERANCE_PCT", "nan")
+        policy = pipeline.execution_tolerance_policy()
+        assert policy["price_abs"] == pipeline.DEFAULT_TOLERANCE_PRICE_ABS
+        assert policy["price_pct"] == pipeline.DEFAULT_TOLERANCE_PRICE_PCT
