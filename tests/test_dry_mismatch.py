@@ -144,8 +144,8 @@ class TestDryBranch2:
         assert any("불일치" in m for m in ctx["notify_messages"]), \
             "불일치 경고가 텔레그램으로 1회 전송되어야 합니다"
 
-    def test_live_raises_and_records(self, reconcile_env, monkeypatch):
-        """LIVE: 기존대로 기록 + RuntimeError raise (회귀 방지)."""
+    def test_live_raises_without_early_save(self, reconcile_env, monkeypatch):
+        """LIVE 불일치는 중단하되, 실패 정산을 조기 저장하지 않습니다 (fail-closed)."""
         monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
         ctx = reconcile_env
         ctx["load"]("TQQQ", _make_state(T=0.0))
@@ -154,10 +154,8 @@ class TestDryBranch2:
         with pytest.raises(RuntimeError, match="불일치"):
             trading_bot.run_one_symbol(broker, _symbol_config())
 
-        assert any(
-            s.get("balance_mismatch", {}).get("note") == "requires-attention"
-            for s in ctx["saved_states"]
-        ), "LIVE는 balance_mismatch를 기록해야 합니다"
+        assert not ctx["saved_states"], \
+            "불일치 정산은 저장 전에 중단되어야 합니다 (검증 전 조기 저장 금지)"
 
     def test_dry_with_force_t_is_rejected_without_saving(self, reconcile_env, monkeypatch):
         """DRY + FORCE_T: DRY 는 읽기 전용이므로 저장 없이 명시적 오류로 중단합니다 (REPAIR 사용)."""

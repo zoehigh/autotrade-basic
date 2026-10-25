@@ -16,6 +16,7 @@ import re
 import sys
 import time
 from copy import deepcopy
+from pathlib import Path
 
 sys.path.append("src")
 
@@ -23,8 +24,23 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config import SYMBOLS, TRADE_MODE, COMMISSION_RATE, REINVEST, BROKER, BROKER_MODE, LS_DEMO_BYPASS_BUGS, ORDER_HISTORY_VERBOSE, REPAIR_ACTION
-from broker import create_broker
-from broker.base import Broker, OrderResult, OrderNotAcceptedError
+from broker import create_broker, validate_run_phase
+from broker.base import Broker, OrderResult, OrderNotAcceptedError, ReadOnlyBroker
+from pipeline import (
+    SettledState,
+    approve_plan_file,
+    assert_no_pending_fence,
+    assert_reconciliation_current,
+    build_order_plan,
+    evidence_file_for_run,
+    load_approval,
+    settle_positions,
+    settled_from_state,
+    verify_approval,
+    verify_evidence_file_with_ops,
+    write_order_plan,
+)
+from pipeline_execute import execute_approved_plan
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
@@ -682,151 +698,17 @@ def build_settlement_evidence(
     return evidence
 
 
-def _force_t_mode_block_message(mode, symbol_configs):
-    """DRY·LIVE 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
+def run_one_symbol(broker: Broker, symbol_config, approval=None):
+    """단일 종목 통합 실행 (레거시 경로).
 
-    FORCE_T 는 T·orders_meta·reverse_mode·정산 원장·워터마크를 덮어쓰고 저장하는 명시적 복구입니다.
-    - DRY 는 state 를 저장하지 않는 읽기 전용 미리보기라 적용하면 로컬 .state.json 이 바뀝니다.
-    - LIVE 는 보정이 적용된 **같은 실행에서 주문 단계까지** 진행할 수 있어 복구와 주문이 결합됩니다.
-    복구·보정은 TRADE_MODE=REPAIR 로만 실행합니다 (주문 없음).
-    """
-    names = [str(c.get("symbol")) for c in symbol_configs if c.get("force_t") is not None]
-    if not names or mode not in ("DRY", "LIVE"):
-        return ""
-    keys = ", ".join(f"{n}_FORCE_T" for n in names)
-    if mode == "LIVE":
-        reason = "LIVE 에서는 보정과 주문이 한 실행에 결합되므로 허용하지 않습니다"
-    else:
-        reason = "DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다"
-    return (
-        f"TRADE_MODE={mode} 에서는 {keys} 를 적용할 수 없습니다 ({reason}). "
-        "state 저장·브로커 호출·주문 없이 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용됩니다."
-    )
-
-
-def _validate_reinference_t(symbol, new_t, max_t):
-    """REPAIR 재추정 결과를 저장해도 되는지 검증합니다 (문제가 없으면 빈 문자열).
-
-    - 추정 T 와 MAX_T 는 유한한 유효 숫자여야 합니다 (None 인 MAX_T 는 상한 없음으로 건너뜁니다).
-    - T > MAX_T 이면 **저장을 거부**합니다. 상한으로 잘라 저장하면 T 가 그만큼 부풀려진 원인
-      (정산 오류 등)을 숨길 수 있으므로 원인 확인을 요구합니다.
-    """
-    def _is_number(value):
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(value)
-        )
-
-    if not _is_number(new_t):
-        return f"{symbol} 재추정 T 가 유효한 숫자가 아닙니다: {new_t!r}"
-    if max_t is None:
-        return ""
-    if not _is_number(max_t) or max_t < 0:
-        return f"{symbol} MAX_T 가 유효한 숫자가 아닙니다: {max_t!r}"
-    if new_t > max_t:
-        return (
-            f"{symbol} 재추정 T={new_t} 가 설정된 상한 MAX_T={max_t} 를 초과합니다 — 저장을 거부합니다 "
-            f"(상한으로 잘라 저장하면 정산 오류를 숨길 수 있습니다. 초과 원인을 확인하세요)"
-        )
-    return ""
-
-
-def _reinference_hold_reasons(symbol, state):
-    """재추정 결과가 '정산 보류' 상태인지 확인하고 사유 목록을 반환합니다 (정상이면 빈 목록).
-
-    보류 상태에서는 `update_T_from_history` 가 메모리를 보류 직전 스냅샷으로 되돌리는데, REPAIR 재추정은
-    그 스냅샷을 찍기 전에 `last_updated` 를 비워 두었으므로 **그대로 저장하면 워터마크가 빈 값으로 바뀝니다**.
-    따라서 보류 표식이 하나라도 있으면 어떤 종목도 저장하지 않습니다. 주문번호는 마스킹해 출력합니다.
-    """
-    reasons = []
-    if state.get("_settlement_hold"):
-        reasons.append(f"정산 보류({state.get('_settlement_hold_reason') or '사유 없음'})")
-    if state.get("_pending_amount_odnos"):
-        reasons.append(f"체결금액 미확정 주문 {mask_odno(list(state['_pending_amount_odnos'])[:5])}")
-    if state.get("_pending_marker_odnos"):
-        reasons.append(f"마커 누락·무효 주문 {mask_odno(list(state['_pending_marker_odnos'])[:5])}")
-    if state.get("_position_basis_unknown"):
-        reasons.append(f"보유수량 기준 미확보({state.get('_position_basis_unknown_reason') or '사유 없음'})")
-    return [f"{symbol} {reason}" for reason in reasons]
-
-
-# ── 주문 접수 알림 표시 도우미 (표시 전용) ──────────────────────────────
-# 알림 본문 문구만 만듭니다. 브로커 호출·state 변경·주문은 하지 않으며,
-# 넘겨받은 `order` dict 를 절대 수정하지 않습니다.
-# 지정가(주문가가 확정된) 유형만 주문가·예상금액을 표시합니다.
-_PRICE_QUOTED_ORDER_TYPES = {"LIMIT", "LOC"}
-
-
-def _is_positive_number(value) -> bool:
-    """가격·수량으로 표시할 수 있는 유효한 양수인지 판정합니다 (bool·비유한수 제외)."""
-    if isinstance(value, bool):
-        return False
-    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
-
-
-def _format_estimate_amount(amount: float) -> str:
-    """예상 주문금액 표기 — 1달러 미만 금액은 소수 4자리까지 유지합니다."""
-    if abs(amount) < 1:
-        return f"{amount:.4f}"
-    return f"{amount:,.2f}"
-
-
-def _order_detail_lines(symbol, order) -> str:
-    """주문 접수 알림의 공통 상세 줄을 만듭니다 (증권사/계좌 환경/종목/구분/유형/수량/주문가/예상금액).
-
-    - 주문가: 지정가 계열(LIMIT/LOC) + 유효한 양수 가격일 때만 원값 그대로 표시합니다
-      (`str()` 표기라 1달러 미만 4자리 정밀도가 유지됩니다).
-    - 그 외(시장가·가격 없음·0·숫자 아님)는 `가격 미확정(체결가 미정)` 으로만 표시하고
-      **예상금액 줄은 넣지 않습니다** (체결가를 알 수 없으므로 시장가로 단정하지 않습니다).
-    - 예상 주문금액 = 주문가 × 수량 (수수료 제외, 표시용 추정값).
-
-    표시 전용 — 네트워크 호출도, `order` dict 변경도 없습니다.
-    """
-    price = order.get("price")
-    order_type = str(order.get("order_type") or "")
-    quantity = order.get("quantity")
-    price_known = (
-        order_type.strip().upper() in _PRICE_QUOTED_ORDER_TYPES
-        and _is_positive_number(price)
-    )
-
-    lines = [
-        f"증권사: {BROKER}",
-        f"계좌 환경: {BROKER_MODE}",
-        f"종목: {symbol}",
-        f"매수/매도: {order.get('side')}",
-        f"주문 유형: {order_type}",
-        f"수량: {quantity}주",
-    ]
-    if not price_known:
-        lines.append("주문가: 가격 미확정(체결가 미정)")
-        return "\n".join(lines)
-
-    lines.append(f"주문가: ${price}")
-    if _is_positive_number(quantity):
-        lines.append(f"예상 주문금액(수수료 제외): ${_format_estimate_amount(price * quantity)}")
-    return "\n".join(lines)
-
-
-def run_one_symbol(broker: Broker, symbol_config):
-    """
-    단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
-
-    Parameters:
-        symbol_config (dict): 종목별 설정
-            - symbol (str): 종목 코드 (예: "TQQQ")
-            - exchange (str): 거래소 코드 (예: "NAS")
-            - splits (int): 분할 수
-            - symbol_type (str): 종목 타입 (예: "TQQQ", "SOXL")
-            - seed (float): 투입 시드 금액 (달러, 필수)
+    DRY: SETTLE → PREVIEW 만 수행합니다 (기존과 동일, 저장/주문 없음).
+    LIVE: **명시적 승인 없이는 실행하지 않습니다** (P0-A). `APPROVAL_PLAN_ID`/
+    `APPROVAL_FILE` 또는 `approval` 인자로 승인 파일을 받아야 하며, 이 경로는
+    RUN_PHASE 없는 LIVE 를 main()/create_broker() 가 이미 차단하므로 테스트·수동
+    호출용입니다.
     """
     symbol = symbol_config["symbol"]
     exchange = symbol_config["exchange"]
-    splits = symbol_config["splits"]
-    symbol_type = symbol_config["symbol_type"]
-    seed = symbol_config["seed"]
-    additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
 
     # DRY(저장 금지)·LIVE(복구와 주문 결합)에서 FORCE_T 는 어떤 조회·변경보다 먼저 막습니다.
     _force_t_block = _force_t_mode_block_message(TRADE_MODE, [symbol_config])
@@ -837,896 +719,59 @@ def run_one_symbol(broker: Broker, symbol_config):
     print(f"종목 처리 시작: {symbol} ({exchange})")
     print(f"{'=' * 60}")
 
-    # ── 휴장일 체크 ───────────────────────────────────────────
-    if not broker.is_trading_day():
-        today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
-        print(f"  📅 오늘({today_str})은 미국 증시 휴장일입니다. 이 종목을 건너<skip>니다.")
-        return
+    # 정산/계획 단계는 조회 전용 브로커만 받습니다.
+    read_only_broker = ReadOnlyBroker(broker)
 
-    # ── Step 1: T값 로드 및 어제 체결 반영 ──────────────────────
-    print("\n[Step 1] T값 로드 중...")
+    settled = settle_positions(read_only_broker, symbol_config)
+    if settled.halt_reason:
+        if settled.halt_reason == "non_trading_day":
+            return None
+        print(f"  [{symbol}] 정산 보류: {settled.halt_reason}")
+        return None
 
-    state = load_state(symbol)
+    plan = build_order_plan(settled, read_only_broker)
+    if not plan.orders:
+        # 주문이 없어도 리버스 종료 상태 변경은 기존처럼 저장합니다.
+        if TRADE_MODE == "LIVE" and plan.strategy_result.get("reverse_exit"):
+            save_state(symbol, settled.state)
+        return None
 
-    # _state_unavailable 플래그만 보관 — 즉시 차단하지 않고 아래에서
-    # order_history/balance 조회 후 스마트 부트스트랩 여부를 판단합니다.
-    state_unavailable = state.get("_state_unavailable")
+    if TRADE_MODE != "LIVE":
+        # DRY: 프리뷰만. 승인/주문으로 진행하지 않습니다.
+        return None
 
-    # 첫 실행 워터마크 오염 방지 안내: state 없음 + last_updated 없음 + LIVE면
-    # 차단 없이 경고 1줄만 출력합니다 (notify 호출 금지, exit 금지).
-    if state_unavailable and TRADE_MODE == "LIVE" and not state.get("last_updated"):
-        print("[권장] 첫 실행으로 보입니다. DRY 1회 실행 후 LIVE 전환을 권장합니다.")
+    plans_dir = os.getenv("PLAN_DIR", "plans")
+    approvals_dir = os.getenv("APPROVALS_DIR", "approvals")
+    approval_ref = approval or os.getenv("APPROVAL_PLAN_ID") or os.getenv("APPROVAL_FILE")
+    # 승인 없이 실행하려는 경우에만 PREVIEW 계획을 남깁니다. 승인 파일이 이미
+    # 있으면 PREVIEW 산출물을 덮어쓰지 않습니다 (자동 승인 금지, P0-A).
+    plan_file = ""
+    if not approval_ref:
+        plan_file = write_order_plan(plan, plans_dir=plans_dir)
+    if not approval_ref:
+        raise RuntimeError(
+            f"{symbol} LIVE 실행에는 명시적 승인이 필요합니다 "
+            f"(APPROVAL_PLAN_ID/APPROVAL_FILE 또는 approval 인자). "
+            f"PREVIEW 계획을 확인한 뒤 APPROVE 하세요: plan={plan.plan_id}, file={plan_file}"
+        )
 
-    unresolved_zero_invested = (
-        state.get("net_invested_status", "unresolved") != "valid"
-        and float(state.get("net_invested", 0.0) or 0.0) <= 0
+    approval_data = (
+        approval_ref
+        if isinstance(approval_ref, dict)
+        else load_approval(approval_ref, approvals_dir)
     )
-    if unresolved_zero_invested and TRADE_MODE == "LIVE":
-        notify(
-            f"[상태] {symbol} net_invested 미확정(unresolved) 및 0 이하 → 신규 전략 주문을 보류합니다.\n"
-            "STATE_REVERSE_AUDIT_ONLY/reconcile로 상태를 확인하세요."
+    if str(approval_data.get("plan_id") or "") != plan.plan_id:
+        raise RuntimeError(
+            f"{symbol} 승인 파일이 현재 계획과 일치하지 않습니다 "
+            f"(approval={approval_data.get('plan_id')}, plan={plan.plan_id}). "
+            "새 PREVIEW → APPROVE 를 실행하세요."
         )
-
-    force_t = symbol_config.get("force_t")
-    max_t = symbol_config.get("max_t")
-
-    from config import FORCE_T_REINFERENCE as _force_reinference, TRADE_MODE as _trade_mode
-    if _force_reinference:
-        if _trade_mode == "LIVE":
-            print("[T 보정] FORCE_T_REINFERENCE=true + LIVE → 주문 방지를 위해 DRY(미리보기)로 전환합니다. "
-                  "state 는 저장되지 않습니다 (실제 저장은 TRADE_MODE=REPAIR).")
-            import config as _cfg
-            _cfg.TRADE_MODE = "DRY"
-        if state.get("last_updated"):
-            print(f"[T 보정] FORCE_T_REINFERENCE=true → last_updated 초기화 (전체 이력 재추정)")
-            state["last_updated"] = ""
-
-    # 주문 이력 조회 기간을 상황에 맞게 계산합니다
-    cycle_start_date = state.get("cycle_start_date", "")
-    last_updated = state.get("last_updated", "")
-
-    if not last_updated:
-        # 초기 상태(처음 실행 또는 업그레이드 직후): 이전 이력에서 T를 추정하기 위해 넉넉하게 조회합니다
-        # 5~6페이지 × 20건 = 약 100~120건을 확보합니다
-        history_days = 90
-    elif cycle_start_date:
-        # 사이클 시작일 기준으로 전체 사이클 이력을 조회합니다
-        try:
-            start_dt = datetime.strptime(cycle_start_date, "%Y-%m-%d")
-            days_since_start = (datetime.now() - start_dt).days + 5
-            history_days = max(days_since_start, 30)
-        except ValueError:
-            history_days = 30
-    else:
-        history_days = 30
-
-    # DRY 모드 또는 ORDER_HISTORY_VERBOSE=true 시 주문 이력 요약을 로그에 출력합니다.
-    order_history = broker.get_order_history(
-        symbol,
-        exchange,
-        days=history_days,
-        verbose=(TRADE_MODE == "DRY" or ORDER_HISTORY_VERBOSE),
-    )
-
-    # 잔고를 미리 조회하여 update_T_from_history의 잔고 교차 검증에 사용합니다.
-    # 이력이 비었을 때 T 리셋 여부를 잔고로 판별 — 보유 중이면 리셋 보류, 잔고 0이면
-    # 잘못된 state 복구를 위해 리셋 fallback, 조회 실패(None)면 보수적 보류.
-    # 이 결과(live_qty 등)는 아래 상태-잔고 교차검증에서도 그대로 재사용합니다.
-    try:
-        live_balance = broker.get_balance(symbol, exchange)
-        live_qty = live_balance.quantity if live_balance else 0
-        live_avg = live_balance.avg_price if live_balance else 0.0
-    except Exception as e:
-        # LS 모의투자 IGW40014 버그 우회: 예외 발생 시에도 보수적 T 유지
-        if LS_DEMO_BYPASS_BUGS:
-            print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용) - LS 모의투자 버그 우회: {e}")
-        else:
-            print(f"[상태 검증] 브로커 잔고 조회 실패(T 갱신용): {e}")
-        live_balance = None
-        live_qty = None
-        live_avg = None
-
-    # ── 첫 실행 부트스트랩 (state 없음 + 보유 0 + 이력 0) ──
-    # state 파일이 없/손상/미등록이어도, 실제 보유와 이력이 모두 비어 있으면
-    # 첫 실행으로 간주해 T=0 LIVE 진행을 허용합니다. 그 외는 기존처럼 차단합니다.
-    if TRADE_MODE == "LIVE" and state_unavailable:
-        history_filled = sum(
-            1 for o in order_history
-            if int(float(o.get("ft_ccld_qty", "0") or 0)) > 0
-        )
-        if history_filled == 0 and live_qty in (0, None):
-            print(f"[초기 부트스트랩] {symbol} 첫 실행 → T=0 LIVE 허용")
-        else:
-            raise RuntimeError(
-                f"{symbol} 상태 파일을 확인할 수 없어 LIVE 주문을 중단합니다: "
-                f"{state_unavailable}"
-            )
-    # 정산 전 워터마크 (이번 정산이 처리한 구간의 시작점) — 검증기가 사용합니다.
-    watermark_before = str(state.get("last_updated", "") or "")
-    T_before = float(state.get("T", 0.0))
-    net_invested_before = float(state.get("net_invested", 0.0))
-    # 정산 전 원장 스냅샷 — 검증기가 "적용 전/후"를 독립 재생할 수 있게 남깁니다.
-    ledger_before = deepcopy(state.get("settlement_ledger", {}))
-    sell_t_effects_before = deepcopy(state.get("sell_t_effects", {}))
-    position_qty_before = state.get("position_qty")
-    orders_meta_before = deepcopy(state.get("orders_meta", {}))
-    before_snapshot = {
-        "T": T_before,
-        "net_invested": net_invested_before,
-        "settlement_ledger": ledger_before,
-        "sell_t_effects": sell_t_effects_before,
-        "position_qty": position_qty_before,
-        "last_updated": watermark_before,
-        "last_processed_ordno": state.get("last_processed_ordno", ""),
-        "orders_meta": orders_meta_before,
-    }
-
-    state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
-
-    # 금액 미확정 체결 게이트 — update 경로가 놓친 경우에도 저장/주문을 막습니다.
-    pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
-    if not pending_amount_odnos:
-        pending_amount_odnos = _has_unconfirmed_amount_fills(state, order_history)
-    if pending_amount_odnos:
-        state["_pending_amount_odnos"] = pending_amount_odnos
-        state.setdefault("_settlement_hold", True)
-        state.setdefault(
-            "_settlement_hold_reason",
-            f"체결금액 미확정 주문 {len(pending_amount_odnos)}건",
-        )
-
-    # ── 정산 근거 기록 (자동 검증이 독립 검산에 사용) ────────────────
-    # 이 근거가 없으면 검증기는 "검증 불가"로 판단합니다.
-    settlement_evidence = build_settlement_evidence(
-        symbol,
-        state,
-        order_history,
-        mode=TRADE_MODE,
-        run_id=os.environ.get("RUN_ID", ""),
-        balance_qty=live_qty,
-        before=before_snapshot,
-        max_t=max_t,
-    )
-    try:
-        stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
-        with open(f"settlement-{symbol}-{stamp}.json", "w", encoding="utf-8") as fh:
-            json.dump(settlement_evidence, fh, ensure_ascii=False, indent=2)
-    except OSError as evidence_error:
-        print(f"[경고] 정산 근거 기록 실패: {str(evidence_error)[:100]}")
-
-    # 금액 미확정/정산 근거 부족은 evidence 를 남긴 뒤 **즉시** 저장·주문을 보류합니다.
-    if state.get("_pending_amount_odnos") or state.get("_settlement_hold"):
-        _save_settlement_state(symbol, state)
-
-    # ── 포지션 기반 T 추정 진단 (소액 시드 오추정 시 참고용) ──
-    infer_diag = state.get("_inference_diagnostic", {})
-    if infer_diag.get("small_seed_days", 0) > 0 and live_qty is not None and live_avg is not None and live_qty > 0 and live_avg > 0:
-        _used_seed = state.get("effective_seed", 0.0) or seed
-        if _used_seed > 0:
-            T_position = round((live_qty * live_avg * splits) / _used_seed, 4)
-            T_position = min(T_position, max_t if max_t is not None else splits)
-            print(f"  → [참고] 포지션 기반 T 추정: {T_position}")
-            print(f"  → 포지션 기반 값으로 설정하려면 {symbol}_FORCE_T={T_position} 환경변수를 추가하고 재실행하세요")
-
-    # ── T값 상한 적용 (MAX_T) ──
-    if max_t is not None and (_force_reinference or TRADE_MODE == "DRY"):
-        # 미리보기 진단: 원시 추정 T 와 상한 적용 후 T 를 함께 보여줍니다.
-        print(f"[T 보정] {symbol} 원시 추정 T={state['T']}, 상한 MAX_T={max_t} → 적용 T={min(state['T'], max_t)}")
-    if max_t is not None and state["T"] > max_t:
-        print(f"[T 보정] {symbol} T={state['T']} > MAX_T={max_t} → T={max_t}로 조정")
-        state["T"] = max_t
-        reset_settlement_ledger(state, max_t)
-
-    # ── 사이클 종료 감지 (전체 재추정 경로) ──
-    # _infer_T_from_full_history가 전량매도를 감지해 T=0으로 리셋한 경우,
-    # 일반 경로(T > 0 조건)는 작동하지 않으므로 여기서 따로 처리합니다.
-    completed_cycle_start = state.pop("_completed_cycle_start", None)
-    if completed_cycle_start:
-        if _has_unresolved_reverse_orders(state):
-            state.setdefault("reverse_mode", {})["reconciliation_only"] = True
-            state["reverse_mode"]["active"] = False
-            # [DRY READONLY] cycle-end unresolved-reverse save: LIVE only
-            if TRADE_MODE == "LIVE":
-                save_state(symbol, state)
-            return
-        print(f"\n{'=' * 60}")
-        print(f"[사이클 종료] {symbol} — {completed_cycle_start} ~ 완료")
-        print(f"{'=' * 60}")
-        _used_seed = state.get("effective_seed", 0.0)
-        if not (REINVEST and _used_seed > 0):
-            _used_seed = seed
-        # 같은 실행에서 새 사이클 매수가 시작됐는지 판별합니다.
-        # (T>0 또는 cycle_start_date 설정 = 새 사이클 진행 중)
-        new_cycle_started = bool(
-            float(state.get("T", 0.0) or 0.0) != 0.0
-            or float(state.get("net_invested", 0.0) or 0.0) != 0.0
-            or state.get("cycle_start_date", "")
-        )
-        if new_cycle_started:
-            # 새 사이클 상태는 보존하고, 종료된 사이클의 리포트/시드만 갱신합니다.
-            state.pop("_completed_cycle_start", None)
-            finalized = finalize_completed_cycle(
-                symbol=symbol,
-                state=state,
-                order_history=order_history,
-                seed=_used_seed,
-                commission_rate=COMMISSION_RATE,
-                report={"cycle_start_date": completed_cycle_start},
-                require_settled=False,
-            )
-        else:
-            # 정산은 이미 완료된 상태(T=0/net=0)입니다. 원장만 0 기준으로 확정한 뒤
-            # **후처리(리포트/시드)** 만 수행합니다.
-            state["cycle_start_date"] = ""
-            reset_settlement_ledger(state, 0.0)
-            finalized = finalize_completed_cycle(
-                symbol=symbol,
-                state=state,
-                order_history=order_history,
-                seed=_used_seed,
-                commission_rate=COMMISSION_RATE,
-                report={"cycle_start_date": completed_cycle_start},
-            )
-        report = finalized["report"]
-        report_message = format_cycle_report_message(report)
-        print(f"\n{report_message}")
-        notify(report_message)
-        # effective_seed 갱신은 리포트 후 **단 1회**.
-        if REINVEST and finalized["next_cycle_seed"] > 0:
-            state["effective_seed"] = round(finalized["next_cycle_seed"], 2)
-            print(f"  복리 재투자: 다음 사이클 시드 = ${state['effective_seed']:.2f}")
-        else:
-            state["effective_seed"] = 0.0
-
-    # ── 정산 결과 저장 ──────────────────────────────────────────
-    # 보유수량 기준을 확보하지 못한 정산은 **저장하지 않고** 신규 주문도 내지 않습니다.
-    # (먼저 저장하면 다음 실행에서 재처리될 수 없어 잘못된 값이 고정됩니다)
-    _save_settlement_state(symbol, state)
-
-    # [DRY READONLY] T 갱신 후 상태 저장: DRY에서는 절대 저장하지 않습니다.
-    if TRADE_MODE == "LIVE":
-        save_state(symbol, state)
-
-    # ── 상태-잔고 교차검증 (conservative reconciliation) ──
-    try:
-        computed = compute_position_from_history(order_history, cycle_start_date=state.get("cycle_start_date", ""))
-    except Exception as e:
-        print(f"[상태 검증] 이력 기반 포지션 계산 실패: {e}")
-        computed = {"net_qty": 0, "avg_price": 0.0}
-
-    comp_qty = int(computed.get("net_qty", 0))
-    comp_avg = float(computed.get("avg_price", 0.0))
-
-    if live_qty is not None:
-        if live_qty == 0 and comp_qty > 0:
-            if _has_unresolved_reverse_orders(state):
-                state.setdefault("reverse_mode", {})["reconciliation_only"] = True
-                state["reverse_mode"]["active"] = False
-                # [DRY READONLY] unresolved-reverse balance=0 save: LIVE only
-                if TRADE_MODE == "LIVE":
-                    save_state(symbol, state)
-                return
-            msg = (
-                f"[불일치] 이력으로는 보유 {comp_qty}주(평단 ${comp_avg:.2f})로 추정되나, 브로커 잔고는 0입니다."
-            )
-            if TRADE_MODE == "DRY":
-                # DRY는 프리뷰/진단 모드 — 기록·자동보정·중단 없이 경고만 남기고 계속 진행합니다.
-                print(f"{msg} DRY 모드라 기록/보정 없이 프리뷰를 계속합니다. (LIVE 시 자동 보정 후 중단)")
-                notify(msg)
-            else:
-                print(f"{msg} 보수적 자동 보정: T=0으로 초기화합니다.")
-                notify(msg)
-                state["balance_mismatch"] = {
-                    "computed_net_qty": comp_qty,
-                    "computed_avg_price": round(comp_avg, 2),
-                    "live_qty": live_qty,
-                    "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
-                    "note": "auto-corrected-to-zero",
-                }
-                state["T"] = 0.0
-                state["cycle_start_date"] = ""
-                state["net_invested"] = 0.0
-                state["net_invested_status"] = "valid"
-                state["reverse_mode"] = {}
-                reset_settlement_ledger(state, 0.0)
-                save_state(symbol, state)
-                raise RuntimeError(
-                    f"{symbol} 이력 포지션과 브로커 잔고가 불일치하여 주문을 중단합니다. "
-                    f"history={comp_qty}, broker={live_qty}"
-                )
-
-        elif live_qty != comp_qty:
-            # 불일치지만 자동 보정하지 않음 — 관리자 확인 필요
-            msg = (
-                f"[불일치] 이력 net_qty={comp_qty}, 브로커 잔고={live_qty}. 자동 보정하지 않습니다. 확인 필요."
-            )
-            if TRADE_MODE == "DRY":
-                # DRY는 프리뷰/진단 모드 — 상태 기록 없이 경고만 남기고 계속 진행합니다.
-                print(f"{msg} (DRY 모드라 balance_mismatch를 기록하지 않습니다)")
-                notify(msg)
-            else:
-                print(msg)
-                notify(msg)
-                state["balance_mismatch"] = {
-                    "computed_net_qty": comp_qty,
-                    "computed_avg_price": round(comp_avg, 2),
-                    "live_qty": live_qty,
-                    "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
-                    "note": "requires-attention",
-                }
-                save_state(symbol, state)
-                raise RuntimeError(
-                    f"{symbol} 이력 포지션과 브로커 잔고가 불일치하여 주문을 중단합니다. "
-                    f"history={comp_qty}, broker={live_qty}"
-                )
-
-        elif state["T"] == 0 and live_qty > 0:
-            # T=0인데 실제 보유가 있음: T 오추정 (소액 시드로 인한 추가매수 오분류)
-            msg = (
-                f"[경고] {symbol} T=0이지만 브로커 잔고에 {live_qty}주 보유 중입니다. "
-                f"T가 실제보다 낮게 추정되었을 수 있습니다. .state.json 에서 직접 확인/수정하세요."
-            )
-            if TRADE_MODE == "DRY":
-                # DRY는 프리뷰/진단 모드 — 상태 기록 없이 경고만 남기고 계속 진행합니다.
-                print(f"{msg} (DRY 모드라 balance_mismatch를 기록하지 않습니다)")
-                notify(msg)
-            else:
-                print(msg)
-                notify(msg)
-                state["balance_mismatch"] = {
-                    "computed_net_qty": comp_qty,
-                    "computed_avg_price": round(comp_avg, 2),
-                    "live_qty": live_qty,
-                    "live_avg_price": round(live_avg, 2) if live_avg is not None else None,
-                    "note": "T-estimation-suspected-low",
-                }
-                save_state(symbol, state)
-                raise RuntimeError(
-                    f"{symbol} T=0인데 브로커 잔고 {live_qty}주가 있어 주문을 중단합니다."
-                )
-
-        else:
-            # 일치하는 경우, 기존 불일치 표시 제거
-            if state.get("balance_mismatch"):
-                state.pop("balance_mismatch", None)
-                # [DRY READONLY] balance_mismatch removal save: LIVE only
-                if TRADE_MODE == "LIVE":
-                    save_state(symbol, state)
-
-    # ── 주문 fence 복구 (이전 세션 이력 정착 시 자동 해제) ──
-    # 주문이력/잔고 reconciliation이 정상 통과한 뒤에만 도달합니다.
-    # fence가 있어도 즉시 차단하지 않고, 전일(이전 세션)이면 자동 해제 후 진행합니다.
-    if TRADE_MODE == "LIVE":
-        _recover_order_fence(state, symbol, live_qty)
-
-    # ── T값 강제 설정 (FORCE_T) ──
-    if force_t is not None:
-        if _has_unresolved_reverse_orders(state):
-            state.setdefault("reverse_mode", {})["reconciliation_only"] = True
-            state["reverse_mode"]["active"] = False
-            # DRY 에서는 이 블록에 도달하기 전에 차단됩니다(진입부 가드). 여기는 LIVE 레거시 경로이며
-            # FORCE_T 보정은 TRADE_MODE=REPAIR(_repair_force_t) 사용을 권장합니다.
-            save_state(symbol, state)
-            raise RuntimeError("미해결 리버스 주문이 있어 FORCE_T 적용을 중단합니다.")
-        old_T = state["T"]
-        state["T"] = force_t
-        state.pop("balance_mismatch", None)
-        state["orders_meta"] = {}
-        state["additional_loc_odno"] = []
-        state["reverse_mode"] = {}
-        reset_settlement_ledger(state, force_t)
-        # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
-        # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
-        # 주문 시각으로 last_updated를 갱신합니다. 이력이 없으면 현재 UTC를 사용합니다.
-        latest_ord_dt = ""
-        for o in order_history:
-            odt = o.get("ord_datetime_utc", "")
-            if odt and odt > latest_ord_dt:
-                latest_ord_dt = odt
-        if latest_ord_dt:
-            state["last_updated"] = latest_ord_dt
-            latest_order = next(
-                o for o in order_history
-                if o.get("ord_datetime_utc") == latest_ord_dt
-            )
-            state["last_processed_ordno"] = latest_order.get("odno", "")
-        else:
-            state["last_updated"] = datetime.now(ZoneInfo("UTC")).isoformat()
-            state["last_processed_ordno"] = ""
-        if force_t == 0:
-            state["cycle_start_date"] = ""
-            state["net_invested"] = 0.0
-            state["net_invested_status"] = "valid"
-        print(f"[T 보정] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), "
-              f"orders_meta/balance_mismatch 초기화, last_updated 갱신")
-        # DRY 는 진입부에서 차단되므로 이 저장은 LIVE 레거시 경로에서만 실행됩니다 (권장: TRADE_MODE=REPAIR).
-        save_state(symbol, state)
-
-    T = state["T"]
-    print(f"  현재 T값: {T}")
-
-    # ── 사이클 종료 사전 감지 (전략 실행 전에) ─────────────────────────
-    # live 잔고 우선, 없으면 이력 기반 추정값을 사용합니다.
-    # 잔고 조회 실패(None) 시에는 종료 감지를 보류합니다 (SOXL 케이스).
-    current_qty = live_qty if live_qty is not None else comp_qty
-
-    if T > 0 and current_qty == 0 and live_qty is None:
-        # 잔고 조회 실패 → T 유지 (알 수 없음, API 장애 등)
-        print(f"\n[경고] {symbol} 사이클 종료 감지 보류 — 브로커 잔고 조회 실패 (T={T} 유지, 보유수량 알 수 없음)")
-        notify(f"[경고] {symbol} 잔고 조회 실패로 사이클 종료 감지 보류. T={T} 유지. 확인 필요.")
-
-    elif T > 0 and current_qty == 0:
-        # 잔고 0 확정: 정상 전량매도이거나 state.json이 잘못된 상태
-        # Step 1에서 이력 기반 T 재추정을 이미 시도했으며,
-        # 이력이 없으면 _infer_T_from_full_history가 T=0으로 리셋했으므로
-        # 이 조건에 도달한 것은 진짜 T>0이 맞거나, 이력 복원 불가로 판단된 경우
-        # → 사이클 종료 처리 / T 리셋
-        print(f"\n{'=' * 60}")
-        print(f"🏁 {symbol} 사이클 종료 감지 (사전) (T={T}, 보유수량={current_qty})")
-        print(f"{'=' * 60}")
-
-        _used_seed = state.get("effective_seed", 0.0)
-        if not (REINVEST and _used_seed > 0):
-            _used_seed = seed
-        _cycle_start = state.get("cycle_start_date", "")
-        _cycle_orders, _liquidation_event = _liquidation_boundary_orders(
-            order_history, _cycle_start
-        )
-        _cycle_end = _cycle_end_date_from_history(order_history, _cycle_start)
-        report = generate_cycle_report(
-            symbol=symbol,
-            order_history=order_history,
-            cycle_start_date=_cycle_start,
-            cycle_end_date=_cycle_end,
-            seed=_used_seed,
-            commission_rate=COMMISSION_RATE,
-            cycle_orders=_cycle_orders,
-            liquidation_event=_liquidation_event,
-        )
-
-        report_message = format_cycle_report_message(report)
-        print(f"\n{report_message}")
-        notify(report_message)
-
-        if TRADE_MODE == "DRY":
-            # DRY는 프리뷰/진단 모드 — 리포트만 표시하고 캐시(사이클 리셋/시드) 저장을 생략합니다.
-            # 프리뷰가 새 사이클 기준으로 보이도록 in-memory로만 리셋합니다.
-            state["effective_seed"] = 0.0
-            state["T"] = 0.0
-            state["cycle_start_date"] = ""
-            state["net_invested"] = 0.0
-            state["net_invested_status"] = "valid"
-            state["reverse_mode"] = {}
-            reset_settlement_ledger(state, 0.0)
-            T = 0.0
-            print("  [DRY] 사이클 종료 리포트 표시. 캐시 저장은 생략합니다. (LIVE 실행 시 실제 리셋/시드 갱신)")
-        else:
-            # 복리 재투자가 활성화된 경우 다음 사이클 시드를 state에 저장합니다.
-            # 손실이 발생한 경우에도 변경된 시드를 저장합니다.
-            if REINVEST and report["next_cycle_seed"] is not None:
-                state["effective_seed"] = round(report["next_cycle_seed"], 2)
-                print(f"  복리 재투자: 다음 사이클 시드 = ${state['effective_seed']:.2f}")
-            else:
-                state["effective_seed"] = 0.0
-
-            if _has_unresolved_reverse_orders(state):
-                state.setdefault("reverse_mode", {})["reconciliation_only"] = True
-                state["reverse_mode"]["active"] = False
-                save_state(symbol, state)
-                return
-
-            # T 초기화 및 사이클 시작일 리셋
-            state["T"] = 0.0
-            state["cycle_start_date"] = ""
-            state["net_invested"] = 0.0
-            state["net_invested_status"] = "valid"
-            state["reverse_mode"] = {}
-            reset_settlement_ledger(state, 0.0)
-            save_state(symbol, state)
-
-            print("  T값 초기화 완료. 새 사이클을 즉시 시작합니다.")
-            T = 0.0
-            # ── Step 2로 계속 진행 (새 사이클 즉시 시작) ──
-
-    if current_qty == 0 and state.get("reverse_mode", {}).get("active"):
-        if _has_unresolved_reverse_orders(state):
-            state["reverse_mode"]["reconciliation_only"] = True
-            state["reverse_mode"]["active"] = False
-        else:
-            state["reverse_mode"] = {}
-        # [DRY READONLY] reverse_mode cleanup save: LIVE only
-        if TRADE_MODE == "LIVE":
-            save_state(symbol, state)
-
-    # ── seed 적용 (복리 재투자) ────────────────────────────────
-    if REINVEST:
-        effective_seed = state.get("effective_seed", 0.0)
-        if effective_seed > 0:
-            seed = effective_seed
-            print(f"  복리 재투자 적용: 이번 사이클 시드 = ${seed:.2f}")
-
-    # ── Step 2: 전략 실행 ───────────────────────────────────────
-    print("\n[Step 2] 전략 실행 중...")
-
-    # DRY 모드는 주문뿐 아니라 리버스모드 진행일/누적값도 시뮬레이션해야
-    # 실제 캐시 상태를 오염시키지 않습니다.
-    strategy_state = deepcopy(state) if TRADE_MODE == "DRY" else state
-
-    strategy_result = 무한매수법_V4(
+    return execute_approved_plan(
         broker,
-        symbol=symbol,
-        exchange_code=exchange,
-        splits=splits,
-        symbol_type=symbol_type,
-        seed=seed,
-        T=T,
-        additional_loc_levels=additional_loc_levels,
-        state=strategy_state,
+        approval_data,
+        approvals_dir=approvals_dir,
+        state_override=settled.state,
     )
-
-    if strategy_result.get("reverse_exit") and TRADE_MODE == "LIVE":
-        if _has_unresolved_reverse_orders(state):
-            state.setdefault("reverse_mode", {})["reconciliation_only"] = True
-            state["reverse_mode"]["active"] = False
-        else:
-            state["reverse_mode"] = {}
-        save_state(symbol, state)
-
-    last_price = strategy_result['last_price']
-    # [DRY READONLY] close_prices: in-memory only — no save_state() reachable in DRY
-    close_prices = state.get("close_prices", [])
-    if last_price > 0:
-        close_prices = [p for p in close_prices if isinstance(p, (int, float)) and p > 0]
-        close_prices.append(round(last_price, 2))
-        state["close_prices"] = close_prices[-5:]
-
-    print("✓ 전략 실행 완료")
-    print(f"  현재가: ${last_price}")
-    print(f"  보유 수량: {strategy_result['position_qty']}주")
-    print(f"  평단가: ${strategy_result['avg_price']}")
-    print(f"  주문 가능 금액: ${strategy_result['orderable_cash']:.2f}")
-    print(f"  T값: {T} / {splits}")
-    if strategy_result['star_point']:
-        print(f"  별지점: ${strategy_result['star_point']:.2f}")
-
-    rev = state.get("reverse_mode", {})
-    if rev.get("day_count", 0) > 0:
-        print(f"  [리버스모드] {rev['day_count']}일차 진행 중")
-
-    orders = strategy_result["orders"]
-
-    # BUY LOC 1.19 상한 보정과 추가매수 계단 배치는 전략 단계에서 이미 반영되어 있습니다.
-    # (trading_bot에서 다시 보정하면 추가매수 가격이 정상매수와 같아질 수 있습니다)
-    for note in strategy_result.get("price_cap_notes") or []:
-        notify(
-            f"{symbol} ⚠️ LOC 가격 보정\n원가격: ${note['from']:.2f}\n"
-            f"현재가 대비 상한: ${note['to']:.2f}"
-        )
-
-    print(f"\n[Step 3] 생성된 주문 목록 ({len(orders)}개)")
-    print("-" * 60)
-
-    if len(orders) == 0:
-        print("생성된 주문이 없습니다.")
-        return
-
-    for i, order in enumerate(orders, 1):
-        print(f"\n주문 {i}:")
-        print(f"  설명: {order['comment']}")
-        print(f"  매수/매도: {order['side']}")
-        print(f"  주문 유형: {order['order_type']}")
-        print(f"  수량: {order['quantity']}주")
-        if order["price"]:
-            print(f"  가격: ${order['price']}")
-        else:
-            print("  가격: 시장가")
-
-    print("\n[Step 4] 주문 실행 중...")
-    print("-" * 60)
-
-    # Real+LIVE: 프리장 오픈 전이면 KST 기준으로 대기
-    if BROKER_MODE == "real" and TRADE_MODE == "LIVE":
-        now_kst = get_kst_now()
-        is_dst = is_us_dst()
-        pre_market_open_hour = 17 if is_dst else 18
-        if now_kst.hour < pre_market_open_hour:
-            target = now_kst.replace(hour=pre_market_open_hour, minute=0, second=0, microsecond=0)
-            wait_seconds = (target - now_kst).total_seconds()
-            print(f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → {target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)")
-            time.sleep(wait_seconds)
-
-    order_exchange_code = broker.exchange_code(exchange)
-
-    # ── 잔여 주문 정리 ────────────────────────────────────────────
-    # 매 세션마다 새 주문 전체를 새로 냅니다. 이전에 낸 주문이 아직 살아 있으면
-    # (특히 목표매도 LIMIT) 새 주문과 중복되어 매도 수량이 보유량을 넘을 수 있습니다.
-    # 새 주문을 내기 전에 봇 소유의 미체결 주문을 정리합니다.
-    if TRADE_MODE == "LIVE":
-        _cancel_open_bot_orders(broker, symbol, exchange, state, order_history)
-
-    if TRADE_MODE == "LIVE":
-        state["pending_order_batch"] = {
-            "session": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
-            "orders": [
-                {
-                    "side": item["side"],
-                    "quantity": int(item["quantity"]),
-                    "price": item["price"],
-                    "order_type": item["order_type"],
-                    "comment": item["comment"],
-                }
-                for item in orders
-            ],
-        }
-        save_state(symbol, state)
-
-    executed_orders = []
-    reserved_orders = []
-    failed_orders = []
-    fatal_order_error = False
-
-    for i, order in enumerate(orders, 1):
-        print(f"\n주문 {i}/{len(orders)} 실행: {order['comment']}")
-
-        try:
-            order_price = order["price"] if order["price"] else 0
-
-            if TRADE_MODE == "LIVE":
-                state["pending_order_intent"] = {
-                    "symbol": symbol,
-                    "side": order["side"],
-                    "quantity": int(order["quantity"]),
-                    "price": order_price,
-                    "order_type": order["order_type"],
-                    "comment": order["comment"],
-                    "submitted_session": datetime.now(
-                        ZoneInfo("America/New_York")
-                    ).date().isoformat(),
-                }
-                try:
-                    save_state(symbol, state)
-                except Exception as intent_error:
-                    raise GlobalScopedError(
-                        f"주문 전 intent checkpoint 실패: {intent_error}"
-                    ) from intent_error
-
-            result = broker.place_order(
-                symbol,
-                order_exchange_code,
-                order["side"],
-                order["quantity"],
-                order_price,
-                order["order_type"],
-            )
-
-            if result:
-                if not str(result.order_id or "").strip():
-                    raise SymbolScopedError(
-                        "주문 접수 응답에 유효한 주문번호가 없습니다. 주문 fence를 유지합니다."
-                    )
-                is_additional = "[추가매수]" in order.get("comment", "")
-
-                # 기존: additional_loc_odno 유지 (미등록 호환)
-                if is_additional:
-                    state.setdefault("additional_loc_odno", []).append(result.order_id)
-
-                # 신규: orders_meta에 t_target 등록
-                # strategy가 t_target을 제공하면 그대로 사용, 없으면 fallback
-                t_target = order.get("t_target")
-                if t_target is None:
-                    t_target = 0.0 if is_additional else 1.0
-
-                order_meta = {
-                    "side": order["side"],
-                    "total_qty": int(order["quantity"]),
-                    "t_target": float(t_target),
-                    "is_additional": bool(is_additional),
-                    "processed_filled_qty": 0,
-                    # 신규 등록분만 "아직 한 번도 반영되지 않음"을 증명하는 버전 표식
-                    # (기존 메타는 마이그레이션하지 않습니다 — 0 만으로는 미반영을 단정할 수 없음)
-                    "processed_filled_amount": 0.0,
-                    "fill_marker_version": FILL_MARKER_VERSION,
-                }
-                if order.get("reverse_action"):
-                    reverse_mode = state.setdefault("reverse_mode", {})
-                    cycle_id = reverse_mode.get("cycle_id") or datetime.now(
-                        ZoneInfo("UTC")
-                    ).isoformat()
-                    order_meta.update({
-                        "reverse_action": order["reverse_action"],
-                        "reverse_day": int(order.get("reverse_day", 0)),
-                        "cycle_id": cycle_id,
-                        "submitted_at": result.order_time,
-                        "submitted_session": datetime.now(
-                            ZoneInfo("America/New_York")
-                        ).date().isoformat(),
-                    })
-                    for key in ("reverse_base_t", "reverse_t_factor", "reverse_t_target"):
-                        if key in order:
-                            order_meta[key] = float(order[key])
-                    reverse_mode["active"] = True
-                    reverse_mode["cycle_id"] = cycle_id
-                    reverse_mode["last_planned_session"] = datetime.now(
-                        ZoneInfo("America/New_York")
-                    ).date().isoformat()
-                register_order_meta_in_state(state, result.order_id, order_meta)
-                state["pending_order_intent"] = None
-                if TRADE_MODE == "LIVE":
-                    # 주문 응답을 받은 즉시 메타데이터를 checkpoint하여
-                    # 이후 주문 실패/프로세스 중단 시에도 체결 reconciliation이 가능합니다.
-                    try:
-                        save_state(symbol, state)
-                    except Exception as checkpoint_error:
-                        raise GlobalScopedError(
-                            f"주문은 접수됐지만 상태 checkpoint에 실패했습니다: {checkpoint_error}"
-                        ) from checkpoint_error
-
-                if result.is_reservation:
-                    reserved_orders.append({
-                        "comment": order["comment"],
-                        "order_id": result.order_id,
-                        "order_time": result.order_time,
-                    })
-                    print(f"✓ 예약주문 접수 완료 (주문번호: {mask_odno(result.order_id)})")
-                    # 텔레그램 본문은 주문번호 원문을 유지하고(비공개 채널),
-                    # 일반 알림/공개 로그용 message 는 같은 문구에서 번호만 가명 토큰으로 바꿉니다.
-                    telegram_message = f"""📋 예약주문 접수 {symbol}
-
-{order['comment']}
-{_order_detail_lines(symbol, order)}
-예약주문번호: {result.order_id}
-예약접수일자: {result.order_time}
-접수 상태: 예약 접수 완료, 체결 여부 미확인"""
-                    message = _mask_token_in(telegram_message, result.order_id)
-                    notify(message, telegram_message=telegram_message)
-                else:
-                    executed_orders.append({
-                        "comment": order["comment"],
-                        "order_id": result.order_id,
-                        "order_time": result.order_time,
-                    })
-                    print("✓ 주문 성공")
-                    telegram_message = f"""✅ 주문 접수 완료 {symbol}
-
-{order['comment']}
-{_order_detail_lines(symbol, order)}
-주문번호: {result.order_id}
-접수 시각: {result.order_time}
-접수 상태: 체결 여부 미확인"""
-                    message = _mask_token_in(telegram_message, result.order_id)
-                    notify(message, telegram_message=telegram_message)
-            else:
-                if TRADE_MODE == "LIVE":
-                    raise SymbolScopedError(
-                        "주문 접수 응답이 없어 pending intent를 해소하지 못했습니다. 주문 fence를 유지합니다."
-                    )
-                print("✓ 주문 정보 출력 완료")
-
-        except OrderNotAcceptedError as error:
-            # 브로커 사유에 섞인 `odno=…` / `주문번호: …` / 합성번호(YYYYMMDD:NNNN)
-            # 참조만 마스킹합니다 (수량·가격·사유 같은 진단 정보는 그대로 유지).
-            error_text = _mask_odno_references(str(error))
-            print(f"✗ 주문 실패 (미접수 확정): {error_text}")
-            if TRADE_MODE == "LIVE":
-                # 브로커가 명시적으로 거부해 주문이 접수되지 않았음이 보장되므로
-                # 해소할 주문이 없는 fence만 남기지 않습니다.
-                state["pending_order_intent"] = None
-                state["pending_order_batch"] = None
-                try:
-                    save_state(symbol, state)
-                    print("  → 미접수 확정: 주문 fence를 해제하고 해당 종목의 남은 주문을 중단합니다.")
-                except Exception as save_error:
-                    print(f"✗ fence 해제 상태 저장 실패: {save_error}")
-                    fatal_order_error = True
-            failed_orders.append(
-                {
-                    "comment": order["comment"],
-                    "error": error_text,
-                }
-            )
-
-            message = f"""⚠️ 주문 미접수 확정 {symbol}
-
-{order['comment']}
-에러: {error_text}
-접수 여부: 미접수 확정
-fence: 해제"""
-            notify(message, urgent=True)
-            break
-        except Exception as error:
-            # 위와 동일: 공개 로그·알림에 주문번호 원문을 남기지 않습니다.
-            error_text = _mask_odno_references(str(error))
-            print(f"✗ 주문 실패: {error_text}")
-            if TRADE_MODE == "LIVE":
-                fatal_order_error = True
-            failed_orders.append(
-                {
-                    "comment": order["comment"],
-                    "error": error_text,
-                }
-            )
-
-            message = f"""⚠️ 주문 실패 {symbol}
-
-{order['comment']}
-에러: {error_text}
-접수 여부: 불확실
-fence: 유지"""
-            notify(message, urgent=True)
-            if isinstance(error, GlobalScopedError):
-                # 공통 장애(상태 저장 실패)는 전체 실행을 중단합니다.
-                raise
-            if isinstance(error, SymbolScopedError):
-                # 해당 종목만 중단하고 다음 종목으로 계속 진행합니다.
-                raise
-            if fatal_order_error:
-                break
-            continue
-
-    if fatal_order_error:
-        raise SymbolScopedError(
-            "주문 결과를 확정할 수 없어 주문 fence를 유지합니다. "
-            "해당 종목의 남은 주문을 중단합니다 (fence는 종목별로 복구되며 다른 종목은 계속 진행)."
-        )
-
-    if TRADE_MODE == "LIVE":
-        state["pending_order_batch"] = None
-        save_state(symbol, state)
-
-    print("\n" + "=" * 60)
-    print(f"{symbol} 처리 완료")
-    print("=" * 60)
-
-    # ── Step 4: T값 저장 (LIVE 주문 성공 or 리버스모드 or 상태 변경) ──
-    should_save = False
-    if TRADE_MODE == "LIVE" and (len(executed_orders) > 0 or len(reserved_orders) > 0):
-        should_save = True
-    if state.get("reverse_mode", {}).get("active"):
-        should_save = True
-    if should_save:
-        save_state(symbol, state)
-
-    if TRADE_MODE == "DRY":
-        print("\n💡 DRY 모드로 실행되었습니다.")
-        print("   실제 주문은 실행되지 않았으며, 주문 정보만 출력되었습니다.")
-        print(f"   총 {len(orders)}개 주문이 처리되었습니다.")
-        print("\n   실제 주문을 하려면 환경변수 또는 .env 파일에서 TRADE_MODE=LIVE 로 설정하세요.")
-    else:
-        print("\n✓ LIVE 모드로 실행되었습니다.")
-        print(f"   총 {len(orders)}개 주문 중:")
-        print(f"   - 주문 성공: {len(executed_orders)}개")
-        print(f"   - 예약 접수: {len(reserved_orders)}개")
-        print(f"   - 실패:     {len(failed_orders)}개")
-
-    if executed_orders:
-        print("\n[성공한 주문]")
-        for order in executed_orders:
-            print(
-                f"  ✓ {order['comment']}: 주문번호 {mask_odno(order['order_id'])} "
-                f"(시각: {order['order_time']})"
-            )
-
-    if reserved_orders:
-        print("\n[예약 주문] - 다음 정규장 시작 시 체결됩니다")
-        for order in reserved_orders:
-            print(
-                f"  📋 {order['comment']}: 예약번호 {mask_odno(order['order_id'])} "
-                f"(접수일자: {order['order_time']})"
-            )
-
-    if failed_orders:
-        print("\n[실패한 주문]")
-        for order in failed_orders:
-            # 브로커 에러 사유에 섞인 주문번호 참조만 마스킹하고 나머지 진단 정보는 유지합니다.
-            print(f"  ✗ {order['comment']}: {_mask_odno_references(order['error'])}")
-
-    return {
-        "symbol": symbol,
-        "executed": len(executed_orders),
-        "reserved": len(reserved_orders),
-        "failed": len(failed_orders),
-        "errors": [order["error"] for order in failed_orders],
-    }
 
 
 def _order_remaining_qty(row: dict):
@@ -1880,6 +925,13 @@ def _cancel_open_bot_orders(
 
     orders_meta = state.get("orders_meta") or {}
     if not orders_meta:
+        # 메타가 비어 있어도 열린 주문이 있으면 소유/상태를 확정할 수 없으므로
+        # 신규 주문을 내지 않습니다 (이전 early-return 으로 미체결을 덮어쓰던 경로).
+        if open_rows:
+            raise SymbolScopedError(
+                f"{symbol} 봇 주문 메타 없이 열린 주문이 남아 있어 신규 주문을 보류합니다 "
+                f"({len(open_rows)}건). 주문 상태를 확인/정리한 뒤 재실행하세요."
+            )
         return 0
 
     cancel = getattr(broker, "cancel_order", None)
@@ -2091,7 +1143,7 @@ def _fence_session(state):
     return ""
 
 
-def _recover_order_fence(state, symbol, live_qty):
+def _recover_order_fence(state, symbol, live_qty, persist=True):
     """이전 세션에 남은 주문 fence를 이력 정착 기준으로 해제합니다.
 
     run_one_symbol()의 reconciliation(주문이력/잔고 교차검증)이 정상 통과한 뒤에
@@ -2120,7 +1172,8 @@ def _recover_order_fence(state, symbol, live_qty):
         )
     state["pending_order_intent"] = None
     state["pending_order_batch"] = None
-    save_state(symbol, state)
+    if persist:
+        save_state(symbol, state)
     print(f"  → [fence 복구] {symbol} 이전 세션({session}) 주문 fence를 이력 정착으로 해제하고 진행합니다.")
     notify(f"[fence 복구] {symbol} 이전 세션({session}) 미확정 주문 fence를 이력 정착으로 해제하고 진행합니다.")
     return True
@@ -2135,6 +1188,23 @@ def _has_unresolved_reverse_orders(state):
         and not meta.get("terminal")
         for meta in state.get("orders_meta", {}).values()
     )
+
+
+# FORCE_T 저장 전에 반드시 해소돼 있어야 하는 상태 (balance_mismatch 는 FORCE_T 가
+# 의도적으로 지우는 값이라 제외).
+_FORCE_T_BLOCKING_KEYS = (
+    ("pending_order_intent", "주문 intent fence"),
+    ("pending_order_batch", "주문 batch fence"),
+    ("_pending_amount_odnos", "체결금액 미확정 주문"),
+    ("_pending_marker_odnos", "마커 누락·무효 주문"),
+    ("_settlement_hold", "정산 보류"),
+    ("_position_basis_unknown", "보유수량 기준 미확보"),
+)
+
+
+def _force_t_precheck_problems(state):
+    """FORCE_T 적용 전 차단 조건을 문자열 목록으로 돌려줍니다."""
+    return [label for key, label in _FORCE_T_BLOCKING_KEYS if state.get(key)]
 
 
 def _repair_state_only():
@@ -2695,6 +1765,10 @@ def _repair_force_t():
 
     기존 run_one_symbol()의 FORCE_T 처리를 REPAIR 전용으로 재현합니다.
     주문은 생성하지 않습니다.
+
+    FORCE_T 는 운영자가 이력을 확인한 뒤 쓰는 수동 보정이지만, 저장 전에
+    fence/미확정 정산/재정산 보류가 없는지 검증합니다. 검증에 실패하면
+    해당 종목은 저장하지 않고 건너뜁니다 (조기 저장 금지).
     """
     # 적용할 종목별 값이 하나도 없으면 "성공처럼" 끝내지 않고 명시적으로 실패합니다.
     # (예: REPAIR_ACTION=FORCE_T 단독 — 값은 {SYMBOL}_FORCE_T 에서만 읽는데 함께 설정하면 작업 소스 2개로 중단)
@@ -2723,13 +1797,22 @@ def _repair_force_t():
                 print(f"[REPAIR:FORCE_T] {symbol} 미해결 리버스 주문이 있어 FORCE_T 적용 불가 — 건너뜁니다.")
                 continue
 
+            blocking = _force_t_precheck_problems(state)
+            if blocking:
+                print(
+                    f"[REPAIR:FORCE_T] {symbol} 미해결 상태가 있어 FORCE_T 적용 불가 — "
+                    f"저장하지 않고 건너뜁니다: {', '.join(blocking)}"
+                )
+                continue
+
             old_T = state["T"]
-            state["T"] = force_t
-            state.pop("balance_mismatch", None)
-            state["orders_meta"] = {}
-            state["additional_loc_odno"] = []
-            state["reverse_mode"] = {}
-            reset_settlement_ledger(state, force_t)
+            candidate = deepcopy(state)
+            candidate["T"] = force_t
+            candidate.pop("balance_mismatch", None)
+            candidate["orders_meta"] = {}
+            candidate["additional_loc_odno"] = []
+            candidate["reverse_mode"] = {}
+            reset_settlement_ledger(candidate, force_t)
 
             # FORCE_T 이후 이력 조회가 stale last_updated 기준으로 이미 반영된 주문을
             # 다시 가산(이중 가산)하는 것을 방지하기 위해, 이번 RUN에서 조회된 최신
@@ -2741,22 +1824,63 @@ def _repair_force_t():
                 if odt and odt > latest_ord_dt:
                     latest_ord_dt = odt
             if latest_ord_dt:
-                state["last_updated"] = latest_ord_dt
+                candidate["last_updated"] = latest_ord_dt
                 latest_order = next(
                     o for o in order_history
                     if o.get("ord_datetime_utc") == latest_ord_dt
                 )
-                state["last_processed_ordno"] = latest_order.get("odno", "")
+                candidate["last_processed_ordno"] = latest_order.get("odno", "")
             else:
-                state["last_updated"] = datetime.now(ZoneInfo("UTC")).isoformat()
-                state["last_processed_ordno"] = ""
+                candidate["last_updated"] = datetime.now(ZoneInfo("UTC")).isoformat()
+                candidate["last_processed_ordno"] = ""
 
             if force_t == 0:
-                state["cycle_start_date"] = ""
-                state["net_invested"] = 0.0
-                state["net_invested_status"] = "valid"
+                candidate["cycle_start_date"] = ""
+                candidate["net_invested"] = 0.0
+                candidate["net_invested_status"] = "valid"
 
-            save_state(symbol, state)
+            # ── 저장 전 검증 (조기 저장 금지) ──
+            # FORCE_T 로 T 를 덮기 전에 이력/잔고 재정산이 보류를 만들지 않는지
+            # 확인합니다. 검증에 실패하면 어떤 값도 저장하지 않습니다.
+            try:
+                assert_no_pending_fence(candidate, symbol)
+                try:
+                    live_balance = broker.get_balance(symbol, exchange)
+                    # 브로커 계약상 None 은 "조회 실패"가 아니라 **보유 0주 확정**입니다
+                    # (실패는 예외). 0 으로 정규화해야 전체 이력 재추정이 돌아
+                    # 정산 보류를 저장 전에 발견할 수 있습니다 (다른 정산 경로와 동일).
+                    live_qty = live_balance.quantity if live_balance else 0
+                except Exception as balance_error:
+                    # 잔고를 확인하지 못하면 position_qty 같은 저장값으로
+                    # _position_basis_unknown 보류를 피해갈 수 있습니다.
+                    # 보유수량 미확인 상태로 강제 T 를 확정하지 않습니다 (fail-closed).
+                    print(
+                        f"[REPAIR:FORCE_T] {symbol} 잔고 조회 실패 — 보유수량을 "
+                        f"확인할 수 없어 FORCE_T 를 저장하지 않습니다: {balance_error}"
+                    )
+                    continue
+                reconciled = update_T_from_history(
+                    symbol, deepcopy(candidate), order_history, balance_qty=live_qty
+                )
+                holds = (
+                    reconciled.get("_pending_amount_odnos")
+                    or reconciled.get("_pending_marker_odnos")
+                    or reconciled.get("_settlement_hold")
+                    or reconciled.get("_position_basis_unknown")
+                )
+                if holds:
+                    raise RuntimeError(
+                        "재정산 보류(체결/정산 미확정): "
+                        f"{reconciled.get('_settlement_hold_reason', '근거 부족')}"
+                    )
+            except Exception as validation_error:
+                print(
+                    f"[REPAIR:FORCE_T] {symbol} 저장 전 검증 실패 — FORCE_T 를 "
+                    f"저장하지 않습니다: {validation_error}"
+                )
+                continue
+
+            save_state(symbol, candidate)
             print(f"[REPAIR:FORCE_T] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), 저장 완료.")
     finally:
         broker.close()
@@ -2852,8 +1976,577 @@ def _dispatch_repair():
     print(f"[REPAIR] {source} 완료.")
 
 
-def _run_mode_dispatch():
-    """진단·복구 전용 모드를 실행합니다 (브로커 생성 없음).
+
+# ═══════════════════════════════════════════════════════════════════════
+# RUN_PHASE 단계 디스패처 (SETTLE / PREVIEW / APPROVE / EXECUTE / VERIFY)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _settled_from_state(symbol_config):
+    """SETTLE 가 저장해 둔 상태로 PREVIEW/APPROVE 용 SettledState 를 만듭니다."""
+    return settled_from_state(symbol_config)
+
+
+def _approval_recovery_outcome(approval):
+    """EXECUTE 가 남긴 결과 파일의 outcome 을 읽습니다 (없으면 '').
+
+    outcome 은 executed(정상 실행) / execution-failed(실행 실패·부분실패) /
+    approval-skipped(승인만 되고 실행 안 됨) 중 하나입니다 (P1-C).
+    """
+    path = str(approval.get("_path") or "")
+    if not path:
+        return ""
+    try:
+        data = json.loads(Path(path + ".recovery.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("outcome") or "")
+
+
+def _parse_row_int(value, default=None):
+    """브로커 이력의 문자열 수량을 int 로 파싱합니다 (실패 시 default)."""
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _row_side(row):
+    """이력 행의 매수/매도 구분을 표준값(BUY/SELL)으로 정규화합니다."""
+    token = str(
+        row.get("sll_buy_dvsn_cd_name") or row.get("side") or ""
+    ).strip()
+    if token in ("매수", "BUY", "buy"):
+        return "BUY"
+    if token in ("매도", "SELL", "sell"):
+        return "SELL"
+    return ""
+
+
+def _plan_order_metas(state, plan_id):
+    """state.orders_meta 에서 승인 계획(plan_id)으로 실행된 주문을 순번별로 모읍니다."""
+    found = {}
+    for odno, meta in (state.get("orders_meta") or {}).items():
+        if str((meta or {}).get("plan_id") or "") != str(plan_id or ""):
+            continue
+        index = _parse_row_int((meta or {}).get("plan_order_index"), -1)
+        if index is None or index < 1:
+            continue
+        found.setdefault(index, (str(odno), meta))
+    return found
+
+
+def _approved_plan_odnos(state, plan_id):
+    """승인 계획으로 실행된 주문번호 집합 (VERIFY 의 체결 귀속 판정용)."""
+    return {
+        odno for odno, _meta in _plan_order_metas(state, plan_id).values()
+    }
+
+
+# 브로커 이력이 명시적인 주문가/주문유형을 함께 반환하는 경우 비교합니다.
+_ROW_ORDER_PRICE_KEYS = (
+    "_order_price",  # MERITZ 정규화 필드 (ovrs_stck_oder_prc)
+    "ord_unpr",
+    "ord_price",
+    "order_price",
+    "price",
+)
+_ROW_ORDER_TYPE_KEYS = ("order_type", "ord_type", "orderType")
+_ROW_ORIGINAL_QTY_KEYS = ("ft_ord_qty", "ord_qty", "order_qty", "qty")
+_KNOWN_ORDER_TYPES = {"LIMIT", "LOC", "MOC", "MOO", "LOO", "MARKET", "MKT"}
+_MERITZ_ORDER_TYPE_BY_CLASS = {
+    "01": "LIMIT",
+    "05": "MKT",
+    "31": "LOO",
+    "32": "LOC",
+    "33": "MOO",
+    "34": "MOC",
+}
+
+
+def _row_order_price(row):
+    """이력 행의 **주문가**(체결가 아님)가 있으면 float 로 반환합니다."""
+    for key in _ROW_ORDER_PRICE_KEYS:
+        if key not in row:
+            continue
+        try:
+            value = float(str(row.get(key)).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _row_order_type(row):
+    """이력 행의 주문유형이 표준값으로 해석되면 반환합니다 (아니면 '')."""
+    for key in _ROW_ORDER_TYPE_KEYS:
+        token = str(row.get(key) or "").strip().upper()
+        if token in _KNOWN_ORDER_TYPES:
+            return token
+    # MERITZ 어댑터는 원본 주문구분을 내부 필드 `_oder_cls_code` 로 보존합니다.
+    # 공개 표준 주문유형이 없는 경우에만 코드 역매핑으로 비교합니다.
+    for key in ("_oder_cls_code", "oder_cls_code"):
+        cls_code = str(row.get(key) or "").strip()
+        order_type = _MERITZ_ORDER_TYPE_BY_CLASS.get(cls_code)
+        if order_type:
+            return order_type
+    return ""
+
+
+def _row_original_qty(row):
+    """이력 행의 **원주문 수량**과 필드 존재 여부를 반환합니다.
+
+    브로커마다 키 이름이 달라 `ft_ord_qty` → `ord_qty` → `order_qty` → `qty`
+    순서로 첫 번째 양수 값을 사용합니다.
+
+    Returns:
+        tuple(int | None, bool): (원주문 수량, 원주문 수량 필드 존재 여부)
+        필드는 있으나 0/파싱 불가면 (None, True), 필드 자체가 없으면 (None, False).
+    """
+    present = False
+    for key in _ROW_ORIGINAL_QTY_KEYS:
+        if key not in row:
+            continue
+        present = True
+        value = _parse_row_int(row.get(key), None)
+        if value is not None and value > 0:
+            return value, True
+    return None, present
+
+
+def _plan_price_tolerance(price):
+    """승인 주문가 비교 허용오차 (EXECUTE 재계산과 같은 기본값)."""
+    try:
+        pct = float(os.getenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.005"))
+    except (TypeError, ValueError):
+        pct = 0.005
+    try:
+        absolute = float(os.getenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.02"))
+    except (TypeError, ValueError):
+        absolute = 0.02
+    return max(absolute, abs(float(price or 0.0)) * pct)
+
+
+def _verify_orders_against_plan(approval, state, history):
+    """승인 주문별 접수/잔량/체결을 state·브로커 이력과 독립 대조합니다 (P1-B).
+
+    Returns:
+        tuple(list[str], int, int): (문제 목록, 매수 체결 합, 매도 체결 합)
+
+    판정 기준
+      - 접수: orders_meta 에 승인 plan_id + 순번이 있어야 합니다 (주문 API 접수 증거).
+      - 메타: orders_meta 의 side/total_qty 가 승인 주문과 일치해야 합니다.
+      - 이력 행이 없으면: **같은 세션**이면 아직 CLOSED 이력에 안 잡힌 것일 수 있어
+        실패로 보지 않고, 이전 세션 주문이면 확인 불가로 실패 처리합니다.
+      - 잔량>0 은 실패가 아닙니다 (VERIFY 는 장중에 돌 수 있음).
+      - 이력이 주문가/주문유형을 제공하면 승인값과 허용오차 내에서 비교합니다.
+      - 이력이 원주문 수량(`ft_ord_qty`/`ord_qty`/`order_qty`/`qty`)을 제공하면
+        승인 수량과 정확히 일치해야 합니다. 원주문 수량 < 체결수량도 실패입니다.
+      - **원주문 수량 필드가 아예 없으면**(일부 브로커) 실패로 보지 않습니다.
+        "원주문 수량 필드 없음" 을 정보 로그로 남기고, 체결/잔량이 승인 수량과
+        일치하는지만 확인합니다 (lenient 정책).
+      - 체결수량/잔량 파싱 실패, side 불일치, 체결>주문수량,
+        체결+잔량<주문수량, 체결+잔량>주문수량 은 실패.
+      - 같은 날 다른 수동 주문이 섞이면 잔고 기대값이 어긋날 수 있어, 잔고는
+        "SETTLE 근거 + 승인 주문 체결 델타" 로 계산해 대조합니다 (SETTLE 시점 값과
+        직접 비교하지 않음).
+    """
+    problems = []
+    approved = approval.get("orders") or []
+    metas = _plan_order_metas(state, approval.get("plan_id"))
+    by_odno = {str(row.get("odno") or ""): row for row in (history or [])}
+    today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    buy_filled = 0
+    sell_filled = 0
+
+    for index, order in enumerate(approved, 1):
+        comment = str(order.get("comment") or "")
+        side = str(order.get("side") or "").upper()
+        qty = _parse_row_int(order.get("quantity"), 0) or 0
+        if index not in metas:
+            problems.append(
+                f"주문 {index}({comment}) 승인 실행 흔적이 state.orders_meta 에 없습니다 "
+                f"(plan_id={approval.get('plan_id')})"
+            )
+            continue
+        odno, meta = metas[index]
+
+        # ── 접수 메타가 승인 내용과 같은지 (수량/방향) ──
+        meta_side = str((meta or {}).get("side") or "").upper()
+        if not meta_side:
+            problems.append(
+                f"주문 {index}({comment}) orders_meta.side 가 없습니다 (odno={odno})"
+            )
+        elif meta_side != side:
+            problems.append(
+                f"주문 {index}({comment}) orders_meta side 불일치: "
+                f"승인={side}, meta={meta_side}"
+            )
+        meta_qty = _parse_row_int((meta or {}).get("total_qty"), None)
+        if meta_qty is None:
+            problems.append(
+                f"주문 {index}({comment}) orders_meta.total_qty 를 읽을 수 없습니다 "
+                f"(odno={odno})"
+            )
+        elif meta_qty != qty:
+            problems.append(
+                f"주문 {index}({comment}) orders_meta 수량 불일치: "
+                f"승인={qty}, meta={meta_qty}"
+            )
+
+        row = by_odno.get(odno)
+        if row is None:
+            submitted_session = str((meta or {}).get("submitted_session") or "")
+            if submitted_session and submitted_session < today_session:
+                problems.append(
+                    f"주문 {index}({comment}) 가 브로커 이력에 없습니다 (odno={odno})"
+                )
+            continue
+        row_side = _row_side(row)
+        if row_side and side and row_side != side:
+            problems.append(
+                f"주문 {index}({comment}) side 불일치: 승인={side}, 이력={row_side}"
+            )
+
+        # ── 이력이 주문가/주문유형을 제공하면 승인값과 대조 ──
+        row_type = _row_order_type(row)
+        approved_type = str(order.get("order_type") or "").upper()
+        type_keys_present = any(
+            str(row.get(key) or "").strip()
+            for key in (
+                *_ROW_ORDER_TYPE_KEYS,
+                "_oder_cls_code",
+                "oder_cls_code",
+            )
+        )
+        if row_type and approved_type and row_type != approved_type:
+            problems.append(
+                f"주문 {index}({comment}) 주문유형 불일치: "
+                f"승인={approved_type}, 이력={row_type}"
+            )
+        elif not row_type and approved_type:
+            # 해석 실패를 조용히 통과시키면 실제 주문유형이 승인과 달라도
+            # 검증이 성공합니다. 키가 있는데 매핑되지 않았거나, MERITZ 처럼
+            # 이력에서 주문유형을 확인해야 하는 브로커는 실패로 처리합니다.
+            broker_is_meritz = str(BROKER or "").strip().lower() == "meritz"
+            if broker_is_meritz or type_keys_present:
+                type_fields = {
+                    key: row.get(key)
+                    for key in (
+                        *_ROW_ORDER_TYPE_KEYS,
+                        "_oder_cls_code",
+                        "oder_cls_code",
+                    )
+                    if key in row
+                }
+                problems.append(
+                    f"주문 {index}({comment}) 주문유형 필드 없음/해석 불가: "
+                    f"승인={approved_type}, 이력 필드={type_fields}"
+                )
+        row_price = _row_order_price(row)
+        approved_price = float(order.get("price") or 0.0)
+        if row_price is not None and approved_price > 0:
+            tolerance = _plan_price_tolerance(approved_price)
+            if abs(row_price - approved_price) > tolerance:
+                problems.append(
+                    f"주문 {index}({comment}) 주문가 불일치: "
+                    f"승인=${approved_price:.4f}, 이력=${row_price:.4f} "
+                    f"(허용 ±${tolerance:.4f})"
+                )
+
+        # ── 브로커가 실제 접수한 원주문 수량을 승인 수량과 대조 ──
+        original_qty, original_qty_present = _row_original_qty(row)
+        if original_qty is not None:
+            if original_qty != qty:
+                problems.append(
+                    f"주문 {index}({comment}) 주문 수량 불일치: "
+                    f"승인={qty}, 브로커 원주문={original_qty}"
+                )
+        elif original_qty_present:
+            problems.append(
+                f"주문 {index}({comment}) 원주문 수량을 읽을 수 없습니다 (odno={odno})"
+            )
+        else:
+            # 일부 브로커는 원주문 수량을 이력에 노출하지 않습니다.
+            # 필드 자체가 없는 것은 실패가 아니며, 체결/잔량으로만 대조합니다.
+            print(
+                f"  [정보] 주문 {index}({comment}) 원주문 수량 필드 없음 "
+                f"— 체결/잔량으로만 대조합니다 (odno={odno})"
+            )
+
+        filled = _parse_row_int(row.get("ft_ccld_qty"), None)
+        remaining = _parse_row_int(row.get("nccs_qty"), None)
+        if filled is None:
+            problems.append(
+                f"주문 {index}({comment}) 체결수량을 읽을 수 없습니다 (odno={odno})"
+            )
+        elif filled > qty:
+            problems.append(
+                f"주문 {index}({comment}) 체결수량이 승인 수량을 넘습니다: "
+                f"{filled} > {qty}"
+            )
+        else:
+            if original_qty is not None and filled > original_qty:
+                problems.append(
+                    f"주문 {index}({comment}) 체결수량이 원주문 수량을 넘습니다: "
+                    f"{filled} > {original_qty}"
+                )
+            if side == "BUY":
+                buy_filled += filled
+            elif side == "SELL":
+                sell_filled += filled
+        if remaining is None:
+            problems.append(
+                f"주문 {index}({comment}) 잔량을 읽을 수 없습니다 (odno={odno})"
+            )
+        elif filled is not None and filled + remaining < qty:
+            problems.append(
+                f"주문 {index}({comment}) 체결+잔량이 승인 수량보다 적습니다: "
+                f"{filled}+{remaining} < {qty}"
+            )
+        elif filled is not None and filled + remaining > qty:
+            problems.append(
+                f"주문 {index}({comment}) 체결+잔량이 승인 수량을 넘습니다: "
+                f"{filled}+{remaining} > {qty}"
+            )
+    return problems, buy_filled, sell_filled
+
+
+def _verify_broker_readonly(approval, state, broker):
+    """VERIFY 의 read-only 브로커 확인 — 주문/취소 API 를 호출하지 않습니다.
+
+    실행된 승인(consumed=true)은 **승인 주문별** 접수/잔량/체결을 먼저 대조하고,
+    재정산 불일치는 승인 계획에 속하지 않는 체결이 있을 때만 실패로 봅니다
+    (승인 실행으로 인한 정상 T/잔고 변화는 허용). 실행되지 않은 승인은 잔고가
+    SETTLE 근거와 같은지만 확인합니다 (P1-B).
+    """
+    symbol = approval.get("symbol", "")
+    exchange = approval.get("exchange", "")
+    try:
+        history = broker.get_order_history(symbol, exchange, days=30, verbose=False)
+        balance = broker.get_balance(symbol, exchange)
+    except Exception as error:
+        return [f"브로커 read-only 조회 실패: {error}"]
+    problems = []
+    consumed = bool(approval.get("consumed"))
+    buy_filled = 0
+    sell_filled = 0
+
+    # 1) 승인 주문 대조를 **먼저** 수행합니다. 이 결과로 어떤 체결이 승인된
+    #    계획에 속하는지(odno) 확정되고, 재정산 불일치 허용 범위가 정해집니다.
+    if consumed:
+        fill_problems, buy_filled, sell_filled = _verify_orders_against_plan(
+            approval, state, history
+        )
+        problems.extend(fill_problems)
+
+    # 2) 재정산 대조 — 승인 계획에 속하지 않는 새 체결만 실패 사유입니다.
+    allowed_odnos = (
+        _approved_plan_odnos(state, approval.get("plan_id")) if consumed else None
+    )
+    try:
+        assert_reconciliation_current(
+            symbol,
+            state,
+            history,
+            balance,
+            allowed_fill_odnos=allowed_odnos,
+        )
+    except Exception as error:
+        problems.append(f"브로커 주문이력/잔고 재정산 불일치: {error}")
+
+    evidence_path = approval.get("_evidence_path")
+    if evidence_path:
+        try:
+            evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            evidence = {}
+        expected_qty = evidence.get("balance_qty")
+        broker_qty = int(balance.quantity) if balance is not None else None
+        if balance is None:
+            problems.append("브로커 잔고를 확인할 수 없습니다 (SETTLE 근거 대조 불가)")
+        elif expected_qty is not None:
+            if consumed:
+                expected_after = int(expected_qty) + buy_filled - sell_filled
+                if broker_qty != expected_after:
+                    problems.append(
+                        "브로커 잔고가 기대 결과와 다릅니다: "
+                        f"SETTLE={int(expected_qty)}, 승인주문 체결(매수+{buy_filled}/매도-{sell_filled}), "
+                        f"기대={expected_after}, broker={broker_qty}"
+                    )
+            elif broker_qty != int(expected_qty):
+                problems.append(
+                    "브로커 잔고가 SETTLE 근거와 다릅니다(미실행 승인): "
+                    f"evidence={int(expected_qty)}, broker={broker_qty}"
+                )
+    return problems
+
+
+def _run_verify_phase(broker=None):
+    """VERIFY: 승인 파일 + SETTLE evidence 를 읽기 전용으로 독립 검증합니다.
+
+    (1) ops/verify_run.py 의 독립 재계산, (2) 승인 주문별 접수/잔량/체결 +
+    기대 잔고 read-only 대조.
+
+    outcome 구분 (P1-C):
+      - executed           EXECUTE 가 정상 실행 후 남긴 명시적 성공 기록
+      - execution-failed   실행 실패/부분실패, 또는 소비됐지만 기록 없음(보수적)
+      - approval-skipped   승인만 되고 실행되지 않음
+    """
+    approval_ref = os.getenv("APPROVAL_PLAN_ID") or os.getenv("APPROVAL_FILE")
+    if not approval_ref:
+        print("[VERIFY] APPROVAL_PLAN_ID 또는 APPROVAL_FILE 이 필요합니다.")
+        return 1
+    approval = load_approval(approval_ref)
+    symbol = approval.get("symbol", "")
+    state = load_state(symbol)
+
+    problems = verify_approval(
+        approval,
+        state,
+        require_unconsumed=False,
+        check_state_hash=False,
+    )
+    if state.get("pending_order_intent") or state.get("pending_order_batch"):
+        problems.append(
+            "미종결 주문 fence 가 남아 있습니다 "
+            f"(intent={bool(state.get('pending_order_intent'))}, "
+            f"batch={bool(state.get('pending_order_batch'))})"
+        )
+
+    # 승인 파일의 evidence_id(정산 run_id)로 **커밋된** SETTLE 근거만 찾습니다.
+    run_id = approval.get("evidence_id") or approval.get("settlement_run_id")
+    evidence_path = evidence_file_for_run(symbol, run_id)
+    approval["_evidence_path"] = evidence_path
+    if not evidence_path:
+        problems.append(
+            f"커밋된 SETTLE 근거 파일을 찾을 수 없습니다 (symbol={symbol}, run_id={run_id})."
+        )
+    else:
+        try:
+            evidence_mode = json.loads(
+                Path(evidence_path).read_text(encoding="utf-8")
+            ).get("mode", TRADE_MODE)
+            evidence_ok, evidence_problems = verify_evidence_file_with_ops(
+                evidence_path,
+                broker=BROKER,
+                mode=evidence_mode,
+                run_id=run_id,
+                broker_mode=BROKER_MODE,
+                final_state=state,
+            )
+        except Exception as error:
+            evidence_ok, evidence_problems = False, [f"독립 검증 실행 실패: {error}"]
+        if not evidence_ok:
+            problems.extend(evidence_problems or ["정산 근거 검증 실패"])
+
+    if broker is not None:
+        problems.extend(_verify_broker_readonly(approval, state, broker))
+
+    recovery_outcome = _approval_recovery_outcome(approval)
+    # 소비된 승인인데 결과 기록이 없으면(구버전/강제 종료) 보수적으로 실행 실패로 봅니다.
+    # 정상 실행은 EXECUTE 가 outcome="executed" 를 남기므로 여기서 성공으로 판정됩니다.
+    if approval.get("consumed"):
+        outcome = recovery_outcome or "execution-failed"
+    else:
+        outcome = recovery_outcome or "approval-skipped"
+
+    if problems:
+        label = outcome
+        if outcome == "executed":
+            label = "executed(실행 후 검증 실패)"
+        print(f"[VERIFY] 실패 ({label}):")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print(
+        f"[VERIFY] 통과 — outcome={outcome}, "
+        f"plan_id={approval.get('plan_id')}, "
+        f"evidence={evidence_path}, orders={len(approval.get('orders') or [])}, "
+        f"consumed={approval.get('consumed')}"
+    )
+    return 0
+
+
+def _dispatch_pipeline_phase(run_phase, broker):
+    """RUN_PHASE 단계별 실행. SETTLE/PREVIEW/APPROVE 는 ReadOnlyBroker 만 받습니다."""
+    read_only_broker = ReadOnlyBroker(broker)
+    failures = 0
+
+    if run_phase == "SETTLE":
+        for symbol_config in SYMBOLS:
+            try:
+                settled = settle_positions(read_only_broker, symbol_config)
+                if settled.halt_reason:
+                    print(f"[SETTLE] {settled.symbol} 보류: {settled.halt_reason}")
+                else:
+                    print(
+                        f"[SETTLE] {settled.symbol} 완료 — T={settled.T}, "
+                        f"seed=${settled.seed:.2f}, run_id={settled.settlement_run_id}"
+                    )
+            except GlobalScopedError:
+                # 상태 파일 공통 장애 — 다른 종목을 계속 진행하면 안 됩니다.
+                raise
+            except Exception as error:
+                print(f"[SETTLE] {symbol_config['symbol']} 실패: {error}")
+                failures += 1
+        return failures
+
+    if run_phase == "PREVIEW":
+        plans_dir = os.getenv("PLAN_DIR", "plans")
+        for symbol_config in SYMBOLS:
+            try:
+                settled = _settled_from_state(symbol_config)
+                plan = build_order_plan(settled, read_only_broker)
+                plan_file = write_order_plan(plan, plans_dir=plans_dir)
+                print(
+                    f"[PREVIEW] {plan.symbol} — plan_id={plan.plan_id}, "
+                    f"orders={len(plan.orders)}, state_hash={plan.state_hash[:12]}, "
+                    f"file={plan_file}"
+                )
+            except GlobalScopedError:
+                raise
+            except Exception as error:
+                print(f"[PREVIEW] {symbol_config['symbol']} 실패: {error}")
+                failures += 1
+        return failures
+
+    if run_phase == "APPROVE":
+        plan_ref = os.getenv("PLAN_ID") or os.getenv("PLAN_FILE")
+        if not plan_ref:
+            print("[APPROVE] PLAN_ID 또는 PLAN_FILE 이 필요합니다 (PREVIEW 산출물).")
+            return 1
+        try:
+            approval_file = approve_plan_file(
+                plan_ref,
+                approvals_dir=os.getenv("APPROVALS_DIR", "approvals"),
+                plans_dir=os.getenv("PLAN_DIR", "plans"),
+                broker=read_only_broker,
+            )
+            if approval_file:
+                print(f"[APPROVE] 승인 파일: {approval_file}")
+        except Exception as error:
+            print(f"[APPROVE] 실패: {error}")
+            failures += 1
+        return failures
+
+    if run_phase == "EXECUTE":
+        plan_ref = os.getenv("APPROVAL_PLAN_ID") or os.getenv("APPROVAL_FILE")
+        if not plan_ref:
+            print("[EXECUTE] APPROVAL_PLAN_ID 또는 APPROVAL_FILE 이 필요합니다.")
+            return 1
+        if not broker.is_trading_day():
+            print("[EXECUTE] 미국 증시 휴장일입니다. 주문을 실행하지 않습니다.")
+            return 1
+        result = execute_approved_plan(broker, plan_ref)
+        return int((result or {}).get("failed", 0))
+
+    raise RuntimeError(f"알 수 없는 RUN_PHASE: {run_phase}")
+
+
+def main():
+    """
+    자동매매 봇의 메인 실행 함수입니다.
 
     Returns:
         bool: 전용 모드가 실행을 처리했으면 True (호출자는 원장 확정 후 종료),
@@ -2948,6 +2641,15 @@ def main():
         print(f"[중단] {_force_t_block}")
         sys.exit(1)
 
+    run_phase = validate_run_phase(os.getenv("RUN_PHASE", ""), TRADE_MODE)
+    if run_phase == "VERIFY":
+        # VERIFY 도 브로커를 **읽기 전용**으로만 사용합니다 (주문 API 없음).
+        verify_broker = create_broker()
+        try:
+            sys.exit(_run_verify_phase(broker=verify_broker))
+        finally:
+            verify_broker.close()
+
     broker = create_broker()
     try:
         # stdout 버퍼링 해제: GitHub Actions 또는 로컬에서 출력이 한꺼번에 나오지 않고
@@ -2959,6 +2661,15 @@ def main():
         print("=" * 60)
 
         notify("🚀 무한매수 자동매매 시작")
+
+        # ── RUN_PHASE 분리 실행 ──
+        # SETTLE/PREVIEW/APPROVE 는 ReadOnlyBroker, EXECUTE 만 실제 브로커를 받습니다.
+        if run_phase:
+            failures = _dispatch_pipeline_phase(run_phase, broker)
+            print(f"\n[{run_phase}] 완료 — 실패 {failures}건")
+            if failures:
+                sys.exit(1)
+            return
 
         # ========================================
         # 휴장일 체크 — 조기종료

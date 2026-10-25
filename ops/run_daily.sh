@@ -68,7 +68,7 @@ unset STATE_REPAIR_ONLY STATE_DIAGNOSTIC_ONLY STATE_CLEAR_FENCE_ONLY \
       STATE_NET_INVESTED_REPAIR_ONLY STATE_ASSUME_REVERSE_EXPIRY_ONLY \
       STATE_SET_CYCLE_START_ONLY STATE_REPAIR_ONLY REPAIR_ACTION FORCE_T_REINFERENCE
 
-echo "[launcher] start $(date '+%F %T %Z') mode=$TRADE_MODE symbols=$SYMBOLS rev=$(git rev-parse --short HEAD 2>/dev/null)" >> "$LOG"
+echo "[launcher] start $(date '+%F %T %Z') mode=$TRADE_MODE phase=${RUN_PHASE:-} symbols=$SYMBOLS rev=$(git rev-parse --short HEAD 2>/dev/null)" >> "$LOG"
 
 # 알림 채널(텔레그램) 생존 확인 — 거래는 막지 않고 상태만 기록합니다.
 # (토큰이 죽으면 실패 알림도 함께 사라지므로, 여기서 드러내야 합니다)

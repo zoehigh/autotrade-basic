@@ -329,9 +329,24 @@ from datetime import datetime as _dt  # noqa: E402
 from zoneinfo import ZoneInfo as _ZoneInfo  # noqa: E402
 from broker.base import Balance, OrderResult  # noqa: E402
 
+# 테스트 전용 승인 파일 헬퍼 (주문 루프 직접 호출 금지 — execute_approved_plan 경유)
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
+import pipeline_flow  # noqa: E402
+
 
 def _et_today():
     return _dt.now(_ZoneInfo("America/New_York")).strftime("%Y%m%d")
+
+
+def _symbol_config(symbol="TQQQ"):
+    return {
+        "symbol": symbol,
+        "exchange": "NAS",
+        "splits": 20,
+        "symbol_type": symbol,
+        "seed": 8000.0,
+        "additional_loc_levels": 3,
+    }
 
 
 def _fake_strategy(broker, **kwargs):
@@ -370,6 +385,7 @@ def _loop_state(orders_meta=None):
 
 
 def _loop_broker(open_rows=None, open_error=None, history_after=None):
+    """취소 전후 이력을 상태로 들고 있는 브로커 (재조회 횟수에 의존하지 않음)."""
     broker = MagicMock()
     broker.name = "toss"
     broker.supports_open_orders_query = True
@@ -383,66 +399,75 @@ def _loop_broker(open_rows=None, open_error=None, history_after=None):
     broker.get_open_orders.side_effect = (
         open_error if open_error is not None else lambda *a, **k: list(open_rows or [])
     )
-    # 첫 호출(정산용)과 취소 확인 재조회를 구분합니다.
-    broker.get_order_history.side_effect = [
-        list(open_rows or []),
-        list(history_after or []),
-        list(history_after or []),
-        list(history_after or []),
-    ]
+    current = {"history": list(open_rows or [])}
+    broker.get_order_history.side_effect = lambda *a, **k: list(current["history"])
+
+    def _cancel(*_a, **_k):
+        current["history"] = list(history_after or [])
+        return None
+
+    broker.cancel_order.side_effect = _cancel
     return broker
 
 
-def _run_loop(monkeypatch, broker, state):
+def _run_loop(monkeypatch, broker, state, tmp_path):
+    """실제 승인 파일을 만들어 execute_approved_plan() 으로 주문을 실행합니다.
+
+    주문 루프를 직접 호출하는 공개 경로는 없습니다 (P0 회귀 방지).
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: deepcopy(state))
     monkeypatch.setattr(trading_bot, "save_state", lambda *a, **k: None)
     monkeypatch.setattr(trading_bot, "notify", lambda *a, **k: None)
     monkeypatch.setattr(trading_bot, "무한매수법_V4", _fake_strategy)
     monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
     monkeypatch.setattr(trading_bot, "BROKER_MODE", "demo")
-    return trading_bot.run_one_symbol(
+    result, _path, _plan = pipeline_flow.run_approved(
+        tmp_path,
         broker,
-        {"symbol": "TQQQ", "exchange": "NAS", "splits": 20,
-         "symbol_type": "TQQQ", "seed": 5000.0, "additional_loc_levels": 3},
+        state,
+        list(_fake_strategy(None)["orders"]),
     )
+    return result
 
 
-def test_loop_normal_zero_open_orders_places_strategy_orders(monkeypatch):
+def test_loop_normal_zero_open_orders_places_strategy_orders(monkeypatch, tmp_path):
     broker = _loop_broker(open_rows=[], history_after=[])
     # 봇 주문 메타는 있지만 열린 주문/이력에 없음 → 정상 0건으로 진행
-    _run_loop(monkeypatch, broker, _loop_state({"OLD1": {}}))
+    _run_loop(monkeypatch, broker, _loop_state({"OLD1": {}}), tmp_path)
     assert broker.place_order.call_count == 2
 
 
-def test_loop_bot_open_order_cancelled_then_places(monkeypatch):
+def test_loop_bot_open_order_cancelled_then_places(monkeypatch, tmp_path):
     row = _row("OD1", status="OPEN", remaining="18", ord_dt=_et_today(), ord_tmd="040000")
     broker = _loop_broker(
         open_rows=[row],
         history_after=[_row("OD1", status="CANCELED", remaining="0",
                             ord_dt=_et_today(), ord_tmd="040000")],
     )
-    _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}))
+    _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}), tmp_path)
     assert broker.cancel_order.call_count == 1
     assert broker.place_order.call_count == 2
 
 
-def test_loop_open_lookup_failure_places_nothing(monkeypatch):
+def test_loop_open_lookup_failure_places_nothing(monkeypatch, tmp_path):
     broker = _loop_broker(open_error=RuntimeError("network down"))
     with pytest.raises(SymbolScopedError):
-        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}))
+        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}), tmp_path)
     assert broker.place_order.call_count == 0
 
 
-def test_loop_cancel_confirmation_missing_places_nothing(monkeypatch):
+def test_loop_cancel_confirmation_missing_places_nothing(monkeypatch, tmp_path):
     row = _row("OD1", status="OPEN", remaining="18", ord_dt=_et_today(), ord_tmd="040000")
     # 취소 후 이력 재조회에서 주문이 사라짐 → 확정 실패
     broker = _loop_broker(open_rows=[row], history_after=[])
     with pytest.raises(SymbolScopedError):
-        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}))
+        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}), tmp_path)
     assert broker.place_order.call_count == 0
 
 
-def test_loop_fill_increase_during_cancel_places_nothing(monkeypatch):
+def test_loop_fill_increase_during_cancel_places_nothing(monkeypatch, tmp_path):
     row = _row("OD1", status="OPEN", remaining="18", side="매수",
                ord_dt=_et_today(), ord_tmd="040000", filled="0")
     broker = _loop_broker(
@@ -451,7 +476,7 @@ def test_loop_fill_increase_during_cancel_places_nothing(monkeypatch):
                             side="매수", ord_dt=_et_today(), ord_tmd="040000", filled="1")],
     )
     with pytest.raises(SymbolScopedError, match="체결"):
-        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}))
+        _run_loop(monkeypatch, broker, _loop_state({"OD1": {}}), tmp_path)
     assert broker.place_order.call_count == 0
 
 

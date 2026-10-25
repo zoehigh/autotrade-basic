@@ -17,6 +17,7 @@
 from broker.base import (
     Broker,
     DryBroker,
+    ReadOnlyBroker,
     StockPrice,
     StockQuotation,
     Balance,
@@ -26,6 +27,60 @@ from broker.base import (
     AuthError,
     OrderError,
 )
+
+# RUN_PHASE 별 허용 TRADE_MODE — 브로커 생성 전에 fail-closed 로 검증합니다.
+_RUN_PHASE_MATRIX = {
+    "SETTLE": {"DRY", "LIVE"},
+    "PREVIEW": {"DRY", "LIVE"},
+    "APPROVE": {"LIVE"},
+    "EXECUTE": {"LIVE"},
+    "VERIFY": {"DRY", "LIVE"},
+}
+
+
+def validate_run_phase(run_phase=None, trade_mode=None) -> str:
+    """RUN_PHASE / TRADE_MODE 조합을 검증합니다 (브로커 생성 전).
+
+    유효하지 않은 조합이면 broker 를 만들기 전에 SystemExit(1) 로 중단합니다.
+    RUN_PHASE 미설정("")은 기존 통합 실행(레거시)으로 간주합니다.
+    """
+    import os
+
+    phase = (
+        run_phase if run_phase is not None else os.getenv("RUN_PHASE", "")
+    ).strip().upper()
+    mode = (
+        trade_mode if trade_mode is not None else os.getenv("TRADE_MODE", "DRY")
+    ).strip().upper()
+
+    if not phase:
+        # 레거시 통합 실행은 DRY 프리뷰만 허용합니다.
+        # LIVE 주문은 반드시 RUN_PHASE(APPROVE/EXECUTE) 승인 게이트를 통과해야 합니다.
+        if mode == "LIVE":
+            print(
+                "[RUN_PHASE] LIVE 에는 RUN_PHASE 가 필요합니다 "
+                "(SETTLE → PREVIEW → APPROVE → EXECUTE). 레거시 LIVE 실행은 차단됩니다.",
+                file=__import__("sys").stderr,
+            )
+            raise SystemExit(1)
+        return ""
+
+    allowed = _RUN_PHASE_MATRIX.get(phase)
+    if allowed is None:
+        print(
+            f"[RUN_PHASE] 알 수 없는 단계입니다: '{phase}'. "
+            f"지원: {', '.join(sorted(_RUN_PHASE_MATRIX))}",
+            file=__import__("sys").stderr,
+        )
+        raise SystemExit(1)
+    if mode not in allowed:
+        print(
+            f"[RUN_PHASE] 허용되지 않는 조합입니다: RUN_PHASE={phase}, TRADE_MODE={mode}. "
+            f"허용 TRADE_MODE: {', '.join(sorted(allowed))}",
+            file=__import__("sys").stderr,
+        )
+        raise SystemExit(1)
+    return phase
 
 
 def create_broker() -> Broker:
@@ -39,6 +94,9 @@ def create_broker() -> Broker:
         Broker: DRY 모드면 DryBroker, LIVE 모드면 실제 브로커
     """
     from config import BROKER, TRADE_MODE
+
+    # 잘못된 RUN_PHASE/TRADE_MODE 조합은 어댑터 생성 전에 fail-closed.
+    validate_run_phase()
 
     if BROKER == "kis":
         from broker.kis.adapter import KISBroker

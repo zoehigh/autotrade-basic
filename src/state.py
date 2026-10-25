@@ -54,6 +54,9 @@ def load_state(symbol):
             "reverse_mode": {},
             "pending_order_intent": None,
             "pending_order_batch": None,
+            "last_settlement_id": "",
+            "last_settlement_evidence": "",
+            "last_settlement_committed_at_utc": "",
             "_state_unavailable": "missing",
         }
 
@@ -91,6 +94,9 @@ def load_state(symbol):
             "reverse_mode": {},
             "pending_order_intent": None,
             "pending_order_batch": None,
+            "last_settlement_id": "",
+            "last_settlement_evidence": "",
+            "last_settlement_committed_at_utc": "",
             "_state_unavailable": "symbol_missing",
         }
 
@@ -125,6 +131,14 @@ def load_state(symbol):
     # settlement_ledger: T 의 덧셈(매수)/곱셈(매도)을 적용 순서대로 담은 원장.
     # 재시작 후에도 반드시 함께 로드해야 부분체결 재분류가 같은 결과를 냅니다.
     settlement_ledger = state.get("settlement_ledger", {})
+    # last_settlement_id: 마지막으로 **커밋된** SETTLE 실행 id. PREVIEW/APPROVE/
+    # EXECUTE 가 이 id 에만 묶입니다. 파일에 반드시 남아야 다음 RUN 에서도
+    # "이번 SETTLE" 을 구분할 수 있습니다 (P1-A).
+    last_settlement_id = state.get("last_settlement_id", "")
+    last_settlement_evidence = state.get("last_settlement_evidence", "")
+    last_settlement_committed_at_utc = state.get(
+        "last_settlement_committed_at_utc", ""
+    )
 
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
     return {
@@ -146,6 +160,10 @@ def load_state(symbol):
         "position_qty": position_qty,
         "sell_t_effects": sell_t_effects,
         "settlement_ledger": settlement_ledger,
+        # 마지막 커밋 SETTLE id/근거 경로/커밋 시각 — 파이프라인 단계 바인딩용 (P1-A)
+        "last_settlement_id": last_settlement_id,
+        "last_settlement_evidence": last_settlement_evidence,
+        "last_settlement_committed_at_utc": last_settlement_committed_at_utc,
         "_net_invested_missing": net_invested_missing,
     }
 
@@ -195,6 +213,13 @@ def _state_record(state_dict):
         "sell_t_effects": state_dict.get("sell_t_effects", {}),
         # 순서 원장 — 적용 순서(seq)를 가진 T 연산 기록 (정본)
         "settlement_ledger": state_dict.get("settlement_ledger", {}),
+        # 마지막 커밋 SETTLE id/근거/커밋시각 — PREVIEW/APPROVE/EXECUTE 바인딩 (P1-A).
+        # 이 필드가 저장되지 않으면 재시작 후 settled_from_state() 가 항상 실패합니다.
+        "last_settlement_id": state_dict.get("last_settlement_id", ""),
+        "last_settlement_evidence": state_dict.get("last_settlement_evidence", ""),
+        "last_settlement_committed_at_utc": state_dict.get(
+            "last_settlement_committed_at_utc", ""
+        ),
     }
 
 
@@ -282,6 +307,12 @@ def canonical_state_hash(state):
         "position_qty": state.get("position_qty"),
         "sell_t_effects": state.get("sell_t_effects", {}),
         "settlement_ledger": state.get("settlement_ledger", {}),
+        # 커밋된 정산 id 도 저장 대상이므로 지문에 포함합니다 (P1-A).
+        "last_settlement_id": state.get("last_settlement_id", ""),
+        "last_settlement_evidence": state.get("last_settlement_evidence", ""),
+        "last_settlement_committed_at_utc": state.get(
+            "last_settlement_committed_at_utc", ""
+        ),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

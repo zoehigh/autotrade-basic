@@ -62,3 +62,7 @@ tests/output/
 .slim/worktrees/
 .slim/worktrees.json
 # END oh-my-opencode-slim worktrees
+
+# 파이프라인 승인 파일 (런타임 산출물)
+approvals/
+plans/
