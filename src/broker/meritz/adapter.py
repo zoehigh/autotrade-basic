@@ -755,7 +755,7 @@ class MeritzBroker(Broker):
             raw.get("oder_cls_code") or ""
         )
 
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd,
             "ord_datetime_kst": ord_datetime_kst_iso,
@@ -764,7 +764,6 @@ class MeritzBroker(Broker):
             "_ord_dt_is_kst_date": True,
             "prdt_name": str(self._first_value(raw, ("prdt_nm", "prdt_nme", "stk_nm")) or ""),
             "sll_buy_dvsn_cd_name": side,
-            "ft_ord_qty": str(ordered_qty),
             "ft_ccld_qty": str(filled_qty),
             "ft_ccld_unpr3": str(avg_price),
             "ft_ccld_amt3": str(amount),
@@ -793,6 +792,10 @@ class MeritzBroker(Broker):
             ),
             "_source": source,
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if any(key in raw for key in ("der_dqty", "odqt", "oder_dqty", "oder_qty")):
+            row["ft_ord_qty"] = str(ordered_qty)
+        return row
 
     def _merge_order_rows(self, period_rows: list[dict], today_rows: list[dict]) -> list[dict]:
         """

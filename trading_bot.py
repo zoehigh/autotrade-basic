@@ -28,13 +28,21 @@ from broker import create_broker, validate_run_phase
 from broker.base import Broker, OrderResult, OrderNotAcceptedError, ReadOnlyBroker
 from pipeline import (
     SettledState,
+    _session_ymd,
     approve_plan_file,
     assert_no_pending_fence,
     assert_reconciliation_current,
     build_order_plan,
+    deferred_record_path,
+    effective_tolerance_policy,
     evidence_file_for_run,
+    global_lock,
     load_approval,
+    price_tolerance,
+    read_deferred_record,
+    read_transmitted_plan,
     settle_positions,
+    transmitted_plan_problems,
     settled_from_state,
     verify_approval,
     verify_evidence_file_with_ops,
@@ -603,6 +611,7 @@ def build_settlement_evidence(
         "broker_mode": os.environ.get("BROKER_MODE", BROKER_MODE),
         "code_version": os.environ.get("CODE_VERSION") or os.environ.get("GIT_SHA", ""),
         "max_t": max_t,
+        "effective_seed": float(state.get("effective_seed", 0.0) or 0.0),
         "evidence_version": 2,
         "settlement_mode": (
             settlement_mode
@@ -672,6 +681,13 @@ def build_settlement_evidence(
             "odno": odno,
             "side": row.get("sll_buy_dvsn_cd_name", ""),
             "qty": filled,
+            # 사이클 리포트 재계산용 원시값 — 검증기가 날짜 경계/금액을 독립
+            # 재계산할 수 있도록 ord_dt(미국 영업일)와 체결단가를 함께 남깁니다.
+            "ord_dt": str(row.get("ord_dt", "") or "").replace("-", "")[:8],
+            # ord_datetime_utc 가 없는 행도 검증기가 (시각, 주문번호) 순서를
+            # 복원할 수 있도록 원시 주문시각을 함께 남깁니다.
+            "ord_tmd": str(row.get("ord_tmd", "") or ""),
+            "price": float(row.get("ft_ccld_unpr3", "0") or 0.0),
             "amount": fill_amount,
             "amount_confirmed": not bool(amount_estimated),
             "amount_source": row.get("_ft_ccld_amt_source", ""),
@@ -2114,19 +2130,6 @@ def _row_original_qty(row):
     return None, present
 
 
-def _plan_price_tolerance(price):
-    """승인 주문가 비교 허용오차 (EXECUTE 재계산과 같은 기본값)."""
-    try:
-        pct = float(os.getenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.005"))
-    except (TypeError, ValueError):
-        pct = 0.005
-    try:
-        absolute = float(os.getenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.02"))
-    except (TypeError, ValueError):
-        absolute = 0.02
-    return max(absolute, abs(float(price or 0.0)) * pct)
-
-
 def _verify_orders_against_plan(approval, state, history):
     """승인 주문별 접수/잔량/체결을 state·브로커 이력과 독립 대조합니다 (P1-B).
 
@@ -2140,6 +2143,9 @@ def _verify_orders_against_plan(approval, state, history):
         실패로 보지 않고, 이전 세션 주문이면 확인 불가로 실패 처리합니다.
       - 잔량>0 은 실패가 아닙니다 (VERIFY 는 장중에 돌 수 있음).
       - 이력이 주문가/주문유형을 제공하면 승인값과 허용오차 내에서 비교합니다.
+        주문가 허용오차는 **승인 시점에 고정된 정책**(env 는 더 좁힐 수만 있음)을
+        쓰며, 승인 정책이 없거나 손상되면 fail-closed 로 실패합니다. env 를 직접
+        읽으면 승인 후 env 확대로 브로커 이력 검증까지 느슨해지기 때문입니다.
       - 이력이 원주문 수량(`ft_ord_qty`/`ord_qty`/`order_qty`/`qty`)을 제공하면
         승인 수량과 정확히 일치해야 합니다. 원주문 수량 < 체결수량도 실패입니다.
       - **원주문 수량 필드가 아예 없으면**(일부 브로커) 실패로 보지 않습니다.
@@ -2152,7 +2158,18 @@ def _verify_orders_against_plan(approval, state, history):
         직접 비교하지 않음).
     """
     problems = []
-    approved = approval.get("orders") or []
+    # 주문가 비교는 승인 시점 정책을 기준으로 합니다. env 는 좁히는 것만 허용되고,
+    # 정책이 없거나 손상되면 아래에서 fail-closed 로 실패 처리합니다.
+    tolerance_policy = effective_tolerance_policy(approval.get("tolerance_policy"))
+    if tolerance_policy is None:
+        problems.append(
+            "승인 허용오차 정책이 없거나 유효하지 않아 브로커 주문가를 대조할 수 "
+            "없습니다 (fail-closed — 재승인이 필요합니다)"
+        )
+    # EXECUTE 는 승인 계획을 허용오차 게이트로만 쓰고 **재계산 계획**을 전송합니다.
+    # 실제 전송 기록이 있으면 그 값으로 대조해야 승인값과 전송값의 혼동이 없습니다.
+    transmitted = read_transmitted_plan(str(approval.get("_path") or ""))
+    approved = list(transmitted.get("orders") or approval.get("orders") or [])
     metas = _plan_order_metas(state, approval.get("plan_id"))
     by_odno = {str(row.get("odno") or ""): row for row in (history or [])}
     today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
@@ -2245,8 +2262,12 @@ def _verify_orders_against_plan(approval, state, history):
                 )
         row_price = _row_order_price(row)
         approved_price = float(order.get("price") or 0.0)
-        if row_price is not None and approved_price > 0:
-            tolerance = _plan_price_tolerance(approved_price)
+        if (
+            tolerance_policy is not None
+            and row_price is not None
+            and approved_price > 0
+        ):
+            tolerance = price_tolerance(approved_price, tolerance_policy)
             if abs(row_price - approved_price) > tolerance:
                 problems.append(
                     f"주문 {index}({comment}) 주문가 불일치: "
@@ -2312,6 +2333,300 @@ def _verify_orders_against_plan(approval, state, history):
     return problems, buy_filled, sell_filled
 
 
+def _verify_deferred_evidence_fills(evidence, history, frozen=None):
+    """SETTLE 이 미룬 체결 근거를 live 주문이력과 대조합니다 (P2).
+
+    SETTLE 은 실행 세션 체결을 T/순투입/잔고 기준에서 제외하면서
+    `evidence["deferred_fills"]` 에 (odno, side, qty, session, amount) 를 남깁니다.
+    VERIFY 는 이 행들이 **브로커 이력에 그대로 존재**하는지 확인해야 합니다.
+    근거를 신뢰만 하면 변조/누락된 행을 정상 체결처럼 허용하게 됩니다.
+
+    `frozen` 은 EXECUTE 가 동결한 (유효한) `.deferred.json` 행입니다. 동결 기록이
+    있는 odno 는 SETTLE 스냅샷 이후 **EXECUTE 시점까지 누적 체결이 늘어날 수**
+    있으므로 live 수량과의 동일성을 요구하지 않고, 동결된 누적 수량을 기준선으로
+    씁니다. 대신 근거 수량이 동결 수량을 넘으면 fail-closed 입니다.
+    동결 기록이 없는 odno/실행은 기존처럼 live 수량과 정확히 일치해야 합니다.
+
+    Returns:
+        tuple(list[str], set[str], int): (문제 목록, 허용할 odno 집합, 순변동 수량)
+        `deferred_fills` 키가 없는 구버전 근거는 ([], set(), 0) — 기존 동작 유지.
+    """
+    problems = []
+    rows = (evidence or {}).get("deferred_fills")
+    if rows is None:
+        return problems, set(), 0
+    if not isinstance(rows, list):
+        return (["SETTLE 근거의 deferred_fills 형식이 올바르지 않습니다"], set(), 0)
+
+    frozen = frozen or {}
+    by_odno = {str(row.get("odno") or ""): row for row in (history or [])}
+    odnos = set()
+    net_qty = 0
+    for index, item in enumerate(rows, 1):
+        if not isinstance(item, dict):
+            problems.append(f"SETTLE 근거 deferred_fills[{index}] 가 객체가 아닙니다")
+            continue
+        odno = str(item.get("odno") or "").strip()
+        side = _row_side({"side": item.get("side", "")})
+        qty = _parse_row_int(item.get("qty"), None)
+        if not odno:
+            problems.append(f"SETTLE 근거 deferred_fills[{index}] 에 odno 가 없습니다")
+            continue
+        if odno in odnos:
+            problems.append(f"SETTLE 근거에 보류 체결 odno={odno} 가 중복 기록되었습니다")
+            continue
+        odnos.add(odno)
+        if not side:
+            problems.append(
+                f"SETTLE 근거 보류 체결 odno={odno} 의 side 를 해석할 수 없습니다 "
+                f"(side={item.get('side')!r})"
+            )
+            continue
+        if qty is None or qty <= 0:
+            problems.append(
+                f"SETTLE 근거 보류 체결 odno={odno} 의 수량이 올바르지 않습니다 "
+                f"(qty={item.get('qty')!r})"
+            )
+            continue
+
+        frozen_row = frozen.get(odno)
+        if frozen_row is not None:
+            # EXECUTE 동결 기록이 기준선입니다. SETTLE→EXECUTE 증가는 정상이며,
+            # 동결 수량 대비 live 수량은 `_verify_execute_deferred_record` 가
+            # 정확히 대조합니다 (EXECUTE 이후 증가 = fail-closed).
+            if frozen_row["side"] != side:
+                problems.append(
+                    f"보류 체결 odno={odno} side 불일치: "
+                    f"근거={side}, EXECUTE={frozen_row['side']}"
+                )
+            if qty > frozen_row["qty"]:
+                problems.append(
+                    f"보류 체결 odno={odno} 수량 불일치: 근거={qty}, "
+                    f"EXECUTE 동결={frozen_row['qty']} (근거가 동결 수량을 넘습니다)"
+                )
+            if side == "BUY":
+                net_qty += frozen_row["qty"]
+            elif side == "SELL":
+                net_qty -= frozen_row["qty"]
+            continue
+
+        row = by_odno.get(odno)
+        if row is None:
+            problems.append(
+                f"SETTLE 근거 보류 체결 odno={odno} 가 브로커 주문이력에 없습니다 "
+                "(누락/변조 의심)"
+            )
+        else:
+            live_side = _row_side(row)
+            live_qty = _parse_row_int(row.get("ft_ccld_qty"), None)
+            if live_side != side:
+                problems.append(
+                    f"보류 체결 odno={odno} side 불일치: "
+                    f"근거={side}, 이력={live_side or '(해석 불가)'}"
+                )
+            if live_qty is None:
+                problems.append(
+                    f"보류 체결 odno={odno} 의 브로커 체결수량을 읽을 수 없습니다"
+                )
+            elif live_qty != qty:
+                problems.append(
+                    f"보류 체결 odno={odno} 수량 불일치: 근거={qty}, 이력={live_qty}"
+                )
+
+        if side == "BUY":
+            net_qty += qty
+        elif side == "SELL":
+            net_qty -= qty
+    return problems, odnos, net_qty
+
+
+def _verify_execute_deferred_record(approval, state, history):
+    """EXECUTE 가 동결한 보류 체결 기록(.deferred.json)을 검증합니다.
+
+    EXECUTE 는 SETTLE 이후·EXECUTE 이전에 도착한 실행 세션 체결을 승인 소비
+    직후 sidecar 로 남깁니다. VERIFY 는 live 이력만으로 그 체결과 "EXECUTE
+    이후 도착한 체결"을 구분할 수 없으므로 이 기록을 기준선으로 씁니다.
+
+    Returns:
+        tuple(list[str], dict[str, dict], bool):
+            (문제 목록, odno→정규화 행, 기록 파일 존재 여부)
+        파일이 없으면 (기존 승인) 빈 결과 — 호출자는 기존 엄격 동작을 유지합니다.
+    """
+    approval_path = str(approval.get("_path") or "")
+    if not approval_path:
+        return [], {}, False
+    record_path = deferred_record_path(approval_path)
+    if not os.path.exists(record_path):
+        return [], {}, False
+
+    data = read_deferred_record(approval_path)
+    if not data:
+        return [f"EXECUTE 보류 체결 기록을 읽을 수 없습니다 (손상/형식 오류): {record_path}"], {}, True
+
+    problems = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("deferred_fills")
+        # 선택 바인딩: 기록에 있으면 승인과 일치해야 합니다 (다른 승인 기록 혼입 방지).
+        for key in ("plan_id", "symbol"):
+            recorded = str(data.get(key) or "")
+            expected = str(approval.get(key) or "")
+            if recorded and expected and recorded != expected:
+                problems.append(
+                    f"EXECUTE 보류 체결 기록 {key} 불일치: 기록={recorded}, 승인={expected}"
+                )
+    else:
+        return ["EXECUTE 보류 체결 기록 형식이 올바르지 않습니다"], {}, True
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        return ["EXECUTE 보류 체결 기록의 deferred_fills 형식이 올바르지 않습니다"], {}, True
+
+    settled_ymd = _session_ymd(state.get("settled_session"))
+    execution_ymd = _session_ymd(state.get("execution_session"))
+    sessions_known = bool(settled_ymd and execution_ymd)
+    if not sessions_known:
+        problems.append(
+            "EXECUTE 보류 체결 기록을 검증할 세션 정보가 state 에 없습니다 "
+            "(settled_session/execution_session)"
+        )
+
+    by_odno = {str(row.get("odno") or ""): row for row in (history or [])}
+    normalized = {}
+    for index, item in enumerate(rows, 1):
+        if not isinstance(item, dict):
+            problems.append(f"EXECUTE 보류 체결 기록[{index}] 가 객체가 아닙니다")
+            continue
+        odno = str(item.get("odno") or "").strip()
+        side = _row_side({"side": item.get("side", "")})
+        qty = _parse_row_int(item.get("qty"), None)
+        session = _session_ymd(item.get("session"))
+        if not odno:
+            problems.append(f"EXECUTE 보류 체결 기록[{index}] 에 odno 가 없습니다")
+            continue
+        if odno in normalized:
+            problems.append(
+                f"EXECUTE 보류 체결 기록에 odno={odno} 가 중복 기록되었습니다"
+            )
+            continue
+        if not side:
+            problems.append(
+                f"EXECUTE 보류 체결 odno={odno} 의 side 를 해석할 수 없습니다 "
+                f"(side={item.get('side')!r})"
+            )
+            continue
+        if qty is None or qty <= 0:
+            problems.append(
+                f"EXECUTE 보류 체결 odno={odno} 의 수량이 올바르지 않습니다 "
+                f"(qty={item.get('qty')!r})"
+            )
+            continue
+        if sessions_known:
+            if session != execution_ymd:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 세션이 실행 세션과 다릅니다: "
+                    f"기록={session or '(없음)'}, execution={execution_ymd}"
+                )
+            elif session <= settled_ymd:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 세션이 정산 세션 이전/같습니다: "
+                    f"기록={session}, settled={settled_ymd}"
+                )
+
+        row = by_odno.get(odno)
+        if row is None:
+            problems.append(
+                f"EXECUTE 보류 체결 odno={odno} 가 브로커 주문이력에 없습니다 "
+                "(누락/변조 의심)"
+            )
+        else:
+            live_side = _row_side(row)
+            live_qty = _parse_row_int(row.get("ft_ccld_qty"), None)
+            live_session = _session_ymd(_order_us_session_date(row))
+            if live_side != side:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} side 불일치: "
+                    f"기록={side}, 이력={live_side or '(해석 불가)'}"
+                )
+            if live_qty is None:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 브로커 체결수량을 읽을 수 없습니다"
+                )
+            elif live_qty != qty:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 수량 불일치: "
+                    f"기록={qty}, 이력={live_qty}"
+                )
+            # live 이력 행이 정말 **이 실행 세션의 동결 체결**인지 확인합니다.
+            # side/qty 만 같으면 다른 세션(다음 거래일 등)의 체결을 동결 체결로
+            # 오인할 수 있으므로, 기록 세션·실행 세션·정산 세션 경계를 모두 봅니다.
+            if not live_session:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션을 해석할 수 없습니다 "
+                    f"(기록={session or '(없음)'}) — 세션 검증 불가로 중단합니다"
+                )
+            elif live_session != session:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 세션 불일치: "
+                    f"기록={session or '(없음)'}, 이력={live_session}"
+                )
+            elif sessions_known and live_session != execution_ymd:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션이 실행 세션과 다릅니다: "
+                    f"이력={live_session}, execution={execution_ymd}"
+                )
+            elif sessions_known and live_session <= settled_ymd:
+                problems.append(
+                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션이 정산 세션 이전/같습니다: "
+                    f"이력={live_session}, settled={settled_ymd}"
+                )
+
+        normalized[odno] = {
+            "side": side,
+            "qty": qty,
+            "amount": item.get("amount"),
+            "amount_confirmed": bool(item.get("amount_confirmed", "amount" in item)),
+        }
+    return problems, normalized, True
+
+
+def _deferred_rows_from_evidence(evidence):
+    """SETTLE 근거의 보류 체결 행을 odno→정규화 행으로 변환합니다.
+
+    검증(문제 판정)은 `_verify_deferred_evidence_fills` 가 담당하고, 여기서는
+    EXECUTE 기록과의 odno-union 병합에 쓸 정규화 값만 만듭니다.
+    """
+    rows = (evidence or {}).get("deferred_fills")
+    if not isinstance(rows, list):
+        return {}
+    result = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        odno = str(item.get("odno") or "").strip()
+        side = _row_side({"side": item.get("side", "")})
+        qty = _parse_row_int(item.get("qty"), None)
+        if not odno or not side or qty is None or qty <= 0:
+            continue
+        result[odno] = {
+            "side": side,
+            "qty": qty,
+            "amount": item.get("amount"),
+            "amount_confirmed": bool(item.get("amount_confirmed", "amount" in item)),
+        }
+    return result
+
+
+def _verify_transmitted_plan(approval):
+    """VERIFY: 실제 전송 기록(.transmitted.json)의 무결성과 승인 허용오차를 봅니다.
+
+    소비된 승인은 반드시 유효한 전송 기록을 가져야 합니다. 기록이 없거나
+    손상/타 승인 기록/해시 불일치면 실행 내용을 확인할 수 없으므로 실패입니다.
+    """
+    return list(transmitted_plan_problems(approval))
+
+
 def _verify_broker_readonly(approval, state, broker):
     """VERIFY 의 read-only 브로커 확인 — 주문/취소 API 를 호출하지 않습니다.
 
@@ -2332,6 +2647,83 @@ def _verify_broker_readonly(approval, state, broker):
     buy_filled = 0
     sell_filled = 0
 
+    # 0) EXECUTE 가 동결한 보류 체결 기록을 **먼저** 검증합니다. 소비된 승인의
+    #    live 이력만으로는 "EXECUTE 전 수용"과 "EXECUTE 후 도착"을 구분할 수
+    #    없으므로, 실행 시점에 동결한 집합이 VERIFY 의 기준선입니다. 기록이
+    #    없는 구버전 승인은 기존 엄격 동작을 그대로 유지합니다.
+    #    EXECUTE **이후** 도착한 체결은 이 기록에도 승인 계획에도 없으므로
+    #    allowed/기대잔고에 포함되지 않습니다 — 소급 허용하지 않고 fail-closed.
+    record_problems = []
+    record_rows = {}
+    record_present = False
+    if consumed:
+        record_problems, record_rows, record_present = _verify_execute_deferred_record(
+            approval, state, history
+        )
+        problems.extend(record_problems)
+
+    # 0b) SETTLE 이 미룬 체결 근거를 live 이력과 대조합니다. 유효한 EXECUTE
+    #     동결 기록이 있으면 그 odno 는 **동결된 누적 수량**을 기준선으로 씁니다.
+    #     SETTLE 스냅샷(1주) → EXECUTE 수용(2주) 증가는 정상 흐름이지만,
+    #     동결 기록 이후 live 증가는 record 검증에서 fail-closed 됩니다.
+    evidence = {}
+    deferred_odnos = set()
+    deferred_net_qty = 0
+    evidence_path = approval.get("_evidence_path")
+    if evidence_path:
+        try:
+            evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            evidence = {}
+        if isinstance(evidence, dict):
+            frozen_baseline = (
+                record_rows if record_present and not record_problems else None
+            )
+            deferred_problems, deferred_odnos, deferred_net_qty = (
+                _verify_deferred_evidence_fills(
+                    evidence, history, frozen=frozen_baseline
+                )
+            )
+            problems.extend(deferred_problems)
+
+    # 0c) SETTLE 근거와 EXECUTE 동결 기록을 odno 기준으로 합칩니다 (중복 계산 금지).
+    #     같은 odno 는 동결된 누적 수량이 최종 기준선이며, SETTLE→EXECUTE 증가는
+    #     허용하되 감소/방향 변경은 변조 의심으로 fail-closed 입니다.
+    merged_deferred = _deferred_rows_from_evidence(evidence)
+    if record_present:
+        for odno, record_row in (record_rows or {}).items():
+            existing = merged_deferred.get(odno)
+            if existing is None:
+                merged_deferred[odno] = record_row
+                continue
+            if existing["side"] != record_row["side"]:
+                problems.append(
+                    f"보류 체결 odno={odno} 기록 불일치: "
+                    f"SETTLE={existing['side']} {existing['qty']}주, "
+                    f"EXECUTE={record_row['side']} {record_row['qty']}주"
+                )
+                continue
+            if record_row["qty"] < existing["qty"]:
+                problems.append(
+                    f"보류 체결 odno={odno} 수량 불일치: "
+                    f"SETTLE={existing['qty']}주, EXECUTE 동결={record_row['qty']}주 "
+                    "(동결 수량이 SETTLE 근거보다 적습니다)"
+                )
+                continue
+            # SETTLE→EXECUTE 누적 증가는 정상 — 동결 수량을 기준선으로 삼습니다.
+            merged = dict(record_row)
+            if existing.get("amount_confirmed") and existing.get("amount") is not None:
+                # 금액은 SETTLE 근거의 확정값을 우선합니다.
+                merged["amount"] = existing["amount"]
+                merged["amount_confirmed"] = True
+            merged_deferred[odno] = merged
+        deferred_odnos = set(deferred_odnos) | set(record_rows or {})
+    if deferred_odnos:
+        deferred_net_qty = sum(
+            row["qty"] if row["side"] == "BUY" else -row["qty"]
+            for row in merged_deferred.values()
+        )
+
     # 1) 승인 주문 대조를 **먼저** 수행합니다. 이 결과로 어떤 체결이 승인된
     #    계획에 속하는지(odno) 확정되고, 재정산 불일치 허용 범위가 정해집니다.
     if consumed:
@@ -2340,44 +2732,47 @@ def _verify_broker_readonly(approval, state, broker):
         )
         problems.extend(fill_problems)
 
-    # 2) 재정산 대조 — 승인 계획에 속하지 않는 새 체결만 실패 사유입니다.
-    allowed_odnos = (
-        _approved_plan_odnos(state, approval.get("plan_id")) if consumed else None
-    )
+    # 2) 재정산 대조 — 승인 계획 + 미룬 체결에 속하지 않는 새 체결만 실패 사유입니다.
+    allowed_odnos = set()
+    if consumed:
+        allowed_odnos.update(_approved_plan_odnos(state, approval.get("plan_id")))
+    allowed_odnos.update(deferred_odnos)
     try:
         assert_reconciliation_current(
             symbol,
             state,
             history,
             balance,
-            allowed_fill_odnos=allowed_odnos,
+            allowed_fill_odnos=allowed_odnos or None,
         )
     except Exception as error:
         problems.append(f"브로커 주문이력/잔고 재정산 불일치: {error}")
 
-    evidence_path = approval.get("_evidence_path")
     if evidence_path:
-        try:
-            evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            evidence = {}
         expected_qty = evidence.get("balance_qty")
         broker_qty = int(balance.quantity) if balance is not None else None
         if balance is None:
             problems.append("브로커 잔고를 확인할 수 없습니다 (SETTLE 근거 대조 불가)")
         elif expected_qty is not None:
+            # SETTLE 의 balance_qty 는 미룬 체결을 되감은 "정산 세션 시점" 값입니다.
+            # 미룬 순변동을 더한 뒤, 실행된 승인 주문의 체결 델타를 반영합니다.
+            baseline_after = int(expected_qty) + deferred_net_qty
             if consumed:
-                expected_after = int(expected_qty) + buy_filled - sell_filled
+                expected_after = baseline_after + buy_filled - sell_filled
                 if broker_qty != expected_after:
                     problems.append(
                         "브로커 잔고가 기대 결과와 다릅니다: "
-                        f"SETTLE={int(expected_qty)}, 승인주문 체결(매수+{buy_filled}/매도-{sell_filled}), "
+                        f"SETTLE={int(expected_qty)}, "
+                        f"보류체결={deferred_net_qty:+d}, "
+                        f"승인주문 체결(매수+{buy_filled}/매도-{sell_filled}), "
                         f"기대={expected_after}, broker={broker_qty}"
                     )
-            elif broker_qty != int(expected_qty):
+            elif broker_qty != baseline_after:
                 problems.append(
                     "브로커 잔고가 SETTLE 근거와 다릅니다(미실행 승인): "
-                    f"evidence={int(expected_qty)}, broker={broker_qty}"
+                    f"evidence={int(expected_qty)}, "
+                    f"보류체결={deferred_net_qty:+d}, "
+                    f"기대={baseline_after}, broker={broker_qty}"
                 )
     return problems
 
@@ -2389,9 +2784,9 @@ def _run_verify_phase(broker=None):
     기대 잔고 read-only 대조.
 
     outcome 구분 (P1-C):
-      - executed           EXECUTE 가 정상 실행 후 남긴 명시적 성공 기록
-      - execution-failed   실행 실패/부분실패, 또는 소비됐지만 기록 없음(보수적)
-      - approval-skipped   승인만 되고 실행되지 않음
+      - executed           EXECUTE 가 정상 실행 후 남긴 명시적 성공 기록 → exit 0
+      - execution-failed   실행 실패/부분실패, 또는 소비됐지만 기록 없음 → exit 1
+      - approval-skipped   승인만 되고 실행되지 않음 → exit 2 (검증 통과와 구분)
     """
     approval_ref = os.getenv("APPROVAL_PLAN_ID") or os.getenv("APPROVAL_FILE")
     if not approval_ref:
@@ -2407,6 +2802,9 @@ def _run_verify_phase(broker=None):
         require_unconsumed=False,
         check_state_hash=False,
     )
+    # 소비된 승인은 실제 전송 기록까지 독립 검증합니다 (P1: transmitted integrity).
+    if approval.get("consumed"):
+        problems.extend(_verify_transmitted_plan(approval))
     if state.get("pending_order_intent") or state.get("pending_order_batch"):
         problems.append(
             "미종결 주문 fence 가 남아 있습니다 "
@@ -2448,6 +2846,11 @@ def _run_verify_phase(broker=None):
     # 정상 실행은 EXECUTE 가 outcome="executed" 를 남기므로 여기서 성공으로 판정됩니다.
     if approval.get("consumed"):
         outcome = recovery_outcome or "execution-failed"
+        if not recovery_outcome:
+            problems.append(
+                "소비된 승인에 실행 결과 기록(.recovery.json)이 없습니다 "
+                "— 실행 성공을 확인할 수 없습니다."
+            )
     else:
         outcome = recovery_outcome or "approval-skipped"
 
@@ -2459,6 +2862,21 @@ def _run_verify_phase(broker=None):
         for problem in problems:
             print(f"  - {problem}")
         return 1
+    # 실행 실패/부분실패는 검증 실패입니다 (성공으로 조용히 끝나면 안 됩니다).
+    if outcome == "execution-failed":
+        print(
+            "[VERIFY] 실패 (execution-failed): EXECUTE 가 실행 실패를 기록했습니다 "
+            f"— plan_id={approval.get('plan_id')}"
+        )
+        return 1
+    # 승인만 되고 실행되지 않은 상태는 "검증 통과"와 구분되는 자체 종료코드(2)를
+    # 씁니다. 실행은 없었지만 운영자가 인지해야 하는 상태입니다.
+    if outcome == "approval-skipped":
+        print(
+            "[VERIFY] 실행 안 됨 (approval-skipped): 승인만 존재하고 실행 기록이 "
+            f"없습니다 — plan_id={approval.get('plan_id')}, exit=2"
+        )
+        return 2
     print(
         f"[VERIFY] 통과 — outcome={outcome}, "
         f"plan_id={approval.get('plan_id')}, "
@@ -2469,6 +2887,16 @@ def _run_verify_phase(broker=None):
 
 
 def _dispatch_pipeline_phase(run_phase, broker):
+    """RUN_PHASE 단계별 실행 — 전역 실행 잠금 안에서 직렬화합니다.
+
+    cron 을 거치지 않는 직접 CLI 실행도 `.state.json` read-modify-write 를
+    공유하므로, 셸 런처와 같은 `.run.lock` 을 파이썬에서도 잡습니다.
+    """
+    with global_lock():
+        return _dispatch_pipeline_phase_locked(run_phase, broker)
+
+
+def _dispatch_pipeline_phase_locked(run_phase, broker):
     """RUN_PHASE 단계별 실행. SETTLE/PREVIEW/APPROVE 는 ReadOnlyBroker 만 받습니다."""
     read_only_broker = ReadOnlyBroker(broker)
     failures = 0
@@ -2478,7 +2906,13 @@ def _dispatch_pipeline_phase(run_phase, broker):
             try:
                 settled = settle_positions(read_only_broker, symbol_config)
                 if settled.halt_reason:
-                    print(f"[SETTLE] {settled.symbol} 보류: {settled.halt_reason}")
+                    # 정산이 확정되지 않았는데 성공(exit 0)으로 끝나면, 운영자는
+                    # 정산이 끝난 줄 알고 다음 단계를 진행합니다. 보류는 실패입니다.
+                    print(
+                        f"[SETTLE] {settled.symbol} 보류: {settled.halt_reason} "
+                        "(정산 미확정 → 실패로 집계)"
+                    )
+                    failures += 1
                 else:
                     print(
                         f"[SETTLE] {settled.symbol} 완료 — T={settled.T}, "
@@ -2545,6 +2979,17 @@ def _dispatch_pipeline_phase(run_phase, broker):
 
 
 def main():
+    """자동매매 봇 메인 진입점 — 전역 실행 잠금 안에서 실행합니다.
+
+    SETTLE/PREVIEW/APPROVE/EXECUTE/VERIFY/REPAIR 는 모두 `.state.json` 을
+    읽고 쓰므로, 같은 `.run.lock` 으로 프로세스 간 직렬화합니다. 셸 런처가
+    이미 잡은 경우(`RUN_LOCK_HELD=1`)에는 재진입합니다.
+    """
+    with global_lock():
+        return _main_locked()
+
+
+def _main_locked():
     """
     자동매매 봇의 메인 실행 함수입니다.
 

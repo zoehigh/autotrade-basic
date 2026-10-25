@@ -309,7 +309,7 @@ class KiwoomBroker(Broker):
             except Exception:
                 pass
 
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd_raw,
             "ord_datetime_kst": ord_datetime_kst_iso,
@@ -318,7 +318,6 @@ class KiwoomBroker(Broker):
             "_resolved_kst_iso": resolved_kst_iso,
             "prdt_name": raw.get("prdt_name", ""),
             "sll_buy_dvsn_cd_name": raw.get("sll_buy_dvsn_cd_name", ""),
-            "ft_ord_qty": raw.get("ft_ord_qty", "0"),
             "ft_ccld_qty": raw.get("ft_ccld_qty", "0"),
             # 키움 가격/금액 필드는 부호 포함 문자열 → 절대값 문자열로 정규화
             "ft_ccld_unpr3": str(_parse_price(raw.get("ft_ccld_unpr3"))),
@@ -330,6 +329,10 @@ class KiwoomBroker(Broker):
             "odno": raw.get("odno", ""),
             "ovrs_excg_cd": raw.get("ovrs_excg_cd", ""),
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if "ft_ord_qty" in raw:
+            row["ft_ord_qty"] = raw["ft_ord_qty"]
+        return row
 
     def _normalize_ust21150_item(self, raw: dict, ord_dt: str = "") -> dict:
         """
@@ -375,7 +378,7 @@ class KiwoomBroker(Broker):
             except Exception:
                 pass
 
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd,
             "ord_datetime_kst": ord_datetime_kst_iso,
@@ -384,7 +387,6 @@ class KiwoomBroker(Broker):
             "_resolved_kst_iso": resolved_kst_iso,
             "prdt_name": raw.get("frgn_stk_nm", ""),
             "sll_buy_dvsn_cd_name": raw.get("slby_tp_nm", ""),
-            "ft_ord_qty": raw.get("ord_qty", "0"),
             "ft_ccld_qty": str(cntr_qty),
             "ft_ccld_unpr3": str(cntr_uv),
             "ft_ccld_amt3": ft_ccld_amt3,
@@ -399,6 +401,10 @@ class KiwoomBroker(Broker):
             "odno": raw.get("ord_no", ""),
             "ovrs_excg_cd": "",  # ust21150에 없음
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if "ord_qty" in raw or "ft_ord_qty" in raw:
+            row["ft_ord_qty"] = raw.get("ord_qty", raw.get("ft_ord_qty"))
+        return row
 
     # ═══════════════════════════════════════════════════════════════════
     # 시장 정보

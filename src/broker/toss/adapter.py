@@ -352,14 +352,13 @@ class TossBroker(Broker):
         is_terminal = status_raw.upper() in _TOSS_TERMINAL_STATUSES
         remaining = 0 if is_terminal else max(quantity - filled_qty, 0)
 
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd,
             "ord_datetime_kst": ord_datetime_kst_iso,
             "ord_datetime_utc": ord_datetime_utc_iso,
             "prdt_name": raw.get("symbol", ""),
             "sll_buy_dvsn_cd_name": sll_buy_dvsn_cd_name,
-            "ft_ord_qty": str(quantity),
             "ft_ccld_qty": str(filled_qty),
             "ft_ccld_unpr3": str(effective_price),
             "ft_ccld_amt3": str(filled_amount) if filled_amount > 0 else "0",
@@ -378,6 +377,10 @@ class TossBroker(Broker):
             # orderedAt 기반 ord_dt는 KST 날짜 (미국영업일 아님)
             "_ord_dt_is_kst_date": True,
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if "quantity" in raw:
+            row["ft_ord_qty"] = str(quantity)
+        return row
 
     # ═══════════════════════════════════════════════════════════════════
     # 시장 정보

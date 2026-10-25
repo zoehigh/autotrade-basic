@@ -349,7 +349,7 @@ class NHPlugBroker(Broker):
         ord_tmd_raw = raw.get("orr_tm", "") or raw.get("ord_tmd", "") or raw.get("orr_tmd_raw", "")
         ord_tmd = ord_tmd_raw.zfill(6) if ord_tmd_raw else ""
         # 수량/가격: 원본 필드 우선, 없으면 KIS 호환 필드 fallback
-        ft_ord_qty = raw.get("orr_qty", raw.get("ft_ord_qty", "0"))
+        ft_ord_qty = raw.get("orr_qty", raw.get("ft_ord_qty"))
         ft_ccld_qty = raw.get("cns_qty", raw.get("ft_ccld_qty", "0"))
         ft_ccld_unpr3 = raw.get("cns_pr", raw.get("ft_ccld_unpr3", "0"))
         # 체결금액은 단가*수량으로 계산하거나 fc_trd_amt 있으면 사용
@@ -396,7 +396,7 @@ class NHPlugBroker(Broker):
                     ord_datetime_utc_iso = kst_dt.astimezone(ZoneInfo("UTC")).isoformat()
             except Exception:
                 pass
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd_raw,
             "ord_datetime_kst": ord_datetime_kst_iso,
@@ -405,7 +405,6 @@ class NHPlugBroker(Broker):
             "_resolved_kst_iso": resolved_kst_iso,
             "prdt_name": raw.get("tck_iem_cd", raw.get("iem_cd", raw.get("prdt_name", ""))),
             "sll_buy_dvsn_cd_name": sby,
-            "ft_ord_qty": str(ft_ord_qty),
             "ft_ccld_qty": str(ft_ccld_qty),
             "ft_ccld_unpr3": str(ft_ccld_unpr3),
             "ft_ccld_amt3": str(ft_ccld_amt3),
@@ -416,6 +415,10 @@ class NHPlugBroker(Broker):
             "odno": odno,
             "ovrs_excg_cd": raw.get("ovrs_excg_cd", ""),
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if "orr_qty" in raw or "ft_ord_qty" in raw:
+            row["ft_ord_qty"] = str(ft_ord_qty)
+        return row
 
     def _normalize_order_item(self, raw: dict) -> dict:
         """
@@ -453,7 +456,7 @@ class NHPlugBroker(Broker):
             except Exception:
                 pass
 
-        return {
+        row = {
             "ord_dt": ord_dt,
             "ord_tmd": ord_tmd_raw,
             "ord_datetime_kst": ord_datetime_kst_iso,
@@ -462,7 +465,6 @@ class NHPlugBroker(Broker):
             "_resolved_kst_iso": resolved_kst_iso,
             "prdt_name": raw.get("prdt_name", ""),
             "sll_buy_dvsn_cd_name": raw.get("sll_buy_dvsn_cd_name", ""),
-            "ft_ord_qty": raw.get("ft_ord_qty", "0"),
             "ft_ccld_qty": raw.get("ft_ccld_qty", "0"),
             "ft_ccld_unpr3": raw.get("ft_ccld_unpr3", "0"),
             "ft_ccld_amt3": raw.get("ft_ccld_amt3", "0"),
@@ -473,6 +475,10 @@ class NHPlugBroker(Broker):
             "odno": raw.get("odno", ""),
             "ovrs_excg_cd": raw.get("ovrs_excg_cd", ""),
         }
+        # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+        if "ft_ord_qty" in raw:
+            row["ft_ord_qty"] = raw["ft_ord_qty"]
+        return row
 
     # ═══════════════════════════════════════════════════════════════════
     # 시장 정보

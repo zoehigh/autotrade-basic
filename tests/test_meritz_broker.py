@@ -584,6 +584,21 @@ def test_order_history_contains_standard_fields(make_broker):
     assert row["prcs_stat_name"] == "부분체결"      # 4체결 / 잔량 6
 
 
+def test_order_history_missing_qty_field_omits_ft_ord_qty(make_broker):
+    """원주문 수량(der_dqty 등)이 없으면 "0"을 합성하지 않고 키를 생략합니다."""
+    row = dict(PERIOD_ROW)
+    row.pop("der_dqty", None)
+    broker, _session = make_broker(
+        [ok(rsp_cd="5766", data=[row]), ok(rsp_cd="5766", data=[])]
+    )
+
+    rows = broker.get_order_history("TQQQ", "NAS")
+
+    assert len(rows) == 1
+    assert "ft_ord_qty" not in rows[0]
+    assert rows[0]["ft_ccld_qty"] == "4"
+
+
 def test_history_query_params_official(make_broker):
     """이력 query는 공식 필수 3종 + tr_cont_key만, 당일 API는 파라미터 없음."""
     broker, session = make_broker(

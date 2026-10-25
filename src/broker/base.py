@@ -147,6 +147,11 @@ class Broker(ABC):
             prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
             ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
             tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
+
+        단, `ft_ord_qty`(원주문 수량)는 브로커 응답이 제공하지 않을 때 **키를
+        생략**합니다. "0"을 합성하면 VERIFY 가 "필드 없음(관대)"과
+        "필드 있으나 0(실패)"을 구분하지 못하기 때문입니다.
+        필드가 있으면 값이 "0"이어도 그대로 전달합니다.
         """
         pass
 

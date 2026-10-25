@@ -446,6 +446,35 @@ class TestKISBrokerContract(BrokerContractTest):
         assert item["ft_ccld_qty"] == "5"
         assert item["odno"] == "36267"
 
+    def test_get_order_history_missing_qty_field_omits_ft_ord_qty(self):
+        """원주문 수량이 응답에 없으면 "0"을 합성하지 않고 키를 생략합니다."""
+        self._set_mock_response({
+            "rt_cd": "0",
+            "output": [
+                {
+                    "ord_dt": "20260615",
+                    "ord_tmd": "093000",
+                    "prdt_name": "TQQQ",
+                    "sll_buy_dvsn_cd_name": "매수",
+                    "ft_ccld_qty": "1",
+                    "ft_ccld_unpr3": "54.00",
+                    "ft_ccld_amt3": "54.00",
+                    "nccs_qty": "0",
+                    "prcs_stat_name": "체결완료",
+                    "tr_mket_name": "NASDAQ",
+                    "tr_crcy_cd": "USD",
+                    "odno": "36267",
+                    "ovrs_excg_cd": "NASD",
+                }
+            ],
+        })
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+
+        assert len(history) == 1
+        assert "ft_ord_qty" not in history[0]
+        assert history[0]["ft_ccld_qty"] == "1"
+
     def test_get_order_history_empty(self):
         """체결 내역이 없으면 빈 리스트를 반환해야 합니다."""
         self._set_mock_response({
@@ -673,6 +702,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         """매수가능금액이 PurchaseAmount로 반환되어야 합니다."""
         self._set_mock_response({
             "return_code": 0,
+            # 어댑터는 여러 통화 중 crnc_code=="USD" 항목을 찾으므로 USD 지정이 필수다.
             "result_list": [{"crnc_code": "USD", "fc_ord_alowa": "5000.00"}],
         })
         broker = self._create_broker()
@@ -796,6 +826,35 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         assert calls[0]["extra_headers"] == {"cont-yn": "N", "next-key": ""}
         assert calls[1]["extra_headers"] == {"cont-yn": "Y", "next-key": "NEXT-1"}
 
+    def test_get_order_history_missing_qty_field_omits_ft_ord_qty(self):
+        """원주문 수량이 응답에 없으면 "0"을 합성하지 않고 키를 생략합니다."""
+        self._set_mock_response({
+            "return_code": 0,
+            "output": [
+                {
+                    "ord_dt": "20260615",
+                    "ord_tmd": "093000",
+                    "prdt_name": "TQQQ",
+                    "sll_buy_dvsn_cd_name": "매수",
+                    "ft_ccld_qty": "1",
+                    "ft_ccld_unpr3": "54.00",
+                    "ft_ccld_amt3": "54.00",
+                    "nccs_qty": "0",
+                    "prcs_stat_name": "체결완료",
+                    "tr_mket_name": "NASDAQ",
+                    "tr_crcy_cd": "USD",
+                    "odno": "36267",
+                    "ovrs_excg_cd": "ND",
+                }
+            ],
+        })
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+
+        assert len(history) == 1
+        assert "ft_ord_qty" not in history[0]
+        assert history[0]["ft_ccld_qty"] == "1"
+
     def test_get_order_history_empty(self):
         """체결 내역이 없으면 빈 리스트를 반환해야 합니다."""
         self._set_mock_response({
@@ -808,6 +867,8 @@ class TestKiwoomBrokerContract(BrokerContractTest):
 
     def test_place_order_returns_orderresult(self):
         """성공적인 주문은 OrderResult(order_id, order_time, is_reservation=False)를 반환."""
+        # 키움 주문 API는 flat 구조 + 소문자 ord_no 를 반환하고 주문시각은 미제공하므로,
+        # 어댑터는 get_kst_now() 로컬 시각(YYYYMMDDHHMMSS)을 사용한다.
         self._set_mock_response({
             "return_code": 0,
             "ord_no": "202606150001",  # KIWOOM 은 flat 구조 + 소문자 ord_no
@@ -1020,6 +1081,46 @@ class TestKiwoomDemoBrokerContract:
         assert item["_ord_dt_is_us_trading_date"] is True
         # ord_dt=20260728 + 14:30 KST → ET round-trip(offset 0) 성공 → 동일 시각 복원
         assert item["_resolved_kst_iso"] == "2026-07-28T14:30:00+09:00"
+
+    def test_get_order_history_demo_missing_qty_field_omits_ft_ord_qty(self):
+        """ust21150 원주문 수량(ord_qty)이 없으면 "0"을 합성하지 않습니다."""
+        from broker.kiwoom.tr_registry import TR_HISTORY_DEMO
+
+        def _side_effect(tr_id, body, token, extra_headers=None):
+            if tr_id != TR_HISTORY_DEMO:
+                return _make_response({"return_code": 0})
+            ord_dt = body.get("ord_dt", "")
+            if ord_dt == "20260728":
+                return _make_response({
+                    "return_code": 0,
+                    "result_list": [self._make_demo_item(
+                        ord_no="12345",
+                        ord_time="14:30:00",
+                        cntr_qty="1",
+                        cntr_uv="52.50",
+                    )],
+                })
+            return _make_response({"return_code": 0, "result_list": []})
+
+        self._mock_session.request_with_tr.side_effect = _side_effect
+        broker = self._create_broker()
+        # ord_qty만 제거해 "필드 없음"을 재현합니다.
+        original_make_demo_item = self._make_demo_item
+
+        def _make_demo_item_without_qty(**overrides):
+            item = original_make_demo_item(**overrides)
+            item.pop("ord_qty", None)
+            return item
+
+        self._make_demo_item = _make_demo_item_without_qty
+        try:
+            history = broker.get_order_history("TQQQ", "NAS", days=1)
+        finally:
+            self._make_demo_item = original_make_demo_item
+
+        assert len(history) == 1
+        assert "ft_ord_qty" not in history[0]
+        assert history[0]["ft_ccld_qty"] == "1"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1586,6 +1687,44 @@ class TestNHPlugBrokerContract(BrokerContractTest):
         assert item["sll_buy_dvsn_cd_name"] == "매수"
         assert item["ft_ccld_qty"] == "5"
         assert item["odno"] == "36267"
+
+    def test_get_order_history_missing_qty_field_omits_ft_ord_qty(self):
+        """GSB10030 원주문 수량(orr_qty)이 없으면 "0"을 합성하지 않습니다."""
+        self._set_mock_response({
+            "Output_0": [
+                {
+                    "orr_dt": "20260615",
+                    "orr_no": "36267",
+                    "iem_cd": "TQQQ",
+                    "sby_dit_nm": "2",
+                    "cns_qty": "1",
+                    "cns_pr": "54.00",
+                    "ny_cns_orr_qty": "0",
+                    "tr_mket_name": "NASDAQ",
+                }
+            ],
+            "message": {"msg_code": "", "usr_msg": "", "dvlp_msg": ""},
+        })
+        broker = self._create_broker()
+        history = broker.get_order_history("TQQQ", "NAS")
+
+        assert len(history) == 1
+        assert "ft_ord_qty" not in history[0]
+        assert history[0]["ft_ccld_qty"] == "1"
+
+    def test_normalize_order_item_missing_qty_field_omits_ft_ord_qty(self):
+        """KIS 호환 필드 경로에서도 수량 필드가 없으면 키를 생략합니다."""
+        broker = self._create_broker()
+        row = broker._normalize_order_item({
+            "ord_dt": "20260615",
+            "ord_tmd": "093000",
+            "prdt_name": "TQQQ",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1",
+        })
+
+        assert "ft_ord_qty" not in row
+        assert row["ft_ccld_qty"] == "1"
 
     def test_get_order_history_empty(self):
         """체결 내역이 없으면 빈 리스트를 반환해야 합니다."""

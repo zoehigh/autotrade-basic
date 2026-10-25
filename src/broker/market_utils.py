@@ -4,6 +4,7 @@
 KIS, 키움, LS 등 모든 증권사가 공통으로 사용하는
 시간 계산, 미국 장 영업일 확인 등의 유틸리티를 제공합니다.
 """
+import os
 from datetime import date as _date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -153,6 +154,91 @@ def us_session_closed(session_date: str, now_utc: datetime | None = None) -> boo
     return now_utc >= close_utc
 
 
+AFTER_HOURS_END_ET_HOUR_ENV = "AFTER_HOURS_END_ET_HOUR"
+DEFAULT_AFTER_HOURS_END_ET_HOUR = 20
+
+
+def after_hours_end_et_hour() -> int:
+    """미국 애프터아워(시간외) 종료 시각(ET, 정수시)을 반환합니다.
+
+    `us_session_closed()` 는 **정규장 마감(16:00 ET)** 만 판단합니다. 정산은
+    그 뒤에 이어지는 애프터아워 체결까지 확정되어야 하므로 별도 기준이
+    필요합니다. 기본 20:00 ET 이며 `AFTER_HOURS_END_ET_HOUR` 로 조정합니다.
+
+    조기폐장일에도 보수적으로 20:00 를 씁니다(실제 17:00 종료보다 늦게 기다림).
+    """
+    raw = os.getenv(AFTER_HOURS_END_ET_HOUR_ENV, "").strip()
+    if raw:
+        try:
+            hour = int(raw)
+        except ValueError:
+            hour = DEFAULT_AFTER_HOURS_END_ET_HOUR
+        if 0 <= hour <= 23:
+            return hour
+    return DEFAULT_AFTER_HOURS_END_ET_HOUR
+
+
+def us_session_after_hours_end(
+    session_date: str, now_utc: datetime | None = None
+) -> bool:
+    """지정 세션의 **애프터아워 창까지** 끝났는지 확인합니다.
+
+    정규장 마감(`us_session_closed`)과 분리된 기준입니다. KST 09:30 은
+    동절기 기준 ET 19:30 이라 정규장은 닫혔지만 애프터아워(20:00 종료)는
+    아직 진행 중입니다. 이 함수가 False 이면 SETTLE 은 보류해야 합니다.
+
+    Parameters:
+        session_date (str): "YYYY-MM-DD" 형식의 세션 날짜.
+        now_utc (datetime | None): 기준 시각(UTC). None 이면 현재 시각.
+
+    Returns:
+        bool: 세션이 존재하고 now ≥ 해당 세션일의 애프터아워 종료(ET)이면 True.
+    """
+    cal = _get_xnys_calendar()
+    if not session_date or not cal.is_session(session_date):
+        return False
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    try:
+        session_day = _date.fromisoformat(str(session_date))
+    except ValueError:
+        return False
+    end_et = datetime.combine(
+        session_day,
+        dtime(hour=after_hours_end_et_hour()),
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    return now_utc.astimezone(timezone.utc) >= end_et.astimezone(timezone.utc)
+
+
+def us_session_in_progress(now_utc: datetime | None = None) -> str | None:
+    """현재 **정규장이 진행 중**인 세션 날짜를 반환합니다 (없으면 None).
+
+    정산 대상 선택에서 "진행 중인 세션"을 실수로 포함하지 않도록 확인하는
+    진단용 helper 입니다. `us_session_last_closed_date()` 는 정규장이 닫힌
+    세션만 반환하므로, 진행 중 세션의 체결은 그 대상에 포함되지 않습니다.
+    """
+    cal = _get_xnys_calendar()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_utc = now_utc.astimezone(timezone.utc)
+    session_date = us_session_date_now(now_utc)
+    if not session_date or not cal.is_session(session_date):
+        return None
+    try:
+        open_ts = cal.session_open(session_date).to_pydatetime()
+        close_ts = cal.session_close(session_date).to_pydatetime()
+    except Exception:
+        return None
+    if open_ts.astimezone(timezone.utc) <= now_utc < close_ts.astimezone(timezone.utc):
+        return session_date
+    return None
+
+
 def us_session_last_closed_date(now_utc: datetime | None = None) -> str | None:
     """
     이미 마감된 가장 최근 세션 날짜를 반환합니다.
@@ -189,3 +275,32 @@ def us_session_last_closed_date(now_utc: datetime | None = None) -> str | None:
             return None
         session_str = nxt.strftime("%Y-%m-%d")
     return None
+
+
+def next_us_session(session_date: str) -> str | None:
+    """
+    지정한 세션 **다음** 미국 정규 세션 날짜를 반환합니다 (주말/공휴일 건너뜀).
+
+    PREVIEW/APPROVE/EXECUTE 의 실행 대상 세션을 계산할 때 사용합니다.
+    KST 아침 정산(setttle) 대상 세션(직전 마감 세션)의 다음 세션이 곧
+    "오늘 밤 실행할 세션" 입니다. exchange_calendars(XNYS) 를 쓰므로
+    주말·공휴일·서머타임 경계를 모두 반영합니다.
+
+    Parameters:
+        session_date (str): "YYYY-MM-DD" 형식의 기준 날짜/세션.
+
+    Returns:
+        str | None: 다음 세션 날짜. 캘린더 범위를 벗어나면 None.
+    """
+    cal = _get_xnys_calendar()
+    try:
+        if cal.is_session(session_date):
+            nxt = cal.next_session(session_date)
+        else:
+            # 세션이 아닌 날짜(주말/공휴일)면 그 이후 첫 세션을 찾습니다.
+            nxt = cal.date_to_session(session_date, direction="next")
+            if nxt is not None and nxt.strftime("%Y-%m-%d") < session_date:
+                nxt = cal.next_session(nxt)
+    except Exception:
+        return None
+    return nxt.strftime("%Y-%m-%d") if nxt is not None else None

@@ -139,6 +139,10 @@ def load_state(symbol):
     last_settlement_committed_at_utc = state.get(
         "last_settlement_committed_at_utc", ""
     )
+    # 정산 대상 세션(이미 마감)과 실행 대상 세션(다음 세션). PREVIEW/APPROVE/EXECUTE
+    # 세션 검증이 `_et_today()`(KST 아침=ET 전날) 대신 이 값을 씁니다.
+    settled_session = state.get("settled_session", "")
+    execution_session = state.get("execution_session", "")
 
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
     return {
@@ -164,6 +168,8 @@ def load_state(symbol):
         "last_settlement_id": last_settlement_id,
         "last_settlement_evidence": last_settlement_evidence,
         "last_settlement_committed_at_utc": last_settlement_committed_at_utc,
+        "settled_session": settled_session,
+        "execution_session": execution_session,
         "_net_invested_missing": net_invested_missing,
     }
 
@@ -220,6 +226,9 @@ def _state_record(state_dict):
         "last_settlement_committed_at_utc": state_dict.get(
             "last_settlement_committed_at_utc", ""
         ),
+        # SETTLE 대상 세션 / 실행 대상 세션 — 파이프라인 세션 검증 바인딩
+        "settled_session": state_dict.get("settled_session", ""),
+        "execution_session": state_dict.get("execution_session", ""),
     }
 
 
@@ -313,6 +322,8 @@ def canonical_state_hash(state):
         "last_settlement_committed_at_utc": state.get(
             "last_settlement_committed_at_utc", ""
         ),
+        "settled_session": state.get("settled_session", ""),
+        "execution_session": state.get("execution_session", ""),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

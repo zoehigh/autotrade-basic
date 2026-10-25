@@ -17,11 +17,21 @@ from pipeline import (
     approval_outcome_path,
     assert_no_pending_fence,
     assert_reconciliation_current,
+    _assert_reconciliation_with_deferred,
     build_order_plan,
+    compute_plan_hash,
+    _deferred_buy_spend,
+    _deferred_fills_evidence,
+    deferred_record_path,
+    effective_tolerance_policy,
     evidence_file_for_run,
+    global_lock,
     load_approval,
+    normalize_tolerance_policy,
+    price_tolerance,
     read_approval_outcome,
     settled_from_state,
+    transmitted_plan_path,
     verify_approval,
 )
 
@@ -30,6 +40,38 @@ def _tb():
     import trading_bot
 
     return trading_bot
+
+
+def _wait_until_pre_market(tb, now=None):
+    """프리장 개장 전이면 **먼저** 대기하고, 재검증에 쓸 기준 시각을 반환합니다.
+
+    EXECUTE 는 승인 검증/선점/전송 **전에** 대기해야 합니다. 대기 후 시세·체결이
+    바뀌었을 수 있으므로 모든 게이트(승인/세션/만료/fence/재정산/계획 재계산/
+    매도<=보유)를 대기 **뒤에** 다시 실행합니다.
+
+    Returns:
+        datetime | None: 재검증 기준 시각. None 이면 실제 현재 시각을 사용합니다.
+        테스트/재생처럼 `now` 가 주어지면 대기하지 않고 그대로 반환합니다.
+    """
+    if now is not None:
+        return now
+    if not (tb.BROKER_MODE == "real" and tb.TRADE_MODE == "LIVE"):
+        return None
+    now_kst = tb.get_kst_now()
+    pre_market_open_hour = 17 if tb.is_us_dst() else 18
+    if now_kst.hour < pre_market_open_hour:
+        target = now_kst.replace(
+            hour=pre_market_open_hour, minute=0, second=0, microsecond=0
+        )
+        wait_seconds = (target - now_kst).total_seconds()
+        print(
+            f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → "
+            f"{target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)"
+        )
+        tb.time.sleep(wait_seconds)
+        # 대기 후에는 최신 시각으로 전체 게이트를 다시 통과해야 합니다.
+        return None
+    return None
 
 
 # ── 승인 재검증 ────────────────────────────────────────────────
@@ -83,36 +125,40 @@ def _symbol_config(symbol):
     raise RuntimeError(f"{symbol} 종목 설정을 찾을 수 없습니다.")
 
 
-def _price_tolerance(price):
-    try:
-        pct = float(os.getenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.005"))
-    except ValueError:
-        pct = 0.005
-    try:
-        absolute = float(os.getenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.02"))
-    except ValueError:
-        absolute = 0.02
-    return max(absolute, abs(float(price or 0.0)) * pct)
+def _price_tolerance(price, policy):
+    """정책 기준 가격 허용오차. 정책은 승인 시점에 고정된 값입니다."""
+    return price_tolerance(price, policy)
 
 
-def _qty_tolerance():
+def _qty_tolerance(policy):
     try:
-        return int(os.getenv("EXECUTION_QTY_TOLERANCE", "0"))
-    except ValueError:
+        return int(policy["qty"])
+    except (KeyError, TypeError, ValueError):
         return 0
 
 
-def compare_order_plans(approved_orders, rebuilt_orders):
-    """승인 계획과 현재 재계산 계획의 주문을 허용 오차 내에서 비교합니다."""
+def compare_order_plans(approved_orders, rebuilt_orders, policy=None):
+    """승인 계획과 현재 재계산 계획의 주문을 허용 오차 내에서 비교합니다.
+
+    `policy` 는 **승인 파일에 고정된** 허용오차 정책입니다. EXECUTE 경로는
+    반드시 승인 정책(env 로 더 좁힌 유효 정책)을 넘겨야 하며, 없으면
+    fail-closed 로 비교하지 않습니다.
+    """
     problems = []
     approved_orders = list(approved_orders or [])
     rebuilt_orders = list(rebuilt_orders or [])
+    if policy is None:
+        problems.append(
+            "승인 파일에 허용오차 정책이 없어 주문 계획을 비교할 수 없습니다 "
+            "(재승인 필요)"
+        )
+        return problems
     if len(approved_orders) != len(rebuilt_orders):
         problems.append(
             f"주문 개수 불일치: 승인 {len(approved_orders)} vs 재계산 {len(rebuilt_orders)}"
         )
         return problems
-    qty_tol = _qty_tolerance()
+    qty_tol = _qty_tolerance(policy)
     for index, (approved, rebuilt) in enumerate(
         zip(approved_orders, rebuilt_orders), 1
     ):
@@ -131,7 +177,7 @@ def compare_order_plans(approved_orders, rebuilt_orders):
             )
         a_price = float(approved.get("price") or 0.0)
         r_price = float(rebuilt.get("price") or 0.0)
-        tolerance = _price_tolerance(a_price)
+        tolerance = _price_tolerance(a_price, policy)
         if abs(a_price - r_price) > tolerance:
             problems.append(
                 f"주문 {index} 가격 불일치: 승인=${a_price:.4f}, "
@@ -139,7 +185,7 @@ def compare_order_plans(approved_orders, rebuilt_orders):
             )
         a_amount = a_price * a_qty
         r_amount = r_price * r_qty
-        amount_tolerance = max(_price_tolerance(a_price) * max(a_qty, 1), 0.01)
+        amount_tolerance = max(_price_tolerance(a_price, policy) * max(a_qty, 1), 0.01)
         if abs(a_amount - r_amount) > amount_tolerance:
             problems.append(
                 f"주문 {index} 금액 불일치: 승인=${a_amount:.2f}, "
@@ -218,11 +264,169 @@ def confirm_open_orders_cancelled(broker, symbol, exchange, state, order_history
     return tb._cancel_open_bot_orders(broker, symbol, exchange, state, order_history)
 
 
+def _write_execute_deferred_record(approval_path, approval, deferred_rows, now=None):
+    """EXECUTE 가 수용한 실행 세션 보류 체결 집합을 **동결**해 기록합니다.
+
+    VERIFY 는 live 이력만으로 "EXECUTE 전에 수용된 체결"과 "EXECUTE 후에
+    도착한 체결"을 구분할 수 없습니다. 그래서 승인 소비(claim) 직후, 주문
+    전송과 같은 잠금 경계에서 이 집합을 sidecar 로 남깁니다.
+
+    행 형식은 `{odno, side, qty, session, amount?}` 이며, 금액은 확정된
+    경우에만 기록합니다 (추정 금지). 기록 실패는 주문 전에 fail-closed 로
+    중단되어야 하므로 호출자는 예외를 그대로 전파합니다.
+    """
+    payload = {
+        "plan_id": str(approval.get("plan_id") or ""),
+        "symbol": str(approval.get("symbol") or ""),
+        "session": str(approval.get("session") or ""),
+        "settlement_run_id": str(approval.get("settlement_run_id") or ""),
+        "deferred_fills": _deferred_fills_evidence(deferred_rows),
+        "recorded_at_utc": (
+            (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        ),
+    }
+    path = deferred_record_path(approval_path)
+    _atomic_write_json(path, payload)
+    print(
+        f"[EXECUTE] 실행 세션 보류 체결 기록: {path} "
+        f"({len(payload['deferred_fills'])}건)"
+    )
+    return path
+
+
+def _write_transmitted_plan(approval_path, plan, approval, drift=None, now=None):
+    """EXECUTE 가 실제로 전송하는 최종 계획을 승인 파일 옆에 기록합니다.
+
+    승인 파일은 "승인 시점" 값이고, 전송 계획은 재계산으로 허용오차 내에서
+    달라질 수 있습니다. VERIFY 는 이 기록(transmitted)을 기준으로 주문을
+    대조해야 실제 전송값과 승인값을 혼동하지 않습니다.
+    """
+    path = transmitted_plan_path(approval_path)
+    policy = normalize_tolerance_policy(plan.tolerance_policy) or {}
+    transmitted_hash = compute_plan_hash(
+        plan.plan_id,
+        plan.symbol,
+        plan.exchange,
+        plan.session,
+        plan.state_hash,
+        plan.settlement_run_id,
+        plan.orders,
+        plan.state_patch,
+        plan.evidence_id or plan.settlement_run_id,
+        plan.broker,
+        plan.broker_mode,
+        plan.account_id,
+        plan.created_at_utc,
+        plan.expires_at_utc,
+        plan.account_display,
+        policy,
+    )
+    payload = {
+        "plan_id": plan.plan_id,
+        "symbol": plan.symbol,
+        "exchange": plan.exchange,
+        "session": plan.session,
+        "approval_plan_hash": approval.get("plan_hash", ""),
+        "transmitted_plan_hash": transmitted_hash,
+        "state_hash": plan.state_hash,
+        "settlement_run_id": plan.settlement_run_id,
+        "evidence_id": plan.evidence_id or plan.settlement_run_id,
+        "orders": list(plan.orders or []),
+        "state_patch": dict(plan.state_patch or {}),
+        # VERIFY 가 transmitted_plan_hash 를 **독립 재계산**할 수 있도록 해시
+        # 입력 필드를 모두 남깁니다 (approval hash 와 같은 입력 집합).
+        "broker": plan.broker,
+        "broker_mode": plan.broker_mode,
+        "account_id": plan.account_id,
+        "account_display": plan.account_display,
+        "created_at_utc": plan.created_at_utc,
+        "expires_at_utc": plan.expires_at_utc,
+        # 승인 시점에 고정된 정책(해시 입력) + 실행 시점에 실제 적용한(더 좁힌)
+        # 유효 정책(감사용, 해시 비입력).
+        "tolerance_policy": policy,
+        "effective_tolerance_policy": effective_tolerance_policy(
+            approval.get("tolerance_policy")
+        )
+        or {},
+        "drift_within_tolerance": list(drift or []),
+        "source": "rebuilt" if drift is not None else "approval",
+        "recorded_at_utc": (
+            (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        ),
+    }
+    _atomic_write_json(path, payload)
+    print(f"[EXECUTE] 실제 전송 계획 기록: {path}")
+    return path
+
+
+def _assert_refresh_allowed(refresh):
+    """계획 재계산 생략(`refresh=False`)은 DRY/테스트에서만 허용합니다.
+
+    파이프라인의 핵심 보장은 "승인 시점 계획이 아니라 **실행 직전 재계산한**
+    계획만 전송한다" 입니다. LIVE 에서 재계산을 생략하면 승인 후 바뀐
+    시세·체결을 반영하지 않은 stale 주문이 그대로 나가므로, 브로커 조회/주문/
+    승인 소비 같은 **어떤 부수효과보다 먼저** fail-closed 로 거부합니다.
+    """
+    if refresh:
+        return
+    tb = _tb()
+    if str(getattr(tb, "TRADE_MODE", "")).strip().upper() == "DRY":
+        return
+    raise RuntimeError(
+        "refresh=False 는 DRY 모드에서만 허용됩니다 — LIVE 에서는 승인 계획을 "
+        "실행 직전에 반드시 다시 계산해야 합니다 (stale 주문 전송 금지)."
+    )
+
+
+def _assert_execute_phase_allowed():
+    """실행 함수 자체의 경계 게이트 — 호출자와 무관하게 LIVE+EXECUTE 만 허용합니다.
+
+    `main()`/`create_broker()` 의 RUN_PHASE 검증을 우회해 이 함수를 직접 호출해도
+    (DRY + 오래된 LIVE 승인 + 실제 브로커) 주문 API 에 도달할 수 없어야 합니다.
+    승인 로드/잠금/브로커 조회/주문 **이전에** 거부하므로 승인은 소비되지 않습니다.
+
+    RUN_PHASE 해석은 `broker.validate_run_phase()` 와 같습니다
+    (env, strip().upper(), 미설정="").
+    """
+    tb = _tb()
+    mode = str(getattr(tb, "TRADE_MODE", "")).strip().upper()
+    phase = os.getenv("RUN_PHASE", "").strip().upper()
+    if mode == "LIVE" and phase == "EXECUTE":
+        return
+    raise RuntimeError(
+        "execute_approved_plan() 은 TRADE_MODE=LIVE 이고 RUN_PHASE=EXECUTE 일 때만 "
+        f"실행할 수 있습니다 (현재 TRADE_MODE={mode or '미설정'}, "
+        f"RUN_PHASE={phase or '미설정'}) — 승인은 소비하지 않았습니다."
+    )
+
+
 def execute_approved_plan(
     broker, approval_or_id, approvals_dir=None, now=None, refresh=True,
     state_override=None,
 ):
+    """EXECUTE 진입점 — 전역 실행 잠금 안에서 승인 계획을 실행합니다."""
+    # 승인 로드/잠금/브로커 호출 전에 검사합니다 (승인은 소비되지 않습니다).
+    _assert_execute_phase_allowed()
+    _assert_refresh_allowed(refresh)
+    with global_lock():
+        return _execute_approved_plan(
+            broker,
+            approval_or_id,
+            approvals_dir=approvals_dir,
+            now=now,
+            refresh=refresh,
+            state_override=state_override,
+        )
+
+
+def _execute_approved_plan(
+    broker, approval_or_id, approvals_dir=None, now=None, refresh=True,
+    state_override=None,
+):
     """승인 파일을 검증·새로고침·취소확정한 뒤 1회 실행합니다.
+
+    `refresh=False` 는 DRY 전용 escape hatch 이며, LIVE 에서는 진입 즉시
+    거부됩니다 (`_assert_refresh_allowed`).
 
     순서:
       1) 승인 파일 로드 + state 재로드 + hash/session/expiry/broker 바인딩 검증
@@ -233,6 +437,10 @@ def execute_approved_plan(
       6) **파일 잠금 안에서** consumed=true 선점 + 실행 마커 + 디스크 재검증 + 주문 실행
          (실행 루프는 이 함수 안의 내부 함수 — 외부에서 호출할 수 없습니다)
     """
+    # 공개 진입점과 같은 fail-closed 검사를 여기서도 수행합니다 (직접 호출 방어).
+    # 위상 게이트는 승인/브로커/주문 그 무엇보다 먼저입니다.
+    _assert_execute_phase_allowed()
+    _assert_refresh_allowed(refresh)
     tb = _tb()
     approval = (
         approval_or_id
@@ -251,14 +459,29 @@ def execute_approved_plan(
             + " / ".join(blockers)
         )
 
+    # ── 0.5) 프리장 대기 → **대기 후** 전체 게이트 재실행 ─────────────
+    # 대기 전에 검증/재조회/전송을 하면 대기 중 바뀐 시세·체결을 반영하지 못합니다.
+    # (대기 후에는 추가 대기 없이 검증→선점→전송→주문을 연속 수행합니다.)
+    effective_now = _wait_until_pre_market(tb, now)
+    # 대기 중 다른 프로세스가 승인을 선점/변경했을 수 있으므로 디스크에서 다시 읽습니다.
+    approval = load_approval(path)
+
     symbol = approval.get("symbol", "")
     exchange = approval.get("exchange", "")
     state = state_override if state_override is not None else tb.load_state(symbol)
 
-    problems = verify_approval(approval, state, now=now)
+    problems = verify_approval(approval, state, now=effective_now)
     if problems:
         raise RuntimeError(
             "승인 검증 실패 — 주문을 실행하지 않습니다: " + " / ".join(problems)
+        )
+    # 승인 시점에 고정된 정책 + 현재 env 중 **더 좁은** 범위만 사용합니다.
+    # env 를 넓혀도 승인 범위를 넘을 수 없습니다 (넓히려면 재승인).
+    tolerance_policy = effective_tolerance_policy(approval.get("tolerance_policy"))
+    if tolerance_policy is None:
+        raise RuntimeError(
+            "승인 파일의 허용오차 정책을 확인할 수 없어 주문을 실행하지 않습니다 "
+            "— 재승인(PREVIEW→APPROVE)이 필요합니다."
         )
     assert_no_pending_fence(state, symbol)
 
@@ -290,9 +513,37 @@ def execute_approved_plan(
         )
 
     # ── 3b) 승인 후 새 체결/잔고 불일치 재확인 (계획 재계산보다 먼저) ──
-    assert_reconciliation_current(symbol, state, order_history, balance)
+    # SETTLE 이 실행 세션으로 **미룬** 체결(프리마켓 등)은 state 워터마크 앞이라
+    # 새 체결처럼 보이지만, 그 세션의 다음 SETTLE 에서 반영될 예정입니다.
+    # 잔고 교차검증으로 포지션 변화가 정확히 설명될 때만 허용 목록에 넣고,
+    # 그 외 새 체결/불일치는 기존처럼 fail-closed 로 중단합니다.
+    accepted_deferred_rows = _assert_reconciliation_with_deferred(
+        symbol, state, order_history, balance, context="EXECUTE"
+    )
 
+    # 승인 계획은 **허용오차 게이트**일 뿐, 실제 전송 대상이 아닙니다.
+    # 실행 직전 재계산한 계획(허용오차 내 드리프트 반영)을 전송합니다.
+    rebuilt = None
+    drift = []
     if refresh:
+        # SETTLE 이 실행 세션으로 미룬 매수는 state.net_invested 에 아직 없습니다.
+        # 재계산 계획의 **시드 캡에만** 그 금액을 더합니다 (수량 reconciliation 은
+        # 달러 초과를 막지 못함 — P1). 금액 미확정 매수가 있으면 추정하지 않고
+        # 정산 전까지 실행을 차단합니다 (fail-closed).
+        deferred_spend, pending_deferred = _deferred_buy_spend(
+            state, order_history, deferred_rows=accepted_deferred_rows
+        )
+        if pending_deferred:
+            raise tb.SymbolScopedError(
+                f"{symbol} 미룬 매수 체결의 금액이 확정되지 않았거나 방향을 "
+                f"해석할 수 없습니다 (odno: {', '.join(pending_deferred[:5])}) — "
+                "시드 캡을 정확히 계산할 수 없어 SETTLE 전까지 실행을 중단합니다."
+            )
+        net_invested_overlay = None
+        if deferred_spend > 0:
+            net_invested_overlay = (
+                float(state.get("net_invested", 0.0) or 0.0) + deferred_spend
+            )
         try:
             symbol_config = _symbol_config(symbol)
             settled = settled_from_state(
@@ -300,27 +551,34 @@ def execute_approved_plan(
                 state=state,
                 settlement_run_id=approval.get("settlement_run_id", ""),
             )
-            rebuilt = build_order_plan(settled, broker)
+            rebuilt = build_order_plan(
+                settled, broker, net_invested_overlay=net_invested_overlay
+            )
         except Exception as error:
             raise RuntimeError(
                 f"{symbol} 실행 전 계획 재계산 실패 — 주문을 실행하지 않습니다: {error}"
             ) from error
-        drift = compare_order_plans(approval.get("orders") or [], rebuilt.orders)
+        drift = compare_order_plans(
+            approval.get("orders") or [], rebuilt.orders, policy=tolerance_policy
+        )
         if drift:
             raise RuntimeError(
                 f"{symbol} 승인 계획과 현재 계획이 허용 오차를 벗어났습니다 — "
                 "재승인(PREVIEW→APPROVE)이 필요합니다: " + " / ".join(drift[:4])
             )
 
-    # ── 4) 매도 합계 <= 보유수량 ──
-    _assert_sell_within_holdings(approval.get("orders") or [], balance, symbol)
+    # ── 4) 매도 합계 <= 보유수량 (전송할 계획 기준) ──
+    transmission_orders = rebuilt.orders if rebuilt is not None else (
+        approval.get("orders") or []
+    )
+    _assert_sell_within_holdings(transmission_orders, balance, symbol)
 
     # ── 5) 취소 확정 (실패 시 승인 소비하지 않음) ──
     try:
         confirm_open_orders_cancelled(broker, symbol, exchange, state, order_history)
     except Exception as error:
         _write_outcome_record(
-            approval, "approval-skipped", f"cancel-confirm: {error}", now=now
+            approval, "approval-skipped", f"cancel-confirm: {error}", now=effective_now
         )
         raise
 
@@ -335,12 +593,12 @@ def execute_approved_plan(
                 + " / ".join(blockers)
             )
         try:
-            claimed_latest = _claim_approval_locked(path, now=now)
+            claimed_latest = _claim_approval_locked(path, now=effective_now)
         except Exception as error:
             # 선점 경합/실패는 기존 결과 기록을 덮어쓰지 않습니다.
             if not approval_execution_blockers(path):
                 _write_outcome_record(
-                    approval, "approval-skipped", f"claim: {error}", now=now
+                    approval, "approval-skipped", f"claim: {error}", now=effective_now
                 )
             raise
         approval["consumed"] = True
@@ -350,9 +608,34 @@ def execute_approved_plan(
         # 실행 함수/핸들을 두지 않으므로, 같은 프로세스에서 import 해 임의
         # 계획/state 로 주문 루프에 진입할 수 없습니다 (P0).
         try:
-            approval, state = _reload_approved_plan(path, now=now)
+            approval, state = _reload_approved_plan(path, now=effective_now)
             plan = _plan_from_approval(approval)
+            if rebuilt is not None:
+                # 재로드한 승인(디스크)과 재계산 계획을 다시 대조합니다. 이 시점의
+                # state 는 state_hash 로 승인과 동일함이 보장됩니다 (fail-closed).
+                drift = compare_order_plans(
+                    approval.get("orders") or [],
+                    rebuilt.orders,
+                    policy=tolerance_policy,
+                )
+                if drift:
+                    raise RuntimeError(
+                        f"{symbol} 승인 계획과 현재 계획이 허용 오차를 벗어났습니다 — "
+                        "재승인(PREVIEW→APPROVE)이 필요합니다: " + " / ".join(drift[:4])
+                    )
+                # 승인 id/바인딩은 유지하고, 전송 내용만 재계산 계획으로 교체합니다.
+                plan.orders = list(rebuilt.orders)
+                plan.state_patch = dict(getattr(rebuilt, "state_patch", {}) or {})
+                plan.strategy_result = dict(getattr(rebuilt, "strategy_result", {}) or {})
             state = apply_state_patch(state, getattr(plan, "state_patch", None))
+            _assert_sell_within_holdings(plan.orders, balance, symbol)
+            # 선점(consumed=true) 이후에만 기록합니다. approval-skipped 는 선점 전
+            # 중단이므로 아무 sidecar 도 남기지 않습니다. 이 기록은 전송/결과
+            # 기록과 같은 잠금 경계 안에서 원자적으로 남깁니다.
+            _write_execute_deferred_record(
+                path, approval, accepted_deferred_rows, now=effective_now
+            )
+            _write_transmitted_plan(path, plan, approval, drift=drift, now=effective_now)
 
             def _run_orders():
                 tb = _tb()
@@ -366,17 +649,9 @@ def execute_approved_plan(
                 print("\n[Step 4] 주문 실행 중...")
                 print("-" * 60)
 
-                # Real+LIVE: 프리장 오픈 전이면 KST 기준으로 대기
-                if tb.BROKER_MODE == "real" and tb.TRADE_MODE == "LIVE":
-                    now_kst = tb.get_kst_now()
-                    is_dst = tb.is_us_dst()
-                    pre_market_open_hour = 17 if is_dst else 18
-                    if now_kst.hour < pre_market_open_hour:
-                        target = now_kst.replace(hour=pre_market_open_hour, minute=0, second=0, microsecond=0)
-                        wait_seconds = (target - now_kst).total_seconds()
-                        print(f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → {target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)")
-                        tb.time.sleep(wait_seconds)
-
+                # 프리장 대기는 execute_approved_plan() 진입 시 **이미** 끝냈습니다.
+                # (대기 후 전체 게이트를 다시 통과한 뒤 선점/전송하므로 여기서 또
+                #  기다리면 검증과 주문 사이에 다시 시차가 생깁니다.)
                 order_exchange_code = broker.exchange_code(exchange)
 
                 # ── 잔여 주문 정리 ────────────────────────────────────────────
@@ -655,27 +930,28 @@ def execute_approved_plan(
                     "reserved": len(reserved_orders),
                     "failed": len(failed_orders),
                     "errors": [order["error"] for order in failed_orders],
+                    "transmitted_orders": list(orders),
                 }
 
             result = _run_orders()
         except Exception as error:
             _write_outcome_record(
-                approval, "execution-failed", str(error), now=now
+                approval, "execution-failed", str(error), now=effective_now
             )
             raise
         # 부분 실패(일부 주문 미접수/불확실)도 성공으로 기록하지 않습니다.
         if int(result.get("failed", 0) or 0) > 0:
             reason = " / ".join(result.get("errors") or []) or "일부 주문 실패"
             result["outcome"] = "execution-failed"
-            _write_outcome_record(approval, "execution-failed", reason, now=now)
+            _write_outcome_record(approval, "execution-failed", reason, now=effective_now)
             return result
         # 깨끗한 실행 — VERIFY 가 성공으로 판정할 수 있게 **명시적** 기록을 남깁니다.
         result["outcome"] = "executed"
         _write_outcome_record(
             approval,
             "executed",
-            f"orders={len(approval.get('orders') or [])}",
-            now=now,
+            f"orders={len(result.get('transmitted_orders') or approval.get('orders') or [])}",
+            now=effective_now,
         )
         return result
 
@@ -700,4 +976,5 @@ def _plan_from_approval(approval):
         broker_mode=approval.get("broker_mode", ""),
         account_id=approval.get("account_id", ""),
         account_display=approval.get("account_display", ""),
+        tolerance_policy=dict(approval.get("tolerance_policy") or {}),
     )
