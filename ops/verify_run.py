@@ -227,6 +227,108 @@ def _unregistered_expected_shares(orders, fills):
     return shares
 
 
+def _independent_odno_hash(odno):
+    """공개 로그용 주문번호 가명 해시 (state.mask_odno 와 **독립 구현**)."""
+    import hashlib
+
+    return "ord#" + hashlib.sha256(str(odno).encode("utf-8")).hexdigest()[:8]
+
+
+def _legacy_zero_marker_unproven(meta):
+    """등록 메타의 수량 마커가 유효한 0 이면서 '미반영 증명'(버전+금액 0.0)이 없는지 판정합니다."""
+    valid, qty = _parse_qty_marker(meta)
+    if not valid or qty != 0:
+        return False
+    if meta.get("fill_marker_version") != 1:
+        return True
+    raw = meta.get("processed_filled_amount")
+    if raw is None or isinstance(raw, bool):
+        return True
+    try:
+        return abs(float(raw)) >= 1e-9
+    except (TypeError, ValueError):
+        return True
+
+
+def _verify_skipped_unverified(evidence):
+    """증명 불가로 '건너뛴' 과거 주문 감사 내역(skipped_unverified)을 독립 검증합니다.
+
+    건너뛰기는 에러 없이 지나가므로 정당성과 누락을 따로 확인하지 않으면
+    (1) 정상 신규 체결을 잘못 건너뛰거나 (2) 건너뛰었다고 적고 실제로는 반영하거나
+    (3) 건너뛰지도 반영하지도 않은 주문이 조용히 사라질 수 있습니다.
+
+    - 각 항목: 해시 일치, 사유 토큰, 워터마크 이전, 등록 메타의 레거시 0 마커(증명 불가),
+      이력 체결수량 일치, 반영(orders)에 없음, 마커 불변
+    - 누락: 같은 조건의 과거 체결이 건너뜀 목록에도 반영 목록에도 없으면 실패
+    - 반영: 증명 불가 과거 주문이 반영됐으면 실패 (72건 재반영 사고의 직접 검출)
+    """
+    problems = []
+    skipped = evidence.get("skipped_unverified") or []
+    if not isinstance(skipped, list):
+        return ["skipped_unverified 형식 오류 (목록이 아님)"]
+    pre_meta = evidence.get("orders_meta_before")
+    post_meta = evidence.get("orders_meta_after")
+    if not isinstance(pre_meta, dict):
+        # 구버전 근거: 판정 근거가 없으므로 건너뛴 항목이 있을 때만 검증 불가로 처리합니다.
+        return ["skipped_unverified 검증 불가 (orders_meta_before 없음)"] if skipped else []
+    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    applied = {
+        str(o.get("odno")) for o in (evidence.get("orders") or []) if o.get("odno") is not None
+    }
+    listed = set()
+    for entry in skipped:
+        odno = str(entry.get("odno", "")) if isinstance(entry, dict) else ""
+        if not odno:
+            problems.append("skipped_unverified 항목에 odno 가 없습니다")
+            continue
+        label = _independent_odno_hash(odno)
+        listed.add(odno)
+        if entry.get("odno_hash") != label:
+            problems.append(f"{label} 건너뜀 항목의 odno_hash 가 주문번호와 일치하지 않습니다")
+        if entry.get("reason") != "legacy_zero_marker_unproven":
+            problems.append(f"{label} 건너뜀 사유가 알 수 없는 값입니다: {entry.get('reason')!r}")
+        fill = fills.get(odno)
+        if fill is None:
+            problems.append(f"{label} 건너뜀 주문이 이력(fills)에 없습니다")
+            continue
+        if _fill_after_watermark(fill, evidence):
+            problems.append(f"{label} 건너뜀 주문이 워터마크 이후 신규 체결입니다 (잘못된 건너뛰기)")
+        if not _legacy_zero_marker_unproven(pre_meta.get(odno)):
+            problems.append(f"{label} 건너뜀 주문의 반영 전 마커가 레거시 0 마커가 아닙니다")
+        if _as_int(entry.get("filled_qty")) != _as_int(fill.get("qty")):
+            problems.append(
+                f"{label} 건너뜀 체결수량 불일치: 기록 {entry.get('filled_qty')} vs 이력 {fill.get('qty')}"
+            )
+        if odno in applied:
+            problems.append(f"{label} 건너뛰었다고 기록됐지만 반영 내역(orders)에도 있습니다")
+        if isinstance(post_meta, dict) and post_meta.get(odno) != pre_meta.get(odno):
+            problems.append(f"{label} 건너뛴 주문의 마커가 변경됐습니다")
+
+    for odno, fill in fills.items():
+        meta = pre_meta.get(odno)
+        if odno in listed or not isinstance(meta, dict):
+            continue
+        if _fill_after_watermark(fill, evidence):
+            continue
+        if not _legacy_zero_marker_unproven(meta) or _as_int(fill.get("qty")) <= 0:
+            continue
+        # 리버스 주문·금액 미확정은 다른 경로(reconcile / 금액 확정 대기)가 담당합니다.
+        if fill.get("reverse_action") or meta.get("reverse_action"):
+            continue
+        if not fill.get("amount_confirmed", True):
+            continue
+        label = _independent_odno_hash(odno)
+        if odno in applied:
+            problems.append(
+                f"{label} 증명 불가 과거 주문(레거시 0 마커)이 재반영됐습니다 (이중 가산 의심)"
+            )
+        else:
+            problems.append(
+                f"{label} 증명 불가 과거 주문이 건너뜀 목록에도 반영 내역에도 없습니다 (감사 누락)"
+            )
+    return problems
+
+
 def _verify_fill_markers(evidence):
     """체결 마커(processed_filled_qty/amount) 무결성을 검사합니다.
 
@@ -919,6 +1021,7 @@ def _recompute_expected_ordered(evidence):
     if evidence.get("basis_unknown"):
         problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
     problems.extend(_verify_fill_markers(evidence))
+    problems.extend(_verify_skipped_unverified(evidence))
     t_before = evidence.get("T_before")
     money_before = evidence.get("net_invested_before")
     if t_before is None or money_before is None:
@@ -1194,6 +1297,7 @@ def _recompute_expected(evidence):
         orders, evidence.get("fills") or []
     )
     problems.extend(_verify_fill_markers(evidence))
+    problems.extend(_verify_skipped_unverified(evidence))
 
     # 묶음 직전 보유량 (독립 계산) — 매도 기준선 대조에 사용
     position = None

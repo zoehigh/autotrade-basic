@@ -84,6 +84,11 @@ on:
       # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
       FINNHUB_API_KEY:
         required: false
+      # 정산 근거 암호화 (없으면 STATE_BACKUP_PASSPHRASE 로 대체)
+      EVIDENCE_PASSPHRASE:
+        required: false
+      STATE_BACKUP_PASSPHRASE:
+        required: false
 
 jobs:
   run-trade:
@@ -319,15 +324,44 @@ jobs:
           path: .state.json
           key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
 
-      - name: 정산 근거 업로드
+      # 정산 근거에는 원문 주문번호(skipped_unverified 등)가 들어 있습니다. 공개 저장소의
+      # Artifact 는 로그인한 누구나 받을 수 있으므로 **암호화한 파일만** 업로드합니다.
+      # 암호문 생성이 불가능하면(패스프레이즈 없음/gpg 없음) 평문을 올리지 않고 실패합니다.
+      - name: 정산 근거 암호화
+        if: always()
+        shell: bash
+        env:
+          PASSPHRASE: ${{ secrets.EVIDENCE_PASSPHRASE || secrets.STATE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(settlement-*.json final-settlement-*.json)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::warning::암호화할 정산 근거 파일이 없습니다"
+            exit 0
+          fi
+          if [[ -z "$PASSPHRASE" ]]; then
+            echo "::error::EVIDENCE_PASSPHRASE(또는 STATE_BACKUP_PASSPHRASE)가 없어 정산 근거를 업로드하지 않습니다"
+            exit 1
+          fi
+          command -v gpg > /dev/null || { echo "::error::gpg 가 없어 정산 근거를 암호화할 수 없습니다"; exit 1; }
+          tar czf evidence.tgz "${files[@]}"
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --symmetric \
+              --cipher-algo AES256 --s2k-digest-algo SHA256 \
+              --output evidence.tgz.gpg evidence.tgz
+          test -s evidence.tgz.gpg
+          rm -f evidence.tgz
+
+      - name: 정산 근거 업로드 (암호화본만)
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: settlement-evidence-${{ github.run_id }}
-          path: |
-            settlement-*.json
-            final-settlement-*.json
+          path: evidence.tgz.gpg
           if-no-files-found: warn
+          retention-days: 14
 
   # 정산 근거 독립 검산 — 브로커 계좌 API 호출 없이 evidence 만 검증합니다.
   verify-settlement:
@@ -335,6 +369,7 @@ jobs:
     # 거래 job 이 실패해도 evidence 가 있으면 검증하고, 없으면 검증 불가로 실패합니다.
     if: always()
     uses: ./.github/workflows/verify.yml
+    secrets: inherit
     with:
       broker: ${{ inputs.broker || 'kis' }}
       broker_mode: ${{ inputs.broker_mode || 'demo' }}

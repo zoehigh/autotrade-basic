@@ -337,3 +337,114 @@ def test_main_notes_missing_symbol_line_and_treats_as_zero(
     assert "TQQQ 종목별 실행 결과 라인이 없습니다" in out
     assert "TQQQ 접수된 주문이 이력에 없습니다" not in out
     assert "SOXL 접수된 주문이 이력에 없습니다" in out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# B4 — skipped_unverified(증명 불가 과거 주문 건너뛰기) 독립 검증
+# ═══════════════════════════════════════════════════════════════════
+BEFORE_WATERMARK = "2026-09-20T09:00:00+00:00"
+
+
+def _skipped_evidence(**overrides):
+    """워터마크 이전 레거시 0 마커 주문 1건을 건너뛴 정상 근거."""
+    meta = {"side": "BUY", "total_qty": 10, "t_target": 1.0, "processed_filled_qty": 0}
+    evidence = _evidence(
+        orders_meta_before={"OLD1": dict(meta)},
+        orders_meta_after={"OLD1": dict(meta)},
+        fills=[{
+            "odno": "OLD1", "qty": 10, "amount": 100.0,
+            "amount_confirmed": True, "ts": BEFORE_WATERMARK,
+        }],
+        skipped_unverified=[{
+            "odno": "OLD1",
+            "odno_hash": verify_run._independent_odno_hash("OLD1"),
+            "filled_qty": 10,
+            "ts": BEFORE_WATERMARK,
+            "reason": "legacy_zero_marker_unproven",
+        }],
+    )
+    evidence.update(overrides)
+    return evidence
+
+
+def test_skipped_unverified_valid_entry_passes():
+    assert verify_run._verify_skipped_unverified(_skipped_evidence()) == []
+
+
+def test_skipped_unverified_hash_matches_state_mask():
+    from state import mask_odno
+    assert verify_run._independent_odno_hash("39445") == mask_odno("39445")
+
+
+def test_skipped_unverified_wrong_hash_or_reason_fails():
+    ev = _skipped_evidence()
+    ev["skipped_unverified"][0]["odno_hash"] = "ord#deadbeef"
+    ev["skipped_unverified"][0]["reason"] = "whatever"
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("odno_hash" in p for p in problems), problems
+    assert any("사유" in p for p in problems), problems
+
+
+def test_skipped_unverified_new_fill_wrongly_skipped_fails():
+    """워터마크 이후 신규 체결을 건너뛰면(신규 체결 누락) 실패해야 합니다."""
+    ev = _skipped_evidence()
+    ev["fills"][0]["ts"] = AFTER_WATERMARK
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("잘못된 건너뛰기" in p for p in problems), problems
+
+
+def test_skipped_unverified_versioned_zero_marker_cannot_be_skipped():
+    """버전 표식이 있는 0 마커는 미반영이 증명되므로 건너뛰면 안 됩니다."""
+    ev = _skipped_evidence()
+    for key in ("orders_meta_before", "orders_meta_after"):
+        ev[key]["OLD1"].update({"fill_marker_version": 1, "processed_filled_amount": 0.0})
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("레거시 0 마커가 아닙니다" in p for p in problems), problems
+
+
+def test_skipped_unverified_claimed_skipped_but_applied_fails():
+    ev = _skipped_evidence(orders=[{"odno": "OLD1", "qty_delta": 10, "amount_delta": 100.0}])
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("반영 내역(orders)에도 있습니다" in p for p in problems), problems
+
+
+def test_skipped_unverified_marker_changed_fails():
+    ev = _skipped_evidence()
+    ev["orders_meta_after"]["OLD1"]["processed_filled_qty"] = 10
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("마커가 변경" in p for p in problems), problems
+
+
+def test_skipped_unverified_qty_mismatch_fails():
+    ev = _skipped_evidence()
+    ev["skipped_unverified"][0]["filled_qty"] = 3
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("체결수량 불일치" in p for p in problems), problems
+
+
+def test_skipped_unverified_unlisted_past_zero_marker_is_audit_gap():
+    """건너뜀 목록·반영 내역 어디에도 없는 증명 불가 과거 주문은 감사 누락입니다."""
+    problems = verify_run._verify_skipped_unverified(_skipped_evidence(skipped_unverified=[]))
+    assert any("감사 누락" in p for p in problems), problems
+
+
+def test_skipped_unverified_reapplied_past_zero_marker_is_flagged():
+    """72건 사고 형태: 건너뜀 없이 과거 0 마커 주문이 반영된 경우."""
+    ev = _skipped_evidence(
+        skipped_unverified=[],
+        orders=[{"odno": "OLD1", "qty_delta": 10, "amount_delta": 100.0}],
+    )
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("재반영" in p for p in problems), problems
+
+
+def test_skipped_unverified_reverse_order_not_flagged():
+    """리버스 주문은 reconcile 경로가 담당하므로 감사 누락으로 보지 않습니다."""
+    ev = _skipped_evidence(skipped_unverified=[])
+    ev["fills"][0]["reverse_action"] = "SELL"
+    assert verify_run._verify_skipped_unverified(ev) == []
+
+
+def test_skipped_unverified_is_part_of_full_verification():
+    problems = verify_run._verify_evidence(_skipped_evidence(skipped_unverified=[]))
+    assert any("감사 누락" in p for p in problems), problems

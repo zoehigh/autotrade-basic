@@ -53,6 +53,59 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true")
 
 
+# ── 소켓 계층 차단 (수집·import 단계 포함) ─────────────────────────────
+# autouse fixture 는 테스트 함수 실행 시점에만 적용되고 `requests.Session.request` 만 막습니다.
+# 수집(collection)·모듈 import 중 호출이나 urllib/http.client/httpx 등 다른 경로는
+# 소켓 연결·DNS 조회 단계에서 막아야 합니다. conftest import 시점(= 수집 전)에 설치합니다.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
+
+
+def _is_local_address(address) -> bool:
+    if isinstance(address, (str, bytes, os.PathLike)):  # AF_UNIX
+        return True
+    host = address[0] if address else ""
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "ignore")
+    return host in _LOCAL_HOSTS or str(host).startswith("127.")
+
+
+def _install_socket_guard():
+    import socket
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _deny(what, target):
+        raise RuntimeError(
+            f"[테스트 차단] 외부 네트워크 접근 금지({what}): {target} "
+            f"(실 API 테스트는 RUN_BROKER_API_TESTS=1 로 opt-in)"
+        )
+
+    def guarded_connect(self, address):
+        if not _is_local_address(address):
+            _deny("connect", address)
+        return real_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        if not _is_local_address(address):
+            _deny("connect_ex", address)
+        return real_connect_ex(self, address)
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if host not in _LOCAL_HOSTS and not str(host).startswith("127."):
+            _deny("DNS", host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    socket.getaddrinfo = guarded_getaddrinfo
+
+
+if not _env_flag("RUN_BROKER_API_TESTS"):
+    _install_socket_guard()
+
+
 @pytest.fixture(autouse=True)
 def _block_external_http(monkeypatch):
     """기본 실행에서는 외부 HTTP를 원천 차단합니다 (마커 누락 테스트가 실 API를 쳐도 막힘).
@@ -225,3 +278,76 @@ def mock_response_factory():
             resp.raise_for_status = MagicMock()
         return resp
     return _create
+
+
+# ── 실제 백업 재생 테스트 결과 기록 ─────────────────────────────────────
+# 외부 백업(STATE_AUDIT_DIR)이 없으면 test_real_state_replay 는 skip 되어 "통과"처럼 보일 수 있습니다.
+# 실행 여부·입력 파일 해시·테스트별 결과를 터미널 요약에 항상 남기고,
+# REPLAY_REPORT_PATH 가 있으면 JSON 으로도 저장합니다 (파일 내용은 담지 않고 이름+sha256 만 기록).
+_REPLAY_MODULE = "test_real_state_replay"
+_replay_outcomes: dict = {}
+
+
+def pytest_runtest_logreport(report):
+    if _REPLAY_MODULE not in report.nodeid:
+        return
+    name = report.nodeid.split("::")[-1]
+    if report.when == "call" or (report.when == "setup" and report.outcome != "passed"):
+        _replay_outcomes[name] = report.outcome
+
+
+def _replay_input_hashes() -> list:
+    import hashlib
+
+    audit = Path(os.getenv("STATE_AUDIT_DIR", str(Path.home() / "state-audit")))
+    names = [f"{b}-before.json" for b in ("kis", "kiwoom", "nhplug")]
+    names += sorted(p.name for p in audit.glob("settlement-evidence-*.zip")) if audit.is_dir() else []
+    rows = []
+    for name in names:
+        path = audit / name
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        rows.append({"file": name, "sha256": digest})
+    return rows
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not _replay_outcomes:
+        return  # 이번 실행에 재생 테스트가 선택되지 않음
+    executed = any(v == "passed" or v == "failed" for v in _replay_outcomes.values())
+    inputs = _replay_input_hashes()
+    terminalreporter.write_sep("-", "실제 백업 재생 검증 기록")
+    if executed:
+        terminalreporter.write_line(
+            "실행됨: " + ", ".join(f"{k}={v}" for k, v in sorted(_replay_outcomes.items()))
+        )
+    else:
+        terminalreporter.write_line(
+            "⚠️ 건너뜀 — 실제 백업/Evidence 가 없어 72건 차단·16건 반영 재생이 검증되지 않았습니다 "
+            "(STATE_AUDIT_DIR 확인). 이 실행의 통과 결과는 재생 검증을 포함하지 않습니다."
+        )
+    for row in inputs:
+        terminalreporter.write_line(f"  입력 {row['file']}: {row['sha256'] or '없음'}")
+    report_path = os.getenv("REPLAY_REPORT_PATH", "").strip()
+    if report_path:
+        import json
+        import platform
+        import subprocess
+        from datetime import datetime, timezone
+
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent.parent,
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            head = ""
+        record = {
+            "executed": executed,
+            "outcomes": dict(sorted(_replay_outcomes.items())),
+            "inputs": inputs,
+            "git_head": head,
+            "python": platform.python_version(),
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        Path(report_path).write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        terminalreporter.write_line(f"기록 저장: {report_path}")

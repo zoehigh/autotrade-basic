@@ -43,6 +43,11 @@ on:
         required: false
         type: string
         default: settlement-evidence
+    secrets:
+      EVIDENCE_PASSPHRASE:
+        required: false
+      STATE_BACKUP_PASSPHRASE:
+        required: false
 
 jobs:
   verify:
@@ -73,6 +78,30 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}
           path: evidence
+
+      # 업로드된 근거는 암호화본(evidence.tgz.gpg)입니다. 복호화 실패는 검증 불가로 실패합니다.
+      # (평문 파일이 이미 있는 구버전 artifact 수동 검증은 그대로 허용)
+      - name: 정산 근거 복호화
+        shell: bash
+        env:
+          PASSPHRASE: ${{ secrets.EVIDENCE_PASSPHRASE || secrets.STATE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          enc=(evidence/*.gpg)
+          if [[ ${#enc[@]} -eq 0 ]]; then
+            echo "[정보] 암호화본이 없습니다 (근거 없음 또는 구버전 평문 artifact)"
+            exit 0
+          fi
+          if [[ -z "$PASSPHRASE" ]]; then
+            echo "::error::복호화 패스프레이즈가 없어 정산 근거를 검증할 수 없습니다"
+            exit 1
+          fi
+          for f in "${enc[@]}"; do
+            printf '%s' "$PASSPHRASE" |
+              gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                --decrypt "$f" | tar xz -C evidence
+          done
 
       - name: 정산 근거 독립 검산
         env:
