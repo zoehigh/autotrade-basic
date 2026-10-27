@@ -10,6 +10,7 @@
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -575,21 +576,54 @@ def build_settlement_evidence(
     return evidence
 
 
-def _force_t_in_dry_message(symbol_configs):
-    """DRY 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
+def _force_t_mode_block_message(mode, symbol_configs):
+    """DRY·LIVE 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
 
-    DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다. FORCE_T 는 T·orders_meta·원장·워터마크를
-    덮어쓰고 저장하는 명시적 복구이므로 DRY 에서 적용하면 로컬 .state.json 이 바뀝니다.
-    복구·보정은 TRADE_MODE=REPAIR 로 실행해야 합니다.
+    FORCE_T 는 T·orders_meta·reverse_mode·정산 원장·워터마크를 덮어쓰고 저장하는 명시적 복구입니다.
+    - DRY 는 state 를 저장하지 않는 읽기 전용 미리보기라 적용하면 로컬 .state.json 이 바뀝니다.
+    - LIVE 는 보정이 적용된 **같은 실행에서 주문 단계까지** 진행할 수 있어 복구와 주문이 결합됩니다.
+    복구·보정은 TRADE_MODE=REPAIR 로만 실행합니다 (주문 없음).
     """
     names = [str(c.get("symbol")) for c in symbol_configs if c.get("force_t") is not None]
-    if not names:
+    if not names or mode not in ("DRY", "LIVE"):
         return ""
     keys = ", ".join(f"{n}_FORCE_T" for n in names)
+    if mode == "LIVE":
+        reason = "LIVE 에서는 보정과 주문이 한 실행에 결합되므로 허용하지 않습니다"
+    else:
+        reason = "DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다"
     return (
-        f"TRADE_MODE=DRY 에서는 {keys} 를 적용할 수 없습니다 (DRY 는 state 를 저장하지 않는 읽기 전용 미리보기). "
-        "state 를 저장하지 않고 중단합니다. T 보정은 TRADE_MODE=REPAIR 로 실행하세요."
+        f"TRADE_MODE={mode} 에서는 {keys} 를 적용할 수 없습니다 ({reason}). "
+        "state 저장·브로커 호출·주문 없이 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용됩니다."
     )
+
+
+def _validate_reinference_t(symbol, new_t, max_t):
+    """REPAIR 재추정 결과를 저장해도 되는지 검증합니다 (문제가 없으면 빈 문자열).
+
+    - 추정 T 와 MAX_T 는 유한한 유효 숫자여야 합니다 (None 인 MAX_T 는 상한 없음으로 건너뜁니다).
+    - T > MAX_T 이면 **저장을 거부**합니다. 상한으로 잘라 저장하면 T 가 그만큼 부풀려진 원인
+      (정산 오류 등)을 숨길 수 있으므로 원인 확인을 요구합니다.
+    """
+    def _is_number(value):
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        )
+
+    if not _is_number(new_t):
+        return f"{symbol} 재추정 T 가 유효한 숫자가 아닙니다: {new_t!r}"
+    if max_t is None:
+        return ""
+    if not _is_number(max_t) or max_t < 0:
+        return f"{symbol} MAX_T 가 유효한 숫자가 아닙니다: {max_t!r}"
+    if new_t > max_t:
+        return (
+            f"{symbol} 재추정 T={new_t} 가 설정된 상한 MAX_T={max_t} 를 초과합니다 — 저장을 거부합니다 "
+            f"(상한으로 잘라 저장하면 정산 오류를 숨길 수 있습니다. 초과 원인을 확인하세요)"
+        )
+    return ""
 
 
 def run_one_symbol(broker: Broker, symbol_config):
@@ -611,8 +645,8 @@ def run_one_symbol(broker: Broker, symbol_config):
     seed = symbol_config["seed"]
     additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
 
-    # DRY 에서 FORCE_T 는 state 를 저장하게 되므로 어떤 조회·변경보다 먼저 막습니다.
-    _force_t_block = _force_t_in_dry_message([symbol_config]) if TRADE_MODE == "DRY" else ""
+    # DRY(저장 금지)·LIVE(복구와 주문 결합)에서 FORCE_T 는 어떤 조회·변경보다 먼저 막습니다.
+    _force_t_block = _force_t_mode_block_message(TRADE_MODE, [symbol_config])
     if _force_t_block:
         raise RuntimeError(_force_t_block)
 
@@ -656,7 +690,8 @@ def run_one_symbol(broker: Broker, symbol_config):
     from config import FORCE_T_REINFERENCE as _force_reinference, TRADE_MODE as _trade_mode
     if _force_reinference:
         if _trade_mode == "LIVE":
-            print("[T 보정] FORCE_T_REINFERENCE=true 이지만 TRADE_MODE=LIVE입니다 — 주문 방지를 위해 DRY로 전환합니다.")
+            print("[T 보정] FORCE_T_REINFERENCE=true + LIVE → 주문 방지를 위해 DRY(미리보기)로 전환합니다. "
+                  "state 는 저장되지 않습니다 (실제 저장은 TRADE_MODE=REPAIR).")
             import config as _cfg
             _cfg.TRADE_MODE = "DRY"
         if state.get("last_updated"):
@@ -791,6 +826,9 @@ def run_one_symbol(broker: Broker, symbol_config):
             print(f"  → 포지션 기반 값으로 설정하려면 {symbol}_FORCE_T={T_position} 환경변수를 추가하고 재실행하세요")
 
     # ── T값 상한 적용 (MAX_T) ──
+    if max_t is not None and (_force_reinference or TRADE_MODE == "DRY"):
+        # 미리보기 진단: 원시 추정 T 와 상한 적용 후 T 를 함께 보여줍니다.
+        print(f"[T 보정] {symbol} 원시 추정 T={state['T']}, 상한 MAX_T={max_t} → 적용 T={min(state['T'], max_t)}")
     if max_t is not None and state["T"] > max_t:
         print(f"[T 보정] {symbol} T={state['T']} > MAX_T={max_t} → T={max_t}로 조정")
         state["T"] = max_t
@@ -2375,6 +2413,10 @@ def _repair_reinference():
 
     기존 main()의 FORCE_T_REINFERENCE 처리를 모방하지만, REPAIR 모드 전용으로
     브로커/전략/주문 없이 T 재추정만 수행합니다.
+
+    **전 종목을 먼저 재추정·검증한 뒤에만 저장합니다.** 한 종목이라도 검증에 실패하면(재추정 T가
+    MAX_T 초과, 숫자 오류) 어떤 종목도 저장하지 않고 종료 코드 1 로 끝납니다 — 일부 종목만 먼저
+    저장되는 부분 복구를 막기 위함입니다. T 를 MAX_T 로 잘라 저장하지 않습니다(정산 오류 은폐 방지).
     """
     import config as runtime_config
     # REPAIR는 LIVE이더라도 DRY로 고정 (T 재추정 중 주문 방지)
@@ -2385,9 +2427,12 @@ def _repair_reinference():
 
     broker = create_broker()
     try:
+        planned = []   # (symbol, 재추정된 state)
+        failures = []
         for symbol_config in SYMBOLS:
             symbol = symbol_config["symbol"]
             exchange = symbol_config["exchange"]
+            max_t = symbol_config.get("max_t")
             print(f"\n[REPAIR:REINFERENCE] {symbol} T 재추정 시작")
             state = load_state(symbol)
 
@@ -2405,6 +2450,19 @@ def _repair_reinference():
                 live_qty = None
 
             state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
+            print(f"[REPAIR:REINFERENCE] {symbol} 재추정 T={state['T']}, 상한 MAX_T={max_t}")
+            problem = _validate_reinference_t(symbol, state["T"], max_t)
+            if problem:
+                failures.append(problem)
+            planned.append((symbol, state))
+
+        if failures:
+            print("\n[REPAIR:REINFERENCE] 검증 실패 — 어떤 종목도 저장하지 않습니다 (state 변경 없음, 주문 0건):")
+            for problem in failures:
+                print(f"  - {problem}")
+            sys.exit(1)
+
+        for symbol, state in planned:
             save_state(symbol, state)
             print(
                 f"[REPAIR:REINFERENCE] {symbol} T 재추정 완료 → T={state['T']}, "
@@ -2421,6 +2479,16 @@ def _repair_force_t():
     기존 run_one_symbol()의 FORCE_T 처리를 REPAIR 전용으로 재현합니다.
     주문은 생성하지 않습니다.
     """
+    # 적용할 종목별 값이 하나도 없으면 "성공처럼" 끝내지 않고 명시적으로 실패합니다.
+    # (예: REPAIR_ACTION=FORCE_T 단독 — 값은 {SYMBOL}_FORCE_T 에서만 읽는데 함께 설정하면 작업 소스 2개로 중단)
+    if not any(c.get("force_t") is not None for c in SYMBOLS):
+        print(
+            "[REPAIR:FORCE_T] 적용할 {SYMBOL}_FORCE_T 값이 없습니다 — 아무것도 적용되지 않았습니다 (실패).\n"
+            "  REPAIR_ACTION=FORCE_T 단독 호출은 지원되지 않습니다. 사용법: TRADE_MODE=REPAIR TQQQ_FORCE_T=29 "
+            "(REPAIR_ACTION 은 비워 둡니다)."
+        )
+        sys.exit(1)
+
     broker = create_broker()
     try:
         for symbol_config in SYMBOLS:
@@ -2630,15 +2698,16 @@ def main():
     if runtime_config.FORCE_T_REINFERENCE and runtime_config.TRADE_MODE == "LIVE":
         runtime_config.TRADE_MODE = "DRY"
         globals()["TRADE_MODE"] = "DRY"
-        print("[T 보정] FORCE_T_REINFERENCE=true → 브로커 생성 전 DRY 모드로 고정합니다.")
+        print("[T 보정] FORCE_T_REINFERENCE=true + LIVE → 주문 방지를 위해 브로커 생성 전 DRY(미리보기)로 고정합니다. "
+              "state 는 저장되지 않습니다 (실제 저장은 TRADE_MODE=REPAIR FORCE_T_REINFERENCE=true).")
 
-    # DRY(고정된 경우 포함)에서는 {SYMBOL}_FORCE_T 를 적용하지 않습니다 — 브로커 생성·state 변경 전에 중단.
+    # DRY·LIVE(DRY 로 고정된 경우 포함)에서는 {SYMBOL}_FORCE_T 를 적용하지 않습니다 —
+    # 브로커 생성·state 변경·주문 전에 종료 코드 1 로 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용.
     # FORCE_T_REINFERENCE 는 DRY 에서 미리보기(저장 없음), REPAIR 에서 실제 저장으로 구분이 유지됩니다.
-    if TRADE_MODE == "DRY":
-        _force_t_block = _force_t_in_dry_message(SYMBOLS)
-        if _force_t_block:
-            print(f"[중단] {_force_t_block}")
-            sys.exit(1)
+    _force_t_block = _force_t_mode_block_message(TRADE_MODE, SYMBOLS)
+    if _force_t_block:
+        print(f"[중단] {_force_t_block}")
+        sys.exit(1)
 
     broker = create_broker()
     try:

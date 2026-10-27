@@ -4,10 +4,11 @@
 |--------|-------------------------|-----------|
 | DRY    | 전략·정산 미리보기       | 금지 (FORCE_T 가 설정되면 저장 없이 오류로 중단) |
 | REPAIR | 명시적 state 복구·보정   | 허용 (주문 없음) |
-| LIVE   | 실제 주문·정산           | 허용 |
+| LIVE   | 실제 주문·정산           | 허용 (단, FORCE_T 는 금지 — 복구와 주문이 결합되므로 브로커 생성 전 종료 코드 1) |
 
-- DRY + {SYMBOL}_FORCE_T  → 저장하지 않고 명시적 오류로 중단 (브로커 생성·조회 전)
-- FORCE_T_REINFERENCE      → DRY 에서는 미리보기(저장 없음), REPAIR 에서는 실제 저장
+- DRY/LIVE + {SYMBOL}_FORCE_T → 저장·브로커 호출·주문 없이 명시적 오류로 중단 (FORCE_T 는 REPAIR 전용)
+- FORCE_T_REINFERENCE      → DRY(LIVE 는 DRY 로 고정)에서는 미리보기(저장 없음), REPAIR 에서는 실제 저장
+- REPAIR 재추정: 재추정 T 가 MAX_T 를 넘으면 (자르지 않고) 저장 거부, 다종목은 전부 검증 후에만 저장
 - REPAIR 의 기존 복구 경로(FORCE_T / REINFERENCE)는 그대로 저장하고 주문을 내지 않음
 - REPAIR_ACTION=FORCE_T 와 {SYMBOL}_FORCE_T 를 함께 설정하면 작업 소스 2개로 중단
 """
@@ -194,21 +195,19 @@ def test_repair_force_t_still_saves_and_places_no_orders(env, monkeypatch):
     broker.place_order.assert_not_called()
 
 
-def test_repair_action_force_t_alone_is_a_noop_without_symbol_force_t(env, monkeypatch, capsys):
-    """현재 구현의 한계: REPAIR_ACTION=FORCE_T 단독은 종목별 FORCE_T 값이 없어 아무것도 적용하지 않습니다.
-
-    값은 `{SYMBOL}_FORCE_T` 에서만 읽는데, 함께 설정하면 작업 소스 2개로 중단됩니다(아래 테스트).
-    따라서 실제로 동작하는 T 강제 보정은 `TRADE_MODE=REPAIR TQQQ_FORCE_T=29` (레거시 단일 소스) 입니다.
-    """
+def test_repair_action_force_t_alone_fails_explicitly(env, monkeypatch, capsys):
+    """REPAIR_ACTION=FORCE_T 단독은 값을 읽을 곳이 없어 무효 호출입니다 — 성공처럼 끝나면 안 됩니다."""
     monkeypatch.setattr(trading_bot, "TRADE_MODE", "REPAIR")
     monkeypatch.setattr(trading_bot, "REPAIR_ACTION", "FORCE_T")
     monkeypatch.setattr(trading_bot, "SYMBOLS", [_config()])
     env["load"]("TQQQ", _state(T=3.0))
-    broker = _broker()
-    monkeypatch.setattr(trading_bot, "create_broker", lambda: broker)
-    trading_bot._dispatch_repair()
+    _no_broker(monkeypatch)  # 브로커 생성 전에 실패해야 함
+    with pytest.raises(SystemExit) as exc:
+        trading_bot._dispatch_repair()
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "실패" in out and "TRADE_MODE=REPAIR TQQQ_FORCE_T" in out
     assert env["saved"] == []
-    assert "FORCE_T 미설정" in capsys.readouterr().out
 
 
 def test_repair_action_force_t_plus_symbol_force_t_counts_two_sources(env, monkeypatch, capsys):
@@ -222,3 +221,202 @@ def test_repair_action_force_t_plus_symbol_force_t_counts_two_sources(env, monke
     assert exc.value.code == 1
     assert "2개" in capsys.readouterr().out
     assert env["saved"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4) LIVE + {SYMBOL}_FORCE_T 금지 (복구와 주문의 결합 차단)
+# ═══════════════════════════════════════════════════════════════════
+def test_live_force_t_in_main_exits_1_before_broker_creation(env, monkeypatch, capsys):
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+    monkeypatch.setattr(runtime_config, "TRADE_MODE", "LIVE")
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_config(force_t=20)])
+    _no_broker(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        trading_bot.main()
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "TQQQ_FORCE_T" in out and "LIVE" in out and "REPAIR" in out
+    assert env["saved"] == []
+
+
+def test_live_force_t_in_run_one_symbol_raises_before_any_io_or_order(env, monkeypatch):
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+    broker = _broker()
+    with pytest.raises(RuntimeError, match="LIVE.*REPAIR"):
+        trading_bot.run_one_symbol(broker, _config(force_t=20))
+    assert env["saved"] == []
+    broker.get_order_history.assert_not_called()
+    broker.get_balance.assert_not_called()
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
+def test_live_force_t_with_unresolved_reverse_orders_does_not_save(env, monkeypatch):
+    """기존에는 LIVE 에서 미해결 리버스가 있으면 reconciliation_only 를 저장한 뒤 중단했습니다."""
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+    env["load"]("TQQQ", _state(orders_meta={"R1": {"reverse_action": "SELL", "terminal": False}}))
+    with pytest.raises(RuntimeError):
+        trading_bot.run_one_symbol(_broker(), _config(force_t=5))
+    assert env["saved"] == []
+
+
+def test_live_without_force_t_is_not_blocked_by_the_guard():
+    """가드는 FORCE_T 가 설정된 경우에만 동작합니다 (일반 LIVE 는 영향 없음)."""
+    assert trading_bot._force_t_mode_block_message("LIVE", [_config()]) == ""
+    assert trading_bot._force_t_mode_block_message("REPAIR", [_config(force_t=3)]) == ""
+    assert trading_bot._force_t_mode_block_message("LIVE", [_config(force_t=3)]) != ""
+    assert trading_bot._force_t_mode_block_message("DRY", [_config(force_t=3)]) != ""
+
+
+def test_live_with_reinference_message_says_preview_and_no_save(env, monkeypatch, capsys):
+    """LIVE + FORCE_T_REINFERENCE 는 DRY 미리보기로 고정되며, 로그가 '저장되지 않음'을 분명히 알려야 합니다."""
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+    monkeypatch.setattr(runtime_config, "TRADE_MODE", "LIVE")
+    monkeypatch.setattr(runtime_config, "FORCE_T_REINFERENCE", True)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_config()])
+
+    class _Stop(Exception):
+        pass
+
+    def _stop():
+        raise _Stop()
+    monkeypatch.setattr(trading_bot, "create_broker", _stop)
+    with pytest.raises(_Stop):
+        trading_bot.main()
+    out = capsys.readouterr().out
+    assert "미리보기" in out and "저장되지 않" in out and "REPAIR" in out
+    assert trading_bot.TRADE_MODE == "DRY"
+    assert env["saved"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 5) REPAIR 재추정의 MAX_T: 상한 초과 시 (자르지 않고) 저장 거부, 다종목은 사전 검증
+# ═══════════════════════════════════════════════════════════════════
+def _repair_reinference_env(env, monkeypatch, configs, t_by_symbol):
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "REPAIR")
+    monkeypatch.setattr(runtime_config, "TRADE_MODE", "REPAIR")
+    monkeypatch.setattr(runtime_config, "FORCE_T_REINFERENCE", True)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", configs)
+    broker = _broker(history=[_fill()])
+    monkeypatch.setattr(trading_bot, "create_broker", lambda: broker)
+    monkeypatch.setattr(
+        trading_bot, "update_T_from_history",
+        lambda symbol, state, history, balance_qty=None: {**state, "T": t_by_symbol[symbol]},
+    )
+    return broker
+
+
+def _cfg(symbol, max_t):
+    c = _config()
+    c["symbol"] = symbol
+    c["max_t"] = max_t
+    return c
+
+
+def test_reinference_above_max_t_is_rejected_without_saving(env, monkeypatch, capsys):
+    """추정 T=24 > MAX_T=20: 저장 거부, state 변경 없음, 주문 0건, 종료 코드 1 (20 으로 자르지 않음)."""
+    broker = _repair_reinference_env(env, monkeypatch, [_cfg("TQQQ", 20.0)], {"TQQQ": 24.0})
+    with pytest.raises(SystemExit) as exc:
+        trading_bot._dispatch_repair()
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "T=24.0" in out and "MAX_T=20.0" in out and "저장을 거부" in out
+    assert env["saved"] == []
+    broker.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize("t,max_t", [(20.0, 20.0), (19.5, 20.0), (0.0, 20.0)])
+def test_reinference_at_or_below_max_t_still_saves(env, monkeypatch, t, max_t):
+    broker = _repair_reinference_env(env, monkeypatch, [_cfg("TQQQ", max_t)], {"TQQQ": t})
+    trading_bot._dispatch_repair()
+    assert [st["T"] for st in env["saved"]] == [t]
+    broker.place_order.assert_not_called()
+
+
+def test_reinference_without_max_t_keeps_existing_behavior(env, monkeypatch):
+    _repair_reinference_env(env, monkeypatch, [_config()], {"TQQQ": 33.0})
+    trading_bot._dispatch_repair()
+    assert [st["T"] for st in env["saved"]] == [33.0]
+
+
+def test_multi_symbol_failure_saves_no_symbol_at_all(env, monkeypatch, capsys):
+    """첫 종목은 정상, 둘째가 상한 초과여도 첫 종목조차 먼저 저장하지 않습니다 (부분 복구 방지)."""
+    configs = [_cfg("TQQQ", 20.0), _cfg("SOXL", 20.0)]
+    _repair_reinference_env(env, monkeypatch, configs, {"TQQQ": 10.0, "SOXL": 25.0})
+    with pytest.raises(SystemExit) as exc:
+        trading_bot._dispatch_repair()
+    assert exc.value.code == 1
+    assert env["saved"] == [], "검증 실패 시 정상 종목도 저장되면 안 됩니다"
+    out = capsys.readouterr().out
+    assert "SOXL" in out and "어떤 종목도 저장하지 않습니다" in out
+
+
+def test_multi_symbol_all_valid_saves_all(env, monkeypatch):
+    configs = [_cfg("TQQQ", 20.0), _cfg("SOXL", 20.0)]
+    _repair_reinference_env(env, monkeypatch, configs, {"TQQQ": 10.0, "SOXL": 20.0})
+    trading_bot._dispatch_repair()
+    assert sorted(st["T"] for st in env["saved"]) == [10.0, 20.0]
+
+
+@pytest.mark.parametrize("bad_max", [float("nan"), float("inf"), -1.0, "20", True])
+def test_invalid_max_t_is_rejected_without_saving(env, monkeypatch, bad_max):
+    _repair_reinference_env(env, monkeypatch, [_cfg("TQQQ", bad_max)], {"TQQQ": 10.0})
+    with pytest.raises(SystemExit):
+        trading_bot._dispatch_repair()
+    assert env["saved"] == []
+
+
+@pytest.mark.parametrize("bad_t", [float("nan"), float("inf"), None, "5"])
+def test_invalid_estimated_t_is_rejected_without_saving(env, monkeypatch, bad_t):
+    _repair_reinference_env(env, monkeypatch, [_cfg("TQQQ", 20.0)], {"TQQQ": bad_t})
+    with pytest.raises(SystemExit):
+        trading_bot._dispatch_repair()
+    assert env["saved"] == []
+
+
+def test_dry_preview_shows_raw_and_capped_t(env, monkeypatch, capsys):
+    """DRY 미리보기는 원시 추정 T 와 상한 적용 후 T 를 함께 보여줍니다."""
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    env["load"]("TQQQ", _state(T=0.0, last_updated="2026-07-10T00:00:00+00:00", cycle_start_date="2026-06-01"))
+    cfg = _config()
+    cfg["max_t"] = 20.0
+    trading_bot.run_one_symbol(_broker(balance_qty=1, history=[_fill()]), cfg)
+    out = capsys.readouterr().out
+    assert "원시 추정 T=" in out and "상한 MAX_T=20.0" in out and "적용 T=" in out
+    assert env["saved"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6) 운영 안전: 워크플로가 항상 넘기는 빈 FORCE_T env 가 LIVE 차단을 오발동시키지 않음
+# ═══════════════════════════════════════════════════════════════════
+def _parsed_symbols(monkeypatch, **env):
+    base = {"SYMBOLS": "TQQQ:NAS", "TQQQ_SEED": "8000", "SOXL_SEED": "8000"}
+    for key in ("TQQQ_FORCE_T", "SOXL_FORCE_T", "TQQQ_MAX_T", "SOXL_MAX_T"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in {**base, **env}.items():
+        monkeypatch.setenv(key, value)
+    return runtime_config._parse_symbols()
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_empty_force_t_env_from_workflow_does_not_block_live(monkeypatch, raw):
+    """trade_base.yml 은 `TQQQ_FORCE_T: ${{ vars.TQQQ_FORCE_T }}` 를 항상 넘깁니다 (미설정이면 빈 문자열)."""
+    symbols = _parsed_symbols(monkeypatch, TQQQ_FORCE_T=raw)
+    assert symbols[0]["force_t"] is None
+    assert trading_bot._force_t_mode_block_message("LIVE", symbols) == ""
+    assert trading_bot._force_t_mode_block_message("DRY", symbols) == ""
+
+
+def test_force_t_zero_reset_is_blocked_in_live_and_dry(monkeypatch):
+    """FORCE_T=0(사이클 리셋)은 0.0 이라 'is not None' 으로 판정돼 DRY·LIVE 에서 차단됩니다."""
+    symbols = _parsed_symbols(monkeypatch, TQQQ_FORCE_T="0")
+    assert symbols[0]["force_t"] == 0.0
+    assert trading_bot._force_t_mode_block_message("LIVE", symbols) != ""
+    assert trading_bot._force_t_mode_block_message("DRY", symbols) != ""
+    assert trading_bot._force_t_mode_block_message("REPAIR", symbols) == ""
+
+
+def test_max_t_defaults_to_splits_when_unset(monkeypatch):
+    """MAX_T 는 항상 채워집니다(기본 분할수) — REPAIR 재추정 상한 검사가 모든 종목에 적용됩니다."""
+    symbols = _parsed_symbols(monkeypatch, TQQQ_SPLITS="20")
+    assert symbols[0]["max_t"] == 20.0

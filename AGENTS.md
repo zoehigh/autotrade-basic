@@ -87,10 +87,12 @@ autotrade-basic/
   |------|------|-----------|----------------------|
   | `DRY` | 전략·정산 미리보기 | 원칙적으로 금지 | **금지** |
   | `REPAIR` | 명시적 state 복구·보정 (주문 없음) | 허용 | 허용 |
-  | `LIVE` | 실제 주문·정산 | 허용 | 허용 |
+  | `LIVE` | 실제 주문·정산 (**`{SYMBOL}_FORCE_T` 금지**) | 허용 | 허용 |
 
-  - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` → state를 저장하지 않고 **명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성·조회 전). `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일
-  - `FORCE_T_REINFERENCE`: **DRY = 미리보기(저장 없음), REPAIR = 실제 저장**. LIVE는 주문 방지를 위해 DRY로 자동 전환(=미리보기)
+  - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` 또는 `LIVE` → state 저장·브로커 호출·주문 **없이 명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성 전). **FORCE_T는 `TRADE_MODE=REPAIR`에서만 허용**. LIVE를 막는 이유: FORCE_T는 T·`orders_meta`·`reverse_mode`·정산 원장·워터마크를 덮어쓰는데, LIVE에서는 같은 실행에서 주문 단계까지 이어져 복구와 주문이 결합됨. `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일하게 차단
+  - `FORCE_T_REINFERENCE`: **DRY = 미리보기(저장 없음), REPAIR = 실제 저장**. LIVE + `FORCE_T_REINFERENCE=true`는 주문 방지를 위해 **DRY 미리보기로 고정**되며 state는 저장되지 않음(로그에 명시). 실제 저장은 `TRADE_MODE=REPAIR`
+  - REPAIR 재추정(`_repair_reinference`): 재추정 T가 `{SYMBOL}_MAX_T`(기본 분할수)를 **초과하면 저장을 거부**하고 종료 코드 1 (T를 상한으로 **자르지 않음** — 자르면 정산 오류가 숨겨짐). 여러 종목은 **전부 재추정·검증한 뒤에만** 저장하므로 일부 종목만 먼저 저장되지 않음. T/MAX_T가 유한한 유효 숫자가 아니어도 거부. 일반 실행 경로(`run_one_symbol`)는 기존대로 상한으로 조정
+  - ⚠️ 예외 — **레거시 `STATE_*_ONLY`는 DRY여도 대부분 state를 저장**합니다: 읽기 전용은 `STATE_DIAGNOSTIC_ONLY`·`STATE_REVERSE_AUDIT_ONLY`뿐이고, `STATE_REPAIR_ONLY`·`STATE_CLEAR_FENCE_ONLY`·`STATE_REVERSE_RECONCILE_ONLY`·`STATE_NET_INVESTED_REPAIR_ONLY`·`STATE_ASSUME_REVERSE_EXPIRY_ONLY`·`STATE_SET_CYCLE_START_ONLY`는 저장합니다. 따라서 이들은 **운영 사용을 제한**합니다(`TRADE_MODE=DRY`를 읽기 전용으로 오해하지 말 것 — 사용 전 백업·승인 필수, "확인용" 실행 금지). 후속 작업에서 REPAIR 전용으로 통합 예정
   - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
   - `TRADE_MODE=REPAIR`는 Actions wrapper의 `workflow_dispatch` 선택지(DRY/LIVE)에 없고 `repository_dispatch` payload의 `trade_mode` 또는 `vars.TRADE_MODE`로 지정
   - ⚠️ REPAIR라고 자동으로 안전한 것은 아닙니다. FORCE_T는 `orders_meta`·`reverse_mode`·정산 원장·워터마크까지 바꿉니다 → **실행 전 state 백업(저장소 밖) + 브로커 체결 이력 대조 + 작업자≠승인자 승인**은 그대로 유지 (`docs/marker-correction-runbook.md` §2~§4 참고)
@@ -118,14 +120,14 @@ TRADE_MODE=REPAIR FORCE_T_REINFERENCE=true uv run python trading_bot.py
 
 # T값 강제 설정 — 실제 T 보정 및 state 저장, 주문은 실행하지 않음 (1회성 — 보정 RUN 후 env var 즉시 삭제)
 TRADE_MODE=REPAIR TQQQ_FORCE_T=29 SOXL_FORCE_T=20 uv run python trading_bot.py
-# ※ TRADE_MODE=DRY 와 {SYMBOL}_FORCE_T 를 함께 쓰면 저장 없이 오류로 중단됩니다.
+# ※ TRADE_MODE=DRY 또는 LIVE 와 {SYMBOL}_FORCE_T 를 함께 쓰면 브로커 생성 전에 오류(종료 코드 1)로 중단됩니다.
 # ※ REPAIR 는 작업 소스가 정확히 1개여야 합니다. {SYMBOL}_FORCE_T 와 REPAIR_ACTION=FORCE_T 를 함께 설정하지 마세요
-#    (작업 소스 2개로 중단). REPAIR_ACTION=FORCE_T 단독은 종목별 값이 없어 아무것도 적용하지 않습니다.
+#    (작업 소스 2개로 중단). REPAIR_ACTION=FORCE_T 단독은 값을 읽을 곳이 없어 명시적으로 실패합니다(종료 코드 1).
 
-# T값 상한 설정 (재추정 미리보기에서 상한 제한, 기본값은 분할수)
+# T값 상한 설정 (기본값은 분할수) — DRY 미리보기는 "원시 추정 T"와 "상한 적용 후 T"를 함께 출력
 TRADE_MODE=DRY SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
-# ※ 현재 REPAIR 재추정(_repair_reinference)은 {SYMBOL}_MAX_T 를 적용하지 않습니다 — 미리보기와 저장 결과가 다를 수 있으니
-#    상한이 필요하면 REPAIR 재추정 후 {SYMBOL}_FORCE_T 로 별도 보정하세요.
+# ※ REPAIR 재추정은 추정 T 가 MAX_T 를 넘으면 T 를 자르지 않고 저장을 거부합니다(종료 코드 1, state 변경 없음).
+#    초과 원인(정산 오류 등)을 확인한 뒤 필요하면 별도로 {SYMBOL}_FORCE_T 보정을 승인받아 진행하세요.
 
 # 테스트 실행
 # 기본 `pytest tests/` 는 외부 브로커 API·주문을 **원천 차단**합니다 (유닛/모의 테스트만 실행).
@@ -352,7 +354,7 @@ uv run pytest tests/test_broker_preflight.py -v
 - **텔레그램 재시도**: `send_telegram()`은 타임아웃/연결 오류/서버 5xx 시 최대 3회 재시도(1초 간격). 4xx(설정 오류 등)는 재시도 없이 즉시 실패
 - **T 보정 환경변수**:
   - `FORCE_T_REINFERENCE=true`: `last_updated` 초기화 → 전체 이력(90일)에서 T 재추정. **DRY=미리보기(저장 없음) / REPAIR=실제 저장** (LIVE는 주문 방지를 위해 DRY로 자동 전환)
-  - `{SYMBOL}_FORCE_T={value}` (**`TRADE_MODE=REPAIR` 전용** — DRY에서는 저장 없이 오류로 중단): state.json의 T를 강제 덮어쓰기 (orders_meta/balance_mismatch 초기화, `last_updated`/`last_processed_ordno`를 이력 최신 주문 시각으로 갱신 → 이중 가산 방지, `FORCE_T=0`이면 `cycle_start_date` 초기화)
+  - `{SYMBOL}_FORCE_T={value}` (**`TRADE_MODE=REPAIR` 전용** — DRY·LIVE에서는 브로커 생성 전 오류로 중단): state.json의 T를 강제 덮어쓰기 (orders_meta/balance_mismatch 초기화, `last_updated`/`last_processed_ordno`를 이력 최신 주문 시각으로 갱신 → 이중 가산 방지, `FORCE_T=0`이면 `cycle_start_date` 초기화)
   - `{SYMBOL}_MAX_T={value}`: T 자동추정 결과의 상한선 (기본값: `{SYMBOL}_SPLITS` — 리버스모드 진입 위해 `T=splits` 허용, 초과만 방지)
   - FORCE_T_REINFERENCE 실행 시 small_seed_days(소액 시드 오추정)가 감지되면 포지션 기반 T 추정값이 함께 출력되며, 해당 값을 `{SYMBOL}_FORCE_T`로 설정하여 직접 보정 가능
   - ⚠️ `{SYMBOL}_FORCE_T`는 **1회성 점화용**입니다. 보정 RUN 1회 실행 후 env var를 **즉시 삭제**하세요. 리버스모드 진행은 `day_count`(state `reverse_mode`)와 체결 이력 기반 T 갱신이 주도하므로 FORCE_T 불필요. 유지하면 리버스모드 종료 → 새 사이클(T=0)에서 T를 다시 `splits`로 강제해 **새 사이클 매수가 영구 차단**됩니다.
