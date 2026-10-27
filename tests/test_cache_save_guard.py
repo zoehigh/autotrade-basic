@@ -412,3 +412,19 @@ def test_notice_step_does_not_execute_hostile_mode_value(hostile, tmp_path):
     assert not (tmp_path / "PWNED").exists(), "주입된 명령이 실행됐습니다"
     # 값에 개행이 있어도 별도 워크플로 명령(::error:: 등)이 줄 머리에 나오면 안 됩니다
     assert [l for l in result.stdout.splitlines() if l.startswith("::") and not l.startswith("::notice::")] == []
+
+
+# ── 이식성: self-hosted runner(오래된 bash 가능)에서도 동작하는 문법만 사용 ──
+def test_resolve_script_avoids_bash4_only_syntax_and_pins_locale():
+    script = _step("Resolve and log inputs")["run"]
+    for banned in (",,", "^^", "declare -A", "mapfile", "readarray", "&>>", "|&"):
+        assert banned not in script, f"bash 4+ 전용 문법 {banned!r} 사용 — 오래된 bash 에서 실패할 수 있습니다"
+    assert "export LC_ALL=C" in script, "로케일에 따라 [A-Z]/대소문자 변환이 달라지지 않도록 고정해야 합니다"
+
+
+@pytest.mark.parametrize("locale_env", [{}, {"LANG": "C.UTF-8"}, {"LC_ALL": "C.UTF-8"}, {"LC_ALL": "POSIX"}])
+def test_resolve_result_does_not_depend_on_caller_locale(locale_env, tmp_path):
+    result, lines = _run_resolve(tmp_path, IN_TRADE_MODE=" live ", IN_BROKER_MODE="REAL", **locale_env)
+    assert result.returncode == 0 and lines == ["trade_mode=LIVE"]
+    result, lines = _run_resolve(tmp_path, IN_BROKER_MODE="Real", **locale_env)
+    assert lines == ["trade_mode=DRY"], "broker_mode 대소문자 무시 비교가 로케일과 무관해야 합니다"

@@ -146,13 +146,17 @@ jobs:
           IN_SYMBOLS: ${{ inputs.symbols }}
           VAR_SYMBOLS: ${{ vars.SYMBOLS }}
         run: |
+          # 로케일에 따라 [A-Z] 범위·대소문자 변환이 달라지지 않도록 고정합니다 (self-hosted runner 대비)
+          export LC_ALL=C
           # 로그에 외부 값을 찍을 때 개행·제어문자를 제거합니다 (`::` 워크플로 명령 주입 방지)
           safe() { printf '%s' "${1//[^[:print:]]/?}"; }
+          # 오래된 bash(3.x)에서도 동작하도록 소문자 변환을 tr 로 합니다 (GitHub 표현식의 대소문자 무시 비교와 동일)
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
           # inputs.trade_mode || vars.TRADE_MODE || (broker_mode == 'real' && 'DRY') || 'LIVE'  (GitHub 표현식과 같은 우선순위)
           MODE="${IN_TRADE_MODE:-}"
           if [[ -z "$MODE" ]]; then MODE="${VAR_TRADE_MODE:-}"; fi
-          if [[ -z "$MODE" && "${IN_BROKER_MODE,,}" == "real" ]]; then MODE="DRY"; fi
+          if [[ -z "$MODE" && "$(lower "${IN_BROKER_MODE:-}")" == "real" ]]; then MODE="DRY"; fi
           if [[ -z "$MODE" ]]; then MODE="LIVE"; fi
 
           # 봇(src/config.py)은 TRADE_MODE 를 strip().upper() 로 정규화합니다. state 캐시 저장 가드가
@@ -180,7 +184,7 @@ jobs:
           BROKER_MODE="${IN_BROKER_MODE:-demo}"
           SYMBOLS="${IN_SYMBOLS:-}"
           if [[ -z "$SYMBOLS" ]]; then SYMBOLS="${VAR_SYMBOLS:-}"; fi
-          if [[ -z "$SYMBOLS" && "${IN_BROKER,,}" == "kiwoom" ]]; then SYMBOLS="TQQQ:NAS,SOXL:NYS"; fi
+          if [[ -z "$SYMBOLS" && "$(lower "${IN_BROKER:-}")" == "kiwoom" ]]; then SYMBOLS="TQQQ:NAS,SOXL:NYS"; fi
           if [[ -z "$SYMBOLS" ]]; then SYMBOLS="TQQQ:NAS,SOXL:AMS"; fi
           echo "Resolved BROKER=$(safe "$BROKER")"
           echo "Resolved BROKER_MODE=$(safe "$BROKER_MODE")"
