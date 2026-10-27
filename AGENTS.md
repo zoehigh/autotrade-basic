@@ -204,6 +204,12 @@ uv run pytest tests/test_broker_preflight.py -v
 마커가 누락·무효인 주문은 자동 반영하지 않고 보류합니다 → 수동 정정 절차는 `docs/marker-correction-runbook.md`
 (마커만 명시 설정, T/net/원장·워터마크 불변, 백업+해시, 직후 reconcile 1회 확인, 환경변수 1회성).
 
+**공개 로그의 주문번호는 가명 식별자로만 출력**: 정산·체결 복구·보류 경로(`src/state.py`, `trading_bot.py`)의 stdout·예외·알림과
+검증기(`ops/verify_run.py`) 실패 메시지는 `mask_odno()` = `ord#` + HMAC-SHA256(**실행별 무작위 salt**, 주문번호) 앞 10자리만 씁니다
+(단순 해시는 짧은 숫자 주문번호가 전수 대입으로 복원됨). salt(`log_salt`)와 원문 주문번호는 **비공개(암호화) Evidence** 에만 남습니다.
+정적 가드 `tests/test_odno_log_masking.py`. 일반 주문 접수·취소·브로커 어댑터 로그는 미적용 → `docs/odno-log-masking-followup.md`.
+**Evidence artifact 는 gpg 암호화본만 업로드**합니다 (tar→gpg 스트리밍, 실패 시 부분 암호문·평문 tgz 잔존 없음, 패스프레이즈 없으면 업로드 없이 실패).
+
 **지연 체결(부분체결 증가) 반영**: 전역 워터마크보다 오래된 주문이라도 **이미 반영된 주문**(processed_filled_qty > 0)의
 누적 체결이 늘면 주문번호별 델타로 반영합니다 (`_apply_late_fill_deltas`). 워터마크 이전에 있고 반영된 적 없는
 주문은 "처리된 범위 밖"이므로 건드리지 않습니다.

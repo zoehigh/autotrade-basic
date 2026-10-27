@@ -343,12 +343,14 @@ def test_main_notes_missing_symbol_line_and_treats_as_zero(
 # B4 — skipped_unverified(증명 불가 과거 주문 건너뛰기) 독립 검증
 # ═══════════════════════════════════════════════════════════════════
 BEFORE_WATERMARK = "2026-09-20T09:00:00+00:00"
+SALT = "00112233445566778899aabbccddeeff"
 
 
 def _skipped_evidence(**overrides):
     """워터마크 이전 레거시 0 마커 주문 1건을 건너뛴 정상 근거."""
     meta = {"side": "BUY", "total_qty": 10, "t_target": 1.0, "processed_filled_qty": 0}
     evidence = _evidence(
+        log_salt=SALT,
         orders_meta_before={"OLD1": dict(meta)},
         orders_meta_after={"OLD1": dict(meta)},
         fills=[{
@@ -357,7 +359,7 @@ def _skipped_evidence(**overrides):
         }],
         skipped_unverified=[{
             "odno": "OLD1",
-            "odno_hash": verify_run._independent_odno_hash("OLD1"),
+            "odno_hash": verify_run._independent_odno_hash("OLD1", SALT),
             "filled_qty": 10,
             "ts": BEFORE_WATERMARK,
             "reason": "legacy_zero_marker_unproven",
@@ -373,7 +375,37 @@ def test_skipped_unverified_valid_entry_passes():
 
 def test_skipped_unverified_hash_matches_state_mask():
     from state import mask_odno
-    assert verify_run._independent_odno_hash("39445") == mask_odno("39445")
+    assert verify_run._independent_odno_hash("39445", SALT) == mask_odno("39445", SALT)
+
+
+def test_mask_is_salted_so_short_numeric_odno_is_not_bruteforceable():
+    """salt 를 모르면 단순 SHA-256 앞자리 대입으로 주문번호를 복원할 수 없어야 합니다."""
+    import hashlib
+    from state import mask_odno
+
+    plain = "ord#" + hashlib.sha256(b"39445").hexdigest()[:10]
+    assert mask_odno("39445", SALT) != plain
+    assert mask_odno("39445", SALT) != mask_odno("39445", "ff" * 16), "salt 가 달라도 같은 값"
+    assert mask_odno("39445", SALT) == mask_odno("39445", SALT)
+
+
+def test_skipped_unverified_requires_log_salt():
+    ev = _skipped_evidence()
+    del ev["log_salt"]
+    problems = verify_run._verify_skipped_unverified(ev)
+    assert any("log_salt" in p for p in problems), problems
+
+
+def test_verification_output_masks_raw_odno(tmp_path):
+    """검증 실패 메시지(공개 Actions 로그로 출력)에 원문 주문번호가 없어야 합니다."""
+    ev = _skipped_evidence(skipped_unverified=[])  # 감사 누락 → 실패 메시지에 주문번호 포함
+    ev["orders_meta_before"]["OLD1"]["side"] = "BUY"
+    path = _write_evidence(tmp_path, ev)
+    ok, problems = verify_run.verify_evidence_file(path, "meritz", "LIVE", run_id="run-1")
+    assert ok is False
+    joined = "\n".join(problems)
+    assert "OLD1" not in joined, joined
+    assert verify_run._independent_odno_hash("OLD1", SALT) in joined, joined
 
 
 def test_skipped_unverified_wrong_hash_or_reason_fails():

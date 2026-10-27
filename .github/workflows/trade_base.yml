@@ -334,6 +334,7 @@ jobs:
           PASSPHRASE: ${{ secrets.EVIDENCE_PASSPHRASE || secrets.STATE_BACKUP_PASSPHRASE }}
         run: |
           set -euo pipefail
+          umask 077
           shopt -s nullglob
           files=(settlement-*.json final-settlement-*.json)
           if [[ ${#files[@]} -eq 0 ]]; then
@@ -345,14 +346,29 @@ jobs:
             exit 1
           fi
           command -v gpg > /dev/null || { echo "::error::gpg 가 없어 정산 근거를 암호화할 수 없습니다"; exit 1; }
-          tar czf evidence.tgz "${files[@]}"
-          printf '%s' "$PASSPHRASE" |
+
+          out=evidence.tgz.gpg
+          partial=evidence.tgz.gpg.partial
+          # 어떤 이유로든 실패하면 불완전한 암호문(.partial)·최종 산출물·평문 tgz 를 남기지 않습니다.
+          # (업로드 단계는 산출물이 없으면 올릴 파일이 없어 경고만 합니다)
+          trap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f "$partial" "$out" evidence.tgz; fi' EXIT
+          rm -f "$partial" "$out" evidence.tgz
+
+          # tar → gpg 스트리밍: 중간 평문 압축파일(evidence.tgz)을 디스크에 만들지 않습니다.
+          # 패스프레이즈는 stdin(압축 데이터)과 겹치지 않도록 fd 3 으로 전달합니다.
+          tar czf - "${files[@]}" |
             gpg --batch --yes --pinentry-mode loopback \
-              --passphrase-fd 0 --symmetric \
+              --passphrase-fd 3 --symmetric \
               --cipher-algo AES256 --s2k-digest-algo SHA256 \
-              --output evidence.tgz.gpg evidence.tgz
-          test -s evidence.tgz.gpg
-          rm -f evidence.tgz
+              --output "$partial" 3< <(printf '%s' "$PASSPHRASE")
+          test -s "$partial"
+
+          # 업로드 전 왕복 검증: 복호화·압축 해제가 끝까지 되는지 확인합니다 (잘린/손상 암호문 차단).
+          gpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt "$partial" \
+            3< <(printf '%s' "$PASSPHRASE") | tar tz > /dev/null
+
+          mv "$partial" "$out"
+          test -s "$out"
 
       - name: 정산 근거 업로드 (암호화본만)
         uses: actions/upload-artifact@v4

@@ -87,6 +87,7 @@ jobs:
           PASSPHRASE: ${{ secrets.EVIDENCE_PASSPHRASE || secrets.STATE_BACKUP_PASSPHRASE }}
         run: |
           set -euo pipefail
+          umask 077
           shopt -s nullglob
           enc=(evidence/*.gpg)
           if [[ ${#enc[@]} -eq 0 ]]; then
@@ -97,11 +98,15 @@ jobs:
             echo "::error::복호화 패스프레이즈가 없어 정산 근거를 검증할 수 없습니다"
             exit 1
           fi
+          # 임시 디렉터리에 먼저 풀고 전부 성공했을 때만 evidence/ 로 옮깁니다
+          # (손상 암호문이 일부만 풀린 채 검산 단계로 넘어가는 것을 막습니다).
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
           for f in "${enc[@]}"; do
-            printf '%s' "$PASSPHRASE" |
-              gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-                --decrypt "$f" | tar xz -C evidence
+            gpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt "$f" \
+              3< <(printf '%s' "$PASSPHRASE") | tar xz -C "$stage"
           done
+          mv "$stage"/* evidence/
 
       - name: 정산 근거 독립 검산
         env:

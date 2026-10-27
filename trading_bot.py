@@ -25,7 +25,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import FILL_MARKER_VERSION, load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 from notifier import notify
 
 
@@ -417,11 +417,11 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
         parts = []
         if amount_only:
             parts.append(
-                f"체결금액 미확정 주문 {len(amount_only)}건({', '.join(amount_only[:5])})"
+                f"체결금액 미확정 주문 {len(amount_only)}건({mask_odno(amount_only[:5])[1:-1]})"
             )
         if pending_marker_odnos:
             parts.append(
-                f"마커 누락·무효 주문 {len(pending_marker_odnos)}건({', '.join(pending_marker_odnos[:5])})"
+                f"마커 누락·무효 주문 {len(pending_marker_odnos)}건({mask_odno(pending_marker_odnos[:5])[1:-1]})"
             )
         hold_detail = " + ".join(parts) if parts else f"주문 {len(pending_amount_odnos)}건"
         followup = []
@@ -519,6 +519,9 @@ def build_settlement_evidence(
         "skipped_fills": [],
         # 미반영 증명 불가로 건너뛴 과거(레거시 0 마커) 주문 — 감사용 (원문 odno + 해시)
         "skipped_unverified": deepcopy(state.get("_unverified_skipped_audit") or []),
+        # 공개 로그의 가명 식별자(ord#…)를 원문 주문번호로 되돌려 대조하기 위한 실행별 salt.
+        # 비공개(암호화) Evidence 에만 기록합니다 — 공개 로그에는 절대 출력하지 않습니다.
+        "log_salt": log_salt_hex(),
     }
     for row in order_history or []:
         try:
@@ -2005,7 +2008,7 @@ def _reverse_audit_only():
                 terminal = bool(meta.get("terminal"))
                 delta_amt = max(0.0, broker_amt - state_amt)
                 print(
-                    f"  odno={odno} side={meta.get('reverse_action')} day={meta.get('reverse_day')} "
+                    f"  odno={mask_odno(odno)} side={meta.get('reverse_action')} day={meta.get('reverse_day')} "
                     f"submitted={meta.get('submitted_at', '')} session={meta.get('submitted_session', '')} "
                     f"| 브로커: qty={broker_qty} amt=${broker_amt:.2f} "
                     f"remaining={settled.get('nccs_qty', '') if settled else ''} "
@@ -2248,9 +2251,9 @@ def _assume_reverse_expiry_only():
 
     meta = state.get("orders_meta", {}).get(odno)
     if not meta or not meta.get("reverse_action"):
-        raise RuntimeError(f"리버스 만료 가정 거부: 주문 메타가 없습니다: {odno}")
+        raise RuntimeError(f"리버스 만료 가정 거부: 주문 메타가 없습니다: {mask_odno(odno)}")
     if meta.get("terminal"):
-        print(f"[리버스 만료 가정] {symbol} odno={odno} 이미 terminal입니다.")
+        print(f"[리버스 만료 가정] {symbol} odno={mask_odno(odno)} 이미 terminal입니다.")
         return
     if int(meta.get("processed_filled_qty", 0) or 0) != 0:
         raise RuntimeError("리버스 만료 가정 거부: 이미 체결된 수량이 있습니다.")
@@ -2267,7 +2270,7 @@ def _assume_reverse_expiry_only():
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
     meta["terminal_assumption_reason"] = "kiwoom_demo_day_order_expired_after_session"
     save_state(symbol, state)
-    print(f"[리버스 만료 가정] {symbol} odno={odno}를 terminal_assumed로 저장했습니다.")
+    print(f"[리버스 만료 가정] {symbol} odno={mask_odno(odno)}를 terminal_assumed로 저장했습니다.")
 
 
 def _clear_fence_only():

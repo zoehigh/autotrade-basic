@@ -179,13 +179,18 @@ def test_real_replay_skipped_past_orders_are_audited_and_masked():
             meta = base[sym]["orders_meta"][odno]
             assert meta.get("processed_filled_qty") == 0 and "fill_marker_version" not in meta
         for e in audit:
-            assert re.fullmatch(r"ord#[0-9a-f]{8}", e["odno_hash"])
+            assert re.fullmatch(r"ord#[0-9a-f]{10}", e["odno_hash"])
             assert e["reason"] == "legacy_zero_marker_unproven"
         total += len(audit)
         # 공개 로그(stdout)의 건너뜀 경고에는 실제 주문번호가 없어야 합니다
         for line in out.splitlines():
             if "증명할 마커" in line:
-                assert "odno=" not in line and "ord#" in line
+                assert "ord#" in line
+        # 정산 전체 stdout 에 이력·메타의 어떤 원문 주문번호도 나오지 않아야 합니다
+        all_odnos = {str(f["odno"]) for f in ev["fills"]} | set(base[sym]["orders_meta"])
+        for odno in all_odnos:
+            assert not re.search(rf"(?<![\w.]){re.escape(odno)}(?![\w.])", out), \
+                f"{broker}/{sym}: 공개 로그에 원문 주문번호 노출"
     assert total == 72
 
 

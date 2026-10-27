@@ -1649,7 +1649,9 @@ def test_log_verifier_accepts_late_buy_and_sell(capsys):
         [_row("S", "매도", 25, "2026-10-20T09:00:00+00:00", price=10.0)],
         75,
     )
-    assert "지연 체결 반영: odno=S 매도 20주 추가 (누적 25주) → T=7.5" in late_sell_log
+    # 공개 로그에는 원문 주문번호 대신 가명 식별자가 찍힙니다
+    assert f"지연 체결 반영: odno={state_mod.mask_odno('S')} 매도 20주 추가 (누적 25주) → T=7.5" in late_sell_log
+    assert "odno=S " not in late_sell_log
     assert late_sell["T"] == pytest.approx(7.5)
     assert verify_run._verify_t_transitions(late_sell_log, "TQQQ", [], 75) == []
 

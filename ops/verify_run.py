@@ -227,11 +227,77 @@ def _unregistered_expected_shares(orders, fills):
     return shares
 
 
-def _independent_odno_hash(odno):
-    """공개 로그용 주문번호 가명 해시 (state.mask_odno 와 **독립 구현**)."""
-    import hashlib
+def _independent_odno_hash(odno, salt_hex):
+    """공개 로그용 주문번호 가명 식별자 (state.mask_odno 와 **독립 구현**).
 
-    return "ord#" + hashlib.sha256(str(odno).encode("utf-8")).hexdigest()[:8]
+    `ord#` + HMAC-SHA256(salt, odno) 앞 10자리. salt 는 Evidence 의 `log_salt` 입니다.
+    """
+    import hashlib
+    import hmac
+
+    text = "" if odno is None else str(odno)
+    if not text:
+        return "ord#-"
+    return "ord#" + hmac.new(
+        bytes.fromhex(salt_hex), text.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:10]
+
+
+def _evidence_salt_hex(evidence):
+    """Evidence 의 log_salt(16바이트 hex)를 읽습니다. 없거나 형식이 틀리면 None."""
+    raw = (evidence or {}).get("log_salt")
+    if not isinstance(raw, str) or len(raw) != 32:
+        return None
+    try:
+        bytes.fromhex(raw)
+    except ValueError:
+        return None
+    return raw
+
+
+def _collect_evidence_odnos(evidence):
+    """Evidence 안의 모든 주문번호(원문)를 모읍니다 — 출력 마스킹 대상 목록."""
+    found = set()
+
+    def add(value):
+        if value is not None and str(value):
+            found.add(str(value))
+
+    for key in ("fills", "orders", "skipped_unverified", "skipped_fills"):
+        for item in evidence.get(key) or []:
+            if isinstance(item, dict):
+                add(item.get("odno"))
+    for key in ("orders_meta_before", "orders_meta_after", "sell_t_effects", "sell_t_effects_before"):
+        block = evidence.get(key)
+        if isinstance(block, dict):
+            for odno in block:
+                add(odno)
+    for key in ("pending_marker_odnos", "pending_amount_odnos"):
+        for odno in evidence.get(key) or []:
+            add(odno)
+    add(evidence.get("last_processed_ordno_before"))
+    return found
+
+
+def _mask_problem_messages(problems, evidence):
+    """검증 결과 메시지의 원문 주문번호를 가명 식별자로 바꿉니다 (공개 Actions 로그 보호).
+
+    Evidence 자체(암호화 artifact)는 원문을 유지하므로 독립 검증은 영향받지 않습니다.
+    salt 가 없으면 이번 실행의 임시 salt 를 씁니다 (대조는 불가, 노출은 차단).
+    """
+    salt = _evidence_salt_hex(evidence) or os.urandom(16).hex()
+    odnos = sorted(_collect_evidence_odnos(evidence), key=len, reverse=True)
+    masked = []
+    for message in problems:
+        text = str(message)
+        for odno in odnos:
+            text = re.sub(
+                rf"(?<![\w.#]){re.escape(odno)}(?![\w.])",
+                _independent_odno_hash(odno, salt),
+                text,
+            )
+        masked.append(text)
+    return masked
 
 
 def _legacy_zero_marker_unproven(meta):
@@ -271,6 +337,11 @@ def _verify_skipped_unverified(evidence):
     if not isinstance(pre_meta, dict):
         # 구버전 근거: 판정 근거가 없으므로 건너뛴 항목이 있을 때만 검증 불가로 처리합니다.
         return ["skipped_unverified 검증 불가 (orders_meta_before 없음)"] if skipped else []
+    salt = _evidence_salt_hex(evidence)
+    if salt is None:
+        if skipped:
+            return ["log_salt 가 없거나 형식 오류입니다 (건너뜀 감사 해시 대조 불가 — 검증 불가)"]
+        salt = os.urandom(16).hex()  # 건너뜀 항목이 없으면 메시지 라벨용 임시 salt 만 필요
     fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
     applied = {
         str(o.get("odno")) for o in (evidence.get("orders") or []) if o.get("odno") is not None
@@ -281,7 +352,7 @@ def _verify_skipped_unverified(evidence):
         if not odno:
             problems.append("skipped_unverified 항목에 odno 가 없습니다")
             continue
-        label = _independent_odno_hash(odno)
+        label = _independent_odno_hash(odno, salt)
         listed.add(odno)
         if entry.get("odno_hash") != label:
             problems.append(f"{label} 건너뜀 항목의 odno_hash 가 주문번호와 일치하지 않습니다")
@@ -317,7 +388,7 @@ def _verify_skipped_unverified(evidence):
             continue
         if not fill.get("amount_confirmed", True):
             continue
-        label = _independent_odno_hash(odno)
+        label = _independent_odno_hash(odno, salt)
         if odno in applied:
             problems.append(
                 f"{label} 증명 불가 과거 주문(레거시 0 마커)이 재반영됐습니다 (이중 가산 의심)"
@@ -1810,7 +1881,7 @@ def verify_evidence_file(
 
     problems.extend(_verify_evidence(evidence))
     # 중복 메시지는 제거합니다.
-    deduped = list(dict.fromkeys(problems))
+    deduped = list(dict.fromkeys(_mask_problem_messages(problems, evidence)))
     return not deduped, deduped
 
 
