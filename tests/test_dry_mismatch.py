@@ -9,7 +9,7 @@ DRY 모드 불일치 가드 무력화 테스트.
 - branch 1: 이력 N주 vs 잔고 0  → DRY: 경고 + 사이클 종료 저장 skip
 - branch 2: 이력 0 vs 잔고 N    → DRY: 경고만, 기록 없음 / LIVE: 기록 + raise
 - branch 3: T=0 vs 실보유 N     → DRY: 경고만, 기록 없음
-- FORCE_T + 불일치: DRY에서 FORCE_T 블록이 정상 적용되어야 함
+- FORCE_T + DRY: state 를 저장하지 않고 명시적 오류로 중단 (T 보정은 TRADE_MODE=REPAIR)
 """
 import os
 import sys
@@ -159,17 +159,18 @@ class TestDryBranch2:
             for s in ctx["saved_states"]
         ), "LIVE는 balance_mismatch를 기록해야 합니다"
 
-    def test_dry_with_force_t_applies(self, reconcile_env, monkeypatch):
-        """DRY + FORCE_T + 불일치: 가드가 무력화되므로 FORCE_T가 정상 적용됩니다."""
+    def test_dry_with_force_t_is_rejected_without_saving(self, reconcile_env, monkeypatch):
+        """DRY + FORCE_T: DRY 는 읽기 전용이므로 저장 없이 명시적 오류로 중단합니다 (REPAIR 사용)."""
         monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
         ctx = reconcile_env
         ctx["load"]("TQQQ", _make_state(T=0.0))
         broker = _make_broker(balance_qty=2, order_history=[])
 
-        trading_bot.run_one_symbol(broker, _symbol_config(force_t=5.0))
+        with pytest.raises(RuntimeError, match="REPAIR"):
+            trading_bot.run_one_symbol(broker, _symbol_config(force_t=5.0))
 
-        assert any(s["T"] == 5.0 for s in ctx["saved_states"]), \
-            "DRY에서도 FORCE_T가 적용되어 저장되어야 합니다"
+        assert not ctx["saved_states"], "DRY 에서는 FORCE_T 로도 state 를 저장하면 안 됩니다"
+        broker.get_order_history.assert_not_called()
 
 
 class TestDryBranch1:

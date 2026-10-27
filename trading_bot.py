@@ -575,6 +575,23 @@ def build_settlement_evidence(
     return evidence
 
 
+def _force_t_in_dry_message(symbol_configs):
+    """DRY 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
+
+    DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다. FORCE_T 는 T·orders_meta·원장·워터마크를
+    덮어쓰고 저장하는 명시적 복구이므로 DRY 에서 적용하면 로컬 .state.json 이 바뀝니다.
+    복구·보정은 TRADE_MODE=REPAIR 로 실행해야 합니다.
+    """
+    names = [str(c.get("symbol")) for c in symbol_configs if c.get("force_t") is not None]
+    if not names:
+        return ""
+    keys = ", ".join(f"{n}_FORCE_T" for n in names)
+    return (
+        f"TRADE_MODE=DRY 에서는 {keys} 를 적용할 수 없습니다 (DRY 는 state 를 저장하지 않는 읽기 전용 미리보기). "
+        "state 를 저장하지 않고 중단합니다. T 보정은 TRADE_MODE=REPAIR 로 실행하세요."
+    )
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -593,6 +610,11 @@ def run_one_symbol(broker: Broker, symbol_config):
     symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
     additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
+
+    # DRY 에서 FORCE_T 는 state 를 저장하게 되므로 어떤 조회·변경보다 먼저 막습니다.
+    _force_t_block = _force_t_in_dry_message([symbol_config]) if TRADE_MODE == "DRY" else ""
+    if _force_t_block:
+        raise RuntimeError(_force_t_block)
 
     print(f"\n{'=' * 60}")
     print(f"종목 처리 시작: {symbol} ({exchange})")
@@ -961,9 +983,8 @@ def run_one_symbol(broker: Broker, symbol_config):
         if _has_unresolved_reverse_orders(state):
             state.setdefault("reverse_mode", {})["reconciliation_only"] = True
             state["reverse_mode"]["active"] = False
-            # TODO [REPAIR MIGRATION] FORCE_T save in DRY: 명시적 보정용으로 유지, REPAIR로 이관 예정.
-            # For now kept as-is (FORCE_T is user-initiated state repair).
-            # Migrate to STATE_NET_INVESTED_REPAIR_ONLY or similar read-only tool.
+            # DRY 에서는 이 블록에 도달하기 전에 차단됩니다(진입부 가드). 여기는 LIVE 레거시 경로이며
+            # FORCE_T 보정은 TRADE_MODE=REPAIR(_repair_force_t) 사용을 권장합니다.
             save_state(symbol, state)
             raise RuntimeError("미해결 리버스 주문이 있어 FORCE_T 적용을 중단합니다.")
         old_T = state["T"]
@@ -997,7 +1018,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["net_invested_status"] = "valid"
         print(f"[T 보정] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), "
               f"orders_meta/balance_mismatch 초기화, last_updated 갱신")
-        # TODO [REPAIR MIGRATION] FORCE_T save in DRY: allowed for explicit correction.
+        # DRY 는 진입부에서 차단되므로 이 저장은 LIVE 레거시 경로에서만 실행됩니다 (권장: TRADE_MODE=REPAIR).
         save_state(symbol, state)
 
     T = state["T"]
@@ -2610,6 +2631,14 @@ def main():
         runtime_config.TRADE_MODE = "DRY"
         globals()["TRADE_MODE"] = "DRY"
         print("[T 보정] FORCE_T_REINFERENCE=true → 브로커 생성 전 DRY 모드로 고정합니다.")
+
+    # DRY(고정된 경우 포함)에서는 {SYMBOL}_FORCE_T 를 적용하지 않습니다 — 브로커 생성·state 변경 전에 중단.
+    # FORCE_T_REINFERENCE 는 DRY 에서 미리보기(저장 없음), REPAIR 에서 실제 저장으로 구분이 유지됩니다.
+    if TRADE_MODE == "DRY":
+        _force_t_block = _force_t_in_dry_message(SYMBOLS)
+        if _force_t_block:
+            print(f"[중단] {_force_t_block}")
+            sys.exit(1)
 
     broker = create_broker()
     try:
