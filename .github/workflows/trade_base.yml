@@ -138,6 +138,9 @@ jobs:
         id: resolve
         run: |
           MODE="${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
+          # 봇(src/config.py)은 TRADE_MODE 를 strip().upper() 로 정규화합니다. state 캐시 저장 가드가
+          # 실제 실행 모드와 어긋나지 않도록 같은 방식으로 정규화합니다 (예: 'live ' → 'LIVE').
+          MODE=$(printf '%s' "$MODE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
           echo "trade_mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
           echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
@@ -317,12 +320,25 @@ jobs:
           )
           PY
 
+      # state 캐시 저장 가드: 실제로 확정된 실행 모드(steps.resolve.outputs.trade_mode)가 LIVE 또는 REPAIR 일 때만
+      # 새 캐시를 만듭니다. DRY·미확정·잘못된 값은 저장하지 않아 "운영 복원 후보"가 생기지 않습니다.
+      # - 복원(state 캐시 복원)은 모든 모드에서 허용합니다.
+      # - always() 는 유지합니다: LIVE 실행이 일부 주문 처리 후 실패해도 state 를 보존해야 합니다 (success() 금지).
+      # - 입력값/BROKER_MODE 로 판단하지 않습니다 (실제 실행 모드와 다를 수 있음).
       - name: state 캐시 저장
         uses: actions/cache/save@v4
-        if: always()
+        if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') }}
         with:
           path: .state.json
           key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
+
+      - name: state 캐시 저장 생략 안내
+        if: ${{ always() && !(steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') }}
+        # trade_mode 는 dispatch payload 에서 올 수 있는 외부 입력이므로 셸 스크립트에 직접 끼워 넣지 않고 env 로 전달합니다.
+        env:
+          RESOLVED_MODE: ${{ steps.resolve.outputs.trade_mode }}
+        run: |
+          echo "::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구 결과를 캐시에 남기려면 TRADE_MODE=REPAIR 로 실행하세요."
 
       # 정산 근거에는 원문 주문번호(skipped_unverified 등)가 들어 있습니다. 공개 저장소의
       # Artifact 는 로그인한 누구나 받을 수 있으므로 **암호화한 파일만** 업로드합니다.
