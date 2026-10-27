@@ -72,6 +72,8 @@ def _buy_fill(odno="ORD1", odt="2026-07-14T00:00:00+00:00", qty=1, price=50.0):
         "ord_datetime_utc": odt,
         "ft_ccld_qty": str(qty),
         "ft_ccld_unpr3": str(price),
+        # 체결금액 미확정 게이트(정산 확정성) 통과를 위해 금액을 명시합니다
+        "ft_ccld_amt3": str(round(qty * price, 2)),
         "sll_buy_dvsn_cd_name": "매수",
     }
 

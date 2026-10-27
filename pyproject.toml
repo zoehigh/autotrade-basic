@@ -20,7 +20,8 @@ markers = [
     "toss: TOSS 실 API 통합 테스트 (TOSS_APP_KEY/SECRET 필요)",
     "nhplug: NHPLUG 실 API 통합 테스트 (NHPLUG_APP_KEY/SECRET 필요)",
     "meritz: MERITZ 실 API 통합 테스트 (MERITZ_APP_KEY/SECRET 필요, 실전전용)",
-    "live_order: 실제 주문이 발생하는 위험 테스트",
+    "preflight: 브로커 preflight (실 API 호출, RUN_BROKER_API_TESTS=1 필요)",
+    "live_order: 실제 주문이 발생하는 위험 테스트 (RUN_BROKER_API_TESTS=1 + ALLOW_BROKER_ORDERS=1 필요)",
 ]
 
 [dependency-groups]

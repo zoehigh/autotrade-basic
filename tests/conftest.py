@@ -44,6 +44,35 @@ _REQUIRED_KEYS = {
 }
 
 
+# 실 브로커 API를 호출할 수 있는 테스트 마커 — 기본 실행에서는 전부 skip 됩니다.
+_API_MARKERS = set(_REQUIRED_KEYS) | {"preflight", "live_order"}
+
+
+def _env_flag(name: str) -> bool:
+    """opt-in 플래그: 정확히 '1'/'true' 일 때만 켜집니다 (.env 값도 동일 규칙)."""
+    return os.getenv(name, "").strip().lower() in ("1", "true")
+
+
+@pytest.fixture(autouse=True)
+def _block_external_http(monkeypatch):
+    """기본 실행에서는 외부 HTTP를 원천 차단합니다 (마커 누락 테스트가 실 API를 쳐도 막힘).
+
+    RUN_BROKER_API_TESTS=1 일 때만 해제합니다. 개별 테스트가 requests를 mock 하면
+    이 차단보다 나중에 적용되므로 그대로 동작합니다.
+    """
+    if _env_flag("RUN_BROKER_API_TESTS"):
+        return
+    import requests
+
+    def _blocked(self, method, url, *args, **kwargs):
+        raise RuntimeError(
+            f"[테스트 차단] 외부 HTTP 호출 금지: {method} {url} "
+            f"(실 API 테스트는 RUN_BROKER_API_TESTS=1 로 opt-in)"
+        )
+
+    monkeypatch.setattr(requests.sessions.Session, "request", _blocked)
+
+
 def _get_marked_brokers(item) -> set:
     """테스트에 지정된 브로커 마커 집합을 반환합니다."""
     return {m.name for m in item.iter_markers() if m.name in _REQUIRED_KEYS}
@@ -58,7 +87,20 @@ def pytest_collection_modifyitems(config, items):
     해당 브로커의 필수 키가 설정돼 있을 때만 실행됩니다.
     마커가 없는 유닛/모의 테스트는 항상 실행됩니다.
     """
+    api_enabled = _env_flag("RUN_BROKER_API_TESTS")
+    orders_enabled = api_enabled and _env_flag("ALLOW_BROKER_ORDERS")
     for item in items:
+        marker_names = {m.name for m in item.iter_markers()}
+        if marker_names & _API_MARKERS and not api_enabled:
+            item.add_marker(pytest.mark.skip(
+                reason="실 브로커 API 테스트는 RUN_BROKER_API_TESTS=1 일 때만 실행됩니다"
+            ))
+            continue
+        if "live_order" in marker_names and not orders_enabled:
+            item.add_marker(pytest.mark.skip(
+                reason="주문이 발생하는 테스트는 ALLOW_BROKER_ORDERS=1 이 추가로 필요합니다"
+            ))
+            continue
         marked = _get_marked_brokers(item)
         if not marked:
             continue
