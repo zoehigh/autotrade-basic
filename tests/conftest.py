@@ -106,6 +106,43 @@ if not _env_flag("RUN_BROKER_API_TESTS"):
     _install_socket_guard()
 
 
+# ── 저장소 .state.json 보호 ───────────────────────────────────────────
+# `src/state.py` 의 `_STATE_FILE` 은 저장소 루트의 `.state.json` 을 가리킵니다. 테스트가 `save_state`/
+# `save_states` 를 mock 하지 않고 실제 구현에 닿으면 이 로컬 state 를 덮어쓰게 됩니다
+# (실제로 일어난 사고: 2026-10-27, save_state 만 mock 한 테스트가 새 save_states 경로로 실제 파일을 씀).
+# 1) 모든 테스트는 기본적으로 임시 경로를 쓰도록 강제하고 (개별 테스트가 따로 지정하면 그것이 우선),
+# 2) 세션 전후 해시를 비교해 저장소 파일이 바뀌었다면 세션을 실패시킵니다.
+_REPO_STATE_FILE = Path(__file__).resolve().parent.parent / ".state.json"
+
+
+def _repo_state_digest():
+    import hashlib
+
+    try:
+        return hashlib.sha256(_REPO_STATE_FILE.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+_REPO_STATE_DIGEST_AT_START = _repo_state_digest()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state_file(monkeypatch, tmp_path):
+    import state as _state_module
+
+    monkeypatch.setattr(_state_module, "_STATE_FILE", str(tmp_path / ".state.json"))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _repo_state_digest() != _REPO_STATE_DIGEST_AT_START:
+        print(
+            f"\n[테스트 사고] 저장소의 {_REPO_STATE_FILE.name} 이 테스트 도중 변경되었습니다 — "
+            "테스트가 실제 state 파일에 썼습니다. 세션을 실패 처리합니다."
+        )
+        session.exitstatus = 1
+
+
 @pytest.fixture(autouse=True)
 def _block_external_http(monkeypatch):
     """기본 실행에서는 외부 HTTP를 원천 차단합니다 (마커 누락 테스트가 실 API를 쳐도 막힘).

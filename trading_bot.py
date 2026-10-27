@@ -26,7 +26,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 from notifier import notify
 
 
@@ -624,6 +624,25 @@ def _validate_reinference_t(symbol, new_t, max_t):
             f"(상한으로 잘라 저장하면 정산 오류를 숨길 수 있습니다. 초과 원인을 확인하세요)"
         )
     return ""
+
+
+def _reinference_hold_reasons(symbol, state):
+    """재추정 결과가 '정산 보류' 상태인지 확인하고 사유 목록을 반환합니다 (정상이면 빈 목록).
+
+    보류 상태에서는 `update_T_from_history` 가 메모리를 보류 직전 스냅샷으로 되돌리는데, REPAIR 재추정은
+    그 스냅샷을 찍기 전에 `last_updated` 를 비워 두었으므로 **그대로 저장하면 워터마크가 빈 값으로 바뀝니다**.
+    따라서 보류 표식이 하나라도 있으면 어떤 종목도 저장하지 않습니다. 주문번호는 마스킹해 출력합니다.
+    """
+    reasons = []
+    if state.get("_settlement_hold"):
+        reasons.append(f"정산 보류({state.get('_settlement_hold_reason') or '사유 없음'})")
+    if state.get("_pending_amount_odnos"):
+        reasons.append(f"체결금액 미확정 주문 {mask_odno(list(state['_pending_amount_odnos'])[:5])}")
+    if state.get("_pending_marker_odnos"):
+        reasons.append(f"마커 누락·무효 주문 {mask_odno(list(state['_pending_marker_odnos'])[:5])}")
+    if state.get("_position_basis_unknown"):
+        reasons.append(f"보유수량 기준 미확보({state.get('_position_basis_unknown_reason') or '사유 없음'})")
+    return [f"{symbol} {reason}" for reason in reasons]
 
 
 def run_one_symbol(broker: Broker, symbol_config):
@@ -2414,9 +2433,12 @@ def _repair_reinference():
     기존 main()의 FORCE_T_REINFERENCE 처리를 모방하지만, REPAIR 모드 전용으로
     브로커/전략/주문 없이 T 재추정만 수행합니다.
 
-    **전 종목을 먼저 재추정·검증한 뒤에만 저장합니다.** 한 종목이라도 검증에 실패하면(재추정 T가
-    MAX_T 초과, 숫자 오류) 어떤 종목도 저장하지 않고 종료 코드 1 로 끝납니다 — 일부 종목만 먼저
-    저장되는 부분 복구를 막기 위함입니다. T 를 MAX_T 로 잘라 저장하지 않습니다(정산 오류 은폐 방지).
+    **전 종목을 먼저 재추정·검증한 뒤, `.state.json` 을 한 번만(원자적으로) 저장합니다.**
+    - 검증 실패(재추정 T 가 MAX_T 초과, 숫자 오류, 정산 보류 표식)가 한 종목이라도 있으면
+      어떤 종목도 저장하지 않고 종료 코드 1 로 끝납니다 — 일부 종목만 먼저 저장되는 부분 복구 방지.
+    - 검증은 통과했지만 파일 저장이 실패하면 종료 코드 2 로 끝납니다. 임시 파일에 쓴 뒤 교체하므로
+      원본 상태 파일은 그대로입니다 (검증 실패와 구분).
+    - T 를 MAX_T 로 잘라 저장하지 않습니다(정산 오류 은폐 방지).
     """
     import config as runtime_config
     # REPAIR는 LIVE이더라도 DRY로 고정 (T 재추정 중 주문 방지)
@@ -2427,7 +2449,7 @@ def _repair_reinference():
 
     broker = create_broker()
     try:
-        planned = []   # (symbol, 재추정된 state)
+        planned = {}   # {symbol: 재추정된 state}
         failures = []
         for symbol_config in SYMBOLS:
             symbol = symbol_config["symbol"]
@@ -2451,10 +2473,11 @@ def _repair_reinference():
 
             state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
             print(f"[REPAIR:REINFERENCE] {symbol} 재추정 T={state['T']}, 상한 MAX_T={max_t}")
+            failures.extend(_reinference_hold_reasons(symbol, state))
             problem = _validate_reinference_t(symbol, state["T"], max_t)
             if problem:
                 failures.append(problem)
-            planned.append((symbol, state))
+            planned[symbol] = state
 
         if failures:
             print("\n[REPAIR:REINFERENCE] 검증 실패 — 어떤 종목도 저장하지 않습니다 (state 변경 없음, 주문 0건):")
@@ -2462,8 +2485,16 @@ def _repair_reinference():
                 print(f"  - {problem}")
             sys.exit(1)
 
-        for symbol, state in planned:
-            save_state(symbol, state)
+        # 전 종목 검증 통과 → 파일 쓰기 1회 (원자적)
+        try:
+            save_states(planned)
+        except Exception as save_error:
+            print(
+                f"\n[REPAIR:REINFERENCE] 저장 실패(파일 쓰기) — 검증은 통과했지만 상태 파일을 저장하지 못했습니다. "
+                f"임시 파일 교체 방식이라 기존 상태 파일은 변경되지 않았습니다: {str(save_error)[:200]}"
+            )
+            sys.exit(2)
+        for symbol, state in planned.items():
             print(
                 f"[REPAIR:REINFERENCE] {symbol} T 재추정 완료 → T={state['T']}, "
                 f"state_hash={canonical_state_hash(state)}"

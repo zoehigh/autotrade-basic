@@ -147,28 +147,19 @@ def load_state(symbol):
     }
 
 
-def save_state(symbol, state_dict):
-    """
-    종목의 상태(T값 등)를 파일에 저장합니다.
+def _read_all_states():
+    """상태 파일 전체를 읽습니다 (없으면 빈 dict, 손상이면 덮어쓰기 방지를 위해 예외)."""
+    if not os.path.exists(_STATE_FILE):
+        return {}
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"상태 파일이 손상되어 덮어쓰기를 중단합니다: {e}") from e
 
-    기존 파일의 다른 종목 정보는 유지하고, 해당 종목 정보만 덮어씁니다.
 
-    Parameters:
-        symbol (str): 종목 코드 (예: "TQQQ", "SOXL")
-        state_dict (dict): 저장할 상태 정보 (T 포함)
-    """
-    symbol = symbol.upper()
-
-    # 기존 전체 상태 읽기
-    all_states = {}
-    if os.path.exists(_STATE_FILE):
-        try:
-            with open(_STATE_FILE, "r", encoding="utf-8") as f:
-                all_states = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            raise RuntimeError(f"상태 파일이 손상되어 덮어쓰기를 중단합니다: {e}") from e
-
-    # 이 종목 상태 업데이트
+def _state_record(state_dict):
+    """한 종목의 state dict 에서 **저장 대상 필드만** 뽑은 레코드를 만듭니다."""
     # state_dict에 이미 'last_updated' 값이 있으면 그 값을 우선 사용합니다 (UTC ISO 권장).
     last_updated_val = state_dict.get("last_updated")
     if not last_updated_val:
@@ -179,7 +170,7 @@ def save_state(symbol, state_dict):
         last_updated_val = ""
 
     # Allow optional new fields to be persisted for diagnostic purposes
-    all_states[symbol] = {
+    return {
         "T": float(state_dict.get("T", 0.0)),
         "last_updated": last_updated_val,
         "cycle_start_date": state_dict.get("cycle_start_date", ""),
@@ -203,6 +194,9 @@ def save_state(symbol, state_dict):
         "settlement_ledger": state_dict.get("settlement_ledger", {}),
     }
 
+
+def _write_all_states_atomic(all_states):
+    """임시 파일에 쓰고 fsync 한 뒤 `os.replace` 로 교체합니다 (실패 시 원본 파일은 그대로)."""
     state_dir = os.path.dirname(_STATE_FILE)
     fd, temp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=state_dir)
     try:
@@ -218,13 +212,46 @@ def save_state(symbol, state_dict):
             pass
         raise
 
-    T = all_states[symbol]["T"]
-    effective_seed = all_states[symbol]["effective_seed"]
-    last_upd = all_states[symbol].get("last_updated", "")
-    last_ordno = all_states[symbol].get("last_processed_ordno", "")
-    mismatch = all_states[symbol].get("balance_mismatch")
-    mismatch_flag = "YES" if mismatch else "NO"
-    print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}, last_updated={last_upd}, last_processed_ordno={mask_odno(last_ordno)}, balance_mismatch={mismatch_flag}")
+
+def _print_saved(symbol, record):
+    last_ordno = record.get("last_processed_ordno", "")
+    mismatch_flag = "YES" if record.get("balance_mismatch") else "NO"
+    print(f"[상태] {symbol} 상태 저장 완료 → T={record['T']}, effective_seed=${record['effective_seed']:.2f}, last_updated={record.get('last_updated', '')}, last_processed_ordno={mask_odno(last_ordno)}, balance_mismatch={mismatch_flag}")
+
+
+def save_state(symbol, state_dict):
+    """
+    종목의 상태(T값 등)를 파일에 저장합니다.
+
+    기존 파일의 다른 종목 정보는 유지하고, 해당 종목 정보만 덮어씁니다.
+
+    Parameters:
+        symbol (str): 종목 코드 (예: "TQQQ", "SOXL")
+        state_dict (dict): 저장할 상태 정보 (T 포함)
+    """
+    symbol = symbol.upper()
+    all_states = _read_all_states()
+    all_states[symbol] = _state_record(state_dict)
+    _write_all_states_atomic(all_states)
+    _print_saved(symbol, all_states[symbol])
+
+
+def save_states(updates):
+    """여러 종목의 상태를 **파일 쓰기 1회(원자적)** 로 저장합니다.
+
+    종목별로 `save_state` 를 반복하면 중간 실패 시 일부 종목만 저장된 부분 복구가 생깁니다.
+    여기서는 기존 파일을 한 번 읽고, 모든 종목 레코드를 메모리에서 만든 뒤, 임시 파일 → `os.replace`
+    한 번으로 교체하므로 전부 반영되거나(성공) 원본이 그대로이거나(실패) 둘 중 하나입니다.
+
+    Parameters:
+        updates (dict): {종목코드: state_dict}
+    """
+    all_states = _read_all_states()
+    records = {str(sym).upper(): _state_record(st) for sym, st in updates.items()}
+    all_states.update(records)
+    _write_all_states_atomic(all_states)
+    for sym, record in records.items():
+        _print_saved(sym, record)
 
 
 def canonical_state_hash(state):

@@ -102,3 +102,26 @@ def test_conftest_guard_is_installed_at_import_time():
         capture_output=True, text=True, timeout=60,
     )
     assert result.stdout.strip().endswith("BLOCKED"), result.stdout + result.stderr[-300:]
+
+
+# ── 저장소 .state.json 보호: 테스트는 기본적으로 임시 state 파일만 씁니다 ──
+def test_state_file_is_isolated_from_repo_by_default(tmp_path):
+    import state as state_module
+
+    repo_state = (Path(__file__).resolve().parent.parent / ".state.json").resolve()
+    assert Path(state_module._STATE_FILE).resolve() != repo_state, "테스트가 저장소 .state.json 을 가리킵니다"
+    assert Path(state_module._STATE_FILE).resolve().parent == tmp_path.resolve()
+
+
+def test_unmocked_save_state_and_save_states_never_touch_repo_state_file():
+    import hashlib
+
+    import state as state_module
+
+    repo_state = Path(__file__).resolve().parent.parent / ".state.json"
+    before = hashlib.sha256(repo_state.read_bytes()).hexdigest() if repo_state.exists() else None
+    record = {"T": 1.0, "last_updated": "", "orders_meta": {}}
+    state_module.save_state("TQQQ", record)
+    state_module.save_states({"TQQQ": record, "SOXL": record})
+    after = hashlib.sha256(repo_state.read_bytes()).hexdigest() if repo_state.exists() else None
+    assert before == after

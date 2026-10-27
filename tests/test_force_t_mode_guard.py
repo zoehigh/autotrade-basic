@@ -73,9 +73,14 @@ def _fake_strategy(broker, **kwargs):
 
 @pytest.fixture
 def env(monkeypatch):
-    saved, loaded = [], {}
+    saved, loaded, save_calls = [], {}, []
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: deepcopy(loaded.get(symbol, _state())))
     monkeypatch.setattr(trading_bot, "save_state", lambda symbol, state: saved.append(deepcopy(state)))
+
+    def _save_states(updates):
+        save_calls.append(sorted(updates))  # 파일 쓰기 1회 = 호출 1회
+        saved.extend(deepcopy(st) for st in updates.values())
+    monkeypatch.setattr(trading_bot, "save_states", _save_states)
     monkeypatch.setattr(trading_bot, "notify", lambda message, urgent=False: None)
     monkeypatch.setattr(trading_bot, "무한매수법_V4", _fake_strategy)
     # 모든 복구 소스를 끈 상태에서 시작 (실행 환경변수가 새어 들어오지 않도록)
@@ -86,7 +91,7 @@ def env(monkeypatch):
                  "STATE_SET_CYCLE_START_ONLY"):
         monkeypatch.setattr(trading_bot, flag, False)
     monkeypatch.setattr(runtime_config, "FORCE_T_REINFERENCE", False)
-    return {"saved": saved, "load": lambda sym, st: loaded.__setitem__(sym, st)}
+    return {"saved": saved, "save_calls": save_calls, "load": lambda sym, st: loaded.__setitem__(sym, st)}
 
 
 def _no_broker(monkeypatch):

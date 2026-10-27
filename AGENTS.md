@@ -92,6 +92,9 @@ autotrade-basic/
   - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` 또는 `LIVE` → state 저장·브로커 호출·주문 **없이 명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성 전). **FORCE_T는 `TRADE_MODE=REPAIR`에서만 허용**. LIVE를 막는 이유: FORCE_T는 T·`orders_meta`·`reverse_mode`·정산 원장·워터마크를 덮어쓰는데, LIVE에서는 같은 실행에서 주문 단계까지 이어져 복구와 주문이 결합됨. `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일하게 차단
   - `FORCE_T_REINFERENCE`: **DRY = 미리보기(저장 없음), REPAIR = 실제 저장**. LIVE + `FORCE_T_REINFERENCE=true`는 주문 방지를 위해 **DRY 미리보기로 고정**되며 state는 저장되지 않음(로그에 명시). 실제 저장은 `TRADE_MODE=REPAIR`
   - REPAIR 재추정(`_repair_reinference`): 재추정 T가 `{SYMBOL}_MAX_T`(기본 분할수)를 **초과하면 저장을 거부**하고 종료 코드 1 (T를 상한으로 **자르지 않음** — 자르면 정산 오류가 숨겨짐). 여러 종목은 **전부 재추정·검증한 뒤에만** 저장하므로 일부 종목만 먼저 저장되지 않음. T/MAX_T가 유한한 유효 숫자가 아니어도 거부. 일반 실행 경로(`run_one_symbol`)는 기존대로 상한으로 조정
+  - REPAIR 재추정은 **정산 보류 표식**(`_settlement_hold`·`_pending_amount_odnos`·`_pending_marker_odnos`·`_position_basis_unknown`)이 있으면 저장을 거부하고 종료 코드 1로 끝납니다. 재추정이 `last_updated`를 비운 뒤 `update_T_from_history`를 부르기 때문에, 보류 시 되돌려진 스냅샷도 `last_updated=""`라 그대로 저장하면 워터마크가 지워집니다
+  - REPAIR 재추정은 전 종목 검증 후 `.state.json`을 **파일 쓰기 1회(`save_states`, 임시 파일→`os.replace`)** 로만 저장합니다. 종료 코드: **1 = 검증 실패**(MAX_T 초과·숫자 오류·보류, 저장 시도 없음), **2 = 파일 저장 실패**(검증은 통과, 원본 파일은 변경되지 않음)
+  - ⚠️ **알려진 한계 — Actions의 REPAIR**: REPAIR 핸들러는 `settlement-*.json`(정산 근거)을 만들지 않으므로 `verify-settlement`가 "정산 근거 파일이 없습니다 — 검증 불가"로 **항상 실패**하고, state 캐시는 검증 이전 job에서 이미 저장됩니다. REPAIR 전용 독립 검증이 준비되기 전까지 Actions REPAIR 사용은 보류하고 로컬(`docs/marker-correction-runbook.md` 절차)에서 실행하세요
   - ⚠️ 예외 — **레거시 `STATE_*_ONLY`는 DRY여도 대부분 state를 저장**합니다: 읽기 전용은 `STATE_DIAGNOSTIC_ONLY`·`STATE_REVERSE_AUDIT_ONLY`뿐이고, `STATE_REPAIR_ONLY`·`STATE_CLEAR_FENCE_ONLY`·`STATE_REVERSE_RECONCILE_ONLY`·`STATE_NET_INVESTED_REPAIR_ONLY`·`STATE_ASSUME_REVERSE_EXPIRY_ONLY`·`STATE_SET_CYCLE_START_ONLY`는 저장합니다. 따라서 이들은 **운영 사용을 제한**합니다(`TRADE_MODE=DRY`를 읽기 전용으로 오해하지 말 것 — 사용 전 백업·승인 필수, "확인용" 실행 금지). 후속 작업에서 REPAIR 전용으로 통합 예정
   - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
   - `TRADE_MODE=REPAIR`는 Actions wrapper의 `workflow_dispatch` 선택지(DRY/LIVE)에 없고 `repository_dispatch` payload의 `trade_mode` 또는 `vars.TRADE_MODE`로 지정
@@ -136,6 +139,7 @@ TRADE_MODE=DRY SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.
 #  - 실 API 통합 테스트: RUN_BROKER_API_TESTS=1 (opt-in, 자격증명도 필요)
 #  - 주문이 발생하는 테스트(live_order): 위에 더해 ALLOW_BROKER_ORDERS=1 (추가 opt-in)
 #  - 주문 함수 진입 직전에도 `_assert_order_allowed()` 가 ALLOW_BROKER_ORDERS 를 재검증 (CLI 포함)
+#  - 테스트는 conftest autouse fixture 로 `state._STATE_FILE` 을 임시 경로로 격리하고, 세션 전후 저장소 `.state.json` 해시가 달라지면 세션을 실패 처리합니다
 uv run pytest tests/ -v                                        # 안전: 유닛/모의만
 RUN_BROKER_API_TESTS=1 uv run pytest tests/ -m kis -v          # 읽기 전용 통합 테스트
 RUN_BROKER_API_TESTS=1 ALLOW_BROKER_ORDERS=1 uv run pytest tests/test_broker_preflight.py -v  # 주문 포함
