@@ -1,0 +1,65 @@
+name: Backup state caches (encrypted)
+
+# Read-only recovery of six known cache snapshots. Never executes trading.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: kis-before
+            key: state-kis-demo-40009255811
+          - label: kis-after
+            key: state-kis-demo-40384302200
+          - label: kiwoom-before
+            key: state-kiwoom-demo-40009933869
+          - label: kiwoom-after
+            key: state-kiwoom-demo-40385059348
+          - label: nhplug-before
+            key: state-nhplug-demo-40010604565
+          - label: nhplug-after
+            key: state-nhplug-demo-40385826091
+
+    steps:
+      - name: Restore the exact snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: .state.json
+          key: ${{ matrix.key }}
+          fail-on-cache-miss: true
+
+      - name: Validate and encrypt without printing state
+        shell: bash
+        env:
+          PASSPHRASE: ${{ secrets.STATE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -s .state.json
+          python3 -m json.tool .state.json > /dev/null
+          if [[ -z "$PASSPHRASE" ]]; then
+            echo "::error::STATE_BACKUP_PASSPHRASE is empty or unavailable"
+            exit 1
+          fi
+
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --symmetric \
+              --cipher-algo AES256 --s2k-digest-algo SHA256 \
+              --output "backup-${{ matrix.label }}.gpg" .state.json
+          test -s "backup-${{ matrix.label }}.gpg"
+
+      - name: Upload encrypted snapshot only
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ matrix.label }}
+          path: backup-${{ matrix.label }}.gpg
+          if-no-files-found: error
+          retention-days: 7
