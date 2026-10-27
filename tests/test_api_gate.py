@@ -125,3 +125,37 @@ def test_unmocked_save_state_and_save_states_never_touch_repo_state_file():
     state_module.save_states({"TQQQ": record, "SOXL": record})
     after = hashlib.sha256(repo_state.read_bytes()).hexdigest() if repo_state.exists() else None
     assert before == after
+
+
+def test_session_fails_when_a_test_writes_the_repo_state_file(tmp_path):
+    """conftest 감시가 실제로 종료 코드를 바꾸는지 임시 프로젝트에서 끝까지 확인합니다 (실제 저장소는 건드리지 않음)."""
+    import os
+    import shutil
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    os.symlink(root / "src", proj / "src")
+    shutil.copy(root / "tests" / "conftest.py", proj / "tests" / "conftest.py")
+    shutil.copy(root / "pyproject.toml", proj / "pyproject.toml")
+    (proj / "tests" / "test_dirty.py").write_text(
+        "from pathlib import Path\n"
+        "def test_writes_repo_state():\n"
+        "    (Path(__file__).resolve().parent.parent / '.state.json').write_text('{}')\n"
+    )
+    (proj / "tests" / "test_clean.py").write_text("def test_clean():\n    assert True\n")
+    env = {k: v for k, v in os.environ.items() if k != "RUN_BROKER_API_TESTS"}
+
+    def run(name):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", f"tests/{name}", "-q", "-p", "no:cacheprovider"],
+            cwd=proj, env=env, capture_output=True, text=True, timeout=120,
+        )
+
+    dirty = run("test_dirty.py")
+    assert "1 passed" in dirty.stdout and "테스트 사고" in dirty.stdout
+    assert dirty.returncode == 1, "테스트가 통과해도 저장소 state 파일을 건드렸다면 세션은 실패해야 합니다"
+    (proj / ".state.json").unlink()
+    clean = run("test_clean.py")
+    assert clean.returncode == 0 and "테스트 사고" not in clean.stdout
