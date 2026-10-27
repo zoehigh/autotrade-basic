@@ -1277,6 +1277,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
     state["_settlement_mode"] = "full_reinference"
     state["sell_t_effects"] = {}
     state.pop("_position_basis_unknown", None)
+    state.pop("_position_basis_unknown_reason", None)
     reset_settlement_ledger(state, 0.0)
     state["_settlement_deltas"] = []
     # ── 금액 미확정 필수 체결 게이트 ──────────────────────────────
@@ -2278,7 +2279,45 @@ def _has_processed_qty_marker(meta):
     return valid
 
 
-def _apply_late_fill_deltas(state, order_history, skip_odnos):
+def mask_odno(odno):
+    """공개 로그용 주문번호 가명 식별자 (같은 번호는 항상 같은 값 — 감사 대조 가능).
+
+    실제 주문번호는 공개 GitHub Actions 로그에 남기지 않습니다.
+    Evidence(비공개 아티팩트)에는 원문과 함께 이 해시를 기록해 상호 대조할 수 있습니다.
+    """
+    import hashlib
+
+    return "ord#" + hashlib.sha256(str(odno).encode("utf-8")).hexdigest()[:8]
+
+
+# 주문 등록 시점에 수량·금액 마커를 함께 0 으로 기록한 신규 메타의 버전 표식.
+# 이 표식이 있는 메타만 "processed_filled_qty=0 → 미반영"으로 신뢰합니다.
+FILL_MARKER_VERSION = 1
+
+
+def _marker_proves_unapplied(meta):
+    """워터마크 이전 주문의 0 마커를 '미반영'으로 신뢰할 수 있는지 판정합니다.
+
+    버전 표식 + 수량 0 + 금액 0.0 이 모두 명시된 신규 등록 메타만 인정합니다.
+    그 외(기존 state 의 processed_filled_qty=0 등)는 반영 여부를 증명할 수 없습니다.
+    """
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("fill_marker_version") != FILL_MARKER_VERSION:
+        return False
+    qty_ok, qty = _parse_processed_qty_marker(meta)
+    if not qty_ok or qty != 0:
+        return False
+    raw = meta.get("processed_filled_amount")
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        return abs(float(raw)) < 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_late_fill_deltas(state, order_history, skip_odnos, skipped_unverified=None):
     """
     워터마크보다 오래된 주문의 **누적 체결 증가분**을 계산합니다 (메타 변경 없음).
 
@@ -2337,6 +2376,24 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
                     f"레거시 메타입니다. 자동 복구하지 않고 정산을 보류합니다."
                 )
                 continue
+            if not _marker_proves_unapplied(meta):
+                # 기존 state 의 0 마커는 미반영의 증거가 아닙니다 (과거 72건 재반영 사고).
+                # 증명할 근거가 없으면 **반영하지 않고 건너뜁니다**. 종목 전체를 보류하지 않는
+                # 이유: 보류하면 같은 실행의 실제 신규 체결까지 정산되지 못합니다.
+                if skipped_unverified is not None:
+                    skipped_unverified.append({
+                        "odno": str(odno),
+                        "odno_hash": mask_odno(odno),
+                        "filled_qty": filled_for_recovery,
+                        "ts": str(row.get("ord_datetime_utc", "")),
+                        "reason": "legacy_zero_marker_unproven",
+                    })
+                print(
+                    f"  [경고] 지연 체결 {mask_odno(odno)} 는 미반영을 증명할 마커"
+                    f"(fill_marker_version)가 없어 자동 반영하지 않고 건너뜁니다 "
+                    f"(필요 시 수동 보정 런북 참고)."
+                )
+                continue
             # 등록된 봇 주문인데 아직 한 번도 반영되지 않은 체결입니다.
             # 이전 RUN 에서 금액 미확정으로 보류된 사이 워터마크가 뒤로 밀리면
             # "처리된 범위 밖"으로 영구 제외되므로, 금액이 확정된 지금 복구합니다.
@@ -2357,6 +2414,89 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
             net_amount += da
     return pending, net_qty, net_amount, held_odnos
 
+
+
+def _mark_position_basis_unknown(
+    state, anchored, balance_qty, *, late_sell=False, prior_cycle=False
+):
+    """보유수량 기준 미확보 사실과 **사유**를 함께 남깁니다 (저장·주문 보류 근거).
+
+    사유는 네 가지 토큰의 조합으로만 만듭니다 (운영 로그·알림에서 바로 읽을 수 있게):
+      - 잔고조회실패       : 브로커 잔고를 받지 못함
+      - 저장보유수량없음   : state.position_qty 로도 기준선을 잡지 못함
+      - 지연매도기준선없음 : 지연 체결 매도의 sell_t_effects.basis 가 비어 있음
+      - 이전사이클매도     : 매도가 현재 사이클 시작 이전(이전 사이클)에 형성됨 →
+                             현재 잔고·position_qty 를 분모로 쓰면 T가 왜곡됨
+
+    사유 키는 소비 시점(`trading_bot._save_settlement_state`)에서 플래그와 함께 pop 하므로
+    `.state.json` 에 남지 않습니다 (save_state 는 화이트리스트이기도 함).
+    """
+    reasons = []
+    if not anchored:
+        if balance_qty is None:
+            reasons.append("잔고조회실패")
+        reasons.append("저장보유수량없음")
+    if late_sell:
+        reasons.append("지연매도기준선없음")
+    if prior_cycle:
+        reasons.append("이전사이클매도")
+    state["_position_basis_unknown"] = True
+    state["_position_basis_unknown_reason"] = " + ".join(reasons)
+    return state["_position_basis_unknown_reason"]
+
+
+def _cycle_date_key(value):
+    """`YYYYMMDD` / `YYYY-MM-DD` / ISO 문자열을 비교 가능한 `YYYY-MM-DD` 로 정규화합니다.
+
+    알 수 없는 형식이면 빈 문자열을 돌려줍니다 (0으로 대체하지 않습니다).
+    """
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _sell_precedes_cycle_window(order, ord_dt, window_start):
+    """매도가 **현재 사이클 구간 이전**(이전 사이클)에 형성됐는지 판별합니다.
+
+    `cycle_start_date` 는 주문일자(`ord_dt`)에서 만들어지므로 같은 기준으로 비교합니다.
+    (KIS/LS/KIWOOM 은 미국영업일, TOSS/MERITZ 는 KST 일자 — 한 배포는 한 브로커만 쓰므로
+     같은 컨벤션 안에서 비교됩니다)
+    주문일자나 사이클 시작일을 알 수 없으면 ``False`` — 판단 근거가 없으므로
+    기존 분류를 그대로 유지합니다 (과차단 방지).
+    """
+    start_key = _cycle_date_key(window_start)
+    if not start_key:
+        return False
+    sell_key = _cycle_date_key(ord_dt) or _cycle_date_key(order.get("ord_dt", ""))
+    if not sell_key:
+        return False
+    return sell_key < start_key
+
+
+def _sell_recorded_basis(state, odno):
+    """매도 주문에 **이미 기록된** 기준선(보유량)을 반환합니다 (없으면 0).
+
+    `sell_t_effects` 는 누적 체결 기준 판정의 근거이고, 원장 sell 항목의 `basis` 도
+    같은 값입니다. 기록된 기준선이 있으면 분류가 현재 잔고에 의존하지 않으므로
+    사이클 경계 가드가 필요 없습니다.
+    """
+    try:
+        entry = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+        basis = int(entry.get("basis") or 0)
+    except (TypeError, ValueError):
+        basis = 0
+    if basis > 0:
+        return basis
+    ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
+    if ledger_entry is None:
+        return 0
+    try:
+        return max(0, int(ledger_entry.get("basis") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty=None):
@@ -2494,8 +2634,10 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         return state, pending_amount_odnos
 
     # ── 1) 지연 체결 후보 (워터마크 이전 주문의 누적 체결 증가분) — 순수 계산 ──
+    unverified_skipped: list[dict] = []
     late_pending, late_net_qty, late_net_amount, late_held_odnos = _apply_late_fill_deltas(
-        state, order_history, {str(odno) for _o, odno, _r in recent_candidates}
+        state, order_history, {str(odno) for _o, odno, _r in recent_candidates},
+        skipped_unverified=unverified_skipped,
     )
 
     # processed_filled_qty 마커가 누락된 레거시 주문도 정산 보류 대상으로 처리합니다.
@@ -2518,6 +2660,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return state, pending_amount_odnos
+
+    if unverified_skipped:
+        # 운영 로그·검증용 일회성 표식 (save_state 화이트리스트 밖이라 저장되지 않습니다)
+        state["_unverified_skipped_odnos"] = [e["odno"] for e in unverified_skipped]
+        state["_unverified_skipped_audit"] = unverified_skipped
 
     # ── 2) 이번 묶음의 반영분(수량·금액) 계산 — 순수 계산 ─────────────
     # 등록된 주문은 메타의 반영 마커와 비교해 **새로 늘어난 부분만** 계산합니다.
@@ -2689,10 +2836,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             else:
                 # 기준선 없이 분류한 지연 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 # (기존 T를 되돌려 최초 기준을 역산하지 않습니다)
-                state["_position_basis_unknown"] = True
+                # ⚠️ 기준선 추론 fallback 금지 — 여기서 별지점/현재가로 기준을 "추정"하면
+                #    매도 비율이 틀어져 T가 잘못 고정됩니다. 보류가 정답입니다.
+                _mark_position_basis_unknown(
+                    state, position_anchored, balance_qty, late_sell=True
+                )
                 entry_now = {}
                 print(
                     f"  [경고] 지연 매도 odno={odno} 의 보유수량 기준을 확보하지 못했습니다 "
+                    f"(사유: {state.get('_position_basis_unknown_reason', '')}) "
                     f"→ 저장·신규 주문을 보류합니다"
                 )
                 net_invested -= da
@@ -2844,6 +2996,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     last_dt_processed = last_updated_dt
     last_ordno_processed = last_processed_ordno
 
+    # ── 사이클 경계 기준 (이전 사이클 매도 가드용) ────────────────────
+    # 이번 묶음 처리 중 `cycle_start_date` 가 리셋(전량매도)될 수 있으므로
+    # 판단 기준이 되는 시작값을 묶음 시작 시점에 고정합니다.
+    _cycle_window_start = state.get("cycle_start_date", "")
+
     # 날짜(ord_dt)별로 그룹화하여 처리합니다
     orders_meta = state.get("orders_meta", {})
     orders_by_date = defaultdict(list)
@@ -2899,9 +3056,30 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if sell_qty <= 0 and abs(sell_amt) < 1e-9:
                 # 이미 반영된 매도 (부분체결 후 추가 체결 없음) → 재분류하지 않습니다.
                 continue
+            # ── 이전 사이클 매도 가드 ─────────────────────────────────
+            # 사이클 경계 이전에 형성된 매도에 **현재** 잔고/position_qty 를 분모로 쓰면
+            # 비율이 틀어져 T 가 왜곡됩니다 (10/22 사고: 실제 81주를 30주로 계산 →
+            # 쿼터매도가 목표매도로 오분류 → T 13.375→3.3438).
+            # 기준선이 원장/마커에 이미 기록돼 있으면 그 값을 쓰므로 안전하지만,
+            # 기록이 없으면 현재 기준선으로 **재분류하지 않고** 보류합니다
+            # (불확실한 정산은 어떤 경로에서도 확정하지 않습니다).
+            if (
+                _sell_recorded_basis(state, odno) <= 0
+                and _sell_precedes_cycle_window(order, ord_dt, _cycle_window_start)
+            ):
+                _mark_position_basis_unknown(
+                    state, position_anchored, balance_qty, prior_cycle=True
+                )
+                print(
+                    f"  [경고] 매도 odno={odno} 는 사이클 시작({_cycle_window_start}) 이전 "
+                    f"주문({ord_dt})입니다 → 현재 보유수량 기준으로 재분류하지 않고 보류합니다 "
+                    f"(사유: {state.get('_position_basis_unknown_reason', '')})"
+                )
+                continue
             if not position_anchored:
                 # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
-                state["_position_basis_unknown"] = True
+                # (사유: 잔고조회실패 / 저장보유수량없음)
+                _mark_position_basis_unknown(state, position_anchored, balance_qty)
             cumulative_qty = int(float(order.get("ft_ccld_qty", "0") or 0))
             kind = "쿼터매도"
             t_before_effect = T

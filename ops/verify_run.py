@@ -112,6 +112,48 @@ def _as_int(value, default=0):
         return int(default)
 
 
+def _parse_qty_marker(meta):
+    """`processed_filled_qty` 마커를 엄격히 판정합니다 (state.py 와 **독립 구현**).
+
+    검증기는 정산 코드를 재사용하지 않습니다 (같은 오류를 그대로 통과시키지 않기 위해).
+    - 키 누락·None·bool·파싱 불가·음수·소수(float) 는 무효입니다.
+    - 명시적이고 유효한 0 이상 정수만 유효 마커로 인정합니다.
+
+    Returns:
+        tuple: (유효 여부, 반영 수량 — 무효면 0)
+    """
+    if not isinstance(meta, dict) or "processed_filled_qty" not in meta:
+        return False, 0
+    raw = meta.get("processed_filled_qty")
+    if raw is None or isinstance(raw, bool):
+        return False, 0
+    try:
+        if isinstance(raw, float) and not raw.is_integer():
+            # 0.5 를 0 으로 절삭하면 "미반영"으로 오인되어 이중 가산됩니다.
+            return False, 0
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return False, 0
+    if value < 0:
+        return False, 0
+    return True, value
+
+
+def _pending_marker_odnos(evidence):
+    """마커 누락·무효로 **정산이 보류된** 주문번호 목록을 읽습니다."""
+    raw = (evidence or {}).get("pending_marker_odnos") or []
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    result = []
+    for value in raw:
+        if value is None:
+            continue
+        odno = str(value)
+        if odno and odno not in result:
+            result.append(odno)
+    return result
+
+
 def _adjustment_is_explicit(entry):
     """T-only 복구처럼 근거가 기록된 adjust 인지 확인합니다."""
     target = entry.get("target_T", entry.get("target"))
@@ -193,8 +235,18 @@ def _verify_fill_markers(evidence):
     - 적용되지 않은 주문의 마커가 바뀌면 이중 가산/변조입니다.
     - 브로커 누적금액이 역행한 경우 정산은 차감하지 않으므로
       마커도 역행하면 안 됩니다 (차감 누락/이중 차감 검출).
+    - **적용된 주문의 마커가 누락·무효면 실패**입니다. 마커가 없을 때 0 으로
+      읽으면 "미반영"으로 오인되어 이중 가산을 통과시킵니다.
+    - 마커 누락·무효로 정산이 **보류된** 주문이 있으면 통과시키지 않습니다.
     """
     problems = []
+    pending_marker = _pending_marker_odnos(evidence)
+    if pending_marker:
+        # 보류는 "검증할 것이 없다"가 아니라 "이 실행의 정산을 신뢰할 수 없다"입니다.
+        problems.append(
+            f"마커 누락·무효 주문 {len(pending_marker)}건"
+            f"({', '.join(pending_marker[:5])})이 있어 정산이 보류됐습니다 (검증 불가)"
+        )
     post_meta = evidence.get("orders_meta_after")
     if not isinstance(post_meta, dict):
         # 구버전 근거에는 after 스냅샷이 없습니다 — 검증 불가로 실패시키지 않습니다.
@@ -208,14 +260,22 @@ def _verify_fill_markers(evidence):
         for order in (evidence.get("orders") or [])
         if order.get("odno") is not None
     }
+    # 미등록 매수는 orders_meta 자체가 없으므로 마커 요구 대상이 아닙니다.
+    unregistered = {
+        str(order.get("odno"))
+        for order in (evidence.get("orders") or [])
+        if order.get("unregistered") and order.get("odno") is not None
+    }
 
     for odno, after_meta in post_meta.items():
         odno = str(odno)
         if not isinstance(after_meta, dict):
             problems.append(f"{odno} 정산 후 체결 마커 형식 오류")
             continue
-        before_meta = pre_meta.get(odno) or {}
-        before_qty = _as_int(before_meta.get("processed_filled_qty"))
+        before_meta = pre_meta.get(odno)
+        if not isinstance(before_meta, dict):
+            before_meta = {}
+        marker_valid, before_qty = _parse_qty_marker(before_meta)
         before_amount = _as_float(before_meta.get("processed_filled_amount"))
         after_qty = _as_int(after_meta.get("processed_filled_qty"))
         after_amount = _as_float(after_meta.get("processed_filled_amount"))
@@ -256,6 +316,18 @@ def _verify_fill_markers(evidence):
             continue
         expected_qty = max(before_qty, raw_qty)
         expected_amount = max(before_amount, raw_amount)
+        if odno not in unregistered and odno in pre_meta and not marker_valid:
+            # 마커 없음/무효를 0 으로 읽으면 "미반영"으로 오인되어
+            # 이미 반영된 체결을 다시 가산하도록 통과시킵니다.
+            # (orders_meta_before 에 항목 자체가 없는 경우는 미등록 매수이거나
+            #  스냅샷 누락이라, 필수 체결 전량 대조가 보수적으로 검출합니다)
+            problems.append(
+                f"{odno} 적용된 주문의 체결 수량 마커"
+                f"(orders_meta_before.processed_filled_qty="
+                f"{before_meta.get('processed_filled_qty')!r}) 가 누락·무효입니다 "
+                f"(반영 여부 판정 불가 — 검증 불가)"
+            )
+            continue
         if after_qty != expected_qty:
             problems.append(
                 f"{odno} 체결 수량 마커 불일치: 기대 {expected_qty}주 vs 기록 {after_qty}주 "
@@ -297,6 +369,8 @@ def _required_settlement_fills(evidence):
         order_by_odno.setdefault(str(order.get("odno")), order)
     effects_before = evidence.get("sell_t_effects_before") or {}
     unreg_shares = _unregistered_expected_shares(orders, fills)
+    pending_marker = _pending_marker_odnos(evidence)
+    pending_marker_set = set(pending_marker)
 
     def _meta_for(odno):
         meta = dict(order_by_odno.get(odno) or {})
@@ -355,6 +429,7 @@ def _required_settlement_fills(evidence):
             required.append({
                 "odno": odno, "side": side, "req_qty": 0, "req_amount": 0.0,
                 "kind": None, "expects_entry": False,
+                "pending_marker": odno in pending_marker_set,
             })
             continue
 
@@ -407,7 +482,7 @@ def _required_settlement_fills(evidence):
                 old_factor = _as_float(marker.get("factor", 1.0))
                 kind = "sell"
                 expects_entry = req_qty > 0 or abs(expected_factor - old_factor) > 1e-9
-        required.append({
+        item = {
             "odno": odno,
             "side": side,
             "req_qty": req_qty,
@@ -420,7 +495,30 @@ def _required_settlement_fills(evidence):
             "raw_qty": raw_qty,
             "raw_amount": raw_amount,
             "ts": fill.get("ts"),
-        })
+        }
+        if odno in pending_marker_set:
+            # 마커 누락·무효로 **보류된** 주문은 이번 실행에서 반영되면 안 됩니다.
+            # 루프 상단에서 통째로 걸러내면 필수 체결 집합 자체가 달라져
+            # 순보유/순투입 기대가 왜곡되므로, 항목은 남기고 기대만 무력화합니다.
+            item.update({
+                "req_qty": 0,
+                "req_amount": 0.0,
+                "kind": None,
+                "expected_delta": 0.0,
+                "expected_factor": None,
+                "expects_entry": False,
+                "pending_marker": True,
+            })
+        required.append(item)
+
+    # 보류(마커 누락·무효) 주문은 반영되지 않아야 합니다 — 둘 다면 판정 불가입니다.
+    applied_odnos = {str(order.get("odno")) for order in orders}
+    for odno in pending_marker:
+        if odno in applied_odnos:
+            problems.append(
+                f"{odno} 마커 누락·무효 보류 주문인데 적용 내역이 있습니다 "
+                f"(보류와 적용이 동시에 존재 — 검증 불가)"
+            )
 
     # 보유 궤적·기준선·순투입금은 **필수 체결을 시간순으로** 적용해 독립 계산합니다.
     position = None
@@ -1290,6 +1388,29 @@ def _verify_evidence(evidence):
     return problems
 
 
+def _symbol_executed_count(text, symbol):
+    """로그의 **종목별** 실행 결과 라인에서 성공 건수를 읽습니다.
+
+    실제 출력 형식 (trading_bot.py `[실행 결과]`):
+        ``  {symbol}: 성공 N건 / 예약 N건 / 실패 N건``
+    전체 합계(`합계: ...`)나 다른 종목 라인을 부분 매칭하지 않도록
+    줄 시작 + 정확한 심볼 + 콜론으로 고정합니다.
+
+    Returns:
+        tuple: (라인 발견 여부, 성공 건수)
+    """
+    line = re.compile(
+        rf"^[ \t]*{re.escape(symbol)}:[ \t]*성공[ \t]+(\d+)건"
+        rf"[ \t]*/[ \t]*예약[ \t]+\d+건"
+        rf"[ \t]*/[ \t]*실패[ \t]+\d+건[ \t]*$",
+        re.MULTILINE,
+    )
+    match = line.search(text or "")
+    if not match:
+        return False, 0
+    return True, int(match.group(1))
+
+
 def _verify_t_transitions(text, symbol, rows, balance_qty):
     """로그의 T 전이를 실제 정산 출력 형식 그대로 해석해 검증합니다.
 
@@ -1850,6 +1971,14 @@ def main():
             ok(f"{sym} 매도 합계 {sells}주 ≤ 보유 {bal.quantity}주")
         for msg in _verify_t_transitions(text, sym, rows, bal.quantity):
             problem(msg)
+        # "접수된 주문이 이력에 없습니다"는 **그 종목의** 성공 건수로 판정합니다.
+        # 전체 합계를 쓰면 다른 종목이 성공했을 때 이 종목 누락을 놓칩니다.
+        sym_line_found, sym_executed = _symbol_executed_count(text, sym)
+        if mode == "LIVE" and not sym_line_found:
+            note(
+                f"{sym} 종목별 실행 결과 라인이 없습니다 — "
+                f"접수 건수는 0 으로 보고 검사합니다"
+            )
         evidence = _load_settlement_evidence(sym, run_id)
         if evidence is None:
             problem(
@@ -1858,7 +1987,7 @@ def main():
         else:
             for msg in _verify_evidence(evidence):
                 problem(msg)
-        if mode == "LIVE" and executed and len(live) + len(filled) == 0:
+        if mode == "LIVE" and sym_executed and len(live) + len(filled) == 0:
             problem(f"{sym} 접수된 주문이 이력에 없습니다")
         print(
             f"    state: T={st.get('T')} net_invested=${st.get('net_invested')} "

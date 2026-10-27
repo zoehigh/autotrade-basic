@@ -105,13 +105,15 @@ TQQQ_FORCE_T=29 SOXL_FORCE_T=20 TRADE_MODE=DRY uv run python trading_bot.py
 SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
 
 # 테스트 실행
-# 브로커 실 API 통합 테스트는 pytest 마커(kis/kiwoom/ls/toss/nhplug/meritz)로 구분됩니다.
-# tests/conftest.py가 .env 자격증명만으로 실행 여부를 판단합니다 — BROKER 값과 무관하게
-# 해당 브로커 키가 설정돼 있으면 실행되고, 없으면 자동 skip됩니다.
-# 마커 없는 유닛/모의 테스트는 항상 실행됩니다.
-uv run pytest tests/ -v                          # 키 설정된 브로커 통합 테스트 + 유닛
-uv run pytest tests/ -m kis -v                   # 특정 브로커만 (kis/kiwoom/ls/toss/nhplug/meritz)
-uv run pytest tests/test_kiwoom_integration.py -v  # 특정 파일도 자격증명 기준으로 동작
+# 기본 `pytest tests/` 는 외부 브로커 API·주문을 **원천 차단**합니다 (유닛/모의 테스트만 실행).
+#  - 외부 HTTP: conftest autouse fixture 가 `requests.Session.request` 를 막음
+#  - 브로커 마커(kis/kiwoom/ls/toss/nhplug/meritz)·preflight·live_order 테스트: 기본 skip
+#  - 실 API 통합 테스트: RUN_BROKER_API_TESTS=1 (opt-in, 자격증명도 필요)
+#  - 주문이 발생하는 테스트(live_order): 위에 더해 ALLOW_BROKER_ORDERS=1 (추가 opt-in)
+#  - 주문 함수 진입 직전에도 `_assert_order_allowed()` 가 ALLOW_BROKER_ORDERS 를 재검증 (CLI 포함)
+uv run pytest tests/ -v                                        # 안전: 유닛/모의만
+RUN_BROKER_API_TESTS=1 uv run pytest tests/ -m kis -v          # 읽기 전용 통합 테스트
+RUN_BROKER_API_TESTS=1 ALLOW_BROKER_ORDERS=1 uv run pytest tests/test_broker_preflight.py -v  # 주문 포함
 
 # 참고: 브로커별 필수 자격증명
 #   kis   = KIS_APP_KEY + KIS_APP_SECRET + KIS_ACCOUNT_NO
@@ -196,6 +198,11 @@ uv run pytest tests/test_broker_preflight.py -v
 **체결 반영은 수량·금액 델타로만** (`processed_filled_qty` + `processed_filled_amount`):
 새로 늘어난 부분만 반영하므로 부분체결이 나중에 늘어나도 중복 가산되지 않습니다.
 이전 버전 메타에는 반영 금액 표식이 없으므로, **신규분만** 누적금액 비율로 추정해 1회 적용하고 표식을 기록합니다.
+신규 주문은 등록 시 `processed_filled_qty=0` + `processed_filled_amount=0.0` + `fill_marker_version=1` 을 함께 기록합니다.
+워터마크 이전 주문의 0 마커는 **이 버전 표식이 있을 때만** 미반영으로 신뢰하고(`_marker_proves_unapplied`),
+기존 state 의 0 마커(버전 표식 없음)는 미반영의 증거가 아니므로 **반영하지 않고 건너뜁니다**(종목 전체를 보류하지 않아 같은 실행의 신규 체결은 정상 정산). 기존 메타는 일괄 마이그레이션 금지.
+마커가 누락·무효인 주문은 자동 반영하지 않고 보류합니다 → 수동 정정 절차는 `docs/marker-correction-runbook.md`
+(마커만 명시 설정, T/net/원장·워터마크 불변, 백업+해시, 직후 reconcile 1회 확인, 환경변수 1회성).
 
 **지연 체결(부분체결 증가) 반영**: 전역 워터마크보다 오래된 주문이라도 **이미 반영된 주문**(processed_filled_qty > 0)의
 누적 체결이 늘면 주문번호별 델타로 반영합니다 (`_apply_late_fill_deltas`). 워터마크 이전에 있고 반영된 적 없는

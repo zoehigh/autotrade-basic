@@ -25,7 +25,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 from notifier import notify
 
 
@@ -386,10 +386,23 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
     Raises:
         SymbolScopedError: 기준 미확보로 저장하지 못한 경우
     """
-    if state.pop("_position_basis_unknown", False):
+    basis_unknown = state.pop("_position_basis_unknown", False)
+    # 사유 키도 **항상** 함께 소비합니다 (남으면 .state.json 으로 새는 것을 방지).
+    basis_reason = state.pop("_position_basis_unknown_reason", "")
+    skipped_unverified = state.pop("_unverified_skipped_odnos", [])
+    skipped_audit = state.pop("_unverified_skipped_audit", [])
+    if skipped_unverified:
+        # 공개 로그에는 실제 주문번호 대신 해시만 남깁니다 (원문은 Evidence 에만 기록)
+        hashes = [e.get("odno_hash", "") for e in skipped_audit][:5]
+        print(
+            f"[정보] {symbol} 미반영 증명 불가 과거 주문 {len(skipped_unverified)}건은 "
+            f"반영하지 않고 건너뛰었습니다 ({', '.join(hashes)})"
+        )
+    if basis_unknown:
         msg = (
             f"[보류] {symbol} 보유수량 기준을 확보하지 못해 정산 결과와 신규 주문을 "
-            f"보류합니다. (브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
+            f"보류합니다. 사유: {basis_reason or '잔고조회실패 + 저장보유수량없음'} "
+            f"(브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
         )
         print(msg)
         notify(msg, urgent=True)
@@ -504,6 +517,8 @@ def build_settlement_evidence(
         "orders": deepcopy(state.get("_settlement_deltas", [])),
         "fills": [],
         "skipped_fills": [],
+        # 미반영 증명 불가로 건너뛴 과거(레거시 0 마커) 주문 — 감사용 (원문 odno + 해시)
+        "skipped_unverified": deepcopy(state.get("_unverified_skipped_audit") or []),
     }
     for row in order_history or []:
         try:
@@ -1262,6 +1277,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                     "t_target": float(t_target),
                     "is_additional": bool(is_additional),
                     "processed_filled_qty": 0,
+                    # 신규 등록분만 "아직 한 번도 반영되지 않음"을 증명하는 버전 표식
+                    # (기존 메타는 마이그레이션하지 않습니다 — 0 만으로는 미반영을 단정할 수 없음)
+                    "processed_filled_amount": 0.0,
+                    "fill_marker_version": FILL_MARKER_VERSION,
                 }
                 if order.get("reverse_action"):
                     reverse_mode = state.setdefault("reverse_mode", {})
