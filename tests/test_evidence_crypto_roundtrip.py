@@ -45,6 +45,26 @@ def _run(script, cwd, passphrase, gnupg_home, shim=None):
     )
 
 
+
+def _path_without_gpg(tmp_path):
+    """gpg 만 없는 PATH — rm/tar/mv 등 나머지 도구는 있어야 '진짜 gpg 부재'만 재현됩니다."""
+    bin_dir = tmp_path / "no-gpg-bin"
+    bin_dir.mkdir(exist_ok=True)
+    for tool in ("rm", "tar", "mv", "cat", "gzip", "mktemp", "ls", "dirname", "env"):
+        found = shutil.which(tool)
+        if found and not (bin_dir / tool).exists():
+            (bin_dir / tool).symlink_to(found)
+    assert not (bin_dir / "gpg").exists()
+    return bin_dir
+
+
+def _run_without_gpg(script, cwd, tmp_path):
+    env = {"PATH": str(_path_without_gpg(tmp_path)), "HOME": str(cwd), "PASSPHRASE": PASSPHRASE}
+    return subprocess.run(
+        ["/bin/bash", "-c", script], cwd=cwd, env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
 @pytest.fixture
 def gnupg_home(tmp_path):
     home = tmp_path / "gnupg"
@@ -213,16 +233,12 @@ def test_encrypt_failure_removes_stale_previous_ciphertext(workspace, gnupg_home
     assert _leftovers(workspace) == []
 
 
-def test_encrypt_without_gpg_fails_closed(workspace, gnupg_home, tmp_path):
-    """gpg 가 없으면(PATH 에서 제거) 평문을 올리지 않고 실패합니다."""
+def test_encrypt_without_gpg_fails_closed(workspace, tmp_path):
+    """gpg 가 없으면(PATH 에서 제거) 평문을 올리지 않고 **gpg 부재 사유로** 실패합니다."""
     script, _env = _step_script("trade_base.yml", "정산 근거 암호화")
-    env = {"PATH": str(tmp_path / "empty-bin"), "HOME": str(workspace), "PASSPHRASE": PASSPHRASE}
-    (tmp_path / "empty-bin").mkdir()
-    # bash 자체는 절대경로로 호출합니다 (PATH 에 gpg/tar 가 없는 환경 재현)
-    result = subprocess.run(
-        ["/bin/bash", "-c", script], cwd=workspace, env=env, capture_output=True, text=True, timeout=60,
-    )
+    result = _run_without_gpg(script, workspace, tmp_path)
     assert result.returncode != 0
+    assert "gpg" in result.stdout + result.stderr, result.stdout + result.stderr
     assert _leftovers(workspace) == []
 
 
@@ -249,3 +265,62 @@ def test_decrypt_failure_leaves_no_staging_dir(workspace, gnupg_home, tmp_path):
     env_script = f"export TMPDIR='{tmpdir}'\n" + script
     assert _run(env_script, verify, PASSPHRASE, gnupg_home).returncode != 0
     assert list(tmpdir.iterdir()) == [], "임시 스테이징 디렉터리가 남았습니다"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 이전 실행의 오래된 암호문(self-hosted runner 작업 디렉터리 재사용) 업로드 차단
+# ═══════════════════════════════════════════════════════════════════
+def _plant_stale(work):
+    (work / "evidence.tgz.gpg").write_bytes(b"STALE-CIPHERTEXT-FROM-PREVIOUS-RUN")
+    (work / "evidence.tgz.gpg.partial").write_bytes(b"stale-partial")
+    (work / "evidence.tgz").write_bytes(b"stale-plain-archive")
+
+
+def test_stale_ciphertext_removed_when_no_evidence_json(tmp_path, gnupg_home):
+    """이번 실행의 Evidence JSON 이 없고 이전 암호문만 남은 경우: 정리 후 업로드 대상이 없어야 합니다."""
+    work = tmp_path / "stale-work"
+    work.mkdir()
+    _plant_stale(work)
+    result = _encrypt(work, gnupg_home)
+    assert result.returncode == 0, result.stderr
+    assert _leftovers(work) == [], f"오래된 암호문이 남았습니다: {_leftovers(work)}"
+    # 검증 불가 상태가 명시적으로 보고돼야 합니다 (조용히 넘어가지 않음)
+    assert "::warning::" in result.stdout and "검증 불가" in result.stdout, result.stdout
+
+
+def test_stale_ciphertext_never_matches_upload_path_without_evidence(tmp_path, gnupg_home):
+    """업로드 단계가 읽는 경로(evidence.tgz.gpg)에 이전 내용이 절대 남지 않습니다."""
+    work = tmp_path / "stale-upload"
+    work.mkdir()
+    _plant_stale(work)
+    assert _encrypt(work, gnupg_home).returncode == 0
+    assert not (work / "evidence.tgz.gpg").exists()
+
+
+def test_stale_ciphertext_removed_even_when_passphrase_missing(workspace, gnupg_home):
+    """Evidence 는 있으나 패스프레이즈가 없어 실패하는 경우에도 이전 암호문은 먼저 제거됩니다."""
+    _plant_stale(workspace)
+    result = _encrypt(workspace, gnupg_home, passphrase="")
+    assert result.returncode != 0
+    assert _leftovers(workspace) == []
+
+
+def test_stale_ciphertext_removed_when_gpg_missing(workspace, tmp_path):
+    _plant_stale(workspace)
+    script, _env = _step_script("trade_base.yml", "정산 근거 암호화")
+    result = _run_without_gpg(script, workspace, tmp_path)
+    assert result.returncode != 0
+    assert "gpg" in result.stdout + result.stderr, result.stdout + result.stderr
+    assert _leftovers(workspace) == []
+
+
+def test_stale_ciphertext_replaced_by_fresh_one_on_success(workspace, gnupg_home, tmp_path):
+    """정상 실행에서는 이전 암호문이 이번 실행의 암호문으로 완전히 교체됩니다."""
+    _plant_stale(workspace)
+    assert _encrypt(workspace, gnupg_home).returncode == 0
+    assert _leftovers(workspace) == ["evidence.tgz.gpg"]
+    assert b"STALE-CIPHERTEXT" not in (workspace / "evidence.tgz.gpg").read_bytes()
+    verify = _download(workspace, tmp_path)
+    script, _env = _step_script("verify.yml", "정산 근거 복호화")
+    assert _run(script, verify, PASSPHRASE, gnupg_home).returncode == 0
+    assert (verify / "evidence" / "final-settlement-1.json").exists()
