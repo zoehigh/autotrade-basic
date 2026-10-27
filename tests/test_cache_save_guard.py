@@ -39,8 +39,8 @@ def _tokens(expr):
     return out
 
 
-def evaluate(expr, ctx, status="success"):
-    """GitHub Actions `if:` 표현식(부분집합) 평가. 반환값은 Python 진리값."""
+def evaluate(expr, ctx, status="success", raw=False):
+    """GitHub Actions `if:` 표현식(부분집합) 평가. 반환값은 Python 진리값 (raw=True 면 `||`/`&&` 의 값 그대로)."""
     expr = expr.strip()
     if expr.startswith("${{") and expr.endswith("}}"):
         expr = expr[3:-2]
@@ -112,7 +112,7 @@ def evaluate(expr, ctx, status="success"):
 
     result = or_expr()
     assert pos == len(toks), "표현식 일부가 해석되지 않았습니다"
-    return bool(result)
+    return result if raw else bool(result)
 
 
 def _steps():
@@ -204,34 +204,39 @@ def test_notice_is_exact_complement_of_save(mode, status):
     assert save != notice
 
 
-# ── Resolve 단계: 봇(config.py)과 같은 정규화 ────────────────────────
-def _resolve_output(mode_value, tmp_path):
+# ── Resolve 단계: env 로만 외부 입력을 받고, 봇(config.py)과 같은 정규화, REPAIR 는 차단 ──
+def _run_resolve(tmp_path, **env):
+    """Resolve 단계의 run 스크립트를 실제로 실행합니다 (외부 입력은 env 로만 전달)."""
     script = _step("Resolve and log inputs")["run"]
-    # MODE 대입식만 테스트 값으로 바꾸고, 나머지 ${{ }} 는 자리표시자로 치환
-    script = re.sub(r'MODE="\$\{\{.*?\}\}"', f'MODE="{mode_value}"', script, count=1)
-    script = re.sub(r"\$\{\{.*?\}\}", "x", script)
     out = tmp_path / "gh_output"
     out.write_text("")
-    subprocess.run(
-        ["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(out)},
-        capture_output=True, text=True, timeout=30, check=True,
+    full_env = {"PATH": "/usr/bin:/bin", "GITHUB_OUTPUT": str(out), **env}
+    result = subprocess.run(
+        ["bash", "-c", script], env=full_env, cwd=tmp_path, capture_output=True, text=True, timeout=30,
     )
-    values = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    lines = out.read_text().splitlines()
+    return result, lines
+
+
+def _resolve_output(mode_value, tmp_path):
+    result, lines = _run_resolve(tmp_path, IN_TRADE_MODE=mode_value)
+    assert result.returncode == 0, result.stdout + result.stderr
+    values = dict(line.split("=", 1) for line in lines if "=" in line)
     return values["trade_mode"]
 
 
 @pytest.mark.parametrize(
     "raw,expected",
-    [("live", "LIVE"), (" LIVE ", "LIVE"), ("Repair", "REPAIR"), ("dry", "DRY"), ("DRY", "DRY"),
-     ("bogus", "BOGUS"), ("LI VE", "LI VE")],
+    [("live", "LIVE"), (" LIVE ", "LIVE"), ("dry", "DRY"), ("DRY", "DRY"), ("bogus", "BOGUS"),
+     ("LI VE", "INVALID"), ("DRY-RUN", "INVALID"), ("L1VE", "INVALID")],
 )
 def test_resolve_normalizes_like_bot_config(raw, expected, tmp_path):
     assert _resolve_output(raw, tmp_path) == expected
 
 
-@pytest.mark.parametrize("raw", ["live", " LIVE ", "Repair"])
+@pytest.mark.parametrize("raw", ["live", " LIVE "])
 def test_normalized_value_matches_what_the_bot_runs(raw, tmp_path, monkeypatch):
-    """워크플로가 저장을 허용한 값은 봇이 실제로 LIVE/REPAIR 로 해석하는 값과 같아야 합니다."""
+    """워크플로가 저장을 허용한 값은 봇이 실제로 LIVE 로 해석하는 값과 같아야 합니다."""
     import importlib
     import sys
 
@@ -241,16 +246,17 @@ def test_normalized_value_matches_what_the_bot_runs(raw, tmp_path, monkeypatch):
     sys.path.insert(0, str(ROOT / "src"))
     import config
     importlib.reload(config)
-    assert config.TRADE_MODE in ("LIVE", "REPAIR")
+    assert config.TRADE_MODE == "LIVE"
     monkeypatch.delenv("TRADE_MODE")
     importlib.reload(config)
 
 
-def test_invalid_value_is_dry_in_bot_and_blocked_in_workflow(tmp_path, monkeypatch):
+@pytest.mark.parametrize("raw", ["bogus", "LI VE", "DRY-RUN"])
+def test_invalid_value_is_dry_in_bot_and_blocked_in_workflow(raw, tmp_path, monkeypatch):
     import importlib
     import sys
 
-    resolved = _resolve_output("bogus", tmp_path)
+    resolved = _resolve_output(raw, tmp_path)
     assert _save_decision(resolved, "success") is False
     monkeypatch.setenv("TRADE_MODE", resolved)
     sys.path.insert(0, str(ROOT / "src"))
@@ -259,6 +265,128 @@ def test_invalid_value_is_dry_in_bot_and_blocked_in_workflow(tmp_path, monkeypat
     assert config.TRADE_MODE == "DRY"
     monkeypatch.delenv("TRADE_MODE")
     importlib.reload(config)
+
+
+# 옛 표현식과의 동등성: 우선순위(inputs → vars → real 이면 DRY → LIVE)와 GitHub 의 대소문자 무시 비교를 보존
+_OLD_MODE_EXPR = "inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE'"
+
+
+def _normalize_like_script(value):
+    return value.strip().upper()
+
+
+@pytest.mark.parametrize("in_mode", ["", "LIVE", " ", "dry"])
+@pytest.mark.parametrize("var_mode", ["", "DRY", "Live"])
+@pytest.mark.parametrize("broker_mode", ["demo", "real", "REAL", ""])
+def test_resolve_keeps_old_expression_precedence(in_mode, var_mode, broker_mode, tmp_path):
+    ctx = {"inputs.trade_mode": in_mode, "vars.TRADE_MODE": var_mode, "inputs.broker_mode": broker_mode}
+    expected = _normalize_like_script(evaluate(_OLD_MODE_EXPR, ctx, raw=True))
+    result, lines = _run_resolve(
+        tmp_path, IN_TRADE_MODE=in_mode, VAR_TRADE_MODE=var_mode, IN_BROKER_MODE=broker_mode,
+    )
+    assert result.returncode == 0, result.stdout
+    assert lines == [f"trade_mode={expected}"]
+
+
+# ── A안: Actions 에서의 REPAIR 차단 ──────────────────────────────────
+@pytest.mark.parametrize("raw", ["REPAIR", "repair", " Repair "])
+@pytest.mark.parametrize("source", ["IN_TRADE_MODE", "VAR_TRADE_MODE"])
+def test_repair_is_blocked_before_any_output(raw, source, tmp_path):
+    result, lines = _run_resolve(tmp_path, **{source: raw})
+    assert result.returncode == 1
+    assert "::error::" in result.stdout and "REPAIR" in result.stdout
+    assert lines == [], "차단된 실행은 trade_mode 출력을 쓰면 안 됩니다 (이후 캐시 저장 가드가 저장하지 않도록)"
+
+
+def test_repair_in_inputs_wins_over_var_and_real_default(tmp_path):
+    result, lines = _run_resolve(tmp_path, IN_TRADE_MODE="REPAIR", VAR_TRADE_MODE="DRY", IN_BROKER_MODE="real")
+    assert result.returncode == 1 and lines == []
+
+
+# ── 외부 입력이 셸·출력 파일에 주입되지 않음 ────────────────────────
+_HOSTILE = [
+    "$(touch PWNED)", "`touch PWNED`", 'x"; touch PWNED; echo "', "x'; touch PWNED; echo '",
+    "LIVE\nextra_output=pwned", "LIVE\n::error::injected", "a\r::set-env name=X::y",
+]
+
+
+def _decode(value):
+    return value.encode().decode("unicode_escape")
+
+
+@pytest.mark.parametrize("hostile", _HOSTILE)
+@pytest.mark.parametrize("field", ["IN_TRADE_MODE", "VAR_TRADE_MODE", "IN_BROKER_MODE", "IN_BROKER", "IN_SYMBOLS", "VAR_SYMBOLS"])
+def test_resolve_does_not_execute_or_inject_external_inputs(hostile, field, tmp_path):
+    value = _decode(hostile)
+    result, lines = _run_resolve(tmp_path, **{field: value})
+    assert not (tmp_path / "PWNED").exists(), "외부 입력이 셸 명령으로 실행됐습니다"
+    # GITHUB_OUTPUT 에는 trade_mode 한 줄만 (다른 출력 키 주입 불가)
+    assert len(lines) == 1 and lines[0].startswith("trade_mode="), lines
+    # 로그에 외부 값이 줄 머리의 워크플로 명령(::)으로 나오지 않음 (우리가 쓴 ::warning::/::error:: 제외)
+    injected = [
+        l for l in result.stdout.splitlines()
+        if l.startswith("::") and not l.startswith(("::warning::유효하지 않은 TRADE_MODE", "::error::Actions 에서의"))
+    ]
+    assert injected == [], injected
+
+
+def test_resolve_step_has_no_expression_interpolation_in_shell(tmp_path):
+    step = _step("Resolve and log inputs")
+    assert "${{" not in step["run"], "run 스크립트에 GitHub 표현식이 직접 들어 있습니다"
+    assert set(step["env"]) == {
+        "IN_TRADE_MODE", "VAR_TRADE_MODE", "IN_BROKER", "IN_BROKER_MODE", "IN_SYMBOLS", "VAR_SYMBOLS",
+    }
+    assert step["env"]["IN_TRADE_MODE"] == "${{ inputs.trade_mode }}"
+    assert step["env"]["VAR_TRADE_MODE"] == "${{ vars.TRADE_MODE }}"
+
+
+# ── 차단된 REPAIR 실행의 단계별 시뮬레이션: 봇 미실행 · 신규 state 캐시 미저장 ──
+def _simulate_job(tmp_path, **resolve_env):
+    """run-trade 잡의 단계를 순서대로 평가합니다 (Resolve 는 실제 실행, 나머지는 성공으로 가정)."""
+    status, outputs, executed = "success", {}, []
+    for step in _steps():
+        ctx = {CONTEXT_KEY: outputs.get("trade_mode", "")}
+        cond = step.get("if", "success()")
+        if not evaluate(cond, ctx, status):
+            continue
+        executed.append(step.get("name"))
+        if step.get("id") == "resolve":
+            result, lines = _run_resolve(tmp_path, **resolve_env)
+            outputs = dict(l.split("=", 1) for l in lines if "=" in l)
+            if result.returncode != 0:
+                status = "failure"
+    return executed, status
+
+
+BOT_STEP = "자동매매 봇 실행"
+
+
+def test_blocked_repair_runs_no_bot_and_saves_no_new_cache(tmp_path):
+    executed, status = _simulate_job(tmp_path, IN_TRADE_MODE="REPAIR")
+    assert status == "failure"
+    assert RESTORE in executed, "복원은 state 를 바꾸지 않으므로 그대로 실행됩니다"
+    assert BOT_STEP not in executed, "차단된 REPAIR 에서 봇이 실행되면 안 됩니다"
+    assert SAVE not in executed, "차단된 REPAIR 에서 신규 state 캐시가 저장되면 안 됩니다"
+    assert NOTICE in executed
+
+
+@pytest.mark.parametrize("source", ["IN_TRADE_MODE", "VAR_TRADE_MODE"])
+def test_blocked_repair_via_repository_variable_also_saves_nothing(source, tmp_path):
+    executed, _ = _simulate_job(tmp_path, **{source: "repair"})
+    assert BOT_STEP not in executed and SAVE not in executed
+
+
+def test_non_repair_modes_keep_their_behavior(tmp_path):
+    live, _ = _simulate_job(tmp_path, IN_TRADE_MODE="LIVE")
+    dry, _ = _simulate_job(tmp_path, IN_TRADE_MODE="DRY")
+    assert BOT_STEP in live and SAVE in live
+    assert BOT_STEP in dry and SAVE not in dry
+
+
+def test_nothing_runs_between_resolve_and_bot_step():
+    """Resolve 와 봇 실행 사이에 다른 단계가 끼어들면(부작용 가능) 차단 보장이 약해지므로 막습니다."""
+    names = [s.get("name") for s in _steps()]
+    assert names.index(BOT_STEP) == names.index("Resolve and log inputs") + 1
 
 
 # ── 표현식 주입 방지: 외부 입력(trade_mode)을 셸 스크립트에 직접 끼워 넣지 않습니다 ──

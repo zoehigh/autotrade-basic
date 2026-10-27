@@ -134,20 +134,59 @@ jobs:
             state-${{ inputs.broker }}-${{ inputs.broker_mode }}-
             ${{ inputs.broker == 'kis' && format('state-{0}-', inputs.broker_mode) || '_no-legacy_' }}
 
+      # 외부 입력(trade_mode / vars.TRADE_MODE / broker_mode / broker / symbols)은 dispatch payload 등 외부에서 올 수
+      # 있으므로 셸 스크립트에 `${{ }}` 로 직접 끼워 넣지 않고 env 로만 전달합니다 (셸 주입·출력 주입 방지).
       - name: Resolve and log inputs
         id: resolve
+        env:
+          IN_TRADE_MODE: ${{ inputs.trade_mode }}
+          VAR_TRADE_MODE: ${{ vars.TRADE_MODE }}
+          IN_BROKER: ${{ inputs.broker }}
+          IN_BROKER_MODE: ${{ inputs.broker_mode }}
+          IN_SYMBOLS: ${{ inputs.symbols }}
+          VAR_SYMBOLS: ${{ vars.SYMBOLS }}
         run: |
-          MODE="${{ inputs.trade_mode || vars.TRADE_MODE || (inputs.broker_mode == 'real' && 'DRY') || 'LIVE' }}"
+          # 로그에 외부 값을 찍을 때 개행·제어문자를 제거합니다 (`::` 워크플로 명령 주입 방지)
+          safe() { printf '%s' "${1//[^[:print:]]/?}"; }
+
+          # inputs.trade_mode || vars.TRADE_MODE || (broker_mode == 'real' && 'DRY') || 'LIVE'  (GitHub 표현식과 같은 우선순위)
+          MODE="${IN_TRADE_MODE:-}"
+          if [[ -z "$MODE" ]]; then MODE="${VAR_TRADE_MODE:-}"; fi
+          if [[ -z "$MODE" && "${IN_BROKER_MODE,,}" == "real" ]]; then MODE="DRY"; fi
+          if [[ -z "$MODE" ]]; then MODE="LIVE"; fi
+
           # 봇(src/config.py)은 TRADE_MODE 를 strip().upper() 로 정규화합니다. state 캐시 저장 가드가
           # 실제 실행 모드와 어긋나지 않도록 같은 방식으로 정규화합니다 (예: 'live ' → 'LIVE').
           MODE=$(printf '%s' "$MODE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
+
+          # 영문 대문자 외 값(개행·특수문자 포함)은 GITHUB_OUTPUT 에 쓰지 않고 INVALID 로 치환합니다.
+          # 봇은 잘못된 값을 DRY 로 처리하고, 캐시 저장 가드도 저장하지 않습니다.
+          if [[ ! "$MODE" =~ ^[A-Z]*$ ]]; then
+            echo "::warning::유효하지 않은 TRADE_MODE 값을 INVALID 로 처리합니다 (봇은 DRY 로 동작, state 캐시 저장 안 함)"
+            MODE="INVALID"
+          fi
+
+          # Actions 에서의 REPAIR 는 차단합니다: REPAIR 핸들러는 settlement-*.json 을 만들지 않아 verify 가 항상
+          # 실패하는데, state 캐시는 검증 job 보다 앞선 이 job 에서 이미 저장됩니다. REPAIR 전용 독립 검증이
+          # 준비되기 전까지는 봇 실행·state 변경·캐시 저장이 일어나기 전에 여기서 중단합니다
+          # (trade_mode 출력을 쓰지 않으므로 이후 state 캐시 저장 가드도 저장하지 않습니다).
+          if [[ "$MODE" == "REPAIR" ]]; then
+            echo "::error::Actions 에서의 TRADE_MODE=REPAIR 는 현재 차단됩니다 (REPAIR 전용 독립 검증 미구현: 정산 근거 없이 state 만 바뀝니다). 로컬에서 docs/marker-correction-runbook.md 절차로 실행하세요. 봇 실행·state 변경·캐시 저장 없이 중단합니다."
+            exit 1
+          fi
           echo "trade_mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "Resolved BROKER=${{ inputs.broker || 'kis' }}"
-          echo "Resolved BROKER_MODE=${{ inputs.broker_mode || 'demo' }}"
+
+          BROKER="${IN_BROKER:-kis}"
+          BROKER_MODE="${IN_BROKER_MODE:-demo}"
+          SYMBOLS="${IN_SYMBOLS:-}"
+          if [[ -z "$SYMBOLS" ]]; then SYMBOLS="${VAR_SYMBOLS:-}"; fi
+          if [[ -z "$SYMBOLS" && "${IN_BROKER,,}" == "kiwoom" ]]; then SYMBOLS="TQQQ:NAS,SOXL:NYS"; fi
+          if [[ -z "$SYMBOLS" ]]; then SYMBOLS="TQQQ:NAS,SOXL:AMS"; fi
+          echo "Resolved BROKER=$(safe "$BROKER")"
+          echo "Resolved BROKER_MODE=$(safe "$BROKER_MODE")"
           echo "Resolved TRADE_MODE=$MODE"
-          echo "Resolved SYMBOLS=${{ inputs.symbols || vars.SYMBOLS || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}"
-          echo "Environment=${{ inputs.broker }}-${{ inputs.broker_mode }}"
-          echo "Runner=${{ ((inputs.broker == 'kiwoom' || inputs.broker == 'toss') && inputs.broker_mode == 'real') && format('{0}-real', inputs.broker) || 'ubuntu-latest' }}"
+          echo "Resolved SYMBOLS=$(safe "$SYMBOLS")"
+          echo "Environment=$(safe "${IN_BROKER}")-$(safe "${IN_BROKER_MODE}")"
 
       - name: 자동매매 봇 실행
         env:
@@ -338,7 +377,7 @@ jobs:
         env:
           RESOLVED_MODE: ${{ steps.resolve.outputs.trade_mode }}
         run: |
-          echo "::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구 결과를 캐시에 남기려면 TRADE_MODE=REPAIR 로 실행하세요."
+          echo "::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구는 로컬에서 TRADE_MODE=REPAIR 로 실행하세요 (Actions 의 REPAIR 는 현재 차단됩니다)."
 
       # 정산 근거에는 원문 주문번호(skipped_unverified 등)가 들어 있습니다. 공개 저장소의
       # Artifact 는 로그인한 누구나 받을 수 있으므로 **암호화한 파일만** 업로드합니다.

@@ -86,7 +86,7 @@ autotrade-basic/
   | 모드 | 목적 | state 저장 | Actions 새 캐시 저장 |
   |------|------|-----------|----------------------|
   | `DRY` | 전략·정산 미리보기 | 원칙적으로 금지 | **금지** |
-  | `REPAIR` | 명시적 state 복구·보정 (주문 없음) | 허용 | 허용 |
+  | `REPAIR` | 명시적 state 복구·보정 (주문 없음, **로컬 전용** — Actions 에서는 차단) | 허용 | 허용 (Actions 에서는 REPAIR 자체가 차단됨) |
   | `LIVE` | 실제 주문·정산 (**`{SYMBOL}_FORCE_T` 금지**) | 허용 | 허용 |
 
   - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` 또는 `LIVE` → state 저장·브로커 호출·주문 **없이 명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성 전). **FORCE_T는 `TRADE_MODE=REPAIR`에서만 허용**. LIVE를 막는 이유: FORCE_T는 T·`orders_meta`·`reverse_mode`·정산 원장·워터마크를 덮어쓰는데, LIVE에서는 같은 실행에서 주문 단계까지 이어져 복구와 주문이 결합됨. `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일하게 차단
@@ -94,10 +94,10 @@ autotrade-basic/
   - REPAIR 재추정(`_repair_reinference`): 재추정 T가 `{SYMBOL}_MAX_T`(기본 분할수)를 **초과하면 저장을 거부**하고 종료 코드 1 (T를 상한으로 **자르지 않음** — 자르면 정산 오류가 숨겨짐). 여러 종목은 **전부 재추정·검증한 뒤에만** 저장하므로 일부 종목만 먼저 저장되지 않음. T/MAX_T가 유한한 유효 숫자가 아니어도 거부. 일반 실행 경로(`run_one_symbol`)는 기존대로 상한으로 조정
   - REPAIR 재추정은 **정산 보류 표식**(`_settlement_hold`·`_pending_amount_odnos`·`_pending_marker_odnos`·`_position_basis_unknown`)이 있으면 저장을 거부하고 종료 코드 1로 끝납니다. 재추정이 `last_updated`를 비운 뒤 `update_T_from_history`를 부르기 때문에, 보류 시 되돌려진 스냅샷도 `last_updated=""`라 그대로 저장하면 워터마크가 지워집니다
   - REPAIR 재추정은 전 종목 검증 후 `.state.json`을 **파일 쓰기 1회(`save_states`, 임시 파일→`os.replace`)** 로만 저장합니다. 종료 코드: **1 = 검증 실패**(MAX_T 초과·숫자 오류·보류, 저장 시도 없음), **2 = 파일 저장 실패**(검증은 통과, 원본 파일은 변경되지 않음)
-  - ⚠️ **알려진 한계 — Actions의 REPAIR**: REPAIR 핸들러는 `settlement-*.json`(정산 근거)을 만들지 않으므로 `verify-settlement`가 "정산 근거 파일이 없습니다 — 검증 불가"로 **항상 실패**하고, state 캐시는 검증 이전 job에서 이미 저장됩니다. REPAIR 전용 독립 검증이 준비되기 전까지 Actions REPAIR 사용은 보류하고 로컬(`docs/marker-correction-runbook.md` 절차)에서 실행하세요
+  - ⚠️ **Actions의 `TRADE_MODE=REPAIR`는 차단됩니다** (`trade_base.yml` Resolve 단계, 봇 실행·state 변경·캐시 저장 전 `exit 1`). 이유: REPAIR 핸들러는 `settlement-*.json`(정산 근거)을 만들지 않아 `verify-settlement`가 "정산 근거 파일이 없습니다 — 검증 불가"로 항상 실패하는데, state 캐시는 검증 job보다 앞선 job에서 이미 저장되기 때문입니다. `repository_dispatch` payload·`workflow_dispatch` 입력·`vars.TRADE_MODE` 어디서 지정해도 동일하게 차단됩니다. **REPAIR 전용 독립 검증(후속 PR)이 준비되기 전까지 state 복구·보정은 로컬에서만** 실행하세요 (`docs/marker-correction-runbook.md` 절차)
   - ⚠️ 예외 — **레거시 `STATE_*_ONLY`는 DRY여도 대부분 state를 저장**합니다: 읽기 전용은 `STATE_DIAGNOSTIC_ONLY`·`STATE_REVERSE_AUDIT_ONLY`뿐이고, `STATE_REPAIR_ONLY`·`STATE_CLEAR_FENCE_ONLY`·`STATE_REVERSE_RECONCILE_ONLY`·`STATE_NET_INVESTED_REPAIR_ONLY`·`STATE_ASSUME_REVERSE_EXPIRY_ONLY`·`STATE_SET_CYCLE_START_ONLY`는 저장합니다. 따라서 이들은 **운영 사용을 제한**합니다(`TRADE_MODE=DRY`를 읽기 전용으로 오해하지 말 것 — 사용 전 백업·승인 필수, "확인용" 실행 금지). 후속 작업에서 REPAIR 전용으로 통합 예정
-  - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
-  - `TRADE_MODE=REPAIR`는 Actions wrapper의 `workflow_dispatch` 선택지(DRY/LIVE)에 없고 `repository_dispatch` payload의 `trade_mode` 또는 `vars.TRADE_MODE`로 지정
+  - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(Actions REPAIR 는 위처럼 Resolve 에서 이미 차단되므로 현재는 LIVE 만 해당)(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
+  - Resolve 단계의 외부 모드 입력(`inputs.trade_mode`·`vars.TRADE_MODE`·`broker_mode` 등)은 셸 문자열에 `${{ }}`로 삽입하지 않고 **env로만 전달**합니다. 영문 대문자가 아닌 값(개행·특수문자 포함)은 `GITHUB_OUTPUT`에 쓰지 않고 `INVALID`로 치환(봇은 DRY, 캐시 저장 안 함)
   - ⚠️ REPAIR라고 자동으로 안전한 것은 아닙니다. FORCE_T는 `orders_meta`·`reverse_mode`·정산 원장·워터마크까지 바꿉니다 → **실행 전 state 백업(저장소 밖) + 브로커 체결 이력 대조 + 작업자≠승인자 승인**은 그대로 유지 (`docs/marker-correction-runbook.md` §2~§4 참고)
 - 리버스모드(`execute_reverse_mode()`): T>분할수-1 시 발동, 5일 MA 별지점 기반 무한매도+쿼터매수
 - T값 환경변수 보정: `FORCE_T_REINFERENCE`, `{SYMBOL}_FORCE_T`, `{SYMBOL}_MAX_T` (기본 MAX_T=분할수, 리버스모드 진입용 `T=splits` 허용)
@@ -362,7 +362,7 @@ uv run pytest tests/test_broker_preflight.py -v
   - `{SYMBOL}_MAX_T={value}`: T 자동추정 결과의 상한선 (기본값: `{SYMBOL}_SPLITS` — 리버스모드 진입 위해 `T=splits` 허용, 초과만 방지)
   - FORCE_T_REINFERENCE 실행 시 small_seed_days(소액 시드 오추정)가 감지되면 포지션 기반 T 추정값이 함께 출력되며, 해당 값을 `{SYMBOL}_FORCE_T`로 설정하여 직접 보정 가능
   - ⚠️ `{SYMBOL}_FORCE_T`는 **1회성 점화용**입니다. 보정 RUN 1회 실행 후 env var를 **즉시 삭제**하세요. 리버스모드 진행은 `day_count`(state `reverse_mode`)와 체결 이력 기반 T 갱신이 주도하므로 FORCE_T 불필요. 유지하면 리버스모드 종료 → 새 사이클(T=0)에서 T를 다시 `splits`로 강제해 **새 사이클 매수가 영구 차단**됩니다.
-  - ⚠️ GH Actions의 새 state 캐시는 **`LIVE`/`REPAIR` 실행에서만** 저장됩니다. DRY(또는 DRY로 고정된 실행)의 결과는 캐시에 남지 않으므로 Actions에서 T 보정을 남기려면 `trade_mode=REPAIR`로 실행하세요 (`TRADE_MODE=DRY` + `FORCE_T` 같은 기존 방식은 더 이상 동작하지 않음).
+  - ⚠️ GH Actions의 새 state 캐시는 **`LIVE`/`REPAIR` 실행에서만** 저장됩니다. DRY(또는 DRY로 고정된 실행)의 결과는 캐시에 남지 않으므로 Actions에서는 REPAIR 가 차단되므로 T 보정은 로컬에서 `TRADE_MODE=REPAIR`로 실행하세요 (`TRADE_MODE=DRY`/`LIVE` + `FORCE_T` 같은 기존 방식은 더 이상 동작하지 않음).
   - ⚠️ GH Actions 캐시는 **브랜치별 격리**입니다. `develop` 수동 RUN에서 보정해도 `main`(repository_dispatch) RUN의 캐시에는 반영되지 않습니다. T 보정은 반드시 운영 브랜치(`main`)에서 실행하세요.
 - **리버스모드** (`src/strategy.py execute_reverse_mode()`):
   - 발동: `T > splits - 1` + position > 0 (20분할 T>19, 40분할 T>39 — 원본 규칙: 마지막 1회 매수도 불가능한 상태)
