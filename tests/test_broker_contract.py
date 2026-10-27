@@ -468,7 +468,8 @@ class TestKISBrokerContract(BrokerContractTest):
         assert result is not None
         assert isinstance(result, OrderResult)
         assert result.order_id == "202606150001"
-        assert result.order_time == "103000"
+        # 주문 시각은 API 응답이 아니라 로컬 KST(YYYYMMDDHHMMSS)를 사용합니다
+        assert len(result.order_time) == 14 and result.order_time.isdigit()
         assert result.is_reservation is False
 
     def test_place_order_raises_ordererror(self):
@@ -672,7 +673,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         """매수가능금액이 PurchaseAmount로 반환되어야 합니다."""
         self._set_mock_response({
             "return_code": 0,
-            "result_list": [{"fc_ord_alowa": "5000.00"}],
+            "result_list": [{"crnc_code": "USD", "fc_ord_alowa": "5000.00"}],
         })
         broker = self._create_broker()
         result = broker.get_purchase_amount("TQQQ", "NAS")
@@ -809,7 +810,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         """성공적인 주문은 OrderResult(order_id, order_time, is_reservation=False)를 반환."""
         self._set_mock_response({
             "return_code": 0,
-            "output": {"ODNO": "202606150001", "ORD_TMD": "103000"},
+            "ord_no": "202606150001",  # KIWOOM 은 flat 구조 + 소문자 ord_no
         })
         broker = self._create_broker()
         result = broker.place_order("TQQQ", "ND", "BUY", 1, 50.0, "LIMIT")
@@ -817,7 +818,7 @@ class TestKiwoomBrokerContract(BrokerContractTest):
         assert result is not None
         assert isinstance(result, OrderResult)
         assert result.order_id == "202606150001"
-        assert result.order_time == "103000"
+        assert len(result.order_time) == 14 and result.order_time.isdigit()
         assert result.is_reservation is False
 
     # ── Base 계약 테스트 오버라이드 ────────────────────────────────────
@@ -1214,6 +1215,7 @@ class TestTossBrokerContract(BrokerContractTest):
                         "execution": {
                             "filledQuantity": 10,
                             "averagePrice": "50.00",
+                            "filledAmount": "500.00",
                         },
                     },
                     {
@@ -1229,6 +1231,7 @@ class TestTossBrokerContract(BrokerContractTest):
                         "execution": {
                             "filledQuantity": 5,
                             "averagePrice": "55.00",
+                            "filledAmount": "275.00",
                         },
                     },
                 ],

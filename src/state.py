@@ -147,28 +147,19 @@ def load_state(symbol):
     }
 
 
-def save_state(symbol, state_dict):
-    """
-    종목의 상태(T값 등)를 파일에 저장합니다.
+def _read_all_states():
+    """상태 파일 전체를 읽습니다 (없으면 빈 dict, 손상이면 덮어쓰기 방지를 위해 예외)."""
+    if not os.path.exists(_STATE_FILE):
+        return {}
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"상태 파일이 손상되어 덮어쓰기를 중단합니다: {e}") from e
 
-    기존 파일의 다른 종목 정보는 유지하고, 해당 종목 정보만 덮어씁니다.
 
-    Parameters:
-        symbol (str): 종목 코드 (예: "TQQQ", "SOXL")
-        state_dict (dict): 저장할 상태 정보 (T 포함)
-    """
-    symbol = symbol.upper()
-
-    # 기존 전체 상태 읽기
-    all_states = {}
-    if os.path.exists(_STATE_FILE):
-        try:
-            with open(_STATE_FILE, "r", encoding="utf-8") as f:
-                all_states = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            raise RuntimeError(f"상태 파일이 손상되어 덮어쓰기를 중단합니다: {e}") from e
-
-    # 이 종목 상태 업데이트
+def _state_record(state_dict):
+    """한 종목의 state dict 에서 **저장 대상 필드만** 뽑은 레코드를 만듭니다."""
     # state_dict에 이미 'last_updated' 값이 있으면 그 값을 우선 사용합니다 (UTC ISO 권장).
     last_updated_val = state_dict.get("last_updated")
     if not last_updated_val:
@@ -179,7 +170,7 @@ def save_state(symbol, state_dict):
         last_updated_val = ""
 
     # Allow optional new fields to be persisted for diagnostic purposes
-    all_states[symbol] = {
+    return {
         "T": float(state_dict.get("T", 0.0)),
         "last_updated": last_updated_val,
         "cycle_start_date": state_dict.get("cycle_start_date", ""),
@@ -203,6 +194,9 @@ def save_state(symbol, state_dict):
         "settlement_ledger": state_dict.get("settlement_ledger", {}),
     }
 
+
+def _write_all_states_atomic(all_states):
+    """임시 파일에 쓰고 fsync 한 뒤 `os.replace` 로 교체합니다 (실패 시 원본 파일은 그대로)."""
     state_dir = os.path.dirname(_STATE_FILE)
     fd, temp_path = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=state_dir)
     try:
@@ -218,13 +212,46 @@ def save_state(symbol, state_dict):
             pass
         raise
 
-    T = all_states[symbol]["T"]
-    effective_seed = all_states[symbol]["effective_seed"]
-    last_upd = all_states[symbol].get("last_updated", "")
-    last_ordno = all_states[symbol].get("last_processed_ordno", "")
-    mismatch = all_states[symbol].get("balance_mismatch")
-    mismatch_flag = "YES" if mismatch else "NO"
-    print(f"[상태] {symbol} 상태 저장 완료 → T={T}, effective_seed=${effective_seed:.2f}, last_updated={last_upd}, last_processed_ordno={last_ordno}, balance_mismatch={mismatch_flag}")
+
+def _print_saved(symbol, record):
+    last_ordno = record.get("last_processed_ordno", "")
+    mismatch_flag = "YES" if record.get("balance_mismatch") else "NO"
+    print(f"[상태] {symbol} 상태 저장 완료 → T={record['T']}, effective_seed=${record['effective_seed']:.2f}, last_updated={record.get('last_updated', '')}, last_processed_ordno={mask_odno(last_ordno)}, balance_mismatch={mismatch_flag}")
+
+
+def save_state(symbol, state_dict):
+    """
+    종목의 상태(T값 등)를 파일에 저장합니다.
+
+    기존 파일의 다른 종목 정보는 유지하고, 해당 종목 정보만 덮어씁니다.
+
+    Parameters:
+        symbol (str): 종목 코드 (예: "TQQQ", "SOXL")
+        state_dict (dict): 저장할 상태 정보 (T 포함)
+    """
+    symbol = symbol.upper()
+    all_states = _read_all_states()
+    all_states[symbol] = _state_record(state_dict)
+    _write_all_states_atomic(all_states)
+    _print_saved(symbol, all_states[symbol])
+
+
+def save_states(updates):
+    """여러 종목의 상태를 **파일 쓰기 1회(원자적)** 로 저장합니다.
+
+    종목별로 `save_state` 를 반복하면 중간 실패 시 일부 종목만 저장된 부분 복구가 생깁니다.
+    여기서는 기존 파일을 한 번 읽고, 모든 종목 레코드를 메모리에서 만든 뒤, 임시 파일 → `os.replace`
+    한 번으로 교체하므로 전부 반영되거나(성공) 원본이 그대로이거나(실패) 둘 중 하나입니다.
+
+    Parameters:
+        updates (dict): {종목코드: state_dict}
+    """
+    all_states = _read_all_states()
+    records = {str(sym).upper(): _state_record(st) for sym, st in updates.items()}
+    all_states.update(records)
+    _write_all_states_atomic(all_states)
+    for sym, record in records.items():
+        _print_saved(sym, record)
 
 
 def canonical_state_hash(state):
@@ -458,7 +485,7 @@ def reconcile_reverse_fills(state, order_history):
             if meta.get("submitted_session", "") < today_session:
                 reverse_mode["reconciliation_error"] = "reverse_order_history_missing"
                 reverse_mode["reconciliation_only"] = True
-                print(f"[경고] 리버스 주문 이력 누락: odno={odno} → 신규 주문을 보류합니다.")
+                print(f"[경고] 리버스 주문 이력 누락: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
             continue
         submitted_at = str(meta.get("submitted_at", ""))
         today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
@@ -473,12 +500,12 @@ def reconcile_reverse_fills(state, order_history):
             elif _auto_assume_reverse_expiry(meta, order):
                 print(
                     f"[경고] 이전 세션 미체결 리버스 주문을 만료로 가정합니다: "
-                    f"odno={odno} → 자동 종결 처리 (데모 일중 주문)"
+                    f"odno={mask_odno(odno)} → 자동 종결 처리 (데모 일중 주문)"
                 )
             else:
                 reverse_mode["reconciliation_error"] = "reverse_order_not_terminal"
                 reverse_mode["reconciliation_only"] = True
-                print(f"[경고] 전일 리버스 주문이 종결되지 않음: odno={odno} → 신규 주문을 보류합니다.")
+                print(f"[경고] 전일 리버스 주문이 종결되지 않음: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
         try:
             filled_qty = max(0, int(float(order.get("ft_ccld_qty", "0"))))
             total_qty = max(0, int(meta.get("total_qty", 0)))
@@ -493,7 +520,7 @@ def reconcile_reverse_fills(state, order_history):
             marker_held_odnos.append(str(odno))
             print(
                 f"  [경고] 리버스 주문 보류(마커 누락·무효): "
-                f"odno={odno}, qty={order.get('ft_ccld_qty','0')}"
+                f"odno={mask_odno(odno)}, qty={order.get('ft_ccld_qty','0')}"
             )
             continue
         events.append((
@@ -515,7 +542,7 @@ def reconcile_reverse_fills(state, order_history):
         _mark_settlement_hold(
             state,
             f"리버스 마커 누락·무효 주문 {len(marker_held_odnos)}건 "
-            f"({', '.join([str(o) for o in marker_held_odnos[:5]])}) — 마커 보정 후 재실행 필요",
+            f"({mask_odno(marker_held_odnos[:5])[1:-1]}) — 마커 보정 후 재실행 필요",
         )
         return
 
@@ -570,7 +597,7 @@ def reconcile_reverse_fills(state, order_history):
                     continue
                 meta["reverse_base_t"] = float(state.get("T", 0.0))
                 print(
-                    f"  [정보] 리버스 주문 {odno} 에 reverse_base_t가 없습니다 "
+                    f"  [정보] 리버스 주문 {mask_odno(odno)} 에 reverse_base_t가 없습니다 "
                     f"(미반영 주문) → 현재 T를 기준선으로 사용합니다"
                 )
             base_t = float(meta.get("reverse_base_t", state.get("T", 0.0)))
@@ -729,9 +756,9 @@ def reconcile_reverse_fills(state, order_history):
             meta["processed_filled_amount"] = 0.0
 
         if action == "sell":
-            print(f"  → 리버스 매도 체결 반영: odno={odno}, ({filled_qty}/{total_qty})")
+            print(f"  → 리버스 매도 체결 반영: odno={mask_odno(odno)}, ({filled_qty}/{total_qty})")
         elif action == "buy":
-            print(f"  → 리버스 매수 체결 반영: odno={odno}, ({filled_qty}/{total_qty})")
+            print(f"  → 리버스 매수 체결 반영: odno={mask_odno(odno)}, ({filled_qty}/{total_qty})")
 
     # 리버스 주문 체결 처리 후 last_updated 갱신
     # _apply_recent_history_dt는 리버스 주문을 필터링하므로,
@@ -802,7 +829,7 @@ def reconcile_reverse_fills(state, order_history):
         _mark_settlement_hold(
             state,
             f"리버스 체결금액 미확정 또는 마커 누락·무효 주문 {len(pending_amount_odnos)}건 "
-            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
+            f"({mask_odno(pending_amount_odnos[:5])[1:-1]}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return
     if state.get("_settlement_hold"):
@@ -1077,7 +1104,7 @@ def _fill_amount(order):
 
     order["_fill_amount_unavailable"] = True
     print(
-        f"  [경고] 체결금액 미확정(odno={order.get('odno', '')}, "
+        f"  [경고] 체결금액 미확정(odno={mask_odno(order.get('odno', ''))}, "
         f"qty={order.get('ft_ccld_qty', '0')}) → 정산 보류 대상"
     )
     return 0.0, True
@@ -1277,6 +1304,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
     state["_settlement_mode"] = "full_reinference"
     state["sell_t_effects"] = {}
     state.pop("_position_basis_unknown", None)
+    state.pop("_position_basis_unknown_reason", None)
     reset_settlement_ledger(state, 0.0)
     state["_settlement_deltas"] = []
     # ── 금액 미확정 필수 체결 게이트 ──────────────────────────────
@@ -1321,7 +1349,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 return state
             o["_ft_ccld_amt_inferred"] = estimated_amount
             print(
-                f"  [경고] FORCE_T_REINFERENCE: odno={o.get('odno', '')} "
+                f"  [경고] FORCE_T_REINFERENCE: odno={mask_odno(o.get('odno', ''))} "
                 f"금액 미확정 → ${estimated_amount:.2f} 추정 허용"
             )
     # 체결 완료된 주문만 추출(타임스탬프가 있는 항목 우선)
@@ -1341,7 +1369,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 reasons.append("ord_datetime_utc 없음")
             if qty > 0 and dt_utc and not _fill_amount_is_available(o):
                 reasons.append("체결금액 계산불가(체결금액/평균가/현재가 없음)")
-            print(f"  [디버그] 초기모드 주문 제외: odno={o.get('odno','')}, "
+            print(f"  [디버그] 초기모드 주문 제외: odno={mask_odno(o.get('odno',''))}, "
                   f"ord_dt={o.get('ord_dt','')}, ord_tmd={o.get('ord_tmd','')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}, "
                   f"qty={o.get('ft_ccld_qty','0')}, 사유={'/'.join(reasons)}")
@@ -1527,7 +1555,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
             fill_ratio = (fill_price / current_avg_price) if current_avg_price > 0 and fill_price > 0 else 0.0
             odno = str(o.get("odno", ""))
             has_meta = "있음" if odno and odno in orders_meta else "없음"
-            print(f"  [디버그] 매수 분류({ord_dt}): odno={odno}, "
+            print(f"  [디버그] 매수 분류({ord_dt}): odno={mask_odno(odno)}, "
                   f"qty={qty}, fill_price=${fill_price:.2f}, "
                   f"avg_price=${current_avg_price:.2f}, "
                   f"fill_ratio={fill_ratio:.4f}, "
@@ -2203,7 +2231,7 @@ def _fill_delta(meta, order, odno_meta=""):
         if delta_qty > 0 and filled_now > 0:
             delta_amount = amount_now * (delta_qty / filled_now)
             print(
-                f"  → [경고] 주문 {odno_meta} 에 반영금액 표식이 없어 신규분 ${delta_amount:.2f} 를 "
+                f"  → [경고] 주문 {mask_odno(odno_meta)} 에 반영금액 표식이 없어 신규분 ${delta_amount:.2f} 를 "
                 f"누적금액 비율로 추정했습니다 (1회)"
             )
         else:
@@ -2223,7 +2251,7 @@ def _commit_fill_markers(meta, order, applied_qty, applied_amount):
     amount_now, amount_estimated = _fill_amount(order)
     if amount_estimated and filled_now > 0:
         # 금액 미확정 체결은 마커를 진행시키지 않습니다 (다음 실행에서 1회 반영).
-        print(f"  [경고] 금액 미확정 주문 {order.get('odno', '')} 마커 갱신 보류")
+        print(f"  [경고] 금액 미확정 주문 {mask_odno(order.get('odno', ''))} 마커 갱신 보류")
         return
     meta["processed_filled_qty"] = max(int(meta.get("processed_filled_qty", 0) or 0), filled_now)
     meta["processed_filled_amount"] = max(
@@ -2278,7 +2306,65 @@ def _has_processed_qty_marker(meta):
     return valid
 
 
-def _apply_late_fill_deltas(state, order_history, skip_odnos):
+# 공개 로그용 주문번호 가명 식별자의 키(salt). **실행(프로세스)마다 무작위**로 만듭니다.
+# 주문번호는 짧은 숫자라 salt 없는 해시(예: SHA-256 앞 8자리)는 전수 대입으로 복원됩니다.
+# salt 는 비공개 Evidence(암호화 artifact)에만 기록하므로, 공개 로그만으로는 복원할 수 없고
+# 다른 실행의 로그와 같은 주문을 연결할 수도 없습니다.
+_LOG_SALT = os.urandom(16)
+
+
+def log_salt_hex():
+    """이번 실행의 로그 마스킹 salt (Evidence 에만 기록 — 독립 검증기가 대조에 사용)."""
+    return _LOG_SALT.hex()
+
+
+def mask_odno(odno, salt_hex=None):
+    """공개 로그용 주문번호 가명 식별자: `ord#` + HMAC-SHA256(salt, odno) 앞 10자리.
+
+    같은 실행 안에서는 같은 번호가 항상 같은 값이라 로그끼리 대조할 수 있습니다.
+    실제 주문번호는 공개 GitHub Actions 로그·예외 메시지·알림에 남기지 않습니다.
+    목록(list/tuple/set)을 주면 각 원소를 마스킹한 `[a, b]` 문자열을 돌려줍니다.
+    """
+    import hashlib
+    import hmac
+
+    if isinstance(odno, (list, tuple, set, frozenset)):
+        return "[" + ", ".join(mask_odno(o, salt_hex) for o in odno) + "]"
+    text = "" if odno is None else str(odno)
+    if not text:
+        return "ord#-"
+    key = bytes.fromhex(salt_hex) if salt_hex else _LOG_SALT
+    return "ord#" + hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()[:10]
+
+
+# 주문 등록 시점에 수량·금액 마커를 함께 0 으로 기록한 신규 메타의 버전 표식.
+# 이 표식이 있는 메타만 "processed_filled_qty=0 → 미반영"으로 신뢰합니다.
+FILL_MARKER_VERSION = 1
+
+
+def _marker_proves_unapplied(meta):
+    """워터마크 이전 주문의 0 마커를 '미반영'으로 신뢰할 수 있는지 판정합니다.
+
+    버전 표식 + 수량 0 + 금액 0.0 이 모두 명시된 신규 등록 메타만 인정합니다.
+    그 외(기존 state 의 processed_filled_qty=0 등)는 반영 여부를 증명할 수 없습니다.
+    """
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("fill_marker_version") != FILL_MARKER_VERSION:
+        return False
+    qty_ok, qty = _parse_processed_qty_marker(meta)
+    if not qty_ok or qty != 0:
+        return False
+    raw = meta.get("processed_filled_amount")
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        return abs(float(raw)) < 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_late_fill_deltas(state, order_history, skip_odnos, skipped_unverified=None):
     """
     워터마크보다 오래된 주문의 **누적 체결 증가분**을 계산합니다 (메타 변경 없음).
 
@@ -2312,7 +2398,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
             continue
         if not _fill_amount_is_available(row):
             print(
-                f"  [경고] 지연 체결 odno={odno} 의 금액을 계산할 수 없어 "
+                f"  [경고] 지연 체결 odno={mask_odno(odno)} 의 금액을 계산할 수 없어 "
                 f"이번 정산에서 보류합니다 (다음 실행에서 금액 확정 시 반영)"
             )
             continue
@@ -2333,8 +2419,26 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
                 # 정산 보류 대상으로 남겨 다음 실행에서 감사/수동 확인을 받습니다.
                 held_odnos.append(str(odno))
                 print(
-                    f"  [경고] 지연 체결 odno={odno} 는 processed_filled_qty 마커가 누락된 "
+                    f"  [경고] 지연 체결 odno={mask_odno(odno)} 는 processed_filled_qty 마커가 누락된 "
                     f"레거시 메타입니다. 자동 복구하지 않고 정산을 보류합니다."
+                )
+                continue
+            if not _marker_proves_unapplied(meta):
+                # 기존 state 의 0 마커는 미반영의 증거가 아닙니다 (과거 72건 재반영 사고).
+                # 증명할 근거가 없으면 **반영하지 않고 건너뜁니다**. 종목 전체를 보류하지 않는
+                # 이유: 보류하면 같은 실행의 실제 신규 체결까지 정산되지 못합니다.
+                if skipped_unverified is not None:
+                    skipped_unverified.append({
+                        "odno": str(odno),
+                        "odno_hash": mask_odno(odno),
+                        "filled_qty": filled_for_recovery,
+                        "ts": str(row.get("ord_datetime_utc", "")),
+                        "reason": "legacy_zero_marker_unproven",
+                    })
+                print(
+                    f"  [경고] 지연 체결 {mask_odno(odno)} 는 미반영을 증명할 마커"
+                    f"(fill_marker_version)가 없어 자동 반영하지 않고 건너뜁니다 "
+                    f"(필요 시 수동 보정 런북 참고)."
                 )
                 continue
             # 등록된 봇 주문인데 아직 한 번도 반영되지 않은 체결입니다.
@@ -2343,7 +2447,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
             # (수량 마커가 0 이면 미반영이 확실 — 반영됐다면 processed_filled_qty > 0)
             print(
                 f"  [상태] 지연 체결 복구: 워터마크 이전 미반영 등록 주문 "
-                f"odno={odno} ({filled_for_recovery}주) → 이번 실행에서 반영"
+                f"odno={mask_odno(odno)} ({filled_for_recovery}주) → 이번 실행에서 반영"
             )
         dq, da, _est = _fill_delta(meta, row, str(odno))
         if dq <= 0 and abs(da) < 1e-9:
@@ -2357,6 +2461,89 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos):
             net_amount += da
     return pending, net_qty, net_amount, held_odnos
 
+
+
+def _mark_position_basis_unknown(
+    state, anchored, balance_qty, *, late_sell=False, prior_cycle=False
+):
+    """보유수량 기준 미확보 사실과 **사유**를 함께 남깁니다 (저장·주문 보류 근거).
+
+    사유는 네 가지 토큰의 조합으로만 만듭니다 (운영 로그·알림에서 바로 읽을 수 있게):
+      - 잔고조회실패       : 브로커 잔고를 받지 못함
+      - 저장보유수량없음   : state.position_qty 로도 기준선을 잡지 못함
+      - 지연매도기준선없음 : 지연 체결 매도의 sell_t_effects.basis 가 비어 있음
+      - 이전사이클매도     : 매도가 현재 사이클 시작 이전(이전 사이클)에 형성됨 →
+                             현재 잔고·position_qty 를 분모로 쓰면 T가 왜곡됨
+
+    사유 키는 소비 시점(`trading_bot._save_settlement_state`)에서 플래그와 함께 pop 하므로
+    `.state.json` 에 남지 않습니다 (save_state 는 화이트리스트이기도 함).
+    """
+    reasons = []
+    if not anchored:
+        if balance_qty is None:
+            reasons.append("잔고조회실패")
+        reasons.append("저장보유수량없음")
+    if late_sell:
+        reasons.append("지연매도기준선없음")
+    if prior_cycle:
+        reasons.append("이전사이클매도")
+    state["_position_basis_unknown"] = True
+    state["_position_basis_unknown_reason"] = " + ".join(reasons)
+    return state["_position_basis_unknown_reason"]
+
+
+def _cycle_date_key(value):
+    """`YYYYMMDD` / `YYYY-MM-DD` / ISO 문자열을 비교 가능한 `YYYY-MM-DD` 로 정규화합니다.
+
+    알 수 없는 형식이면 빈 문자열을 돌려줍니다 (0으로 대체하지 않습니다).
+    """
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _sell_precedes_cycle_window(order, ord_dt, window_start):
+    """매도가 **현재 사이클 구간 이전**(이전 사이클)에 형성됐는지 판별합니다.
+
+    `cycle_start_date` 는 주문일자(`ord_dt`)에서 만들어지므로 같은 기준으로 비교합니다.
+    (KIS/LS/KIWOOM 은 미국영업일, TOSS/MERITZ 는 KST 일자 — 한 배포는 한 브로커만 쓰므로
+     같은 컨벤션 안에서 비교됩니다)
+    주문일자나 사이클 시작일을 알 수 없으면 ``False`` — 판단 근거가 없으므로
+    기존 분류를 그대로 유지합니다 (과차단 방지).
+    """
+    start_key = _cycle_date_key(window_start)
+    if not start_key:
+        return False
+    sell_key = _cycle_date_key(ord_dt) or _cycle_date_key(order.get("ord_dt", ""))
+    if not sell_key:
+        return False
+    return sell_key < start_key
+
+
+def _sell_recorded_basis(state, odno):
+    """매도 주문에 **이미 기록된** 기준선(보유량)을 반환합니다 (없으면 0).
+
+    `sell_t_effects` 는 누적 체결 기준 판정의 근거이고, 원장 sell 항목의 `basis` 도
+    같은 값입니다. 기록된 기준선이 있으면 분류가 현재 잔고에 의존하지 않으므로
+    사이클 경계 가드가 필요 없습니다.
+    """
+    try:
+        entry = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
+        basis = int(entry.get("basis") or 0)
+    except (TypeError, ValueError):
+        basis = 0
+    if basis > 0:
+        return basis
+    ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
+    if ledger_entry is None:
+        return 0
+    try:
+        return max(0, int(ledger_entry.get("basis") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last_processed_ordno, balance_qty=None):
@@ -2374,7 +2561,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         odt_iso = o.get("ord_datetime_utc")
         if not odt_iso:
             print(f"  [디버그] 최근모드 주문 제외(타임스탬프없음): "
-                  f"odno={o.get('odno','')}, ord_dt={o.get('ord_dt','')}, "
+                  f"odno={mask_odno(o.get('odno',''))}, ord_dt={o.get('ord_dt','')}, "
                   f"ord_tmd={o.get('ord_tmd','')}, "
                   f"qty={o.get('ft_ccld_qty','0')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
@@ -2387,13 +2574,13 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 o_dt = o_dt.astimezone(ZoneInfo("UTC"))
         except Exception:
             print(f"  [디버그] 최근모드 주문 제외(파싱실패): "
-                  f"odno={o.get('odno','')}, odt_iso={odt_iso}")
+                  f"odno={mask_odno(o.get('odno',''))}, odt_iso={odt_iso}")
             continue
 
         # 체결수량 없는 항목은 무시
         if int(float(o.get("ft_ccld_qty", "0"))) <= 0:
             print(f"  [디버그] 최근모드 주문 제외(체결수량0): "
-                  f"odno={o.get('odno','')}, dt={odt_iso}, "
+                  f"odno={mask_odno(o.get('odno',''))}, dt={odt_iso}, "
                   f"qty={o.get('ft_ccld_qty','0')}")
             continue
 
@@ -2419,9 +2606,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             recent_candidates.append((o_dt, odno, o))
         else:
             print(f"  [디버그] 최근모드 주문 제외(기간외): "
-                  f"odno={o.get('odno','')}, o_dt={o_dt}, "
+                  f"odno={mask_odno(o.get('odno',''))}, o_dt={o_dt}, "
                   f"last_updated_dt={last_updated_dt}, "
-                  f"odno={odno}, last_processed_ordno={last_processed_ordno}, "
+                  f"odno={mask_odno(odno)}, last_processed_ordno={mask_odno(last_processed_ordno)}, "
                   f"qty={o.get('ft_ccld_qty','0')}, "
                   f"side={o.get('sll_buy_dvsn_cd_name','')}")
 
@@ -2433,7 +2620,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 pending_amount_odnos.append(str(odno_pending))
             print(
                 f"  [경고] 최근모드 주문 보류(체결금액 미확정): "
-                f"odno={odno_pending}, qty={order_pending.get('ft_ccld_qty','0')}"
+                f"odno={mask_odno(odno_pending)}, qty={order_pending.get('ft_ccld_qty','0')}"
             )
             continue
         pending_meta = (state.get("orders_meta") or {}).get(str(odno_pending))
@@ -2444,7 +2631,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 pending_marker_odnos.append(str(odno_pending))
             print(
                 f"  [경고] 최근모드 주문 보류(마커 누락·무효): "
-                f"odno={odno_pending}, qty={order_pending.get('ft_ccld_qty','0')}"
+                f"odno={mask_odno(odno_pending)}, qty={order_pending.get('ft_ccld_qty','0')}"
             )
 
     # 워터마크 이전 등록 주문의 지연 체결도 금액 확정이 필수입니다.
@@ -2477,7 +2664,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 pending_marker_odnos.append(str(odno))
             print(
                 f"  [경고] 지연 체결 주문 보류(마커 누락·무효): "
-                f"odno={odno}, qty={row.get('ft_ccld_qty','0')}"
+                f"odno={mask_odno(odno)}, qty={row.get('ft_ccld_qty','0')}"
             )
 
     if pending_amount_odnos:
@@ -2489,13 +2676,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         _mark_settlement_hold(
             state,
             f"체결금액 미확정 또는 마커 누락·무효 주문 {len(pending_amount_odnos)}건 "
-            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
+            f"({mask_odno(pending_amount_odnos[:5])[1:-1]}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return state, pending_amount_odnos
 
     # ── 1) 지연 체결 후보 (워터마크 이전 주문의 누적 체결 증가분) — 순수 계산 ──
+    unverified_skipped: list[dict] = []
     late_pending, late_net_qty, late_net_amount, late_held_odnos = _apply_late_fill_deltas(
-        state, order_history, {str(odno) for _o, odno, _r in recent_candidates}
+        state, order_history, {str(odno) for _o, odno, _r in recent_candidates},
+        skipped_unverified=unverified_skipped,
     )
 
     # processed_filled_qty 마커가 누락된 레거시 주문도 정산 보류 대상으로 처리합니다.
@@ -2515,9 +2704,14 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         _mark_settlement_hold(
             state,
             f"체결금액 미확정 또는 마커 누락 주문 {len(pending_amount_odnos)}건 "
-            f"({', '.join(pending_amount_odnos[:5])}) — 금액 확정 또는 마커 보정 후 재실행 필요",
+            f"({mask_odno(pending_amount_odnos[:5])[1:-1]}) — 금액 확정 또는 마커 보정 후 재실행 필요",
         )
         return state, pending_amount_odnos
+
+    if unverified_skipped:
+        # 운영 로그·검증용 일회성 표식 (save_state 화이트리스트 밖이라 저장되지 않습니다)
+        state["_unverified_skipped_odnos"] = [e["odno"] for e in unverified_skipped]
+        state["_unverified_skipped_audit"] = unverified_skipped
 
     # ── 2) 이번 묶음의 반영분(수량·금액) 계산 — 순수 계산 ─────────────
     # 등록된 주문은 메타의 반영 마커와 비교해 **새로 늘어난 부분만** 계산합니다.
@@ -2683,21 +2877,26 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     net_invested -= da
                     if _classify_sell_ratio(ratio) == 0.0:
                         print(
-                            f"  [주의] 지연 매도 odno={odno} 누적 100%지만 "
+                            f"  [주의] 지연 매도 odno={mask_odno(odno)} 누적 100%지만 "
                             f"보유 {max(0, int(_post_after or 0))}주가 남아 사이클을 종료하지 않습니다"
                         )
             else:
                 # 기준선 없이 분류한 지연 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
                 # (기존 T를 되돌려 최초 기준을 역산하지 않습니다)
-                state["_position_basis_unknown"] = True
+                # ⚠️ 기준선 추론 fallback 금지 — 여기서 별지점/현재가로 기준을 "추정"하면
+                #    매도 비율이 틀어져 T가 잘못 고정됩니다. 보류가 정답입니다.
+                _mark_position_basis_unknown(
+                    state, position_anchored, balance_qty, late_sell=True
+                )
                 entry_now = {}
                 print(
-                    f"  [경고] 지연 매도 odno={odno} 의 보유수량 기준을 확보하지 못했습니다 "
+                    f"  [경고] 지연 매도 odno={mask_odno(odno)} 의 보유수량 기준을 확보하지 못했습니다 "
+                    f"(사유: {state.get('_position_basis_unknown_reason', '')}) "
                     f"→ 저장·신규 주문을 보류합니다"
                 )
                 net_invested -= da
             print(
-                f"  → 지연 체결 반영: odno={odno} 매도 {dq}주 추가 "
+                f"  → 지연 체결 반영: odno={mask_odno(odno)} 매도 {dq}주 추가 "
                 f"(누적 {cumulative_qty}주) → T={T}"
             )
             entry_now = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
@@ -2718,7 +2917,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             })
         elif meta.get("is_additional"):
             net_invested += da
-            print(f"  → 지연 체결 반영: odno={odno} 추가매수 {dq}주 → T 변경 없음")
+            print(f"  → 지연 체결 반영: odno={mask_odno(odno)} 추가매수 {dq}주 → T 변경 없음")
             state["_settlement_deltas"].append({
                 "odno": str(odno),
                 "side": "매수",
@@ -2740,7 +2939,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 T, ledger_entry = _apply_buy_t_effect(state, T, delta_T, odno, allow_adjust=False)
                 ledger_seq = ledger_entry.get("seq") if ledger_entry else None
                 print(
-                    f"  → 지연 체결 반영: odno={odno} 추가체결 {dq}주 "
+                    f"  → 지연 체결 반영: odno={mask_odno(odno)} 추가체결 {dq}주 "
                     f"→ ΔT={delta_T} → T={T}"
                 )
             net_invested += da
@@ -2844,6 +3043,11 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     last_dt_processed = last_updated_dt
     last_ordno_processed = last_processed_ordno
 
+    # ── 사이클 경계 기준 (이전 사이클 매도 가드용) ────────────────────
+    # 이번 묶음 처리 중 `cycle_start_date` 가 리셋(전량매도)될 수 있으므로
+    # 판단 기준이 되는 시작값을 묶음 시작 시점에 고정합니다.
+    _cycle_window_start = state.get("cycle_start_date", "")
+
     # 날짜(ord_dt)별로 그룹화하여 처리합니다
     orders_meta = state.get("orders_meta", {})
     orders_by_date = defaultdict(list)
@@ -2899,9 +3103,30 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if sell_qty <= 0 and abs(sell_amt) < 1e-9:
                 # 이미 반영된 매도 (부분체결 후 추가 체결 없음) → 재분류하지 않습니다.
                 continue
+            # ── 이전 사이클 매도 가드 ─────────────────────────────────
+            # 사이클 경계 이전에 형성된 매도에 **현재** 잔고/position_qty 를 분모로 쓰면
+            # 비율이 틀어져 T 가 왜곡됩니다 (10/22 사고: 실제 81주를 30주로 계산 →
+            # 쿼터매도가 목표매도로 오분류 → T 13.375→3.3438).
+            # 기준선이 원장/마커에 이미 기록돼 있으면 그 값을 쓰므로 안전하지만,
+            # 기록이 없으면 현재 기준선으로 **재분류하지 않고** 보류합니다
+            # (불확실한 정산은 어떤 경로에서도 확정하지 않습니다).
+            if (
+                _sell_recorded_basis(state, odno) <= 0
+                and _sell_precedes_cycle_window(order, ord_dt, _cycle_window_start)
+            ):
+                _mark_position_basis_unknown(
+                    state, position_anchored, balance_qty, prior_cycle=True
+                )
+                print(
+                    f"  [경고] 매도 odno={mask_odno(odno)} 는 사이클 시작({_cycle_window_start}) 이전 "
+                    f"주문({ord_dt})입니다 → 현재 보유수량 기준으로 재분류하지 않고 보류합니다 "
+                    f"(사유: {state.get('_position_basis_unknown_reason', '')})"
+                )
+                continue
             if not position_anchored:
                 # 기준선 없이 분류한 매도는 신뢰할 수 없습니다 → 저장·주문 보류 신호
-                state["_position_basis_unknown"] = True
+                # (사유: 잔고조회실패 / 저장보유수량없음)
+                _mark_position_basis_unknown(state, position_anchored, balance_qty)
             cumulative_qty = int(float(order.get("ft_ccld_qty", "0") or 0))
             kind = "쿼터매도"
             t_before_effect = T
@@ -3014,7 +3239,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 "is_additional": True,
                 "t_delta": 0.0,
             })
-            print(f"  → 매수 체결 ({ord_dt}): 추가매수(odno={odno}) 제외 → T 변경 없음")
+            print(f"  → 매수 체결 ({ord_dt}): 추가매수(odno={mask_odno(odno)}) 제외 → T 변경 없음")
             if o_dt > last_dt_processed:
                 last_dt_processed = o_dt
                 last_ordno_processed = odno or last_ordno_processed
@@ -3054,7 +3279,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                     ledger_seq = ledger_entry.get("seq") if ledger_entry else None
                     _commit_fill_markers(meta, order, buy_qty, buy_amt)
                     print(
-                        f"  → 매수 체결 ({ord_dt}): odno={odno} "
+                        f"  → 매수 체결 ({ord_dt}): odno={mask_odno(odno)} "
                         f"t_target={meta.get('t_target')} "
                         f"부분체결({buy_qty}/{total_qty}) → ΔT={delta_T} → T={T}"
                     )

@@ -10,6 +10,7 @@
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -25,7 +26,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import load_state, save_state, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 from notifier import notify
 
 
@@ -386,10 +387,23 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
     Raises:
         SymbolScopedError: 기준 미확보로 저장하지 못한 경우
     """
-    if state.pop("_position_basis_unknown", False):
+    basis_unknown = state.pop("_position_basis_unknown", False)
+    # 사유 키도 **항상** 함께 소비합니다 (남으면 .state.json 으로 새는 것을 방지).
+    basis_reason = state.pop("_position_basis_unknown_reason", "")
+    skipped_unverified = state.pop("_unverified_skipped_odnos", [])
+    skipped_audit = state.pop("_unverified_skipped_audit", [])
+    if skipped_unverified:
+        # 공개 로그에는 실제 주문번호 대신 해시만 남깁니다 (원문은 Evidence 에만 기록)
+        hashes = [e.get("odno_hash", "") for e in skipped_audit][:5]
+        print(
+            f"[정보] {symbol} 미반영 증명 불가 과거 주문 {len(skipped_unverified)}건은 "
+            f"반영하지 않고 건너뛰었습니다 ({', '.join(hashes)})"
+        )
+    if basis_unknown:
         msg = (
             f"[보류] {symbol} 보유수량 기준을 확보하지 못해 정산 결과와 신규 주문을 "
-            f"보류합니다. (브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
+            f"보류합니다. 사유: {basis_reason or '잔고조회실패 + 저장보유수량없음'} "
+            f"(브로커 잔고 조회 실패 + 저장 보유수량 없음) — 확인 후 재실행하세요."
         )
         print(msg)
         notify(msg, urgent=True)
@@ -404,11 +418,11 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
         parts = []
         if amount_only:
             parts.append(
-                f"체결금액 미확정 주문 {len(amount_only)}건({', '.join(amount_only[:5])})"
+                f"체결금액 미확정 주문 {len(amount_only)}건({mask_odno(amount_only[:5])[1:-1]})"
             )
         if pending_marker_odnos:
             parts.append(
-                f"마커 누락·무효 주문 {len(pending_marker_odnos)}건({', '.join(pending_marker_odnos[:5])})"
+                f"마커 누락·무효 주문 {len(pending_marker_odnos)}건({mask_odno(pending_marker_odnos[:5])[1:-1]})"
             )
         hold_detail = " + ".join(parts) if parts else f"주문 {len(pending_amount_odnos)}건"
         followup = []
@@ -504,6 +518,11 @@ def build_settlement_evidence(
         "orders": deepcopy(state.get("_settlement_deltas", [])),
         "fills": [],
         "skipped_fills": [],
+        # 미반영 증명 불가로 건너뛴 과거(레거시 0 마커) 주문 — 감사용 (원문 odno + 해시)
+        "skipped_unverified": deepcopy(state.get("_unverified_skipped_audit") or []),
+        # 공개 로그의 가명 식별자(ord#…)를 원문 주문번호로 되돌려 대조하기 위한 실행별 salt.
+        # 비공개(암호화) Evidence 에만 기록합니다 — 공개 로그에는 절대 출력하지 않습니다.
+        "log_salt": log_salt_hex(),
     }
     for row in order_history or []:
         try:
@@ -557,6 +576,75 @@ def build_settlement_evidence(
     return evidence
 
 
+def _force_t_mode_block_message(mode, symbol_configs):
+    """DRY·LIVE 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
+
+    FORCE_T 는 T·orders_meta·reverse_mode·정산 원장·워터마크를 덮어쓰고 저장하는 명시적 복구입니다.
+    - DRY 는 state 를 저장하지 않는 읽기 전용 미리보기라 적용하면 로컬 .state.json 이 바뀝니다.
+    - LIVE 는 보정이 적용된 **같은 실행에서 주문 단계까지** 진행할 수 있어 복구와 주문이 결합됩니다.
+    복구·보정은 TRADE_MODE=REPAIR 로만 실행합니다 (주문 없음).
+    """
+    names = [str(c.get("symbol")) for c in symbol_configs if c.get("force_t") is not None]
+    if not names or mode not in ("DRY", "LIVE"):
+        return ""
+    keys = ", ".join(f"{n}_FORCE_T" for n in names)
+    if mode == "LIVE":
+        reason = "LIVE 에서는 보정과 주문이 한 실행에 결합되므로 허용하지 않습니다"
+    else:
+        reason = "DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다"
+    return (
+        f"TRADE_MODE={mode} 에서는 {keys} 를 적용할 수 없습니다 ({reason}). "
+        "state 저장·브로커 호출·주문 없이 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용됩니다."
+    )
+
+
+def _validate_reinference_t(symbol, new_t, max_t):
+    """REPAIR 재추정 결과를 저장해도 되는지 검증합니다 (문제가 없으면 빈 문자열).
+
+    - 추정 T 와 MAX_T 는 유한한 유효 숫자여야 합니다 (None 인 MAX_T 는 상한 없음으로 건너뜁니다).
+    - T > MAX_T 이면 **저장을 거부**합니다. 상한으로 잘라 저장하면 T 가 그만큼 부풀려진 원인
+      (정산 오류 등)을 숨길 수 있으므로 원인 확인을 요구합니다.
+    """
+    def _is_number(value):
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        )
+
+    if not _is_number(new_t):
+        return f"{symbol} 재추정 T 가 유효한 숫자가 아닙니다: {new_t!r}"
+    if max_t is None:
+        return ""
+    if not _is_number(max_t) or max_t < 0:
+        return f"{symbol} MAX_T 가 유효한 숫자가 아닙니다: {max_t!r}"
+    if new_t > max_t:
+        return (
+            f"{symbol} 재추정 T={new_t} 가 설정된 상한 MAX_T={max_t} 를 초과합니다 — 저장을 거부합니다 "
+            f"(상한으로 잘라 저장하면 정산 오류를 숨길 수 있습니다. 초과 원인을 확인하세요)"
+        )
+    return ""
+
+
+def _reinference_hold_reasons(symbol, state):
+    """재추정 결과가 '정산 보류' 상태인지 확인하고 사유 목록을 반환합니다 (정상이면 빈 목록).
+
+    보류 상태에서는 `update_T_from_history` 가 메모리를 보류 직전 스냅샷으로 되돌리는데, REPAIR 재추정은
+    그 스냅샷을 찍기 전에 `last_updated` 를 비워 두었으므로 **그대로 저장하면 워터마크가 빈 값으로 바뀝니다**.
+    따라서 보류 표식이 하나라도 있으면 어떤 종목도 저장하지 않습니다. 주문번호는 마스킹해 출력합니다.
+    """
+    reasons = []
+    if state.get("_settlement_hold"):
+        reasons.append(f"정산 보류({state.get('_settlement_hold_reason') or '사유 없음'})")
+    if state.get("_pending_amount_odnos"):
+        reasons.append(f"체결금액 미확정 주문 {mask_odno(list(state['_pending_amount_odnos'])[:5])}")
+    if state.get("_pending_marker_odnos"):
+        reasons.append(f"마커 누락·무효 주문 {mask_odno(list(state['_pending_marker_odnos'])[:5])}")
+    if state.get("_position_basis_unknown"):
+        reasons.append(f"보유수량 기준 미확보({state.get('_position_basis_unknown_reason') or '사유 없음'})")
+    return [f"{symbol} {reason}" for reason in reasons]
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -575,6 +663,11 @@ def run_one_symbol(broker: Broker, symbol_config):
     symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
     additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
+
+    # DRY(저장 금지)·LIVE(복구와 주문 결합)에서 FORCE_T 는 어떤 조회·변경보다 먼저 막습니다.
+    _force_t_block = _force_t_mode_block_message(TRADE_MODE, [symbol_config])
+    if _force_t_block:
+        raise RuntimeError(_force_t_block)
 
     print(f"\n{'=' * 60}")
     print(f"종목 처리 시작: {symbol} ({exchange})")
@@ -616,7 +709,8 @@ def run_one_symbol(broker: Broker, symbol_config):
     from config import FORCE_T_REINFERENCE as _force_reinference, TRADE_MODE as _trade_mode
     if _force_reinference:
         if _trade_mode == "LIVE":
-            print("[T 보정] FORCE_T_REINFERENCE=true 이지만 TRADE_MODE=LIVE입니다 — 주문 방지를 위해 DRY로 전환합니다.")
+            print("[T 보정] FORCE_T_REINFERENCE=true + LIVE → 주문 방지를 위해 DRY(미리보기)로 전환합니다. "
+                  "state 는 저장되지 않습니다 (실제 저장은 TRADE_MODE=REPAIR).")
             import config as _cfg
             _cfg.TRADE_MODE = "DRY"
         if state.get("last_updated"):
@@ -751,6 +845,9 @@ def run_one_symbol(broker: Broker, symbol_config):
             print(f"  → 포지션 기반 값으로 설정하려면 {symbol}_FORCE_T={T_position} 환경변수를 추가하고 재실행하세요")
 
     # ── T값 상한 적용 (MAX_T) ──
+    if max_t is not None and (_force_reinference or TRADE_MODE == "DRY"):
+        # 미리보기 진단: 원시 추정 T 와 상한 적용 후 T 를 함께 보여줍니다.
+        print(f"[T 보정] {symbol} 원시 추정 T={state['T']}, 상한 MAX_T={max_t} → 적용 T={min(state['T'], max_t)}")
     if max_t is not None and state["T"] > max_t:
         print(f"[T 보정] {symbol} T={state['T']} > MAX_T={max_t} → T={max_t}로 조정")
         state["T"] = max_t
@@ -943,9 +1040,8 @@ def run_one_symbol(broker: Broker, symbol_config):
         if _has_unresolved_reverse_orders(state):
             state.setdefault("reverse_mode", {})["reconciliation_only"] = True
             state["reverse_mode"]["active"] = False
-            # TODO [REPAIR MIGRATION] FORCE_T save in DRY: 명시적 보정용으로 유지, REPAIR로 이관 예정.
-            # For now kept as-is (FORCE_T is user-initiated state repair).
-            # Migrate to STATE_NET_INVESTED_REPAIR_ONLY or similar read-only tool.
+            # DRY 에서는 이 블록에 도달하기 전에 차단됩니다(진입부 가드). 여기는 LIVE 레거시 경로이며
+            # FORCE_T 보정은 TRADE_MODE=REPAIR(_repair_force_t) 사용을 권장합니다.
             save_state(symbol, state)
             raise RuntimeError("미해결 리버스 주문이 있어 FORCE_T 적용을 중단합니다.")
         old_T = state["T"]
@@ -979,7 +1075,7 @@ def run_one_symbol(broker: Broker, symbol_config):
             state["net_invested_status"] = "valid"
         print(f"[T 보정] {symbol} FORCE_T={force_t} 적용 (이전 T={old_T}), "
               f"orders_meta/balance_mismatch 초기화, last_updated 갱신")
-        # TODO [REPAIR MIGRATION] FORCE_T save in DRY: allowed for explicit correction.
+        # DRY 는 진입부에서 차단되므로 이 저장은 LIVE 레거시 경로에서만 실행됩니다 (권장: TRADE_MODE=REPAIR).
         save_state(symbol, state)
 
     T = state["T"]
@@ -1262,6 +1358,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                     "t_target": float(t_target),
                     "is_additional": bool(is_additional),
                     "processed_filled_qty": 0,
+                    # 신규 등록분만 "아직 한 번도 반영되지 않음"을 증명하는 버전 표식
+                    # (기존 메타는 마이그레이션하지 않습니다 — 0 만으로는 미반영을 단정할 수 없음)
+                    "processed_filled_amount": 0.0,
+                    "fill_marker_version": FILL_MARKER_VERSION,
                 }
                 if order.get("reverse_action"):
                     reverse_mode = state.setdefault("reverse_mode", {})
@@ -1986,7 +2086,7 @@ def _reverse_audit_only():
                 terminal = bool(meta.get("terminal"))
                 delta_amt = max(0.0, broker_amt - state_amt)
                 print(
-                    f"  odno={odno} side={meta.get('reverse_action')} day={meta.get('reverse_day')} "
+                    f"  odno={mask_odno(odno)} side={meta.get('reverse_action')} day={meta.get('reverse_day')} "
                     f"submitted={meta.get('submitted_at', '')} session={meta.get('submitted_session', '')} "
                     f"| 브로커: qty={broker_qty} amt=${broker_amt:.2f} "
                     f"remaining={settled.get('nccs_qty', '') if settled else ''} "
@@ -2229,9 +2329,9 @@ def _assume_reverse_expiry_only():
 
     meta = state.get("orders_meta", {}).get(odno)
     if not meta or not meta.get("reverse_action"):
-        raise RuntimeError(f"리버스 만료 가정 거부: 주문 메타가 없습니다: {odno}")
+        raise RuntimeError(f"리버스 만료 가정 거부: 주문 메타가 없습니다: {mask_odno(odno)}")
     if meta.get("terminal"):
-        print(f"[리버스 만료 가정] {symbol} odno={odno} 이미 terminal입니다.")
+        print(f"[리버스 만료 가정] {symbol} odno={mask_odno(odno)} 이미 terminal입니다.")
         return
     if int(meta.get("processed_filled_qty", 0) or 0) != 0:
         raise RuntimeError("리버스 만료 가정 거부: 이미 체결된 수량이 있습니다.")
@@ -2248,7 +2348,7 @@ def _assume_reverse_expiry_only():
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
     meta["terminal_assumption_reason"] = "kiwoom_demo_day_order_expired_after_session"
     save_state(symbol, state)
-    print(f"[리버스 만료 가정] {symbol} odno={odno}를 terminal_assumed로 저장했습니다.")
+    print(f"[리버스 만료 가정] {symbol} odno={mask_odno(odno)}를 terminal_assumed로 저장했습니다.")
 
 
 def _clear_fence_only():
@@ -2332,6 +2432,13 @@ def _repair_reinference():
 
     기존 main()의 FORCE_T_REINFERENCE 처리를 모방하지만, REPAIR 모드 전용으로
     브로커/전략/주문 없이 T 재추정만 수행합니다.
+
+    **전 종목을 먼저 재추정·검증한 뒤, `.state.json` 을 한 번만(원자적으로) 저장합니다.**
+    - 검증 실패(재추정 T 가 MAX_T 초과, 숫자 오류, 정산 보류 표식)가 한 종목이라도 있으면
+      어떤 종목도 저장하지 않고 종료 코드 1 로 끝납니다 — 일부 종목만 먼저 저장되는 부분 복구 방지.
+    - 검증은 통과했지만 파일 저장이 실패하면 종료 코드 2 로 끝납니다. 임시 파일에 쓴 뒤 교체하므로
+      원본 상태 파일은 그대로입니다 (검증 실패와 구분).
+    - T 를 MAX_T 로 잘라 저장하지 않습니다(정산 오류 은폐 방지).
     """
     import config as runtime_config
     # REPAIR는 LIVE이더라도 DRY로 고정 (T 재추정 중 주문 방지)
@@ -2342,9 +2449,12 @@ def _repair_reinference():
 
     broker = create_broker()
     try:
+        planned = {}   # {symbol: 재추정된 state}
+        failures = []
         for symbol_config in SYMBOLS:
             symbol = symbol_config["symbol"]
             exchange = symbol_config["exchange"]
+            max_t = symbol_config.get("max_t")
             print(f"\n[REPAIR:REINFERENCE] {symbol} T 재추정 시작")
             state = load_state(symbol)
 
@@ -2362,7 +2472,29 @@ def _repair_reinference():
                 live_qty = None
 
             state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
-            save_state(symbol, state)
+            print(f"[REPAIR:REINFERENCE] {symbol} 재추정 T={state['T']}, 상한 MAX_T={max_t}")
+            failures.extend(_reinference_hold_reasons(symbol, state))
+            problem = _validate_reinference_t(symbol, state["T"], max_t)
+            if problem:
+                failures.append(problem)
+            planned[symbol] = state
+
+        if failures:
+            print("\n[REPAIR:REINFERENCE] 검증 실패 — 어떤 종목도 저장하지 않습니다 (state 변경 없음, 주문 0건):")
+            for problem in failures:
+                print(f"  - {problem}")
+            sys.exit(1)
+
+        # 전 종목 검증 통과 → 파일 쓰기 1회 (원자적)
+        try:
+            save_states(planned)
+        except Exception as save_error:
+            print(
+                f"\n[REPAIR:REINFERENCE] 저장 실패(파일 쓰기) — 검증은 통과했지만 상태 파일을 저장하지 못했습니다. "
+                f"임시 파일 교체 방식이라 기존 상태 파일은 변경되지 않았습니다: {str(save_error)[:200]}"
+            )
+            sys.exit(2)
+        for symbol, state in planned.items():
             print(
                 f"[REPAIR:REINFERENCE] {symbol} T 재추정 완료 → T={state['T']}, "
                 f"state_hash={canonical_state_hash(state)}"
@@ -2378,6 +2510,16 @@ def _repair_force_t():
     기존 run_one_symbol()의 FORCE_T 처리를 REPAIR 전용으로 재현합니다.
     주문은 생성하지 않습니다.
     """
+    # 적용할 종목별 값이 하나도 없으면 "성공처럼" 끝내지 않고 명시적으로 실패합니다.
+    # (예: REPAIR_ACTION=FORCE_T 단독 — 값은 {SYMBOL}_FORCE_T 에서만 읽는데 함께 설정하면 작업 소스 2개로 중단)
+    if not any(c.get("force_t") is not None for c in SYMBOLS):
+        print(
+            "[REPAIR:FORCE_T] 적용할 {SYMBOL}_FORCE_T 값이 없습니다 — 아무것도 적용되지 않았습니다 (실패).\n"
+            "  REPAIR_ACTION=FORCE_T 단독 호출은 지원되지 않습니다. 사용법: TRADE_MODE=REPAIR TQQQ_FORCE_T=29 "
+            "(REPAIR_ACTION 은 비워 둡니다)."
+        )
+        sys.exit(1)
+
     broker = create_broker()
     try:
         for symbol_config in SYMBOLS:
@@ -2587,7 +2729,16 @@ def main():
     if runtime_config.FORCE_T_REINFERENCE and runtime_config.TRADE_MODE == "LIVE":
         runtime_config.TRADE_MODE = "DRY"
         globals()["TRADE_MODE"] = "DRY"
-        print("[T 보정] FORCE_T_REINFERENCE=true → 브로커 생성 전 DRY 모드로 고정합니다.")
+        print("[T 보정] FORCE_T_REINFERENCE=true + LIVE → 주문 방지를 위해 브로커 생성 전 DRY(미리보기)로 고정합니다. "
+              "state 는 저장되지 않습니다 (실제 저장은 TRADE_MODE=REPAIR FORCE_T_REINFERENCE=true).")
+
+    # DRY·LIVE(DRY 로 고정된 경우 포함)에서는 {SYMBOL}_FORCE_T 를 적용하지 않습니다 —
+    # 브로커 생성·state 변경·주문 전에 종료 코드 1 로 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용.
+    # FORCE_T_REINFERENCE 는 DRY 에서 미리보기(저장 없음), REPAIR 에서 실제 저장으로 구분이 유지됩니다.
+    _force_t_block = _force_t_mode_block_message(TRADE_MODE, SYMBOLS)
+    if _force_t_block:
+        print(f"[중단] {_force_t_block}")
+        sys.exit(1)
 
     broker = create_broker()
     try:

@@ -80,7 +80,25 @@ autotrade-basic/
 - T값(float)이 누적 매수 횟수를 나타내는 독특한 상태 관리
 - 모의/실전 TR_ID를 KIS_MODE에 따라 동적 전환
 - DRY 모드에서는 주문 출력만 하고 실행하지 않으며, 리버스모드 상태도 복사본으로 계산해 캐시에 진행 상태를 저장하지 않음
-- **DRY 불일치/사이클 종료 처리**: DRY에서는 이력-잔고 불일치(`balance_mismatch`)가 감지돼도 **기록·자동보정·중단 없이 경고 + 텔레그램 1회(비긴급)만** 출력하고 프리뷰를 계속 진행(exit 0). 사이클 종료 감지 시 리포트만 표시하고 **캐시 저장(T 리셋/시드)을 생략**. LIVE는 기존대로 기록 + 중단(RuntimeError → fatal). `{SYMBOL}_FORCE_T`/`FORCE_T_REINFERENCE`는 가드 아래에 있어 DRY에서 불일치가 있어도 정상 적용됨
+- **DRY 불일치/사이클 종료 처리**: DRY에서는 이력-잔고 불일치(`balance_mismatch`)가 감지돼도 **기록·자동보정·중단 없이 경고 + 텔레그램 1회(비긴급)만** 출력하고 프리뷰를 계속 진행(exit 0). 사이클 종료 감지 시 리포트만 표시하고 **캐시 저장(T 리셋/시드)을 생략**. LIVE는 기존대로 기록 + 중단(RuntimeError → fatal). `{SYMBOL}_FORCE_T`는 DRY에서 **적용하지 않고 오류로 중단**(저장 없음, T 보정은 `TRADE_MODE=REPAIR`), `FORCE_T_REINFERENCE`는 DRY에서 **미리보기만**(저장 없음)
+- **실행 모드별 state 저장 원칙**: **state 복구·보정은 `TRADE_MODE=REPAIR`로 실행한다.**
+
+  | 모드 | 목적 | state 저장 | Actions 새 캐시 저장 |
+  |------|------|-----------|----------------------|
+  | `DRY` | 전략·정산 미리보기 | 원칙적으로 금지 | **금지** |
+  | `REPAIR` | 명시적 state 복구·보정 (주문 없음, **로컬 전용** — Actions 에서는 차단) | 허용 | 허용 (Actions 에서는 REPAIR 자체가 차단됨) |
+  | `LIVE` | 실제 주문·정산 (**`{SYMBOL}_FORCE_T` 금지**) | 허용 | 허용 |
+
+  - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` 또는 `LIVE` → state 저장·브로커 호출·주문 **없이 명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성 전). **FORCE_T는 `TRADE_MODE=REPAIR`에서만 허용**. LIVE를 막는 이유: FORCE_T는 T·`orders_meta`·`reverse_mode`·정산 원장·워터마크를 덮어쓰는데, LIVE에서는 같은 실행에서 주문 단계까지 이어져 복구와 주문이 결합됨. `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일하게 차단
+  - `FORCE_T_REINFERENCE`: **DRY = 미리보기(저장 없음), REPAIR = 실제 저장**. LIVE + `FORCE_T_REINFERENCE=true`는 주문 방지를 위해 **DRY 미리보기로 고정**되며 state는 저장되지 않음(로그에 명시). 실제 저장은 `TRADE_MODE=REPAIR`
+  - REPAIR 재추정(`_repair_reinference`): 재추정 T가 `{SYMBOL}_MAX_T`(기본 분할수)를 **초과하면 저장을 거부**하고 종료 코드 1 (T를 상한으로 **자르지 않음** — 자르면 정산 오류가 숨겨짐). 여러 종목은 **전부 재추정·검증한 뒤에만** 저장하므로 일부 종목만 먼저 저장되지 않음. T/MAX_T가 유한한 유효 숫자가 아니어도 거부. 일반 실행 경로(`run_one_symbol`)는 기존대로 상한으로 조정
+  - REPAIR 재추정은 **정산 보류 표식**(`_settlement_hold`·`_pending_amount_odnos`·`_pending_marker_odnos`·`_position_basis_unknown`)이 있으면 저장을 거부하고 종료 코드 1로 끝납니다. 재추정이 `last_updated`를 비운 뒤 `update_T_from_history`를 부르기 때문에, 보류 시 되돌려진 스냅샷도 `last_updated=""`라 그대로 저장하면 워터마크가 지워집니다
+  - REPAIR 재추정은 전 종목 검증 후 `.state.json`을 **파일 쓰기 1회(`save_states`, 임시 파일→`os.replace`)** 로만 저장합니다. 종료 코드: **1 = 검증 실패**(MAX_T 초과·숫자 오류·보류, 저장 시도 없음), **2 = 파일 저장 실패**(검증은 통과, 원본 파일은 변경되지 않음)
+  - ⚠️ **Actions의 `TRADE_MODE=REPAIR`는 차단됩니다** (`trade_base.yml` Resolve 단계, 봇 실행·state 변경·캐시 저장 전 `exit 1`). 이유: REPAIR 핸들러는 `settlement-*.json`(정산 근거)을 만들지 않아 `verify-settlement`가 "정산 근거 파일이 없습니다 — 검증 불가"로 항상 실패하는데, state 캐시는 검증 job보다 앞선 job에서 이미 저장되기 때문입니다. `repository_dispatch` payload·`workflow_dispatch` 입력·`vars.TRADE_MODE` 어디서 지정해도 동일하게 차단됩니다. **REPAIR 전용 독립 검증(후속 PR)이 준비되기 전까지 state 복구·보정은 로컬에서만** 실행하세요 (`docs/marker-correction-runbook.md` 절차)
+  - ⚠️ 예외 — **레거시 `STATE_*_ONLY`는 DRY여도 대부분 state를 저장**합니다: 읽기 전용은 `STATE_DIAGNOSTIC_ONLY`·`STATE_REVERSE_AUDIT_ONLY`뿐이고, `STATE_REPAIR_ONLY`·`STATE_CLEAR_FENCE_ONLY`·`STATE_REVERSE_RECONCILE_ONLY`·`STATE_NET_INVESTED_REPAIR_ONLY`·`STATE_ASSUME_REVERSE_EXPIRY_ONLY`·`STATE_SET_CYCLE_START_ONLY`는 저장합니다. 따라서 이들은 **운영 사용을 제한**합니다(`TRADE_MODE=DRY`를 읽기 전용으로 오해하지 말 것 — 사용 전 백업·승인 필수, "확인용" 실행 금지). 후속 작업에서 REPAIR 전용으로 통합 예정
+  - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(Actions REPAIR 는 위처럼 Resolve 에서 이미 차단되므로 현재는 LIVE 만 해당)(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
+  - Resolve 단계의 외부 모드 입력(`inputs.trade_mode`·`vars.TRADE_MODE`·`broker_mode` 등)은 셸 문자열에 `${{ }}`로 삽입하지 않고 **env로만 전달**합니다. 영문 대문자가 아닌 값(개행·특수문자 포함)은 `GITHUB_OUTPUT`에 쓰지 않고 `INVALID`로 치환(봇은 DRY, 캐시 저장 안 함)
+  - ⚠️ REPAIR라고 자동으로 안전한 것은 아닙니다. FORCE_T는 `orders_meta`·`reverse_mode`·정산 원장·워터마크까지 바꿉니다 → **실행 전 state 백업(저장소 밖) + 브로커 체결 이력 대조 + 작업자≠승인자 승인**은 그대로 유지 (`docs/marker-correction-runbook.md` §2~§4 참고)
 - 리버스모드(`execute_reverse_mode()`): T>분할수-1 시 발동, 5일 MA 별지점 기반 무한매도+쿼터매수
 - T값 환경변수 보정: `FORCE_T_REINFERENCE`, `{SYMBOL}_FORCE_T`, `{SYMBOL}_MAX_T` (기본 MAX_T=분할수, 리버스모드 진입용 `T=splits` 허용)
 
@@ -95,23 +113,36 @@ TRADE_MODE=DRY uv run python trading_bot.py
 # LIVE 모드 실행 (실제 주문)
 TRADE_MODE=LIVE uv run python trading_bot.py
 
-# T값 보정: 전체 이력 재추정 (DRY 자동 전환)
-FORCE_T_REINFERENCE=true uv run python trading_bot.py
+# state 복구·보정은 TRADE_MODE=REPAIR 로 실행합니다 (주문 없음). 실행 전 state 백업·체결 이력 대조·승인 필수.
 
-# T값 강제 설정 (1회성 — 보정 RUN 후 env var 즉시 삭제)
-TQQQ_FORCE_T=29 SOXL_FORCE_T=20 TRADE_MODE=DRY uv run python trading_bot.py
+# T값 보정: 전체 이력 재추정 — 미리보기 (저장하지 않음)
+TRADE_MODE=DRY FORCE_T_REINFERENCE=true uv run python trading_bot.py
 
-# T값 상한 설정 (재추정 시 상한 제한, 기본값은 분할수)
-SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
+# T값 보정: 전체 이력 재추정 — 결과를 state에 실제 저장
+TRADE_MODE=REPAIR FORCE_T_REINFERENCE=true uv run python trading_bot.py
+
+# T값 강제 설정 — 실제 T 보정 및 state 저장, 주문은 실행하지 않음 (1회성 — 보정 RUN 후 env var 즉시 삭제)
+TRADE_MODE=REPAIR TQQQ_FORCE_T=29 SOXL_FORCE_T=20 uv run python trading_bot.py
+# ※ TRADE_MODE=DRY 또는 LIVE 와 {SYMBOL}_FORCE_T 를 함께 쓰면 브로커 생성 전에 오류(종료 코드 1)로 중단됩니다.
+# ※ REPAIR 는 작업 소스가 정확히 1개여야 합니다. {SYMBOL}_FORCE_T 와 REPAIR_ACTION=FORCE_T 를 함께 설정하지 마세요
+#    (작업 소스 2개로 중단). REPAIR_ACTION=FORCE_T 단독은 값을 읽을 곳이 없어 명시적으로 실패합니다(종료 코드 1).
+
+# T값 상한 설정 (기본값은 분할수) — DRY 미리보기는 "원시 추정 T"와 "상한 적용 후 T"를 함께 출력
+TRADE_MODE=DRY SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
+# ※ REPAIR 재추정은 추정 T 가 MAX_T 를 넘으면 T 를 자르지 않고 저장을 거부합니다(종료 코드 1, state 변경 없음).
+#    초과 원인(정산 오류 등)을 확인한 뒤 필요하면 별도로 {SYMBOL}_FORCE_T 보정을 승인받아 진행하세요.
 
 # 테스트 실행
-# 브로커 실 API 통합 테스트는 pytest 마커(kis/kiwoom/ls/toss/nhplug/meritz)로 구분됩니다.
-# tests/conftest.py가 .env 자격증명만으로 실행 여부를 판단합니다 — BROKER 값과 무관하게
-# 해당 브로커 키가 설정돼 있으면 실행되고, 없으면 자동 skip됩니다.
-# 마커 없는 유닛/모의 테스트는 항상 실행됩니다.
-uv run pytest tests/ -v                          # 키 설정된 브로커 통합 테스트 + 유닛
-uv run pytest tests/ -m kis -v                   # 특정 브로커만 (kis/kiwoom/ls/toss/nhplug/meritz)
-uv run pytest tests/test_kiwoom_integration.py -v  # 특정 파일도 자격증명 기준으로 동작
+# 기본 `pytest tests/` 는 외부 브로커 API·주문을 **원천 차단**합니다 (유닛/모의 테스트만 실행).
+#  - 외부 HTTP: conftest autouse fixture 가 `requests.Session.request` 를 막음
+#  - 브로커 마커(kis/kiwoom/ls/toss/nhplug/meritz)·preflight·live_order 테스트: 기본 skip
+#  - 실 API 통합 테스트: RUN_BROKER_API_TESTS=1 (opt-in, 자격증명도 필요)
+#  - 주문이 발생하는 테스트(live_order): 위에 더해 ALLOW_BROKER_ORDERS=1 (추가 opt-in)
+#  - 주문 함수 진입 직전에도 `_assert_order_allowed()` 가 ALLOW_BROKER_ORDERS 를 재검증 (CLI 포함)
+#  - 테스트는 conftest autouse fixture 로 `state._STATE_FILE` 을 임시 경로로 격리하고, 세션 전후 저장소 `.state.json` 해시가 달라지면 세션을 실패 처리합니다
+uv run pytest tests/ -v                                        # 안전: 유닛/모의만
+RUN_BROKER_API_TESTS=1 uv run pytest tests/ -m kis -v          # 읽기 전용 통합 테스트
+RUN_BROKER_API_TESTS=1 ALLOW_BROKER_ORDERS=1 uv run pytest tests/test_broker_preflight.py -v  # 주문 포함
 
 # 참고: 브로커별 필수 자격증명
 #   kis   = KIS_APP_KEY + KIS_APP_SECRET + KIS_ACCOUNT_NO
@@ -196,6 +227,17 @@ uv run pytest tests/test_broker_preflight.py -v
 **체결 반영은 수량·금액 델타로만** (`processed_filled_qty` + `processed_filled_amount`):
 새로 늘어난 부분만 반영하므로 부분체결이 나중에 늘어나도 중복 가산되지 않습니다.
 이전 버전 메타에는 반영 금액 표식이 없으므로, **신규분만** 누적금액 비율로 추정해 1회 적용하고 표식을 기록합니다.
+신규 주문은 등록 시 `processed_filled_qty=0` + `processed_filled_amount=0.0` + `fill_marker_version=1` 을 함께 기록합니다.
+워터마크 이전 주문의 0 마커는 **이 버전 표식이 있을 때만** 미반영으로 신뢰하고(`_marker_proves_unapplied`),
+기존 state 의 0 마커(버전 표식 없음)는 미반영의 증거가 아니므로 **반영하지 않고 건너뜁니다**(종목 전체를 보류하지 않아 같은 실행의 신규 체결은 정상 정산). 기존 메타는 일괄 마이그레이션 금지.
+마커가 누락·무효인 주문은 자동 반영하지 않고 보류합니다 → 수동 정정 절차는 `docs/marker-correction-runbook.md`
+(마커만 명시 설정, T/net/원장·워터마크 불변, 백업+해시, 직후 reconcile 1회 확인, 환경변수 1회성).
+
+**공개 로그의 주문번호는 가명 식별자로만 출력**: 정산·체결 복구·보류 경로(`src/state.py`, `trading_bot.py`)의 stdout·예외·알림과
+검증기(`ops/verify_run.py`) 실패 메시지는 `mask_odno()` = `ord#` + HMAC-SHA256(**실행별 무작위 salt**, 주문번호) 앞 10자리만 씁니다
+(단순 해시는 짧은 숫자 주문번호가 전수 대입으로 복원됨). salt(`log_salt`)와 원문 주문번호는 **비공개(암호화) Evidence** 에만 남습니다.
+정적 가드 `tests/test_odno_log_masking.py`. 일반 주문 접수·취소·브로커 어댑터 로그는 미적용 → `docs/odno-log-masking-followup.md`.
+**Evidence artifact 는 gpg 암호화본만 업로드**합니다 (tar→gpg 스트리밍, 실패 시 부분 암호문·평문 tgz 잔존 없음, 패스프레이즈 없으면 업로드 없이 실패).
 
 **지연 체결(부분체결 증가) 반영**: 전역 워터마크보다 오래된 주문이라도 **이미 반영된 주문**(processed_filled_qty > 0)의
 누적 체결이 늘면 주문번호별 델타로 반영합니다 (`_apply_late_fill_deltas`). 워터마크 이전에 있고 반영된 적 없는
@@ -315,11 +357,12 @@ uv run pytest tests/test_broker_preflight.py -v
 - **ORDER_HISTORY_VERBOSE=true**: LIVE 모드에서도 `[주문이력 요약]` 상세 출력 (DRY는 항상 출력). KIS/KIWOOM/LS/TOSS 공통
 - **텔레그램 재시도**: `send_telegram()`은 타임아웃/연결 오류/서버 5xx 시 최대 3회 재시도(1초 간격). 4xx(설정 오류 등)는 재시도 없이 즉시 실패
 - **T 보정 환경변수**:
-  - `FORCE_T_REINFERENCE=true`: `last_updated` 초기화 → 전체 이력(90일)에서 T 재추정 (LIVE→DRY 자동 전환)
-  - `{SYMBOL}_FORCE_T={value}`: state.json의 T를 강제 덮어쓰기 (orders_meta/balance_mismatch 초기화, `last_updated`/`last_processed_ordno`를 이력 최신 주문 시각으로 갱신 → 이중 가산 방지, `FORCE_T=0`이면 `cycle_start_date` 초기화)
+  - `FORCE_T_REINFERENCE=true`: `last_updated` 초기화 → 전체 이력(90일)에서 T 재추정. **DRY=미리보기(저장 없음) / REPAIR=실제 저장** (LIVE는 주문 방지를 위해 DRY로 자동 전환)
+  - `{SYMBOL}_FORCE_T={value}` (**`TRADE_MODE=REPAIR` 전용** — DRY·LIVE에서는 브로커 생성 전 오류로 중단): state.json의 T를 강제 덮어쓰기 (orders_meta/balance_mismatch 초기화, `last_updated`/`last_processed_ordno`를 이력 최신 주문 시각으로 갱신 → 이중 가산 방지, `FORCE_T=0`이면 `cycle_start_date` 초기화)
   - `{SYMBOL}_MAX_T={value}`: T 자동추정 결과의 상한선 (기본값: `{SYMBOL}_SPLITS` — 리버스모드 진입 위해 `T=splits` 허용, 초과만 방지)
   - FORCE_T_REINFERENCE 실행 시 small_seed_days(소액 시드 오추정)가 감지되면 포지션 기반 T 추정값이 함께 출력되며, 해당 값을 `{SYMBOL}_FORCE_T`로 설정하여 직접 보정 가능
   - ⚠️ `{SYMBOL}_FORCE_T`는 **1회성 점화용**입니다. 보정 RUN 1회 실행 후 env var를 **즉시 삭제**하세요. 리버스모드 진행은 `day_count`(state `reverse_mode`)와 체결 이력 기반 T 갱신이 주도하므로 FORCE_T 불필요. 유지하면 리버스모드 종료 → 새 사이클(T=0)에서 T를 다시 `splits`로 강제해 **새 사이클 매수가 영구 차단**됩니다.
+  - ⚠️ GH Actions의 새 state 캐시는 **`LIVE`/`REPAIR` 실행에서만** 저장됩니다. DRY(또는 DRY로 고정된 실행)의 결과는 캐시에 남지 않으므로 Actions에서는 REPAIR 가 차단되므로 T 보정은 로컬에서 `TRADE_MODE=REPAIR`로 실행하세요 (`TRADE_MODE=DRY`/`LIVE` + `FORCE_T` 같은 기존 방식은 더 이상 동작하지 않음).
   - ⚠️ GH Actions 캐시는 **브랜치별 격리**입니다. `develop` 수동 RUN에서 보정해도 `main`(repository_dispatch) RUN의 캐시에는 반영되지 않습니다. T 보정은 반드시 운영 브랜치(`main`)에서 실행하세요.
 - **리버스모드** (`src/strategy.py execute_reverse_mode()`):
   - 발동: `T > splits - 1` + position > 0 (20분할 T>19, 40분할 T>39 — 원본 규칙: 마지막 1회 매수도 불가능한 상태)

@@ -113,6 +113,20 @@ def _check_standard_fields(history):
         assert not missing, f"표준 필드 누락: {missing} / keys={sorted(item.keys())}"
 
 
+def _assert_order_allowed(broker):
+    """실제 주문 함수 진입 직전 검증 — ALLOW_BROKER_ORDERS=1 이 없으면 주문하지 않습니다.
+
+    pytest 마커 skip 과 별개로 한 번 더 막습니다 (CLI 직접 실행·마커 누락 대비).
+    테스트 더블(`_is_test_double=True`)은 실 주문이 아니므로 통과합니다.
+    """
+    if getattr(broker, "_is_test_double", False):
+        return
+    if os.getenv("ALLOW_BROKER_ORDERS", "").strip().lower() not in ("1", "true"):
+        raise RuntimeError(
+            "[주문 차단] 실제 주문 전송에는 ALLOW_BROKER_ORDERS=1 이 필요합니다"
+        )
+
+
 def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS", live_order_probe: bool = False):
     broker_name = broker_name.lower()
     symbol = symbol.upper()
@@ -183,6 +197,7 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS",
     if has_cancel:
         # 성공 접수 → (정보용 이력 확인) → 취소 → 재확인
         ex_code = broker.exchange_code(exchange)
+        _assert_order_allowed(broker)
         result = broker.place_order(symbol, ex_code, "BUY", 1, non_market_price, "LIMIT")
         assert result is not None and result.order_id, "주문 접수 실패 — OrderResult 없음"
         odno = str(result.order_id)
@@ -253,6 +268,7 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS",
         print("  cancel 미구현 → OrderNotAcceptedError 거부 확인으로 대체")
         ex_code = broker.exchange_code(exchange)
         try:
+            _assert_order_allowed(broker)
             broker.place_order(symbol, ex_code, "BUY", 99999, 0.01, "LIMIT")
             raise AssertionError("OrderNotAcceptedError 기대였으나 주문이 접수됨")
         except OrderNotAcceptedError as e:
@@ -406,6 +422,7 @@ def _run_collar_probe(
     # (AGENTS.md PREFLIGHT: cancel 미구현 시 거부 확인으로 대체)
     if not has_cancel and not marketable:
         try:
+            _assert_order_allowed(broker)
             broker.place_order(symbol, ex_code, "BUY", 99999, 0.01, "LIMIT")
             result["status"] = "unexpected_accept"
             result["message"] = "OrderNotAcceptedError 기대였으나 주문이 접수됨 — 수동 취소 필요"
@@ -422,6 +439,7 @@ def _run_collar_probe(
 
     # 정상 접수 시도
     try:
+        _assert_order_allowed(broker)
         order = broker.place_order(symbol, ex_code, side, qty, price, "LIMIT")
     except OrderNotAcceptedError as e:
         result["status"] = "rejected"
@@ -601,6 +619,7 @@ def run_collar_probes(broker_name: str, symbol: str = "TQQQ", exchange: str = "N
 
 # pytest 진입점 — 자격증명 없으면 skip, 있으면 실 API 호출
 @pytest.mark.preflight
+@pytest.mark.live_order
 @pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug", "meritz"])
 def test_preflight_all_brokers(broker_name):
     if not _has_credentials(broker_name):
@@ -609,6 +628,8 @@ def test_preflight_all_brokers(broker_name):
     assert result in ("pass", "skip")
 
 
+@pytest.mark.preflight
+@pytest.mark.live_order
 def test_preflight_kis_tqqq():
     if not _has_credentials("kis"):
         pytest.skip("KIS 자격증명 없음")
@@ -622,6 +643,8 @@ def test_preflight_kis_tqqq():
 
 class _FakePreflightBroker:
     """run_preflight 목 검증용 최소 브로커 — 실 API를 호출하지 않습니다."""
+
+    _is_test_double = True  # 실 주문 아님 — 주문 게이트 통과
 
     def __init__(self):
         self.cancel_calls = 0
@@ -692,6 +715,7 @@ def test_non_meritz_cancel_absent_still_fails(monkeypatch):
 
 # 콜라 경계 probe — 자격증명 없으면 skip, 있으면 실 API 호출
 @pytest.mark.preflight
+@pytest.mark.live_order
 @pytest.mark.parametrize("broker_name", ["kis", "kiwoom", "ls", "toss", "nhplug", "meritz"])
 def test_collar_probes_all_brokers(broker_name):
     if not _has_credentials(broker_name):

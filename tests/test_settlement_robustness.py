@@ -439,7 +439,8 @@ def test_unconfirmed_buy_holds_everything():
     state = _state(T=10.0, net_invested=1000.0)
     state["orders_meta"] = {
         "A": {"total_qty": 10, "t_target": 2.0,
-              "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+              "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+                  "fill_marker_version": 1},
     }
     before = deepcopy(state)
     orders = [_amount_row("A", qty=10, amount=None)]
@@ -482,7 +483,8 @@ def test_unconfirmed_then_confirmed_applies_exactly_once():
     state = _state(T=10.0, net_invested=1000.0)
     state["orders_meta"] = {
         "A": {"total_qty": 10, "t_target": 2.0,
-              "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+              "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+                  "fill_marker_version": 1},
     }
     missing = [_amount_row("A", qty=10, amount=None)]
     update_T_from_history("TQQQ", state, missing, balance_qty=70)
@@ -682,7 +684,8 @@ def test_unconfirmed_fill_pushed_before_watermark_is_recovered_once():
         last_processed_ordno="B",
         orders_meta={
             "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
-                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+                  "fill_marker_version": 1},
             "B": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
                   "processed_filled_qty": 1, "processed_filled_amount": 20.0},
         },
@@ -736,7 +739,8 @@ def test_legacy_meta_missing_processed_qty_marker_is_held_not_recovered():
             "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0},
             # 명시적 0 (정상 등록 후 미반영) — 복구 대상
             "B": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
-                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+                  "fill_marker_version": 1},
         },
     )
     before = deepcopy(state)
@@ -777,7 +781,8 @@ def test_explicit_zero_processed_qty_is_recovered_after_amount_confirmed():
         last_processed_ordno="B",
         orders_meta={
             "A": {"side": "BUY", "total_qty": 1, "t_target": 1.0,
-                  "processed_filled_qty": 0, "processed_filled_amount": 0.0},
+                  "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+                  "fill_marker_version": 1},
         },
     )
     before = deepcopy(state)
@@ -942,3 +947,81 @@ def test_fractional_qty_marker_is_invalid_and_held():
     assert "A" in (held.get("_pending_amount_odnos") or [])
     assert "A" in (held.get("_pending_marker_odnos") or [])
     assert held["T"] == pytest.approx(11.0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ⑧ 보류 사유 분리 — _position_basis_unknown_reason
+#    (같은 보류라도 "왜" 기준이 없었는지 알림에서 구분할 수 있어야 합니다)
+# ═══════════════════════════════════════════════════════════════════
+
+def test_basis_unknown_reason_has_balance_and_stored_tokens():
+    """잔고도 저장 보유수량도 없으면 두 사유가 함께 기록됩니다."""
+    orders = [
+        _row("OLD", "매수", 30, "2026-10-19T08:00:00+00:00"),
+        _row("S", "매도", 20, "2026-10-21T09:30:16+00:00", price=72.61),
+    ]
+    result = update_T_from_history("TQQQ", _state(), orders, balance_qty=None)
+
+    assert result.get("_position_basis_unknown") is True
+    reason = result.get("_position_basis_unknown_reason") or ""
+    assert "잔고조회실패" in reason, reason
+    assert "저장보유수량없음" in reason, reason
+    # 일반(지연 아님) 매도 경로이므로 지연 사유는 붙지 않습니다.
+    assert "지연매도기준선없음" not in reason, reason
+
+
+def test_late_sell_without_basis_records_late_reason():
+    """지연 체결 매도에 기준선이 없으면 '지연매도기준선없음' 사유가 남습니다."""
+    state = _state(
+        T=10.0,
+        last_updated="2026-10-22T10:00:00+00:00",
+        last_processed_ordno="OLD",
+        orders_meta={
+            "S": {"side": "SELL", "total_qty": 20, "t_target": 0.0,
+                  "processed_filled_qty": 5,
+                  "processed_filled_amount": 500.0},
+        },
+    )
+    orders = [_row("S", "매도", 20, "2026-10-22T09:00:00+00:00", price=100.0)]
+
+    # 잔고는 있으므로 기준선 자체는 확보 → 지연 사유만 남아야 합니다.
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=50)
+    assert result.get("_position_basis_unknown") is True
+    reason = result.get("_position_basis_unknown_reason") or ""
+    assert "지연매도기준선없음" in reason, reason
+    assert "잔고조회실패" not in reason, reason
+
+
+def test_settlement_hold_message_uses_reason_and_pops_keys(monkeypatch):
+    """보류 알림에 사유가 들어가고, 사유 키는 소비 시점에 함께 pop 됩니다."""
+    captured = []
+    monkeypatch.setattr(trading_bot, "notify", lambda msg, urgent=False: captured.append(msg))
+
+    state = {
+        "orders_meta": {},
+        "_position_basis_unknown": True,
+        "_position_basis_unknown_reason": "잔고조회실패 + 저장보유수량없음",
+    }
+    with pytest.raises(SymbolScopedError):
+        trading_bot._save_settlement_state("TQQQ", state)
+
+    assert captured, "보류 알림이 발송되지 않았습니다"
+    # 사유 토큰이 문구에 그대로 노출됩니다.
+    assert "사유: 잔고조회실패 + 저장보유수량없음" in captured[0], captured[0]
+    # 기존 문구는 suffix로 유지 (로그/문서 호환).
+    assert "(브로커 잔고 조회 실패 + 저장 보유수량 없음)" in captured[0]
+    # state 에 잔류하지 않습니다 (다음 RUN 으로 새지 않게).
+    assert "_position_basis_unknown" not in state
+    assert "_position_basis_unknown_reason" not in state
+
+
+def test_settlement_hold_reason_falls_back_when_missing(monkeypatch):
+    """사유 키가 없는 기존 경로(플래그만 있는 상태)도 기본 문구로 동작합니다."""
+    captured = []
+    monkeypatch.setattr(trading_bot, "notify", lambda msg, urgent=False: captured.append(msg))
+
+    with pytest.raises(SymbolScopedError):
+        trading_bot._save_settlement_state("TQQQ", {"orders_meta": {}, "_position_basis_unknown": True})
+
+    assert captured
+    assert "사유: 잔고조회실패 + 저장보유수량없음" in captured[0], captured[0]

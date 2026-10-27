@@ -280,6 +280,7 @@ class TestApplyRecentHistory:
         register_order_meta_in_state(state, "ORD012", {
             "side": "BUY", "total_qty": 3, "t_target": 1.0,
             "is_additional": False, "processed_filled_qty": 0,
+            "processed_filled_amount": 0.0, "fill_marker_version": 1,
         })
         orders = [_make_buy_order("ORD012", "20260526", qty=3,
                                   utc_dt="2026-05-26T10:00:00+00:00")]
@@ -556,3 +557,45 @@ def test_full_sell_detected_with_balance_anchor():
     result = update_T_from_history("TQQQ", state, orders, balance_qty=0)
 
     assert result["T"] == 0.0
+
+
+# ─────────────────────────────────────────────────────────
+# 테스트: 보유수량 기준 미확보 → 보류 사유 기록 (A2)
+# ─────────────────────────────────────────────────────────
+
+def test_기준선_미확보_사유가_state에_기록된다():
+    """잔고·저장 보유수량이 모두 없으면 두 사유 토큰이 조합되어 기록됩니다."""
+    state = _make_state(T=10.0, last_updated="2026-10-20 11:14:03+00:00")
+    orders = [_make_sell_order("S", "20261021", qty=20,
+                               utc_dt="2026-10-21T09:30:16+00:00")]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=None)
+    assert result.get("_position_basis_unknown") is True
+    reason = result.get("_position_basis_unknown_reason") or ""
+    assert "잔고조회실패" in reason
+    assert "저장보유수량없음" in reason
+
+
+def test_저장_보유수량만_있으면_보류사유가_없다():
+    """state.position_qty 로 기준선을 잡으면 보류 플래그도 사유도 남지 않습니다."""
+    state = _make_state(T=10.0, last_updated="2026-10-20 11:14:03+00:00")
+    state["position_qty"] = 100
+    orders = [_make_sell_order("S", "20261021", qty=20,
+                               utc_dt="2026-10-21T09:30:16+00:00")]
+    result = update_T_from_history("TQQQ", state, orders, balance_qty=None)
+    assert result.get("_position_basis_unknown") is not True
+    assert "_position_basis_unknown_reason" not in result
+
+
+def test_기존_0마커_워터마크_이전_주문은_버전표식_없이_복구하지_않고_건너뛴다():
+    """fill_marker_version 이 없는 기존 0 마커는 미반영의 증거가 아니므로 반영하지 않고 건너뜁니다."""
+    state = _make_state(T=1.0, last_updated="2026-05-27 00:00:00")
+    register_order_meta_in_state(state, "ORD013", {
+        "side": "BUY", "total_qty": 3, "t_target": 1.0,
+        "is_additional": False, "processed_filled_qty": 0,
+    })
+    orders = [_make_buy_order("ORD013", "20260526", qty=3,
+                              utc_dt="2026-05-26T10:00:00+00:00")]
+    result = update_T_from_history("TQQQ", state, orders)
+    assert result["T"] == 1.0
+    assert result.get("_settlement_hold") is not True
+    assert "ORD013" in (result.get("_unverified_skipped_odnos") or [])
