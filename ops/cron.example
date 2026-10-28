@@ -5,7 +5,20 @@
 #
 # 서버 TZ가 Asia/Seoul 이므로 CRON_TZ 없이 KST 기준으로 동작합니다.
 #
-# ── 하루 흐름: 아침 정산 → (수동) 승인 → 18:30 실행 → 18:45 검증 ──
+# ── 하루 흐름 (기본: 수동 승인) ──
+# 아침 정산 → PREVIEW → [운영자 plan_id 확인] → APPROVE → 18:30 EXECUTE → 18:45 VERIFY
+#
+# ── 하루 흐름 (AUTO_EXECUTE=true opt-in) ──
+# 아침 정산 → PREVIEW → 자동 APPROVE → 자동 EXECUTE → 18:45 VERIFY (별도 런 유지)
+#   - AUTO_EXECUTE=true 이면 PREVIEW 직후 승인 파일(APPROVE)과 주문 실행(EXECUTE)을
+#     연속으로 수행합니다. plan_id 수동 복사가 불필요합니다.
+#   - 차단 사유(정산 보류/잔고 불일치/허용오차 이탈/세션 드리프트/펜스 등)가 있으면
+#     해당 종목만 AUTO_BLOCKED 로 중단하고 텔레그램(긴급) 알림을 보냅니다.
+#     다른 종목은 계속 진행합니다.
+#   - 모의투자(demo)도 자동 실행 시 프리장 개장(KST 17:00/18:00)까지 **자동 대기**합니다.
+#     따라서 아침(KST 10:15)에 실행해도 세션 날짜가 맞춰집니다.
+#     (real 과 동일하게 _wait_until_pre_market 이 동작합니다.)
+#   - VERIFY 는 기존과 같이 **별도 런**으로 유지합니다 (KST 18:45).
 #
 #  1) 아침 SETTLE/PREVIEW (KST 10:05 / 10:15)
 #     - SETTLE 은 정규장 마감(16:00 ET)뿐 아니라 **애프터아워 종료(20:00 ET)**
@@ -15,25 +28,26 @@
 #     - SETTLE 은 **직전 마감 세션**을 정산하고, 주문 대상은 그 **다음 세션**입니다
 #       (주말·공휴일·서머타임은 XNYS 캘린더로 계산). 그래서 KST 아침(ET 전날 밤)
 #       PREVIEW 와 KST 18:30(ET 같은 날 새벽) EXECUTE 의 세션이 일치합니다.
-#  2) APPROVE (수동, EXECUTE 전)
-#     - PREVIEW 로그의 plan_id 를 운영자가 확인해 PLAN_ID 로 전달합니다.
+#  2) APPROVE (수동 또는 AUTO_EXECUTE 자동)
+#     - 수동: PREVIEW 로그의 plan_id 를 운영자가 확인해 PLAN_ID 로 전달합니다.
+#     - 자동(AUTO_EXECUTE=true): PREVIEW 직후 plan 파일을 자동 승인 후 실행합니다.
 #  3) EXECUTE (KST 18:30) — 프리장 개장 이후라 계획 시세와 주문 시점이 어긋나지 않음.
 #  4) VERIFY (KST 18:45) — 승인 파일 + 커밋된 SETTLE evidence + 브로커 read-only 대조.
 #
-# ⚠️ PLAN_ID / APPROVAL_PLAN_ID 는 **PREVIEW 1회마다 새로 생성되는 값**이라
-#    crontab 에 고정할 수 없습니다. 운영자가 PREVIEW 로그에서 복사해 수동 전달합니다:
+# ⚠️ AUTO_EXECUTE 는 **opt-in** 입니다. 디폴트(미설정/false) 는 기존 수동 승인 방식을
+#    그대로 유지합니다. 전체 종목에 적용되며, 심볼별 예외는 없습니다.
+#    실전 적용 전 DRY(토스/LS 등)로 1주일 이상 검증하세요.
 #
-#      1) RUN_PHASE=PREVIEW 실행 → 로그의 plan_id 확인
-#         "[PREVIEW] TQQQ — plan_id=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34, orders=2, ..."
-#         (plan_id 에 생성시각+uuid 가 포함되어 PREVIEW 를 다시 돌려도 이전 계획 파일을
-#          덮어쓰지 않습니다. APPROVE 는 그 plan_id 의 파일 내용+해시만 승인합니다.)
-#      2) 그 값을 APPROVE 의 PLAN_ID, EXECUTE/VERIFY 의 APPROVAL_PLAN_ID 로 복사
-#         (who: 당일 운영 담당자 / 값이 실행마다 달라 자동 cron 으로는 불가)
+#      수동 실행 예 (기존, 변경 없음):
+#        RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
 #
-#      수동 실행 예:
-#        RUN_PHASE=APPROVE PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
-#        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
-#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
+#      자동 실행 예 (AUTO_EXECUTE=true, PLAN_ID 불필요):
+#        RUN_PHASE=PREVIEW AUTO_EXECUTE=true LAUNCH_MODE=LIVE ops/run_daily.sh
+#        (PREVIEW → 자동 APPROVE → 자동 EXECUTE 를 한 번에 수행)
+#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        (VERIFY 는 여전히 APPROVAL_PLAN_ID 필요, 별도 런)
 #
 # ⚠️ LIVE 에서 계좌 지문을 쓰는 브로커(KIS/NHPLUG 등 account_no 설정)는 서버 환경변수
 #    ACCOUNT_FINGERPRINT_SECRET 이 **필수**입니다. 없으면 승인/실행이 fail-closed 로

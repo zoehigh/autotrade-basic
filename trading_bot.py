@@ -84,6 +84,13 @@ STATE_NET_INVESTED_REPAIR_ONLY = os.getenv("STATE_NET_INVESTED_REPAIR_ONLY", "")
 STATE_ASSUME_REVERSE_EXPIRY_ONLY = os.getenv("STATE_ASSUME_REVERSE_EXPIRY_ONLY", "").strip().lower() == "true"
 STATE_SET_CYCLE_START_ONLY = os.getenv("STATE_SET_CYCLE_START_ONLY", "").strip().lower() == "true"
 
+# AUTO_EXECUTE(opt-in): PREVIEW 후 자동 APPROVE → EXECUTE 연쇄 실행.
+# 디폴트 false(수동 승인 유지). true 로 설정하면 사람이 plan_id 를 복사하지 않아도
+# 정산·전략·승인·실행을 연속으로 수행하며, 차단 사유(hold/mismatch/tolerance/세션
+# 드리프트 등)가 있으면 해당 종목만 AUTO_BLOCKED 로 중단하고 다음 종목은 계속 진행합니다.
+# VERIFY 는 별도 런(18:45 등) 으로 유지합니다.
+AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # ── 공개 로그 주문번호 마스킹 도우미 ──────────────────────────────────
 # 주문 접수·취소·요약 로그는 공개(GitHub Actions 로그/일반 알림)에 남으므로
@@ -712,6 +719,76 @@ def build_settlement_evidence(
             ),
         })
     return evidence
+
+
+def _force_t_mode_block_message(mode, symbol_configs):
+    """DRY·LIVE 에서 `{SYMBOL}_FORCE_T` 가 설정돼 있으면 중단 사유를 반환합니다 (없으면 빈 문자열).
+
+    FORCE_T 는 T·orders_meta·reverse_mode·정산 원장·워터마크를 덮어쓰고 저장하는 명시적 복구입니다.
+    - DRY 는 state 를 저장하지 않는 읽기 전용 미리보기라 적용하면 로컬 .state.json 이 바뀝니다.
+    - LIVE 는 보정이 적용된 **같은 실행에서 주문 단계까지** 진행할 수 있어 복구와 주문이 결합됩니다.
+    복구·보정은 TRADE_MODE=REPAIR 로만 실행합니다 (주문 없음).
+    """
+    names = [str(c.get("symbol")) for c in symbol_configs if c.get("force_t") is not None]
+    if not names or mode not in ("DRY", "LIVE"):
+        return ""
+    keys = ", ".join(f"{n}_FORCE_T" for n in names)
+    if mode == "LIVE":
+        reason = "LIVE 에서는 보정과 주문이 한 실행에 결합되므로 허용하지 않습니다"
+    else:
+        reason = "DRY 는 state 를 저장하지 않는 읽기 전용 미리보기입니다"
+    return (
+        f"TRADE_MODE={mode} 에서는 {keys} 를 적용할 수 없습니다 ({reason}). "
+        "state 저장·브로커 호출·주문 없이 중단합니다. FORCE_T 는 TRADE_MODE=REPAIR 에서만 허용됩니다."
+    )
+
+
+def _validate_reinference_t(symbol, new_t, max_t):
+    """REPAIR 재추정 결과를 저장해도 되는지 검증합니다 (문제가 없으면 빈 문자열).
+
+    - 추정 T 와 MAX_T 는 유한한 유효 숫자여야 합니다 (None 인 MAX_T 는 상한 없음으로 건너뜁니다).
+    - T > MAX_T 이면 **저장을 거부**합니다. 상한으로 잘라 저장하면 T 가 그만큼 부풀려진 원인
+      (정산 오류 등)을 숨길 수 있으므로 원인 확인을 요구합니다.
+    """
+    def _is_number(value):
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+        )
+
+    if not _is_number(new_t):
+        return f"{symbol} 재추정 T 가 유효한 숫자가 아닙니다: {new_t!r}"
+    if max_t is None:
+        return ""
+    if not _is_number(max_t) or max_t < 0:
+        return f"{symbol} MAX_T 가 유효한 숫자가 아닙니다: {max_t!r}"
+    if new_t > max_t:
+        return (
+            f"{symbol} 재추정 T={new_t} 가 설정된 상한 MAX_T={max_t} 를 초과합니다 — 저장을 거부합니다 "
+            f"(상한으로 잘라 저장하면 정산 오류를 숨길 수 있습니다. 초과 원인을 확인하세요)"
+        )
+    return ""
+
+
+def _reinference_hold_reasons(symbol, state):
+    """재추정 결과가 '정산 보류' 상태인지 확인하고 사유 목록을 반환합니다 (정상이면 빈 목록).
+
+    보류 상태에서는 `update_T_from_history` 가 메모리를 보류 직전 스냅샷으로 되돌리는데, REPAIR 재추정은
+    그 스냅샷을 찍기 전에 `last_updated` 를 비워 두었으므로 **그대로 저장하면 워터마크가 빈 값으로 바뀝니다**.
+    따라서 보류 표식이 하나라도 있으면 어떤 종목도 저장하지 않습니다. 주문번호는 마스킹해 출력합니다.
+    """
+    reasons = []
+    if state.get("_settlement_hold"):
+        reasons.append(f"정산 보류({state.get('_settlement_hold_reason') or '사유 없음'})")
+    if state.get("_pending_amount_odnos"):
+        reasons.append(f"체결금액 미확정 주문 {mask_odno(list(state['_pending_amount_odnos'])[:5])}")
+    if state.get("_pending_marker_odnos"):
+        reasons.append(f"마커 누락·무효 주문 {mask_odno(list(state['_pending_marker_odnos'])[:5])}")
+    if state.get("_position_basis_unknown"):
+        reasons.append(f"보유수량 기준 미확보({state.get('_position_basis_unknown_reason') or '사유 없음'})")
+    return [f"{symbol} {reason}" for reason in reasons]
+
 
 
 def run_one_symbol(broker: Broker, symbol_config, approval=None):
@@ -2938,6 +3015,57 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
                     f"orders={len(plan.orders)}, state_hash={plan.state_hash[:12]}, "
                     f"file={plan_file}"
                 )
+
+                # AUTO_EXECUTE(opt-in): PREVIEW 후 자동 APPROVE → EXECUTE.
+                # 차단 사유(hold/mismatch/tolerance/세션 드리프트 등)가 있으면
+                # 해당 종목만 AUTO_BLOCKED 로 중단하고 다음 종목은 계속 진행합니다.
+                # DRY 는 주문/상태 저장을 하지 않으므로 승인·실행을 건너뛰고
+                # PREVIEW 산출물만 남깁니다 (DRY 검증용).
+                if AUTO_EXECUTE and str(TRADE_MODE).strip().upper() != "DRY":
+                    try:
+                        approval_file = approve_plan_file(
+                            plan_file,
+                            approvals_dir=os.getenv("APPROVALS_DIR", "approvals"),
+                            plans_dir=plans_dir,
+                            broker=read_only_broker,
+                        )
+                        if approval_file:
+                            notify(
+                                f"🤖 [AUTO_APPROVE] {plan.symbol} 승인 완료 — "
+                                f"plan_id={plan.plan_id}, orders={len(plan.orders)}"
+                            )
+                            # 자동 EXECUTE: execute_approved_plan 은
+                            # RUN_PHASE=EXECUTE 만 허용하므로 이 호출 범위에서만
+                            # 일시 변경합니다 (호출 후 복구).
+                            _prev_phase = os.environ.get("RUN_PHASE", "")
+                            os.environ["RUN_PHASE"] = "EXECUTE"
+                            try:
+                                result = execute_approved_plan(broker, approval_file)
+                            finally:
+                                os.environ["RUN_PHASE"] = _prev_phase
+                            failed = int((result or {}).get("failed", 0))
+                            if failed:
+                                notify(
+                                    f"⚠️ [AUTO_EXECUTE] {plan.symbol} 실행 실패 "
+                                    f"({failed}건)",
+                                    urgent=True,
+                                )
+                                failures += 1
+                            else:
+                                notify(f"✅ [AUTO_EXECUTE] {plan.symbol} 실행 완료")
+                    except GlobalScopedError:
+                        # 공통 장애(상태 저장 실패 등)는 삼키지 않고 전체 실행을 중단합니다.
+                        raise
+                    except Exception as auto_error:
+                        msg = f"[AUTO_BLOCKED] {plan.symbol} {str(auto_error)}"
+                        print(msg)
+                        notify(f"🚫 {msg}", urgent=True)
+                        failures += 1
+                elif AUTO_EXECUTE:
+                    print(
+                        f"[AUTO_EXECUTE] {plan.symbol} DRY 모드라 승인·실행을 건너뜁니다 "
+                        f"(PREVIEW 산출물만 저장)."
+                    )
             except GlobalScopedError:
                 raise
             except Exception as error:

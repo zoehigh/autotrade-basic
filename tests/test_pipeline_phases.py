@@ -20,6 +20,7 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 from unittest.mock import MagicMock
 
@@ -4526,3 +4527,89 @@ class TestToleranceBinding:
         policy = pipeline.execution_tolerance_policy()
         assert policy["price_abs"] == pipeline.DEFAULT_TOLERANCE_PRICE_ABS
         assert policy["price_pct"] == pipeline.DEFAULT_TOLERANCE_PRICE_PCT
+
+
+# ── P2: 모의투자 자동 실행 대기 검증 ──────────────────────────────────
+
+@pytest.mark.parametrize('mode', ['demo', 'real'])
+@pytest.mark.parametrize('dst,hour', [(True, 17), (False, 18)])
+def test_live_waits_for_pre_market(mode, dst, hour):
+    """real/demo × 서머타임/동절기: LIVE 는 프리장 개장까지 대기합니다."""
+    now = datetime(2026, 10, 26, 10, 15, tzinfo=ZoneInfo('Asia/Seoul'))
+    sleep = MagicMock()
+    tb = SimpleNamespace(
+        BROKER_MODE=mode, TRADE_MODE='LIVE',
+        get_kst_now=lambda: now, is_us_dst=lambda: dst,
+        time=SimpleNamespace(sleep=sleep),
+    )
+    pipeline_execute._wait_until_pre_market(tb)
+    sleep.assert_called_once_with((hour - 10) * 3600 - 15 * 60)
+
+
+def test_dry_never_waits_for_pre_market():
+    """DRY 는 시계를 읽지 않고 대기하지 않습니다."""
+    tb = SimpleNamespace(
+        TRADE_MODE='DRY',
+        get_kst_now=MagicMock(side_effect=AssertionError('clock accessed')),
+    )
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+
+def test_morning_demo_auto_executes_after_wait(io, monkeypatch):
+    """아침 demo AUTO_EXECUTE 는 대기 후 정상 주문합니다."""
+    TestPhaseDispatcher()._prepare(io, monkeypatch)
+    clock = [datetime(2026, 10, 26, 1, 15, tzinfo=timezone.utc)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0]
+
+    def advance(seconds):
+        clock[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(trading_bot, 'datetime', Clock)
+    monkeypatch.setattr(trading_bot, 'get_kst_now', lambda: clock[0].astimezone(ZoneInfo('Asia/Seoul')))
+    monkeypatch.setattr(trading_bot, 'is_us_dst', lambda: True)
+    monkeypatch.setattr(trading_bot.time, 'sleep', advance)
+    monkeypatch.setattr(trading_bot, 'AUTO_EXECUTE', True)
+    monkeypatch.setenv('RUN_PHASE', 'PREVIEW')
+    broker = _make_broker()
+    broker.place_order.return_value = OrderResult(order_id='EXEC1', order_time='2026-10-26T17:00:00+09:00', is_reservation=False)
+    assert trading_bot._dispatch_pipeline_phase('PREVIEW', broker) == 0
+    assert broker.place_order.call_count == 1
+    assert clock[0].astimezone(ZoneInfo('Asia/Seoul')).hour == 17
+
+
+# ── P1/P2: AUTO_EXECUTE(opt-in) 결함 재현 테스트 ─────────────────────
+
+class TestAutoExecuteDefectRepro:
+    """P1: 공통 상태 장애(GlobalScopedError)가 다음 종목을 삼키지 않아야 합니다.
+    P2: DRY 모드에서 AUTO_EXECUTE 는 승인·실행을 건너뛰고 PREVIEW 만 생성해야 합니다.
+    """
+
+    def test_global_failure_must_stop_all_symbols(self, io, monkeypatch):
+        monkeypatch.setattr(trading_bot, 'AUTO_EXECUTE', True)
+        monkeypatch.setattr(trading_bot, 'SYMBOLS', [_symbol_config(), _symbol_config('SOXL')])
+        monkeypatch.setattr(trading_bot, '_settled_from_state', lambda cfg: cfg)
+        monkeypatch.setattr(trading_bot, 'build_order_plan',
+                            lambda cfg, broker: SimpleNamespace(symbol=cfg['symbol'], plan_id=cfg['symbol'], orders=[{}], state_hash='hash'))
+        monkeypatch.setattr(trading_bot, 'write_order_plan', lambda *a, **k: 'plan.json')
+        monkeypatch.setattr(trading_bot, 'approve_plan_file', lambda *a, **k: 'approval.json')
+
+        execute = MagicMock(side_effect=trading_bot.GlobalScopedError('state save failed'))
+        monkeypatch.setattr(trading_bot, 'execute_approved_plan', execute)
+        with pytest.raises(trading_bot.GlobalScopedError):
+            trading_bot._dispatch_pipeline_phase('PREVIEW', _make_broker())
+        assert execute.call_count == 1
+
+    def test_dry_auto_preview_should_not_fail(self, io, monkeypatch):
+        monkeypatch.setattr(trading_bot, 'AUTO_EXECUTE', True)
+        monkeypatch.setattr(trading_bot, 'SYMBOLS', [_symbol_config(), _symbol_config('SOXL')])
+        monkeypatch.setattr(trading_bot, '_settled_from_state', lambda cfg: cfg)
+        monkeypatch.setattr(trading_bot, 'build_order_plan',
+                            lambda cfg, broker: SimpleNamespace(symbol=cfg['symbol'], plan_id=cfg['symbol'], orders=[{}], state_hash='hash'))
+        monkeypatch.setattr(trading_bot, 'write_order_plan', lambda *a, **k: 'plan.json')
+        monkeypatch.setattr(trading_bot, 'approve_plan_file', lambda *a, **k: 'approval.json')
+        monkeypatch.setattr(trading_bot, 'TRADE_MODE', 'DRY')
+        assert trading_bot._dispatch_pipeline_phase('PREVIEW', _make_broker()) == 0

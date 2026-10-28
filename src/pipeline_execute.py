@@ -55,7 +55,9 @@ def _wait_until_pre_market(tb, now=None):
     """
     if now is not None:
         return now
-    if not (tb.BROKER_MODE == "real" and tb.TRADE_MODE == "LIVE"):
+    # DRY 는 미리보기만 수행하므로 대기하지 않습니다.
+    # real/demo 모두 LIVE 주문이므로 프리장 개장까지 대기해야 세션 날짜가 맞습니다.
+    if tb.TRADE_MODE != "LIVE":
         return None
     now_kst = tb.get_kst_now()
     pre_market_open_hour = 17 if tb.is_us_dst() else 18
