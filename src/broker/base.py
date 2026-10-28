@@ -9,6 +9,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
+# 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 바꾸지 않습니다)
+from log_mask import mask_odno
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 반환 타입 (dataclass)
@@ -335,7 +338,7 @@ class DryBroker(Broker):
     def cancel_order(
         self, odno: str, symbol: str | None = None, exchange: str | None = None,
     ) -> None:
-        print(f"[DRY 모드] 주문 취소 무시: odno={odno}")
+        print(f"[DRY 모드] 주문 취소 무시: odno={mask_odno(odno)}")
 
     # ── 유틸리티: 실제 브로커에 위임 ──
     def exchange_code(self, user_code: str) -> str:

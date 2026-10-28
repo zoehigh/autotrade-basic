@@ -39,6 +39,8 @@ from broker.market_utils import (
     normalize_order_price,
     resolve_real_kst_from_ord,
 )
+# 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
+from log_mask import mask_odno
 from broker.ls.auth import get_access_token
 from broker.ls.exchange import (
     convert_exchange_code,
@@ -765,7 +767,7 @@ class LSBroker(Broker):
                         amt_s = amt
 
                     print(
-                        f"미국영업일 {us_dt_str} | 한국시각 {kst_str} | odno={odno}"
+                        f"미국영업일 {us_dt_str} | 한국시각 {kst_str} | odno={mask_odno(odno)}"
                         f" | {side} | qty={qty} | price={price_s} | amt={amt_s}"
                     )
             return order_history
@@ -848,7 +850,7 @@ class LSBroker(Broker):
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {order_id}")
+            print(f"주문번호: {mask_odno(order_id)}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")

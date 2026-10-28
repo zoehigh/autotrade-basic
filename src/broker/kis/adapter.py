@@ -31,6 +31,8 @@ from broker.market_utils import (
     normalize_order_price,
     resolve_real_kst_from_ord,
 )
+# 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
+from log_mask import mask_odno
 from broker.kis.session import KISSession
 from broker.kis.auth import get_access_token
 from broker.kis.exchange import convert_exchange_code, get_api_exchange_code
@@ -538,7 +540,7 @@ class KISBroker(Broker):
                     except Exception:
                         amt_s = amt
 
-                    print(f"미국영업일 {us_dt_str} | 한국시각 {kst_str} | odno={odno} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
+                    print(f"미국영업일 {us_dt_str} | 한국시각 {kst_str} | odno={mask_odno(odno)} | {side} | qty={qty} | price={price_s} | amt={amt_s}")
 
             return order_history
 
@@ -706,7 +708,7 @@ class KISBroker(Broker):
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {order_id}")
+            print(f"주문번호: {mask_odno(order_id)}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")
@@ -768,7 +770,7 @@ class KISBroker(Broker):
 
             print("\n========== [예약주문] 접수 성공 ==========")
             print(f"종목: {symbol}  수량: {quantity}  가격: {price}")
-            print(f"예약주문번호(ODNO): {output.get('ODNO', '')}")
+            print(f"예약주문번호(ODNO): {mask_odno(output.get('ODNO', ''))}")
             print("========================================\n")
 
             # RSVN_ORD_RCIT_DT가 비어있으면 KST 오늘 날짜로 대체

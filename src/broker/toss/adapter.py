@@ -35,6 +35,8 @@ from broker.base import (
     OrderNotAcceptedError,
 )
 from broker.market_utils import get_kst_now, is_us_trading_day, normalize_order_price
+# 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
+from log_mask import mask_odno
 from broker.toss.auth import get_access_token
 from broker.toss.session import TossSession
 from broker.toss.exchange import get_api_exchange_code
@@ -779,7 +781,7 @@ class TossBroker(Broker):
                     amt_s = amt
 
                 print(
-                    f"{kst_str} | odno={odno} | {side} | status={status} | "
+                    f"{kst_str} | odno={mask_odno(odno)} | {side} | status={status} | "
                     f"qty={qty} | price={price_s} | amt={amt_s}"
                 )
 
@@ -859,7 +861,7 @@ class TossBroker(Broker):
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
             print(f"종목 코드: {symbol}")
-            print(f"주문번호: {order_id}")
+            print(f"주문번호: {mask_odno(order_id)}")
             print(f"주문수량: {quantity}주")
             print(f"주문가격: ${price}")
             print("==========================================\n")
@@ -934,7 +936,7 @@ class TossBroker(Broker):
 
                 # 성공: 200 + error envelope 없음
                 if resp.status_code == 200 and "error" not in body:
-                    print(f"[토스] 주문 취소 성공: odno={odno}")
+                    print(f"[토스] 주문 취소 성공: odno={mask_odno(odno)}")
                     return None
 
                 # error envelope 처리
@@ -948,7 +950,7 @@ class TossBroker(Broker):
 
                 # 이미 취소됨 (409) → idempotent 성공
                 if resp.status_code == 409 and code == "already-canceled":
-                    print(f"[토스] 주문 이미 취소됨 (idempotent): odno={odno}")
+                    print(f"[토스] 주문 이미 취소됨 (idempotent): odno={mask_odno(odno)}")
                     return None
 
                 # 처리 중 → 1회 재시도
@@ -961,7 +963,7 @@ class TossBroker(Broker):
                         retry_after = 1.0
                     print(
                         f"[토스] 주문 처리 중 (already-processing), "
-                        f"{retry_after:.1f}초 후 재시도: odno={odno}"
+                        f"{retry_after:.1f}초 후 재시도: odno={mask_odno(odno)}"
                     )
                     time.sleep(retry_after)
                     # 1회 재시도
@@ -972,13 +974,13 @@ class TossBroker(Broker):
                     except (ValueError, TypeError):
                         body2 = {}
                     if resp2.status_code == 200 and "error" not in body2:
-                        print(f"[토스] 주문 취소 성공 (재시도): odno={odno}")
+                        print(f"[토스] 주문 취소 성공 (재시도): odno={mask_odno(odno)}")
                         return None
                     error2 = body2.get("error", {})
                     code2 = error2.get("code", "")
                     msg2 = error2.get("message", "")
                     if code2 == "already-canceled":
-                        print(f"[토스] 주문 이미 취소됨 (idempotent): odno={odno}")
+                        print(f"[토스] 주문 이미 취소됨 (idempotent): odno={mask_odno(odno)}")
                         return None
                     if code2 in (
                         "already-filled", "cancel-restricted",
