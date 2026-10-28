@@ -2639,6 +2639,9 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
         post_processing["steps"].append({"step": name, **info})
 
     # ── T값 상한 적용 (MAX_T) ──
+    if max_t is not None and (_force_reinference or _trade_mode == "DRY"):
+        # 미리보기 진단: 원시 추정 T 와 상한 적용 후 T 를 함께 보여줍니다.
+        print(f"[T 보정] {symbol} 원시 추정 T={state['T']}, 상한 MAX_T={max_t} → 적용 T={min(state['T'], max_t)}")
     if max_t is not None and state["T"] > max_t:
         print(f"[T 보정] {symbol} T={state['T']} > MAX_T={max_t} → T={max_t}로 조정")
         _post_step("max_t", before=float(state["T"]), after=float(max_t))
