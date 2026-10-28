@@ -3117,9 +3117,8 @@ def main():
         return _main_locked()
 
 
-def _main_locked():
-    """
-    자동매매 봇의 메인 실행 함수입니다.
+def _run_mode_dispatch():
+    """진단·복구 전용 모드를 실행합니다 (브로커 생성 없음).
 
     Returns:
         bool: 전용 모드가 실행을 처리했으면 True (호출자는 원장 확정 후 종료),
@@ -3171,19 +3170,14 @@ def _main_locked():
     return False
 
 
-def main():
+def _main_locked():
     """
     자동매매 봇의 메인 실행 함수입니다.
 
-    SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
-    한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
+    Returns:
+        bool: 전용 모드가 실행을 처리했으면 True (호출자는 원장 확정 후 종료),
+              일반 실행(DRY/LIVE)이 계속되어야 하면 False.
     """
-    # ── 모드 불변식 ──
-    # TRADE_MODE는 DRY(프리뷰, 상태 저장 없음) / LIVE(실주문) / REPAIR(유지보수) 중 하나입니다.
-    # REPAIR는 액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 정확히
-    # 하나일 때만 실행하며, 0개 또는 2개 이상이면 _dispatch_repair()가 sys.exit(1)로 중단합니다.
-    # REPAIR 체크를 레거시 STATE_*_ONLY보다 먼저 수행해 REPAIR 모드의 단일 액션
-    # 불변식을 항상 강제합니다.
     # 진단·복구 전용 모드는 브로커 생성 없이 여기서 끝나며, 공개 로그에 마스킹
     # 토큰을 남길 수 있습니다. 전용 모드가 처리했으면 원장을 확정하고 main()도
     # 종료합니다 (계속 진행하면 읽기 전용 진단 뒤에 실주문이 나갈 수 있음).
@@ -3196,6 +3190,7 @@ def main():
         flush_odno_ledger()
     if _dispatch_handled:
         return
+
 
     # 전체 T 재추정은 주문을 절대 발생시키지 않아야 합니다.
     # 브로커 생성 전 config와 이 모듈의 모드를 함께 DRY로 고정합니다.

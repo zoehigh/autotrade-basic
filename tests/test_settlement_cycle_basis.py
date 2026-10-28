@@ -423,8 +423,8 @@ def test_versioned_zero_marker_old_order_is_recovered(broker, symbol):
 # (i) 신규 등록 메타 형식 — trading_bot 이 쓰는 키와 state 판정이 일치해야 합니다
 # ═══════════════════════════════════════════════════════════════════
 
-def test_trading_bot_registers_versioned_markers():
-    text = (Path(__file__).resolve().parents[1] / "trading_bot.py").read_text(encoding="utf-8")
+def test_pipeline_execute_registers_versioned_markers():
+    text = (Path(__file__).resolve().parents[1] / "src" / "pipeline_execute.py").read_text(encoding="utf-8")
     assert '"processed_filled_amount": 0.0,' in text
     assert '"fill_marker_version": FILL_MARKER_VERSION,' in text
     from state import FILL_MARKER_VERSION, _marker_proves_unapplied
