@@ -59,11 +59,15 @@ def send_telegram(message: str) -> bool:
                 print("✅ 텔레그램 메시지 전송 성공")
                 return True
             if response.status_code >= 500 and attempt < max_attempts:
-                print(f"⚠️ 텔레그램 서버 오류({response.status_code}) — {attempt}/{max_attempts}회 재시도")
+                print(f"⚠️ 텔레그램 서버 오류(HTTP {response.status_code}) — {attempt}/{max_attempts}회 재시도")
                 time.sleep(1)
                 continue
-            print(f"❌ 텔레그램 메시지 전송 실패: {response.status_code}")
-            print(f"   응답 내용: {response.text}")
+            # 응답 본문은 출력하지 않습니다. (설정에 따라 메시지 원문이 되돌아올 수 있습니다)
+            error_kind = "서버 오류(5xx)" if response.status_code >= 500 else "요청 오류(4xx)"
+            print(
+                f"❌ 텔레그램 메시지 전송 실패: HTTP {response.status_code} {error_kind} "
+                f"— {attempt}/{max_attempts}회 시도"
+            )
             return False
 
         except requests.exceptions.Timeout:
@@ -71,14 +75,23 @@ def send_telegram(message: str) -> bool:
                 print(f"⚠️ 텔레그램 전송 시간 초과 — {attempt}/{max_attempts}회 재시도")
                 time.sleep(1)
                 continue
-            print("❌ 텔레그램 메시지 전송 시간 초과")
+            print(f"❌ 텔레그램 메시지 전송 시간 초과 — {attempt}/{max_attempts}회 시도 실패")
             return False
         except Exception as e:
+            # 예외 문자열(str(e))에는 요청 URL이 들어 있을 수 있고 그 URL에는 봇 토큰이 포함됩니다.
+            # 따라서 예외 **타입 이름만** 출력하고 str(e)는 절대 출력하지 않습니다.
+            error_type = type(e).__name__
             if attempt < max_attempts:
-                print(f"⚠️ 텔레그램 전송 중 오류 발생 — {attempt}/{max_attempts}회 재시도: {e}")
+                print(
+                    f"⚠️ 텔레그램 전송 중 오류 발생({error_type}) — "
+                    f"{attempt}/{max_attempts}회 재시도"
+                )
                 time.sleep(1)
                 continue
-            print(f"❌ 텔레그램 메시지 전송 중 오류 발생: {e}")
+            print(
+                f"❌ 텔레그램 메시지 전송 중 오류 발생({error_type}) — "
+                f"{attempt}/{max_attempts}회 시도 실패"
+            )
             return False
 
     return False
