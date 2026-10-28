@@ -8,6 +8,8 @@ import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from state import FILL_MARKER_VERSION
+
 from pipeline import (
     _approval_lock,
     _atomic_write_json,
@@ -738,6 +740,10 @@ def _execute_approved_plan(
                                 "t_target": float(t_target),
                                 "is_additional": bool(is_additional),
                                 "processed_filled_qty": 0,
+                                # 신규 등록분만 "아직 한 번도 반영되지 않음"을 증명하는 버전 표식
+                                # (기존 메타는 마이그레이션하지 않습니다 — 0 만으로는 미반영을 단정할 수 없음)
+                                "processed_filled_amount": 0.0,
+                                "fill_marker_version": FILL_MARKER_VERSION,
                                 # 승인 계획과 1:1 대조용 (VERIFY P1-B). 주문 내용은 여기에
                                 # 복제하지 않고 계획 id/순번만 남겨 대조 기준으로 씁니다.
                                 "plan_id": str(plan.plan_id or ""),
