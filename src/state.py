@@ -303,7 +303,11 @@ def register_order_meta_in_state(state, odno, meta):
     """
     normalized = str(odno)
     state.setdefault("orders_meta", {})[normalized] = meta
-    print(f"[orders_meta 등록] odno={normalized} (원본={odno}), t_target={meta.get('t_target')}")
+    # 공개 로그 보호: 저장 키(normalized)는 원문 그대로 두고 출력만 가명 토큰으로 바꿉니다.
+    print(
+        f"[orders_meta 등록] odno={mask_odno(normalized)} (원본={mask_odno(odno)}), "
+        f"t_target={meta.get('t_target')}"
+    )
 
 
 def get_order_meta(state, odno):

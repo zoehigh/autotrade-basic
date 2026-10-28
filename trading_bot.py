@@ -12,6 +12,7 @@
 import json
 import math
 import os
+import re
 import sys
 import time
 from copy import deepcopy
@@ -55,6 +56,36 @@ STATE_REVERSE_RECONCILE_ONLY = os.getenv("STATE_REVERSE_RECONCILE_ONLY", "").str
 STATE_NET_INVESTED_REPAIR_ONLY = os.getenv("STATE_NET_INVESTED_REPAIR_ONLY", "").strip().lower() == "true"
 STATE_ASSUME_REVERSE_EXPIRY_ONLY = os.getenv("STATE_ASSUME_REVERSE_EXPIRY_ONLY", "").strip().lower() == "true"
 STATE_SET_CYCLE_START_ONLY = os.getenv("STATE_SET_CYCLE_START_ONLY", "").strip().lower() == "true"
+
+
+# ── 공개 로그 주문번호 마스킹 도우미 ──────────────────────────────────
+# 주문 접수·취소·요약 로그는 공개(GitHub Actions 로그/일반 알림)에 남으므로
+# 주문번호 원문을 쓰지 않습니다. 단, 마스킹이 진단 정보를 지우면 안 되므로
+# **주문번호 참조만** 바꾸고 나머지 문구(수량·가격·사유)는 그대로 둡니다.
+_ODNO_REFERENCE = re.compile(
+    r"(?P<label>(?:odno|ordno|주문\s*번호|예약\s*주문\s*번호|예약\s*번호)\s*[:=]?\s*)"
+    r"(?P<id>[0-9A-Za-z:_-]{4,})",
+    re.IGNORECASE,
+)
+
+
+def _mask_odno_references(text):
+    """자유 텍스트(브로커 에러 사유 등)에서 `odno=<번호>` / `주문번호: <번호>` 참조만 마스킹합니다."""
+    if not text:
+        return text
+
+    return _ODNO_REFERENCE.sub(
+        lambda match: match.group("label") + mask_odno(match.group("id")),
+        str(text),
+    )
+
+
+def _mask_token_in(text, odno):
+    """텍스트 안의 주문번호 원문을 같은 가명 토큰으로 치환합니다 (문구·줄바꿈은 그대로)."""
+    if not text or not odno:
+        return text
+
+    return str(text).replace(str(odno), mask_odno(odno))
 
 
 def generate_cycle_report(
@@ -1403,14 +1434,17 @@ def run_one_symbol(broker: Broker, symbol_config):
                         "order_id": result.order_id,
                         "order_time": result.order_time,
                     })
-                    print(f"✓ 예약주문 접수 완료 (주문번호: {result.order_id})")
-                    message = f"""📋 예약주문 접수 {symbol}
+                    print(f"✓ 예약주문 접수 완료 (주문번호: {mask_odno(result.order_id)})")
+                    # 텔레그램 본문은 주문번호 원문을 유지하고(비공개 채널),
+                    # 일반 알림/공개 로그용 message 는 같은 문구에서 번호만 가명 토큰으로 바꿉니다.
+                    telegram_message = f"""📋 예약주문 접수 {symbol}
 
 {order['comment']}
 수량: {order['quantity']}주
 예약주문번호: {result.order_id}
 접수일자: {result.order_time}"""
-                    notify(message)
+                    message = _mask_token_in(telegram_message, result.order_id)
+                    notify(message, telegram_message=telegram_message)
                 else:
                     executed_orders.append({
                         "comment": order["comment"],
@@ -1418,13 +1452,14 @@ def run_one_symbol(broker: Broker, symbol_config):
                         "order_time": result.order_time,
                     })
                     print("✓ 주문 성공")
-                    message = f"""✅ 주문 성공 {symbol}
+                    telegram_message = f"""✅ 주문 성공 {symbol}
 
 {order['comment']}
 수량: {order['quantity']}주
 주문번호: {result.order_id}
 시각: {result.order_time}"""
-                    notify(message)
+                    message = _mask_token_in(telegram_message, result.order_id)
+                    notify(message, telegram_message=telegram_message)
             else:
                 if TRADE_MODE == "LIVE":
                     raise SymbolScopedError(
@@ -1526,20 +1561,24 @@ fence: 유지"""
     if executed_orders:
         print("\n[성공한 주문]")
         for order in executed_orders:
-            print(f"  ✓ {order['comment']}: 주문번호 {order['order_id']} (시각: {order['order_time']})")
+            print(
+                f"  ✓ {order['comment']}: 주문번호 {mask_odno(order['order_id'])} "
+                f"(시각: {order['order_time']})"
+            )
 
     if reserved_orders:
         print("\n[예약 주문] - 다음 정규장 시작 시 체결됩니다")
         for order in reserved_orders:
             print(
-                f"  📋 {order['comment']}: 예약번호 {order['order_id']} "
+                f"  📋 {order['comment']}: 예약번호 {mask_odno(order['order_id'])} "
                 f"(접수일자: {order['order_time']})"
             )
 
     if failed_orders:
         print("\n[실패한 주문]")
         for order in failed_orders:
-            print(f"  ✗ {order['comment']}: {order['error']}")
+            # 브로커 에러 사유에 섞인 주문번호 참조만 마스킹하고 나머지 진단 정보는 유지합니다.
+            print(f"  ✗ {order['comment']}: {_mask_odno_references(order['error'])}")
 
     return {
         "symbol": symbol,
@@ -1767,7 +1806,7 @@ def _cancel_open_bot_orders(
 
     print(f"\n[잔여 주문 정리] 봇 소유 미체결 주문 {len(targets)}건 취소")
     for odno, status, remaining in targets:
-        print(f"  - {odno} ({status}, 잔량 {remaining}주)")
+        print(f"  - {mask_odno(odno)} ({status}, 잔량 {remaining}주)")
 
     rejected: list[tuple[str, str]] = []
     for odno, _status, _remaining in targets:
@@ -1776,7 +1815,9 @@ def _cancel_open_bot_orders(
         except Exception as error:
             # 실패해도 나머지 취소는 계속합니다 (부분 취소 상태로 남지 않도록).
             rejected.append((odno, str(error)))
-            print(f"  ✗ 취소 요청 실패: {odno} — {str(error)[:160]}")
+            # 브로커 사유에 섞인 주문번호 참조만 마스킹합니다 (나머지 진단 정보 유지).
+            masked_reason = _mask_odno_references(str(error))[:160]
+            print(f"  ✗ 취소 요청 실패: {mask_odno(odno)} — {masked_reason}")
 
     # ── 취소 확정 확인 ────────────────────────────────────────────
     # 메리츠 상세조회에는 잔량 정보가 없고(문서상 ncnt_odqt 항상 0),
@@ -1846,14 +1887,16 @@ def _cancel_open_bot_orders(
         raise SymbolScopedError(
             "취소 과정에서 체결이 발생해 포지션이 바뀝니다. "
             "신규 주문을 생략하고 다음 실행에서 재계획합니다: "
-            + ", ".join(filled_during_cancel)
+            + mask_odno(filled_during_cancel)
         )
 
     if still_open:
         detail = []
         for odno in still_open:
             reason = next((m for o, m in rejected if o == odno), "취소 접수 후에도 잔량 유지")
-            detail.append(f"{odno}({reason[:60]})")
+            # 주문번호는 가명 토큰으로, 브로커 사유는 주문번호 참조만 마스킹해 그대로 남깁니다.
+            masked_reason = _mask_odno_references(reason)[:60]
+            detail.append(f"{mask_odno(odno)}({masked_reason})")
         raise SymbolScopedError(
             "이전 주문 취소를 확정하지 못해 신규 주문을 생략합니다: " + ", ".join(detail)
         )
@@ -1875,6 +1918,7 @@ def _print_state_diagnostic():
         )
         pending_intent = state.get("pending_order_intent")
         pending_batch = state.get("pending_order_batch")
+        last_ordno = state.get("last_processed_ordno", "")
         print(
             f"[상태 진단] {symbol} → "
             f"T={state.get('T', 0.0)}, "
@@ -1885,10 +1929,10 @@ def _print_state_diagnostic():
             f"effective_seed=${state.get('effective_seed', 0.0):.2f}, "
             f"cycle_start_date={state.get('cycle_start_date', '') or '(없음)'}, "
             f"pending_intent={bool(pending_intent)}, pending_batch={bool(pending_batch)}, "
-            f"reverse_order_ids={reverse_order_ids}, "
-            f"order_meta_ids={sorted(state.get('orders_meta', {}).keys())}, "
+            f"reverse_order_ids={mask_odno(reverse_order_ids)}, "
+            f"order_meta_ids={mask_odno(sorted(state.get('orders_meta', {}).keys()))}, "
             f"last_updated={state.get('last_updated', '')}, "
-            f"last_processed_ordno={state.get('last_processed_ordno', '')}, "
+            f"last_processed_ordno={mask_odno(last_ordno) if last_ordno else ''}, "
             f"state_hash={canonical_state_hash(state)}"
         )
     print("[상태 진단] 종료합니다. 상태 파일은 변경하지 않았습니다.")
@@ -2029,7 +2073,7 @@ def _repair_state_only():
     state["reverse_mode"] = {}
     reverse_order_ids = expected_reverse_ids
     if reverse_order_ids:
-        print(f"[상태 복구] 리버스 주문 메타데이터 보존(archived): {reverse_order_ids}")
+        print(f"[상태 복구] 리버스 주문 메타데이터 보존(archived): {mask_odno(reverse_order_ids)}")
         for odno in reverse_order_ids:
             meta = state["orders_meta"][odno]
             meta.setdefault("reverse_action", "sell")
