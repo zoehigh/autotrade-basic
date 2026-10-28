@@ -188,7 +188,7 @@ uv run pytest tests/test_broker_preflight.py -v
 
 **MERITZ 주문조건구분(`oder_cond_cls_code`)**: 값이 `oder_cls_code`에 따라 고정됩니다 — `01`·`05`·`35~38` → `0`, `31`·`33` → `2`, `32`·`34` → `7`. 위반 시 주문이 `IGW50002`로 거부됩니다 (2026-10-20 LOC 쿼터매도 실측 미접수). 매핑은 `src/broker/meritz/adapter.py`의 `_ODER_COND_CLS_CODE`.
 
-**MERITZ 주문 정정** (`POST /trading/v1/overseas/orders/modify`): `MeritzBroker.modify_order()` 구현. 필수 6필드 `oder_date`/`orgl_oder_no`/`oder_cls_code`/`odqt`/`ovrs_stck_oder_prc`/`oder_cond_cls_code`. **해외는 재정정 시 직전 정정 건의 주문번호를 씁니다** (국내는 최초 주문번호 유지 — 기준이 반대). 정정하면 주문번호가 바뀌므로 `state.json`의 `orders_meta` 키도 새 번호로 옮기고 `total_qty`를 정정 수량으로 갱신해야 합니다.
+**MERITZ 주문 정정** (`POST /trading/v1/overseas/orders/modify`): `MeritzBroker.modify_order()` 구현. 필수 6필드 `oder_date`/`orgl_oder_no`/`oder_cls_code`/`odqt`/`ovrs_stck_oder_prc`/`oder_cond_cls_code`. **국내·해외 모두 정정·취소 대상 주문의 최신 번호를 씁니다** (2026-10-27 문서 통일, 구 "해외=직전·국내=최초" 구분 폐지 — 서버 동작 변경 없음). 정정하면 주문번호가 바뀌므로 `state.json`의 `orders_meta` 키도 새 번호로 옮기고 `total_qty`를 정정 수량으로 갱신해야 합니다.
 
 **MERITZ 정정은 수량을 바꾸지 않습니다**: 가격만 반영되고, `odqt` 증가는 접수(`rsp_cd=0001`·경고 없음)돼도 실제 `oder_dqty`는 원주문 수량 그대로입니다 (2026-10-20 1주→7주 실측). **수량 변경이 필요하면 취소 후 신규 주문**으로 처리하세요. 취소 확인은 상세조회(`/orders/detail`)가 아니라 **이력 기준**입니다 — 취소는 이력에 별도 행(`rctf_cncl_cls_name="취소"`, `orgl_oder_no=취소 대상`)으로 남습니다.
 
