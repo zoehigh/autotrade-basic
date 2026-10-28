@@ -28,6 +28,9 @@ from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+# 주문번호 매핑 원장은 state 를 거치지 않고 log_mask 에서 직접 가져옵니다
+# (state 와 **같은 모듈 객체**여야 salt·원장이 하나로 유지됩니다 — `src.log_mask` import 금지).
+from log_mask import flush_odno_ledger
 from notifier import notify
 
 
@@ -68,15 +71,28 @@ _ODNO_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 
+# 라벨 없이 등장하는 **합성 주문번호**(메리츠 `YYYYMMDD:주문번호`)도 주문 식별자입니다.
+# 예: "20261028:1234 주문이 거부되었습니다". 8자리 날짜 뒤 콜론이 있어야만 매칭해
+# 수량·가격·에러코드 같은 일반 숫자는 건드리지 않습니다.
+_SYNTHETIC_ODNO_REFERENCE = re.compile(r"(?<![\dA-Za-z:])(?P<id>\d{8}:\d+)(?![\dA-Za-z:])")
+
 
 def _mask_odno_references(text):
-    """자유 텍스트(브로커 에러 사유 등)에서 `odno=<번호>` / `주문번호: <번호>` 참조만 마스킹합니다."""
+    """자유 텍스트(브로커 에러 사유 등)에서 주문번호 참조만 마스킹합니다.
+
+    라벨이 붙은 참조(`odno=…`, `주문번호: …`)와 라벨 없는 합성번호(`YYYYMMDD:NNNN`)를
+    같은 가명 토큰으로 바꿉니다. 수량·가격·사유 같은 나머지 진단 정보는 그대로 둡니다.
+    """
     if not text:
         return text
 
-    return _ODNO_REFERENCE.sub(
+    masked = _ODNO_REFERENCE.sub(
         lambda match: match.group("label") + mask_odno(match.group("id")),
         str(text),
+    )
+    return _SYNTHETIC_ODNO_REFERENCE.sub(
+        lambda match: mask_odno(match.group("id")),
+        masked,
     )
 
 
@@ -86,6 +102,29 @@ def _mask_token_in(text, odno):
         return text
 
     return str(text).replace(str(odno), mask_odno(odno))
+
+
+def _safe_error_text(error, limit=120):
+    """예외 메시지를 공개 로그용으로 정리합니다 (주문번호 참조 마스킹 + 길이 제한)."""
+    return _mask_odno_references(str(error))[:limit]
+
+
+# 주문번호 매핑 원장 flush 여부 (프로세스당 1회 — 종목 수와 무관하게 한 파일에 누적).
+_ODNO_LEDGER_FLUSHED = False
+
+
+def _flush_odno_ledger_once():
+    """이번 실행의 주문번호 매핑 원장을 프로세스당 1회만 기록합니다.
+
+    정산 근거(`settlement-*.json`)와 같은 시점(실행 종료)에 남기므로 게이팅이 같습니다.
+    원장이 비어 있으면 `flush_odno_ledger()` 가 파일을 만들지 않습니다.
+    두 번 불려도(예: 실패 경로 + finally) 중복 기록하지 않습니다.
+    """
+    global _ODNO_LEDGER_FLUSHED
+    if _ODNO_LEDGER_FLUSHED:
+        return None
+    _ODNO_LEDGER_FLUSHED = True
+    return flush_odno_ledger()
 
 
 def generate_cycle_report(
@@ -1468,7 +1507,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                 print("✓ 주문 정보 출력 완료")
 
         except OrderNotAcceptedError as error:
-            print(f"✗ 주문 실패 (미접수 확정): {str(error)}")
+            # 브로커 사유에 섞인 `odno=…` / `주문번호: …` / 합성번호(YYYYMMDD:NNNN)
+            # 참조만 마스킹합니다 (수량·가격·사유 같은 진단 정보는 그대로 유지).
+            error_text = _mask_odno_references(str(error))
+            print(f"✗ 주문 실패 (미접수 확정): {error_text}")
             if TRADE_MODE == "LIVE":
                 # 브로커가 명시적으로 거부해 주문이 접수되지 않았음이 보장되므로
                 # 해소할 주문이 없는 fence만 남기지 않습니다.
@@ -1483,33 +1525,35 @@ def run_one_symbol(broker: Broker, symbol_config):
             failed_orders.append(
                 {
                     "comment": order["comment"],
-                    "error": str(error),
+                    "error": error_text,
                 }
             )
 
             message = f"""⚠️ 주문 미접수 확정 {symbol}
 
 {order['comment']}
-에러: {str(error)}
+에러: {error_text}
 접수 여부: 미접수 확정
 fence: 해제"""
             notify(message, urgent=True)
             break
         except Exception as error:
-            print(f"✗ 주문 실패: {str(error)}")
+            # 위와 동일: 공개 로그·알림에 주문번호 원문을 남기지 않습니다.
+            error_text = _mask_odno_references(str(error))
+            print(f"✗ 주문 실패: {error_text}")
             if TRADE_MODE == "LIVE":
                 fatal_order_error = True
             failed_orders.append(
                 {
                     "comment": order["comment"],
-                    "error": str(error),
+                    "error": error_text,
                 }
             )
 
             message = f"""⚠️ 주문 실패 {symbol}
 
 {order['comment']}
-에러: {str(error)}
+에러: {error_text}
 접수 여부: 불확실
 fence: 유지"""
             notify(message, urgent=True)
@@ -1675,13 +1719,15 @@ def _load_open_orders_for_cancel(broker, symbol, exchange):
         return list(rows or []), None
     except Exception as error:
         text = str(error)
+        # 브로커 사유에 주문번호 참조가 섞여도 공개 로그에는 원문을 남기지 않습니다.
+        safe_text = _mask_odno_references(text)
         if "404" in text or "405" in text:
             print(
                 f"  ⚠️ 열린 주문 조회 미지원(HTTP 404/405) — CLOSED 이력만 사용합니다: "
-                f"{text[:120]}"
+                f"{safe_text[:120]}"
             )
             return [], None
-        print(f"  ⚠️ 열린 주문 조회 실패 — 신규 주문을 보류합니다: {text[:160]}")
+        print(f"  ⚠️ 열린 주문 조회 실패 — 신규 주문을 보류합니다: {safe_text[:160]}")
         return [], error
 
 
@@ -1845,7 +1891,7 @@ def _cancel_open_bot_orders(
         try:
             history = broker.get_order_history(symbol, exchange, days=30, verbose=False)
         except Exception as error:
-            print(f"  ⚠️ 이력 재조회 실패 (확인 시도 {attempt}): {str(error)[:120]}")
+            print(f"  ⚠️ 이력 재조회 실패 (확인 시도 {attempt}): {_safe_error_text(error, 120)}")
             continue
         current = {str(o.get("odno")): o for o in (history or [])}
         still_open = []
@@ -2879,22 +2925,25 @@ def main():
 
             except SymbolScopedError as error:
                 # 해당 종목만 중단하고 다음 종목으로 계속 진행합니다.
-                print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
+                # 공개 로그/알림에는 주문번호 참조 원문을 남기지 않습니다 (진단 정보는 유지).
+                error_text = _mask_odno_references(str(error))
+                print(f"\n✗ {symbol} 처리 중 오류 발생: {error_text}")
                 if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
-                    notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                    notify(f"⚠️ {symbol} 오류\n\n{error_text}", urgent=True)
                 run_results.append({
                     "symbol": symbol, "executed": 0, "reserved": 0,
-                    "failed": 1, "errors": [str(error)],
+                    "failed": 1, "errors": [error_text],
                 })
 
             except Exception as error:
                 # 한 종목이 실패해도 나머지 종목은 계속 처리합니다
-                print(f"\n✗ {symbol} 처리 중 오류 발생: {str(error)}")
+                error_text = _mask_odno_references(str(error))
+                print(f"\n✗ {symbol} 처리 중 오류 발생: {error_text}")
                 if TRADE_MODE != "DRY" or "잔고 부족:" not in str(error):
-                    notify(f"⚠️ {symbol} 오류\n\n{str(error)}", urgent=True)
+                    notify(f"⚠️ {symbol} 오류\n\n{error_text}", urgent=True)
                 run_results.append({
                     "symbol": symbol, "executed": 0, "reserved": 0,
-                    "failed": 1, "errors": [str(error)],
+                    "failed": 1, "errors": [error_text],
                 })
                 # 공통/치명 사안(상태 파일, T 불일치, preflight 실패 등)은 전체 중단합니다.
                 if any(marker in str(error) for marker in (
@@ -2946,21 +2995,27 @@ def main():
         print("\n" + "=" * 60)
         print("✗ 프로그램 실행 중 치명적 에러 발생")
         print("=" * 60)
-        print(f"에러: {str(error)}")
+        # 공개 로그/알림에는 주문번호 참조 원문을 남기지 않습니다 (진단 정보는 유지).
+        error_text = _mask_odno_references(str(error))
+        print(f"에러: {error_text}")
 
         message = f"""🚨 치명적 에러 발생
 
-{str(error)}"""
+{error_text}"""
         notify(message, urgent=True)
 
         import traceback
 
         print("\n[상세 에러 정보]")
-        print(traceback.format_exc())
+        print(_mask_odno_references(traceback.format_exc()))
 
         print("\n프로그램을 에러와 함께 종료합니다.")
         sys.exit(1)
     finally:
+        # 정산 근거와 같은 시점(실행 종료)에 주문번호 매핑 원장을 1회 기록합니다.
+        # 정산 근거 파일을 남기는 실행(DRY 포함)과 게이팅이 같고, 원장이 비어 있으면
+        # 아무 파일도 만들지 않습니다. 암호화 Evidence 묶음에만 포함됩니다.
+        _flush_odno_ledger_once()
         broker.close()
 
 

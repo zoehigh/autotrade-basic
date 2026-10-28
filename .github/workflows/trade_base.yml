@@ -400,7 +400,9 @@ jobs:
           # 가장 먼저 이전 실행의 암호문·부분 파일·평문 tgz 를 지웁니다 (self-hosted runner 작업 디렉터리
           # 재사용 시 오래된 Evidence 가 이번 실행 것으로 업로드되는 것을 막기 위해, 존재 검사보다 앞섭니다).
           rm -f "$partial" "$out" evidence.tgz
-          files=(settlement-*.json final-settlement-*.json)
+          # 주문번호 매핑 원장(odno-map-*.jsonl)은 공개 로그의 가명 토큰을 원문으로 되돌리는
+          # 유일한 근거이므로 정산 근거와 함께 암호화합니다. 평문은 남기지 않습니다.
+          files=(settlement-*.json final-settlement-*.json odno-map-*.jsonl)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::warning::이번 실행에 정산 근거 파일이 없어 Evidence 를 업로드하지 않습니다 — 정산 검증 불가 (verify 단계가 실패로 보고합니다)"
             exit 0
@@ -413,7 +415,8 @@ jobs:
 
           # 어떤 이유로든 실패하면 불완전한 암호문(.partial)·최종 산출물·평문 tgz 를 남기지 않습니다.
           # (업로드 단계는 산출물이 없으면 올릴 파일이 없어 경고만 합니다)
-          trap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f "$partial" "$out" evidence.tgz; fi' EXIT
+          # 원문 주문번호가 든 매핑 원장(평문 JSONL)도 함께 지웁니다 (self-hosted runner 잔존 방지).
+          trap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f "$partial" "$out" evidence.tgz; rm -f odno-map-*.jsonl 2>/dev/null || true; fi' EXIT
 
           # tar → gpg 스트리밍: 중간 평문 압축파일(evidence.tgz)을 디스크에 만들지 않습니다.
           # 패스프레이즈는 stdin(압축 데이터)과 겹치지 않도록 fd 3 으로 전달합니다.
@@ -430,6 +433,10 @@ jobs:
 
           mv "$partial" "$out"
           test -s "$out"
+
+          # 암호화가 끝났으므로 평문 매핑 원장은 남기지 않습니다 (원문 주문번호 잔존 방지).
+          # nullglob 이라 파일이 없으면 인자가 사라져 rm 이 실패하므로 || true 로 무시합니다.
+          rm -f odno-map-*.jsonl 2>/dev/null || true
 
       - name: 정산 근거 업로드 (암호화본만)
         uses: actions/upload-artifact@v4

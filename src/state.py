@@ -598,7 +598,7 @@ def reconcile_reverse_fills(state, order_history):
                     # 이미 일부 반영됐는데 기준선이 없으면 역산하지 않습니다.
                     _mark_settlement_hold(
                         state,
-                        f"리버스 매도 {odno} 기준선(reverse_base_t)이 없고 "
+                        f"리버스 매도 {mask_odno(odno)} 기준선(reverse_base_t)이 없고 "
                         f"{previous_fraction:.2f} 비율이 이미 반영됐습니다",
                     )
                     continue
@@ -633,7 +633,7 @@ def reconcile_reverse_fills(state, order_history):
             if mismatch:
                 _mark_settlement_hold(
                     state,
-                    f"리버스 매도 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"리버스 매도 {mask_odno(odno)} 마커(반영 {previous_fraction:.2f})와 "
                     f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
                 )
                 continue
@@ -707,7 +707,7 @@ def reconcile_reverse_fills(state, order_history):
             if mismatch:
                 _mark_settlement_hold(
                     state,
-                    f"리버스 매수 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"리버스 매수 {mask_odno(odno)} 마커(반영 {previous_fraction:.2f})와 "
                     f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
                 )
                 continue
@@ -1351,7 +1351,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 state["_pending_amount_odnos"] = unconfirmed
                 _mark_settlement_hold(
                     state,
-                    f"FORCE_T_REINFERENCE 추정 불가 주문 {o.get('odno', '')}",
+                    f"FORCE_T_REINFERENCE 추정 불가 주문 {mask_odno(o.get('odno', ''))}",
                 )
                 return state
             o["_ft_ccld_amt_inferred"] = estimated_amount
@@ -2176,7 +2176,7 @@ def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=Non
                     return T, False
                 _mark_settlement_hold(
                     state,
-                    f"매도 {odno} 분류 변경({previous_factor}→{factor})에 대한 "
+                    f"매도 {mask_odno(odno)} 분류 변경({previous_factor}→{factor})에 대한 "
                     f"적용 순서 근거(원장)가 없습니다",
                 )
                 return T, False
