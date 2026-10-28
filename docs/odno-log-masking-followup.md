@@ -4,6 +4,19 @@ PR #1(A안)은 **정산·체결 복구·보류 경로**의 공개 출력(stdout 
 저장소가 PUBLIC 이라 GitHub Actions 로그에 남은 주문번호는 공개됩니다. 아래는 **이번 PR 범위 밖**이라 남긴 항목입니다
 (별도 PR 에서 처리).
 
+## PR-A(주문번호 채널 분리)에서 처리 완료 — 2026-10-28, 브랜치 `feature/order-id-channel-split`
+
+- 기본 원칙: **공개 로그는 마스킹(`ord#` 토큰), 개인 Telegram은 원본 유지, 암호화 Evidence는 원본 유지**.
+- `src/log_mask.py` 신설: salt 단일화(`os.urandom(16)` 프로세스별 1개, `state.py`가 re-export) + 매핑 원장
+  (`odno-map-<run_id>.jsonl`, 암호화 Evidence에만 포함, 평문 업로드 금지).
+- 아래 "미처리 표"의 전 항목 + `trading_bot.py` 접수·취소·요약·진단 출력 +
+  `ops/verify_run.py` CLI(`main`) + TOSS 정규화 `orderId` 경고까지 마스킹 완료. 잔여 예외 0건
+  (`tests/test_odno_log_masking.py` `_EXEMPTIONS == {}`).
+- Telegram 채널 분리: `notify(message, urgent, telegram_message)` + `TELEGRAM_PERSONAL_CHAT_IDS`
+  allowlist. 개인 채팅에만 원본, 그 외(판정 불가 포함)는 마스킹 본문. `notifier`/`telegram`의
+  본문·응답·예외 원문 출력 제거 (상태 코드·오류 분류·재시도 횟수만).
+- 아래 표·메모는 PR-A 이전 기록으로 보존합니다 (현 상태와 혼동 주의).
+
 ## 이번 PR 에서 한 것
 
 - 가명 식별자: `ord#` + HMAC-SHA256(salt, 주문번호) 앞 10자리. **salt 는 실행(프로세스)마다 무작위**
@@ -16,7 +29,7 @@ PR #1(A안)은 **정산·체결 복구·보류 경로**의 공개 출력(stdout 
 - 회귀 방지: `tests/test_odno_log_masking.py` 의 정적 가드가 `src/state.py`, `trading_bot.py` 의
   `print`/`notify`/예외 f-string 에 원문 주문번호가 들어가면 실패시킵니다.
 
-## 후속 PR 대상 (미처리)
+## (PR-A 이전 기록) 후속 PR 대상이었으나 위에서 처리한 항목
 
 | 위치 | 내용 |
 |------|------|

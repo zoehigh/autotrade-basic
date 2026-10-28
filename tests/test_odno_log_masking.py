@@ -13,7 +13,7 @@
   - `tests/test_odno_masking_no_behavior_change.py` — 마스킹이 주문/정산/state 저장을 바꾸지 않음
 
 Evidence(비공개 암호화 artifact)는 독립 검증을 위해 원문 주문번호와 salt 를 유지합니다.
-남은 예외는 `_EXEMPTIONS` 에 **사유와 함께** 기록합니다 (현재 1건: 토스 정규화 경고).
+남은 예외는 `_EXEMPTIONS` 에 **사유와 함께** 기록합니다 (현재 0건).
 """
 import ast
 import re
@@ -152,14 +152,6 @@ _WHOLE_ORDER_NAMES = {"order", "orders"}
 
 # 남은 예외 — **이유가 적힌 것만** 허용합니다. (줄 번호가 아니라 식/문구로 식별)
 _EXEMPTIONS = {
-    (
-        "src/broker/toss/adapter.py",
-        "raw.get('orderId', '')",
-    ): (
-        "토스 주문 정규화 경고(`금액 미확정`)가 응답 원본의 orderId 를 그대로 출력합니다. "
-        "이 PR 은 테스트 범위라 소스는 다른 레인에서 수정합니다 — 후속 PR 에서 mask_odno 적용 "
-        "(docs/odno-log-masking-followup.md)."
-    ),
 }
 
 
@@ -378,17 +370,9 @@ def test_guard_catches_temporarily_unmasked_adapter_line(tmp_path):
     assert "order_id" in violations[0]
 
 
-def test_remaining_exemptions_are_documented_and_still_present():
-    """남은 예외는 **이유와 함께** 등록되어 있어야 하고, 코드에서 사라지면 목록도 줄여야 합니다."""
-    assert _EXEMPTIONS, "예외가 없으면 이 테스트는 지워도 됩니다"
-    for (relpath, expression), reason in _EXEMPTIONS.items():
-        assert len(reason) > 20, f"{relpath}:{expression} 예외 사유가 부족합니다"
-        source = (ROOT / relpath).read_text(encoding="utf-8")
-        assert expression in source, (
-            f"예외로 남긴 식이 더 이상 코드에 없습니다 — 예외를 제거하세요: {relpath} {expression}"
-        )
-    # 예외는 1건(토스 정규화 경고)만 남습니다. 늘리려면 사유를 함께 기록하세요.
-    assert len(_EXEMPTIONS) == 1, sorted(_EXEMPTIONS)
+def test_no_remaining_exemptions():
+    """공개 출력의 원문 주문번호 예외는 0건이어야 합니다 (예외가 생기면 사유와 함께 등록)."""
+    assert _EXEMPTIONS == {}, sorted(_EXEMPTIONS)
 
 
 # ── 접수 알림의 원문(telegram_message)은 twin 마스킹과 함께만 존재 ─────

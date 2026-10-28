@@ -338,7 +338,7 @@ class TossBroker(Broker):
         # (수량을 0으로 바꾸면 보류 대상에서 사라져 워터마크 뒤로 밀린 체결이 영구 누락됩니다)
         if amount_unavailable:
             print(
-                f"[경고] 토스 주문 {raw.get('orderId', '')} 체결 {filled_qty}주 "
+                f"[경고] 토스 주문 {mask_odno(raw.get('orderId', ''))} 체결 {filled_qty}주 "
                 f"금액 미확정(filledAmount 없음) → 정산 보류 대상으로 전달합니다"
             )
 
