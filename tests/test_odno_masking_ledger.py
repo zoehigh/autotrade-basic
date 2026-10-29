@@ -204,3 +204,44 @@ def test_roundtrip_resolves_every_public_token(workspace, gnupg_home, tmp_path):
 
     # 4) 마스킹 모듈의 토큰과 검증기(독립 구현) 토큰이 같은 salt 에서 일치합니다
     assert log_mask.mask_odno(RAW_ODNO) == verify_run._independent_odno_hash(RAW_ODNO, state.log_salt_hex())
+
+
+def test_local_fallback_filename_is_unique_per_process(tmp_path):
+    """RUN_ID 없으면 프로세스마다 다른 원장 파일 — 연속 진단 덮어쓰기 방지."""
+    script = (
+        "import sys; sys.path.insert(0, %r); "
+        "import log_mask; "
+        "print(log_mask.mask_odno(sys.argv[1])); "
+        "print(log_mask.flush_odno_ledger())"
+    ) % str(ROOT / "src")
+    tokens = {}
+    for raw in ("first-order", "second-order"):
+        env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT / "src")}
+        proc = subprocess.run(
+            [sys.executable, "-c", script, raw],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        lines = proc.stdout.splitlines()
+        tokens[raw] = (lines[0], lines[-1])
+    files = sorted(tmp_path.glob("odno-map-local-*.jsonl"))
+    assert len(files) == 2, f"두 프로세스의 원장이 같은 파일에 덮어써졌습니다: {files}"
+    for raw, (token, path) in tokens.items():
+        # 서브프로세스가 출력한 상대경로는 그 프로세스의 CWD(tmp_path) 기준입니다.
+        rows = [json.loads(line) for line in (tmp_path / Path(path).name).read_text(encoding="utf-8").splitlines()]
+        assert rows and all(row["odno_raw"] == raw for row in rows)
+        assert rows[0]["token"] == token
+
+
+def test_same_process_flush_reuses_filename(tmp_path, ledger_masks, monkeypatch):
+    """같은 프로세스의 반복 flush는 같은 파일에 누적합니다."""
+    monkeypatch.delenv("RUN_ID", raising=False)
+    monkeypatch.chdir(tmp_path)
+    log_mask.mask_odno("aaa-order")
+    first = log_mask.flush_odno_ledger()
+    log_mask.mask_odno("bbb-order")
+    second = log_mask.flush_odno_ledger()
+    assert first == second and first is not None
+    assert len(list(tmp_path.glob("odno-map-*.jsonl"))) == 1
+    content = Path(first).read_text(encoding="utf-8")
+    assert "aaa-order" in content and "bbb-order" in content

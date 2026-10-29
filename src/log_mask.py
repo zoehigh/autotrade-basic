@@ -34,6 +34,13 @@ import re
 # 이번 실행의 마스킹 키. 프로세스마다 새로 만들어지며 파일로 저장하지 않습니다(비밀키 아님).
 _LOG_SALT = os.urandom(16)
 
+# RUN_ID 가 없을 때(로컬 실행) 프로세스마다 다른 원장 파일명을 쓰기 위한 태그.
+# 같은 프로세스의 여러 flush 는 같은 파일을 덮어써 누적하고, 다른 프로세스(다른 salt)의
+# 매핑은 지우지 않습니다. 진단 모드는 정산 근거를 남기지 않으므로, 로컬에서 진단을
+# 두 번 하면 첫 실행의 `odno-map-local.jsonl` 이 두 번째 실행에 지워져 복원이
+# 불가능해집니다 (O_TRUNC + 프로세스별 salt 상이). 파일명에만 쓰고 키로 쓰지 않습니다.
+_LOCAL_TAG = f"pid{os.getpid()}-{os.urandom(4).hex()}"
+
 # 이번 실행에서 마스킹한 (토큰 → 원문 주문번호). flush_odno_ledger() 로만 파일이 됩니다.
 _LEDGER = {}
 
@@ -81,9 +88,15 @@ def mask_odno(odno, salt_hex=None):
 
 
 def _ledger_run_id():
-    """Evidence 와 같은 실행 식별자(RUN_ID)를 파일명에 쓸 수 있게 정리합니다."""
+    """Evidence 와 같은 실행 식별자(RUN_ID)를 파일명에 쓸 수 있게 정리합니다.
+
+    RUN_ID 가 있으면 그대로 쓰고, 없으면(로컬 실행) 프로세스 고유 태그를 붙여
+    이전 로컬 실행의 원장을 덮어쓰지 않습니다 (`odno-map-local-pid…-….jsonl`).
+    """
     safe = _UNSAFE_FILENAME.sub("", (os.getenv("RUN_ID") or "").strip())
-    return safe or "local"
+    if safe:
+        return safe
+    return f"local-{_LOCAL_TAG}"
 
 
 def flush_odno_ledger(path=None):
