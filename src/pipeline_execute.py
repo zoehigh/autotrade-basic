@@ -797,10 +797,11 @@ def _execute_approved_plan(
                                 print(f"✓ 예약주문 접수 완료 (주문번호: {result.order_id})")
                                 message = f"""📋 예약주문 접수 {symbol}
 
-            {order['comment']}
-            수량: {order['quantity']}주
-            예약주문번호: {result.order_id}
-            접수일자: {result.order_time}"""
+{order['comment']}
+{tb._order_detail_lines(symbol, order)}
+예약주문번호: {result.order_id}
+예약접수일자: {result.order_time}
+접수 상태: 예약 접수 완료, 체결 여부 미확인"""
                                 tb.notify(message)
                             else:
                                 executed_orders.append({
@@ -809,12 +810,13 @@ def _execute_approved_plan(
                                     "order_time": result.order_time,
                                 })
                                 print("✓ 주문 성공")
-                                message = f"""✅ 주문 성공 {symbol}
+                                message = f"""✅ 주문 접수 완료 {symbol}
 
-            {order['comment']}
-            수량: {order['quantity']}주
-            주문번호: {result.order_id}
-            시각: {result.order_time}"""
+{order['comment']}
+{tb._order_detail_lines(symbol, order)}
+주문번호: {result.order_id}
+접수 시각: {result.order_time}
+접수 상태: 체결 여부 미확인"""
                                 tb.notify(message)
                         else:
                             if tb.TRADE_MODE == "LIVE":
