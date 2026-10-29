@@ -4,6 +4,7 @@
   (b) 개인 채팅이면 `telegram_message`(원문 주문번호 포함)가 전송되고, stdout 에는 남지 않는다.
   (c) 조용한 시간·전송 실패·재시도·예외 경로의 stdout/stderr 에 본문·주문번호·토큰·chat id·URL 이 없다.
   (d) 개인 채팅이 아니면(목록에 없음 / 환경변수 없음 / chat id 없음) 마스킹된 `message` 만 전송된다.
+  (e) 음수 chat id(그룹·채널·슈퍼그룹)는 allowlist·현재 chat id 어느 쪽이든 개인 채팅으로 인정되지 않는다.
 
 실제 텔레그램 API 는 호출하지 않습니다 — `telegram._TELEGRAM_SESSION.post` 를 대체합니다.
 """
@@ -93,6 +94,42 @@ def test_missing_chat_id_means_not_personal(monkeypatch, sent):
 
     notifier.notify(message, telegram_message=telegram_message)
     assert sent == [message] and RAW not in sent[0]
+
+
+# ── (d) 음수 chat id = 그룹/채널/슈퍼그룹 → 개인 아님 ────────────────
+def test_negative_allowlist_ids_are_ignored(monkeypatch, sent):
+    """allowlist 에 음수 id(그룹·채널·슈퍼그룹)만 있으면 개인 채팅으로 인정하지 않습니다."""
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", CHAT_ID)
+    monkeypatch.setenv("TELEGRAM_PERSONAL_CHAT_IDS", "-1001234567890,-9876543210")
+    monkeypatch.setenv("QUIET_HOURS", "false")
+    assert notifier._personal_chat_ids() == set()
+    message, telegram_message = _messages()
+
+    notifier.notify(message, telegram_message=telegram_message)
+    assert sent == [message], "음수 id 는 개인 채팅이 아니므로 마스킹 본문이 가야 합니다"
+    assert RAW not in sent[0] and log_mask.mask_odno(RAW) in sent[0]
+
+
+def test_negative_current_chat_id_is_masked_even_with_allowlist(monkeypatch, sent):
+    """현재 chat id 가 음수(그룹/채널)면 allowlist 에 같은 값이 있어도 마스킹 전송합니다."""
+    group_id = "-1001234567890"
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", group_id)
+    monkeypatch.setenv("TELEGRAM_PERSONAL_CHAT_IDS", f"{CHAT_ID},{group_id}")
+    monkeypatch.setenv("QUIET_HOURS", "false")
+    message, telegram_message = _messages()
+
+    assert notifier.is_personal_chat() is False
+    notifier.notify(message, telegram_message=telegram_message)
+    assert sent == [message]
+    assert RAW not in sent[0] and log_mask.mask_odno(RAW) in sent[0]
+
+
+def test_personal_chat_ids_keeps_only_positive_numbers(monkeypatch):
+    """빈 항목·음수·비숫자 항목은 버리고 양의 정수만 남깁니다."""
+    monkeypatch.setenv(
+        "TELEGRAM_PERSONAL_CHAT_IDS", "112233,,-100123,abc, 445566"
+    )
+    assert notifier._personal_chat_ids() == {"112233", "445566"}
 
 
 # ── (c) 조용한 시간: 본문을 출력하지 않는다 ──────────────────────────

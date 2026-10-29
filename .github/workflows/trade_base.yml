@@ -335,7 +335,14 @@ jobs:
           # GitHub Actions에서 Python 출력이 line-by-line으로 표시되도록 버퍼링 해제
           PYTHONUNBUFFERED: 1
 
-        run: uv run python trading_bot.py
+        run: |
+          # self-hosted runner 작업 디렉터리는 실행 간 재사용됩니다. 이전 실행이 남긴 주문번호 매핑
+          # 원장(odno-map-*.jsonl)은 아래 Evidence 단계의 `odno-map-*.jsonl` 글롭에 그대로 걸려
+          # **이번 실행의 암호화 Evidence 에 섞여** 업로드됩니다 (지난 실행 원문 주문번호가 이번
+          # 실행 근거로 둔갑). 봇을 실행하기 **전**에 지워 이번 실행이 만든 원장만 남깁니다.
+          # ⚠️ 봇 실행 **뒤**에는 절대 지우지 않습니다 — 그 시점의 원장이 이번 실행의 근거입니다.
+          rm -f odno-map-*.jsonl
+          uv run python trading_bot.py
 
       - name: 최종 정산 스냅샷 생성
         if: always()

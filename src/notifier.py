@@ -20,13 +20,22 @@ QUIET_HOURS 환경 변수로 이 기능을 켜고 끌 수 있습니다.
 마스킹한 `message`만 보냅니다. 대상이 개인 채팅인지 판정하는 근거는
 `TELEGRAM_PERSONAL_CHAT_IDS`(쉼표 구분 chat id 목록)뿐입니다.
 
-  TELEGRAM_PERSONAL_CHAT_IDS=123456789,-1001234567890
+  TELEGRAM_PERSONAL_CHAT_IDS=123456789
 
-판정할 수 없으면(환경변수 없음/비어 있음, 현재 chat id가 목록에 없음) **개인 아님**으로
-보고 보수적으로 마스킹된 `message`를 보냅니다.
+**chat id 부호 규칙**: 텔레그램 chat id 가 **음수**면 그룹·채널·슈퍼그룹입니다
+(개인 채팅은 항상 양수). 그래서 개인 채팅 allowlist 에 음수 id 가 섞여 있어도
+(오설정·복사 실수 등) 개인 채팅으로 인정하지 않습니다. 현재 `TELEGRAM_CHAT_ID` 도
+양수일 때만 개인 채팅으로 봅니다.
+
+  - `123456789`          → 개인 채팅 (양수)
+  - `-1001234567890`     → 그룹/채널/슈퍼그룹 (음수) → **개인 아님**
+
+판정할 수 없으면(환경변수 없음/비어 있음, 현재 chat id가 양수가 아님, 목록에 없음)
+**개인 아님**으로 보고 보수적으로 마스킹된 `message`를 보냅니다.
 """
 
 import os
+import re
 from datetime import datetime, timezone, timedelta
 
 from telegram import send_telegram
@@ -41,6 +50,10 @@ QUIET_END_HOUR = 8
 # 개인 채팅으로 취급할 chat id 목록 (쉼표 구분)
 PERSONAL_CHAT_IDS_ENV = "TELEGRAM_PERSONAL_CHAT_IDS"
 
+# 개인 채팅 chat id 형식: 0 으로 시작하지 않는 양의 정수.
+# 텔레그램에서 음수 chat id 는 그룹·채널·슈퍼그룹이므로 개인 채팅 allowlist 에서 제외합니다.
+_PERSONAL_CHAT_ID_RE = re.compile(r"[1-9][0-9]*")
+
 
 def _env_chat_id() -> str:
     """현재 알림을 받을 chat id를 반환합니다 (앞뒤 공백 제거, 없으면 빈 문자열)."""
@@ -48,16 +61,21 @@ def _env_chat_id() -> str:
 
 
 def _personal_chat_ids() -> set[str]:
-    """`TELEGRAM_PERSONAL_CHAT_IDS` 를 chat id 집합으로 파싱합니다.
+    """`TELEGRAM_PERSONAL_CHAT_IDS` 를 개인 채팅 chat id 집합으로 파싱합니다.
 
-    쉼표로 나누고 앞뒤 공백을 지운 뒤 빈 항목은 버립니다.
-    환경변수가 없거나 비어 있으면 빈 집합이 되어, 어떤 채팅도 개인 채팅이 아닙니다.
+    쉼표로 나누고 앞뒤 공백을 지운 뒤, **양의 정수 형식**(`^[1-9][0-9]*$`)만 남깁니다.
+    텔레그램 chat id 가 음수인 것은 그룹·채널·슈퍼그룹이므로 개인 채팅이 아닙니다.
+    따라서 음수·빈 항목·숫자가 아닌 항목은 모두 버립니다.
+
+    환경변수가 없거나 쓸 수 있는 항목이 없으면 빈 집합이 되어,
+    어떤 채팅도 개인 채팅이 아닙니다.
     """
     raw = os.getenv(PERSONAL_CHAT_IDS_ENV, "")
     chat_ids = set()
     for part in raw.split(","):
         chat_id = part.strip()
-        if chat_id:
+        # fullmatch: "112233abc" 처럼 일부만 숫자인 값도 개인 채팅으로 인정하지 않습니다.
+        if _PERSONAL_CHAT_ID_RE.fullmatch(chat_id):
             chat_ids.add(chat_id)
     return chat_ids
 
@@ -67,13 +85,17 @@ def is_personal_chat() -> bool:
 
     **판정 불가는 "개인 아님"으로 처리합니다** (주문번호 원문 노출을 막는 쪽이 안전).
       - `TELEGRAM_CHAT_ID` 가 없으면 → False
-      - `TELEGRAM_PERSONAL_CHAT_IDS` 가 목록에 없거나 비어 있으면 → False
+      - `TELEGRAM_CHAT_ID` 가 양의 정수가 아니면(음수 = 그룹·채널·슈퍼그룹) → False
+      - `TELEGRAM_CHAT_ID` 가 (양수만 남긴) 목록에 없거나 목록이 비어 있으면 → False
 
     Returns:
         bool: 개인 채팅이면 True, 그 외(공용 채널/판정 불가)는 False
     """
     chat_id = _env_chat_id()
     if not chat_id:
+        return False
+    # 음수 chat id 는 그룹·채널·슈퍼그룹입니다 — allowlist 에 잘못 들어 있어도 개인 아님.
+    if not _PERSONAL_CHAT_ID_RE.fullmatch(chat_id):
         return False
     return chat_id in _personal_chat_ids()
 
