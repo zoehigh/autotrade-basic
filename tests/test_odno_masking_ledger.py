@@ -245,3 +245,91 @@ def test_same_process_flush_reuses_filename(tmp_path, ledger_masks, monkeypatch)
     assert len(list(tmp_path.glob("odno-map-*.jsonl"))) == 1
     content = Path(first).read_text(encoding="utf-8")
     assert "aaa-order" in content and "bbb-order" in content
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 원자적 기록 — 실패해도 최종 경로에 부분 파일을 남기지 않는다
+# (임시 파일 → os.replace. 실패 시 임시 파일 제거 + 건수만 경고)
+# ═══════════════════════════════════════════════════════════════════
+def test_ledger_serialization_failure_leaves_no_partial_file(tmp_path, ledger_masks, monkeypatch, capsys):
+    """행 직렬화(json.dumps) 실패 → None, 최종 경로에 파일 없음, 임시 파일도 없음."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "odno-map-run42.jsonl"
+    log_mask.mask_odno(RAW_ODNO)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("fake serialization failure")
+
+    monkeypatch.setattr(log_mask.json, "dumps", boom)
+    assert log_mask.flush_odno_ledger(str(target)) is None
+
+    assert not target.exists(), "실패했는데 최종 경로에 원장 파일이 남았습니다"
+    assert [path.name for path in out.iterdir()] == [], "임시 파일이 정리되지 않았습니다"
+    printed = capsys.readouterr().out
+    assert RAW_ODNO not in printed, "실패 경고에 원문 주문번호가 남았습니다"
+    assert "원장 기록 실패" in printed and "1건" in printed
+
+
+def test_ledger_replace_failure_keeps_existing_file_intact(tmp_path, ledger_masks, monkeypatch, capsys):
+    """교체(os.replace) 실패 → 기존 원장 파일은 **잘리지 않고** 그대로 보존됩니다."""
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "odno-map-run42.jsonl"
+    target.write_text('{"token": "ord#previous"}\n', encoding="utf-8")
+    log_mask.mask_odno(RAW_ODNO)
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(log_mask.os, "replace", boom)
+    assert log_mask.flush_odno_ledger(str(target)) is None
+
+    assert target.read_text(encoding="utf-8") == '{"token": "ord#previous"}\n'
+    assert [path.name for path in out.iterdir()] == [target.name]
+    printed = capsys.readouterr().out
+    assert RAW_ODNO not in printed
+    assert "원장 기록 실패" in printed and "No space left on device" in printed
+
+
+def test_ledger_missing_directory_creates_nothing(tmp_path, ledger_masks, capsys):
+    """대상 디렉터리가 없으면 파일·디렉터리를 만들지 않고 None (건수만 경고)."""
+    log_mask.mask_odno(RAW_ODNO)
+    target = tmp_path / "missing" / "odno-map-run42.jsonl"
+
+    assert log_mask.flush_odno_ledger(str(target)) is None
+    assert not target.exists()
+    assert not target.parent.exists(), "실패 경로에서 디렉터리를 만들었습니다"
+    printed = capsys.readouterr().out
+    assert RAW_ODNO not in printed and "원장 기록 실패" in printed
+
+
+def test_ledger_success_is_byte_exact_and_leaves_no_temp_file(
+    tmp_path, ledger_masks, monkeypatch, capsys
+):
+    """성공 경로는 6필드 JSONL 그대로 + 0600 + 임시 파일 잔존 없음."""
+    monkeypatch.setenv("RUN_ID", "run42")
+    monkeypatch.setenv("RETRY_NUM", "0")
+    monkeypatch.setenv("BROKER", "kis")
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "odno-map-run42.jsonl"
+
+    token = log_mask.mask_odno(RAW_ODNO)
+    assert log_mask.flush_odno_ledger(str(target)) == str(target)
+
+    assert [path.name for path in out.iterdir()] == [target.name], "임시 파일이 남았습니다"
+    expected = json.dumps(
+        {
+            "run_id": "run42",
+            "retry_num": "0",
+            "broker": "kis",
+            "token": token,
+            "odno_raw": RAW_ODNO,
+            "odno_normalized": RAW_ODNO,
+        },
+        ensure_ascii=False,
+    ) + "\n"
+    assert target.read_text(encoding="utf-8") == expected
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert "원장 기록 실패" not in capsys.readouterr().out

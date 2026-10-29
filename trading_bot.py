@@ -67,7 +67,10 @@ STATE_SET_CYCLE_START_ONLY = os.getenv("STATE_SET_CYCLE_START_ONLY", "").strip()
 # **주문번호 참조만** 바꾸고 나머지 문구(수량·가격·사유)는 그대로 둡니다.
 _ODNO_REFERENCE = re.compile(
     r"(?P<label>(?:odno|ordno|주문\s*번호|예약\s*주문\s*번호|예약\s*번호)\s*[:=]?\s*)"
-    r"(?P<id>[0-9A-Za-z:_-]{4,})",
+    # 라벨이 붙은 값은 **최소 길이 제한을 두지 않습니다**. KIS 처럼 앞자리 0 을 떼면
+    # 주문번호가 `1`·`12` 같은 1~3자리가 되는데, `{4,}` 로 막으면 그 참조가 그대로
+    # 공개 로그에 남습니다 (`odno=1`, `주문번호: 123`).
+    r"(?P<id>[0-9A-Za-z:_-]+)",
     re.IGNORECASE,
 )
 

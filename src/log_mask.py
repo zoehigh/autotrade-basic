@@ -30,15 +30,17 @@ import hmac
 import json
 import os
 import re
+import tempfile
 
 # 이번 실행의 마스킹 키. 프로세스마다 새로 만들어지며 파일로 저장하지 않습니다(비밀키 아님).
 _LOG_SALT = os.urandom(16)
 
 # RUN_ID 가 없을 때(로컬 실행) 프로세스마다 다른 원장 파일명을 쓰기 위한 태그.
 # 같은 프로세스의 여러 flush 는 같은 파일을 덮어써 누적하고, 다른 프로세스(다른 salt)의
-# 매핑은 지우지 않습니다. 진단 모드는 정산 근거를 남기지 않으므로, 로컬에서 진단을
-# 두 번 하면 첫 실행의 `odno-map-local.jsonl` 이 두 번째 실행에 지워져 복원이
-# 불가능해집니다 (O_TRUNC + 프로세스별 salt 상이). 파일명에만 쓰고 키로 쓰지 않습니다.
+# 매핑은 지우지 않습니다. 진단 모드는 정산 근거를 남기지 않으므로, 태그가 없으면
+# 로컬에서 진단을 두 번 할 때 첫 실행의 `odno-map-local-<태그>.jsonl` 이 두 번째
+# 실행에 덮어써져 복원이 불가능해집니다 (프로세스별 salt 가 달라 토큰도 다름).
+# 태그는 파일명에만 쓰고 키로 쓰지 않습니다.
 _LOCAL_TAG = f"pid{os.getpid()}-{os.urandom(4).hex()}"
 
 # 이번 실행에서 마스킹한 (토큰 → 원문 주문번호). flush_odno_ledger() 로만 파일이 됩니다.
@@ -110,6 +112,10 @@ def flush_odno_ledger(path=None):
     `odno_normalized` 는 어댑터가 이미 정규화한 값을 **그대로** 씁니다
     (`YYYYMMDD:주문번호` 같은 합성 번호를 쪼개지 않습니다).
 
+    기록은 **임시 파일(0600) → `os.replace` 원자적 교체** 순서입니다. 어떤 이유로든
+    실패하면 임시 파일을 지우고 `None` 을 돌려주므로, 최종 경로에는 절대 부분 기록이
+    남지 않습니다 (실패 경고는 건수·사유만 — 원문 주문번호 없음).
+
     Parameters:
         path (str, optional): 저장 경로 (기본 `odno-map-<run_id>.jsonl`, 테스트용)
 
@@ -124,11 +130,14 @@ def flush_odno_ledger(path=None):
     broker = (os.getenv("BROKER") or "").strip()
     target = path or f"odno-map-{run_id}.jsonl"
     rows = len(_LEDGER)
+    # 최종 경로에 **부분 기록이 남지 않도록** 같은 디렉터리의 임시 파일에 먼저 쓰고
+    # `os.replace`(원자적 rename)로 마무리합니다. 중간에 실패하면 임시 파일만 지우고
+    # 종료하므로, 이전 실행이 남긴 원장이나 최종 경로의 기존 파일이 잘린 채로 남지 않습니다.
+    directory = os.path.dirname(os.path.abspath(target)) or "."
+    tmp_path = None
     try:
-        # 0600: self-hosted runner 의 다른 사용자가 원문 주문번호를 읽지 못하게 합니다.
-        # (umask 는 비트를 지우기만 하므로 0600 은 유지되지만, 기존 파일이 넓게
-        #  열려 있을 수 있어 chmod 로 한 번 더 고정합니다.)
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # mkstemp 는 파일을 0600 으로 만듭니다 (umask 영향 없음).
+        fd, tmp_path = tempfile.mkstemp(prefix=".odno-map-", suffix=".tmp", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             for token, odno_raw in _LEDGER.items():
                 handle.write(
@@ -145,12 +154,24 @@ def flush_odno_ledger(path=None):
                     )
                     + "\n"
                 )
-        os.chmod(target, 0o600)
-    except OSError as error:
+            handle.flush()
+            os.fsync(handle.fileno())
+        # 0600: self-hosted runner 의 다른 사용자가 원문 주문번호를 읽지 못하게 합니다.
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target)
+        tmp_path = None
+    except Exception as error:  # noqa: BLE001 — 실패 원인과 무관하게 부분 파일을 남기지 않습니다
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         # 실패 경고에는 **원문 주문번호를 쓰지 않습니다** (건수와 사유만).
+        # 예외 메시지에는 직렬화에 실패한 값이 섞일 수 있으므로 **타입 이름/strerror** 만 씁니다.
+        reason = getattr(error, "strerror", None) or type(error).__name__
         print(
             f"[경고] 주문번호 매핑 원장 기록 실패 ({rows}건, "
-            f"{error.strerror or 'unknown'}) — 공개 로그에는 원문을 남기지 않습니다"
+            f"{reason or 'unknown'}) — 공개 로그에는 원문을 남기지 않습니다"
         )
         return None
 
