@@ -751,6 +751,64 @@ def _reinference_hold_reasons(symbol, state):
     return [f"{symbol} {reason}" for reason in reasons]
 
 
+# ── 주문 접수 알림 표시 도우미 (표시 전용) ──────────────────────────────
+# 알림 본문 문구만 만듭니다. 브로커 호출·state 변경·주문은 하지 않으며,
+# 넘겨받은 `order` dict 를 절대 수정하지 않습니다.
+# 지정가(주문가가 확정된) 유형만 주문가·예상금액을 표시합니다.
+_PRICE_QUOTED_ORDER_TYPES = {"LIMIT", "LOC"}
+
+
+def _is_positive_number(value) -> bool:
+    """가격·수량으로 표시할 수 있는 유효한 양수인지 판정합니다 (bool·비유한수 제외)."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
+def _format_estimate_amount(amount: float) -> str:
+    """예상 주문금액 표기 — 1달러 미만 금액은 소수 4자리까지 유지합니다."""
+    if abs(amount) < 1:
+        return f"{amount:.4f}"
+    return f"{amount:,.2f}"
+
+
+def _order_detail_lines(symbol, order) -> str:
+    """주문 접수 알림의 공통 상세 줄을 만듭니다 (증권사/계좌 환경/종목/구분/유형/수량/주문가/예상금액).
+
+    - 주문가: 지정가 계열(LIMIT/LOC) + 유효한 양수 가격일 때만 원값 그대로 표시합니다
+      (`str()` 표기라 1달러 미만 4자리 정밀도가 유지됩니다).
+    - 그 외(시장가·가격 없음·0·숫자 아님)는 `가격 미확정(체결가 미정)` 으로만 표시하고
+      **예상금액 줄은 넣지 않습니다** (체결가를 알 수 없으므로 시장가로 단정하지 않습니다).
+    - 예상 주문금액 = 주문가 × 수량 (수수료 제외, 표시용 추정값).
+
+    표시 전용 — 네트워크 호출도, `order` dict 변경도 없습니다.
+    """
+    price = order.get("price")
+    order_type = str(order.get("order_type") or "")
+    quantity = order.get("quantity")
+    price_known = (
+        order_type.strip().upper() in _PRICE_QUOTED_ORDER_TYPES
+        and _is_positive_number(price)
+    )
+
+    lines = [
+        f"증권사: {BROKER}",
+        f"계좌 환경: {BROKER_MODE}",
+        f"종목: {symbol}",
+        f"매수/매도: {order.get('side')}",
+        f"주문 유형: {order_type}",
+        f"수량: {quantity}주",
+    ]
+    if not price_known:
+        lines.append("주문가: 가격 미확정(체결가 미정)")
+        return "\n".join(lines)
+
+    lines.append(f"주문가: ${price}")
+    if _is_positive_number(quantity):
+        lines.append(f"예상 주문금액(수수료 제외): ${_format_estimate_amount(price * quantity)}")
+    return "\n".join(lines)
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -1515,9 +1573,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                     telegram_message = f"""📋 예약주문 접수 {symbol}
 
 {order['comment']}
-수량: {order['quantity']}주
+{_order_detail_lines(symbol, order)}
 예약주문번호: {result.order_id}
-접수일자: {result.order_time}"""
+예약접수일자: {result.order_time}
+접수 상태: 예약 접수 완료, 체결 여부 미확인"""
                     message = _mask_token_in(telegram_message, result.order_id)
                     notify(message, telegram_message=telegram_message)
                 else:
@@ -1527,12 +1586,13 @@ def run_one_symbol(broker: Broker, symbol_config):
                         "order_time": result.order_time,
                     })
                     print("✓ 주문 성공")
-                    telegram_message = f"""✅ 주문 성공 {symbol}
+                    telegram_message = f"""✅ 주문 접수 완료 {symbol}
 
 {order['comment']}
-수량: {order['quantity']}주
+{_order_detail_lines(symbol, order)}
 주문번호: {result.order_id}
-시각: {result.order_time}"""
+접수 시각: {result.order_time}
+접수 상태: 체결 여부 미확인"""
                     message = _mask_token_in(telegram_message, result.order_id)
                     notify(message, telegram_message=telegram_message)
             else:
