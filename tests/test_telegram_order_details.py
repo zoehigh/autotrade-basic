@@ -256,7 +256,7 @@ def test_estimated_amount_is_price_times_quantity(monkeypatch, tmp_path):
     run = _run(monkeypatch, tmp_path, orders=[_order(price=12.5, quantity=4)])
     body = _body(run)
     assert "수량: 4주" in body
-    assert "예상 주문금액: $50.00" in body
+    assert "예상 주문금액(수수료 제외): $50.00" in body
 
 
 # ── (5) 가격 경계값 ──────────────────────────────────────────────────
@@ -275,7 +275,7 @@ def test_sub_dollar_price_keeps_four_decimals(monkeypatch, tmp_path):
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LOC", price=0.9945, quantity=3)])
     body = _body(run)
     assert "주문가: $0.9945" in body, "1달러 미만 주문가가 반올림/절단되면 안 됩니다"
-    assert "예상 주문금액: $2.98" in body
+    assert "예상 주문금액(수수료 제외): $2.98" in body
 
 
 # ── (7) 일반 접수 vs 예약 접수 ────────────────────────────────────────
@@ -403,7 +403,11 @@ def test_notification_does_not_change_order_or_fence_state(monkeypatch, tmp_path
 # ── 정적 계약: 상세 줄 도우미는 주문번호를 만들지 않습니다 ─────────────
 def test_detail_lines_helper_has_no_order_id():
     """`_order_detail_lines()` 는 표시 문구만 만들고 주문번호를 담지 않습니다."""
-    lines = trading_bot._order_detail_lines("TQQQ", _order(price=0.9945))
+    order = _order(price=0.9945)
+    before = deepcopy(order)
+    lines = trading_bot._order_detail_lines("TQQQ", order)
     assert "주문번호" not in lines
     assert "예약주문번호" not in lines
     assert lines.count("\n") == 7  # 증권사/계좌/종목/구분/유형/수량/주문가/예상금액
+    # 도우미에 직접 넘긴 dict 도 변하지 않습니다 (run 경로의 deepcopy 를 우회하는 검증).
+    assert order == before

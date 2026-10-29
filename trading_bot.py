@@ -805,7 +805,7 @@ def _order_detail_lines(symbol, order) -> str:
 
     lines.append(f"주문가: ${price}")
     if _is_positive_number(quantity):
-        lines.append(f"예상 주문금액: ${_format_estimate_amount(price * quantity)}")
+        lines.append(f"예상 주문금액(수수료 제외): ${_format_estimate_amount(price * quantity)}")
     return "\n".join(lines)
 
 
