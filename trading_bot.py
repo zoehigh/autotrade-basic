@@ -2759,24 +2759,24 @@ def _dispatch_repair():
 def _run_mode_dispatch():
     """진단·복구 전용 모드를 실행합니다 (브로커 생성 없음).
 
-    호출부가 `try/finally` 로 원장 finalization 을 보장하므로, 이 안의
-    early-return·`sys.exit(1)`·예외 경로에서도 마스킹 토큰 매핑이 유실되지 않습니다.
-    일반 실행(DRY/LIVE)은 아무 분기도 타지 않고 그대로 반환합니다.
+    Returns:
+        bool: 전용 모드가 실행을 처리했으면 True (호출자는 원장 확정 후 종료),
+              일반 실행(DRY/LIVE)이 계속되어야 하면 False.
     """
     if TRADE_MODE == "REPAIR":
         _dispatch_repair()
-        return
+        return True
 
     if STATE_DIAGNOSTIC_ONLY:
         _print_state_diagnostic()
-        return
+        return True
 
     if STATE_REPAIR_ONLY:
         _repair_state_only()
-        return
+        return True
     if STATE_CLEAR_FENCE_ONLY:
         _clear_fence_only()
-        return
+        return True
 
     # 리버스 주문 감사/체결 반영/reverse net_invested 복구는 서로 동시에 설정할 수 없습니다.
     _exclusive_modes = {
@@ -2793,19 +2793,20 @@ def _run_mode_dispatch():
         )
     if STATE_REVERSE_AUDIT_ONLY:
         _reverse_audit_only()
-        return
+        return True
     if STATE_REVERSE_RECONCILE_ONLY:
         _reverse_reconcile_only()
-        return
+        return True
     if STATE_NET_INVESTED_REPAIR_ONLY:
         _net_invested_repair_only()
-        return
+        return True
     if STATE_ASSUME_REVERSE_EXPIRY_ONLY:
         _assume_reverse_expiry_only()
-        return
+        return True
     if STATE_SET_CYCLE_START_ONLY:
         _set_cycle_start_only()
-        return
+        return True
+    return False
 
 
 def main():
@@ -2822,12 +2823,17 @@ def main():
     # REPAIR 체크를 레거시 STATE_*_ONLY보다 먼저 수행해 REPAIR 모드의 단일 액션
     # 불변식을 항상 강제합니다.
     # 진단·복구 전용 모드는 브로커 생성 없이 여기서 끝나며, 공개 로그에 마스킹
-    # 토큰을 남길 수 있습니다. 원장 finalization 이 모든 경로에서 실행되도록
-    # try/finally 로 감쌉니다 (브로커 생성 여부와 무관, 비어 있으면 no-op, 1회만).
+    # 토큰을 남길 수 있습니다. 전용 모드가 처리했으면 원장을 확정하고 main()도
+    # 종료합니다 (계속 진행하면 읽기 전용 진단 뒤에 실주문이 나갈 수 있음).
+    # flush 는 once-flag 을 세우지 않는 원시 호출이라, 일반 실행이 뒤이어
+    # 종료 시점에 남기는 전체 원장에 영향을 주지 않습니다 (덮어쓰기 구조).
+    # 또한 raise·sys.exit 경로에서도 finally 가 동작해 부분 매핑을 남깁니다.
     try:
-        _run_mode_dispatch()
+        _dispatch_handled = _run_mode_dispatch()
     finally:
-        _flush_odno_ledger_once()
+        flush_odno_ledger()
+    if _dispatch_handled:
+        return
 
     # 전체 T 재추정은 주문을 절대 발생시키지 않아야 합니다.
     # 브로커 생성 전 config와 이 모듈의 모드를 함께 DRY로 고정합니다.
