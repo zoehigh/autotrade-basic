@@ -202,3 +202,33 @@ def test_telegram_timeout_logs_no_body(monkeypatch, capsys):
         assert RAW not in stream and BODY_MARKER not in stream
         assert BOT_TOKEN not in stream
     assert "시간 초과" in out.out
+
+
+# ── 접수 twin: 라벨 있는 주문번호 필드만 치환 ────────────────────────
+def test_mask_token_in_replaces_only_labeled_order_number_field():
+    """주문번호가 수량·가격·시각과 겹쳐도 라벨 필드만 마스킹합니다 (KIS trim `1` 대비)."""
+    import trading_bot
+
+    token = log_mask.mask_odno("1")
+    telegram_message = (
+        "✅ 주문 성공 TQQQ\n\n매수 1주\n수량: 1주\n주문번호: 1\n"
+        "시각: 2026-10-21 01:10:41\n금액: $11.01"
+    )
+    message = trading_bot._mask_token_in(telegram_message, "1")
+
+    assert f"주문번호: {token}" in message
+    assert "수량: 1주" in message and "매수 1주" in message
+    assert "01:10:41" in message and "$11.01" in message
+    assert "주문번호: 1\n" not in message
+
+
+def test_mask_token_in_prefers_reservation_label():
+    """`예약주문번호:`가 `주문번호:` 부분일치로 이중 치환되지 않습니다."""
+    import trading_bot
+
+    token = log_mask.mask_odno("0000077777")
+    telegram_message = f"📋 예약주문 접수 TQQQ\n\n예약주문번호: 0000077777\n수량: 2주"
+    message = trading_bot._mask_token_in(telegram_message, "0000077777")
+
+    assert f"예약주문번호: {token}" in message
+    assert "0000077777" not in message

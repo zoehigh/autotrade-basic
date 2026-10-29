@@ -1459,7 +1459,7 @@ class MeritzBroker(Broker):
         self._submitted_orders.pop(odno, None)
 
         print(
-            f"[메리츠] 주문 정정 성공: {mask_odno(f'{odno} → {new_odno}')} "
+            f"[메리츠] 주문 정정 성공: {mask_odno(odno)} → {mask_odno(new_odno)} "
             f"({side} {quantity}주 ${send_price}, {order_type}→{cls_code})"
         )
         return new_odno

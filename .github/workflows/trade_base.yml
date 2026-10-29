@@ -272,6 +272,8 @@ jobs:
           # 텔레그램 (environment에서 주입 — 브로커+모드별로 다른 채널 가능)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 개인 채팅 주문번호 원문 표시용 allowlist (쉼표 구분 chat id, 미설정 시 마스킹 전송)
+          TELEGRAM_PERSONAL_CHAT_IDS: ${{ vars.TELEGRAM_PERSONAL_CHAT_IDS || '' }}
 
           # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}

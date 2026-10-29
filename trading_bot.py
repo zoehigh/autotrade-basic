@@ -97,11 +97,21 @@ def _mask_odno_references(text):
 
 
 def _mask_token_in(text, odno):
-    """텍스트 안의 주문번호 원문을 같은 가명 토큰으로 치환합니다 (문구·줄바꿈은 그대로)."""
+    """접수 알림 twin 메시지의 **라벨 있는 주문번호 필드만** 가명 토큰으로 치환합니다.
+
+    `str.replace(odno)` 같은 무제한 치환은 주문번호가 수량·가격·시각과 겹칠 때
+    그 값까지 망가뜨립니다 (예: KIS는 앞자리 0을 떼므로 주문번호 `1`이 `수량: 1주`를
+    오염시킴). `예약주문번호:`·`주문번호:` 라벨이 붙은 자리만 바꿉니다 (긴 라벨 우선).
+    """
     if not text or not odno:
         return text
 
-    return str(text).replace(str(odno), mask_odno(odno))
+    token = mask_odno(odno)
+    raw = str(odno)
+    masked = str(text)
+    for label in ("예약주문번호", "주문번호"):
+        masked = masked.replace(f"{label}: {raw}", f"{label}: {token}")
+    return masked
 
 
 def _safe_error_text(error, limit=120):
