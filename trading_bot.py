@@ -759,10 +759,10 @@ _PRICE_QUOTED_ORDER_TYPES = {"LIMIT", "LOC"}
 
 
 def _is_positive_number(value) -> bool:
-    """가격·수량으로 표시할 수 있는 유효한 양수인지 판정합니다 (bool 은 제외)."""
+    """가격·수량으로 표시할 수 있는 유효한 양수인지 판정합니다 (bool·비유한수 제외)."""
     if isinstance(value, bool):
         return False
-    return isinstance(value, (int, float)) and value > 0
+    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
 
 
 def _format_estimate_amount(amount: float) -> str:

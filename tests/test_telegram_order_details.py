@@ -260,7 +260,7 @@ def test_estimated_amount_is_price_times_quantity(monkeypatch, tmp_path):
 
 
 # ── (5) 가격 경계값 ──────────────────────────────────────────────────
-@pytest.mark.parametrize("price", [None, 0, 0.0, -3.0, "12.5", True])
+@pytest.mark.parametrize("price", [None, 0, 0.0, -3.0, "12.5", True, float("inf"), float("-inf"), float("nan")])
 def test_unknown_price_omits_estimate(monkeypatch, tmp_path, price):
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LIMIT", price=price)])
     body = _body(run)
