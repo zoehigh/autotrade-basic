@@ -80,19 +80,34 @@ _ODNO_REFERENCE = re.compile(
 _SYNTHETIC_ODNO_REFERENCE = re.compile(r"(?<![\dA-Za-z:])(?P<id>\d{8}:\d+)(?![\dA-Za-z:])")
 
 
+def _mask_one_reference(match):
+    """`_ODNO_REFERENCE` 매치 하나를 마스킹합니다 (멱등).
+
+    이미 마스킹된 토큰(`odno=ord#…`)이 다시 들어오면 손대지 않고 돌려줍니다.
+    `ord` 뒤에 `#`이 오거나 값이 `ord#…`으로 시작하면 기존 토큰이므로,
+    `mask_odno("ord")` 같은 엉뚱한 토큰을 만들지 않습니다 (원장 대조 깨짐 방지).
+    """
+    label = match.group("label")
+    oid = match.group("id")
+    lowered = oid.lower()
+    if lowered.startswith("ord#"):
+        return match.group(0)
+    if lowered == "ord" and match.string[match.end():match.end() + 1] == "#":
+        return match.group(0)
+    return label + mask_odno(oid)
+
+
 def _mask_odno_references(text):
     """자유 텍스트(브로커 에러 사유 등)에서 주문번호 참조만 마스킹합니다.
 
     라벨이 붙은 참조(`odno=…`, `주문번호: …`)와 라벨 없는 합성번호(`YYYYMMDD:NNNN`)를
     같은 가명 토큰으로 바꿉니다. 수량·가격·사유 같은 나머지 진단 정보는 그대로 둡니다.
+    이미 마스킹된 텍스트에 다시 걸어도 토큰이 바뀌지 않습니다 (멱등).
     """
     if not text:
         return text
 
-    masked = _ODNO_REFERENCE.sub(
-        lambda match: match.group("label") + mask_odno(match.group("id")),
-        str(text),
-    )
+    masked = _ODNO_REFERENCE.sub(_mask_one_reference, str(text))
     return _SYNTHETIC_ODNO_REFERENCE.sub(
         lambda match: mask_odno(match.group("id")),
         masked,

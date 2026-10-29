@@ -113,3 +113,31 @@ def test_mask_token_in_still_masks_only_labeled_field():
     text = "매수 1주\n수량: 1주\n주문번호: 1\n금액: $11.01"
     masked = trading_bot._mask_token_in(text, "1")
     assert masked == f"매수 1주\n수량: 1주\n주문번호: {mask_odno('1')}\n금액: $11.01"
+
+
+# ── 멱등: 이미 마스킹된 토큰은 그대로 ──────────────────────────────
+def test_already_masked_token_is_preserved():
+    """`odno=ord#…`를 다시 마스킹해도 토큰이 바뀌지 않습니다 (이중 마스킹 방지)."""
+    import trading_bot
+
+    token = mask_odno("0000039445")
+    text = f"취소 실패: odno={token} (잔량 확인 불가)"
+    assert trading_bot._mask_odno_references(text) == text
+
+
+def test_masking_is_idempotent_on_error_text():
+    """정리된 에러를 요약 단계에서 다시 처리해도 결과가 같습니다."""
+    import trading_bot
+
+    once = trading_bot._mask_odno_references("미접수 확정: odno=0000039445, 수량 7주")
+    twice = trading_bot._mask_odno_references(once)
+    assert twice == once
+    assert "0000039445" not in twice
+
+
+def test_empty_marker_token_is_preserved():
+    """`ord#-`(빈 값 표식)는 마스킹 대상이 아닙니다."""
+    import trading_bot
+
+    text = "last_processed_ordno=ord#-"
+    assert trading_bot._mask_odno_references(text) == text
