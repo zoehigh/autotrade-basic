@@ -33,6 +33,52 @@ on:
         required: false
         type: string
 
+      # ── 단계형 라이프사이클 (SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY) ──
+      # RUN_PHASE 없는 LIVE 는 봇이 브로커 생성 전에 차단(fail-closed)하므로 Actions 는
+      # 반드시 단계를 지정해야 합니다.
+      # 기본값은 **LIFECYCLE** 입니다 — 한 job 안에서 SETTLE → PREVIEW → APPROVE → EXECUTE 를
+      # **연속 실행**하므로 PREVIEW 산출물(plans/*.json)이 같은 러너 작업 디렉터리에 남아
+      # APPROVE/EXECUTE 가 그대로 이어집니다 (산출물은 job 밖으로 넘기지 않습니다).
+      # 운영 계좌(real)의 LIVE 는 dispatch payload 에 "reviewed":"true" 표식을 명시해야
+      # 통과합니다 (사람 검토 표식, trade_base.yml 실행 전 게이트). LIFECYCLE 은 사람 개입 없이
+      # 자동 승인·실행이므로, 운영 계좌에서는 이 표식이 곧 "운영자 승인 선언"입니다.
+      # SETTLE/PREVIEW/APPROVE/EXECUTE/VERIFY 단독 실행은 **작업 디렉터리가 남는 환경**
+      # (self-hosted runner)이나 로컬(.state.json·plans/·approvals/ 보유) 진단용입니다.
+      # GitHub hosted(fresh) 러너에서 단독 실행하면 앞 단계 산출물이 없어 fail-closed 로
+      # 실패합니다 — 캐시로는 `.state.json` 만 복원되므로 EXECUTE/VERIFY 가 필요로 하는
+      # settlement-*.json(정산 근거)이 없습니다 (근거 없는 실행을 허용하지 않기 위함).
+      # 아침 dispatch 는 프리장 개장까지 최대 7.5시간을 대기해 hosted 러너 6시간 제한을
+      # 넘기므로, LIFECYCLE/EXECUTE 는 **저녁(KST 17시 이후) dispatch** 로 실행하세요.
+      # VERIFY(정산 근거 독립 검산)는 이 워크플로의 verify-settlement job 이 담당합니다.
+      run_phase:
+        description: '실행 단계 (기본: LIFECYCLE — 한 job 연속 실행. 실주문은 LIVE + reviewed=true, 저녁 실행)'
+        required: false
+        type: choice
+        default: LIFECYCLE
+        options:
+          - LIFECYCLE
+          - SETTLE
+          - PREVIEW
+          - APPROVE
+          - EXECUTE
+          - VERIFY
+      plan_id:
+        description: 'APPROVE 대상 plan_id (PREVIEW 로그에서 복사, 쉼표로 다중 지정) — LIFECYCLE 은 불필요'
+        required: false
+        type: string
+      approval_plan_id:
+        description: 'EXECUTE/VERIFY 대상 plan_id (승인 파일 기준, 쉼표로 다중 지정) — LIFECYCLE 은 불필요'
+        required: false
+        type: string
+      auto_execute:
+        description: 'PREVIEW 직후 자동 승인·실행 (opt-in, true/false — LIFECYCLE 은 미사용)'
+        required: false
+        type: string
+      reviewed:
+        description: '사람 검토 표식 — 운영 계좌(real)의 LIVE LIFECYCLE/EXECUTE/AUTO_EXECUTE 에 "true" 필수'
+        required: false
+        type: string
+
 jobs:
   trade_toss_real:
     uses: ./.github/workflows/trade_base.yml
@@ -43,5 +89,12 @@ jobs:
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
       run_id: ${{ github.event.inputs.run_id || github.event.client_payload.run_id || '' }}
       retry_num: ${{ github.event.inputs.retry_num || github.event.client_payload.retry_num || '' }}
+      # 단계형 라이프사이클 — dispatch payload 로도 단계/대상을 지정할 수 있습니다.
+      run_phase: ${{ github.event.inputs.run_phase || github.event.client_payload.run_phase || 'LIFECYCLE' }}
+      plan_id: ${{ github.event.inputs.plan_id || github.event.client_payload.plan_id || '' }}
+      approval_plan_id: ${{ github.event.inputs.approval_plan_id || github.event.client_payload.approval_plan_id || '' }}
+      auto_execute: ${{ github.event.inputs.auto_execute || github.event.client_payload.auto_execute || '' }}
+      # 사람 검토 표식 — real LIVE 주문 경로(LIFECYCLE/EXECUTE/AUTO_EXECUTE)에 필수.
+      reviewed: ${{ github.event.inputs.reviewed || github.event.client_payload.reviewed || '' }}
 
     secrets: inherit

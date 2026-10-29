@@ -91,3 +91,108 @@
 # VERIFY 종료코드: 0=정상(executed), 1=실행 실패/검증 실패, 2=승인만 되고 미실행.
 # run_daily.sh 는 LIVE 에서 exit 2 를 **실행 실패(exit 1)와 다른 문구**로 알립니다
 # (exit 2 = 승인만 됨, 운영자 확인 필요 / exit 1 = 주문·검증 실패, 긴급).
+
+# ── GitHub Actions (repository_dispatch) 는 같은 5단계를 워크플로 안에서 수행합니다 ──
+# .github/workflows/trade_base.yml 이 run_phase 입력으로 단계를 받습니다
+# (RUN_PHASE 없는 LIVE 는 봇이 브로커 생성 전에 차단하므로 Actions 는 단계 지정이 필수).
+#
+#   run_phase 의 **기본값은 real/demo 모두 LIFECYCLE** 입니다 — 한 job 안에서
+#   SETTLE → PREVIEW → APPROVE → EXECUTE 를 연속 실행하므로 PREVIEW 산출물이 같은 러너
+#   작업 디렉터리에 남아 APPROVE/EXECUTE 가 그대로 이어집니다 (산출물은 job 밖으로 안 넘어감).
+#     - real(운영 계좌): 기본 LIFECYCLE 이지만 **LIVE 주문에는 reviewed=true 표식이 필수** 입니다
+#       (아래 "사람 검토 표식"). 아침 dispatch 는 대기 시간 게이트에 걸리므로 실제 주문은 저녁 실행.
+#     - demo(모의 계좌): 기본 LIFECYCLE, reviewed 표식 불필요.
+#
+#   run_phase=LIFECYCLE: 한 job 안에서 SETTLE → PREVIEW → APPROVE → EXECUTE 를 순서대로
+#     실행합니다. 승인 파일은 PREVIEW 산출물에서 자동으로 이어지지만, 봇의 승인 게이트
+#     (plan_hash·세션·상태해시 바인딩, 허용오차, TTL)를 통과해야만 주문이 나갑니다.
+#     VERIFY(정산 근거 독립 검산)는 같은 워크플로의 verify-settlement job 이 담당합니다.
+#   run_phase=SETTLE|PREVIEW|APPROVE|EXECUTE|VERIFY: 단일 단계만 실행 (진단·수동 확인용).
+#     ⚠️ **앞 단계 산출물이 디스크에 남아 있어야** 동작합니다. 그래서 다음 환경 전용입니다:
+#        · self-hosted runner (작업 디렉터리가 실행 간 재사용됨), 또는
+#        · 로컬 (.state.json·plans/·approvals/ 가 있는 작업 디렉터리)
+#     ⚠️ self-hosted 에서도 `actions/checkout` 기본값(clean: true)은 `git clean -ffdx` 로
+#        **gitignore 산출물**(plans/, approvals/, settlement-*.json, odno-map-*.jsonl)을 지워
+#        체인을 끊습니다. 그래서 워크플로는 **단독 단계일 때만 `clean: false`** 로 산출물을
+#        보존하고(첫 단계 '실행 단계 정규화' 가 run_phase 를 보고 판정), LIFECYCLE·레거시는
+#        clean: true 입니다 (이전 실행 산출물이 이번 자동 체인에 섞이지 않도록).
+#        → 단독 단계는 **같은 self-hosted 러너의 같은 작업 디렉터리**에서 앞 단계를 먼저
+#          실행했을 때만 이어집니다. 러너/디렉터리가 바뀌면 앞 단계부터 다시 실행하세요.
+#     GitHub hosted(fresh) 러너는 매 실행이 새 디렉터리이고 캐시로 `.state.json` 만 복원하므로
+#     plans//approvals/, settlement-*.json 이 없습니다. 그래서 hosted 단독 실행은 **봇 실행
+#     전에 fail-closed 로 중단**합니다 ('실행 시간 예산 검증' 단계: 근거 없는 실행·검증을
+#     조용히 통과시키지 않습니다). 산출물을 job artifact 로 넘기는 방식은 정산 근거·주문번호
+#     원장의 **평문 원문 주문번호**를 artifact storage 에 올려야 해서 채택하지 않았습니다
+#     (Evidence 는 gpg 암호화본만 업로드한다는 기존 원칙과 충돌).
+#     hosted 의 정식 경로는 LIFECYCLE + 같은 워크플로의 verify-settlement 입니다.
+#     사람이 승인하는 정식 경로는 이 파일의 cron 5단계(수동 APPROVE, 작업 디렉터리 유지)입니다.
+#     ⚠️ 알려진 한계 — 산출물이 작업 디렉터리에 **누적**됩니다: 보존된 이전 실행의
+#        settlement-*.json 이 Evidence 에 함께 암호화되어 올라가고, verify-settlement job 은
+#        그 실행(run_id) 기준으로 검증하므로 **단독 단계 dispatch 의 검증 job 은 실패로 보일 수
+#        있습니다** (검증 기준 실행은 LIFECYCLE). 정산 검증까지 통과해야 하는 실행은
+#        LIFECYCLE 로 돌리세요.
+#   run_phase 를 비우면 레거시 단일 실행입니다 (DRY 미리보기 전용 — LIVE 는 봇이 차단).
+#
+# ── ⚠️ 사람 검토 표식 (운영 계좌 real 전용) ──
+#   LIFECYCLE 은 사람 개입 없이 계획을 자동 승인·자동 실행합니다. 그래서 운영 계좌(real)의
+#   **LIVE 주문 경로**(run_phase=LIFECYCLE, run_phase=EXECUTE, PREVIEW+AUTO_EXECUTE=true)는
+#   dispatch payload 에 "reviewed":"true" 표식을 **명시해야** 실행됩니다. 없으면 봇을 실행하지
+#   않고 중단합니다 (브로커 호출·주문·state 변경 없음).
+#     {"event_type":"trigger_trade_kis_real",
+#      "client_payload":{"run_phase":"LIFECYCLE","trade_mode":"LIVE","reviewed":"true"}}
+#   즉 "기계적 승인 게이트(plan_hash·세션·TTL)는 통과했고, 운영자가 이 실행을 승인했다" 는
+#   두 번째 서명입니다. 없으면 주문이 나가지 않습니다.
+#   demo(모의 계좌)는 표식이 필요하지 않습니다.
+#
+# ── ⚠️ 실행 시각 (hosted 러너 6시간 제한) ──
+#   EXECUTE 는 프리장 개장(KST 17시/18시) **전이면 그때까지 대기**합니다. 아침 dispatch
+#   (예: KST 10시)는 최대 7.5시간을 기다려 GitHub hosted 러너의 6시간 제한을 넘고, 그러면
+#   job 이 강제 종료되어 **Evidence 업로드·정산 검증이 실행되지 않습니다**.
+#   그래서 워크플로는 대기 예상치가 상한(기본 4시간, vars.LIFECYCLE_MAX_WAIT_SECONDS)을
+#   넘으면 **실행 전에 fail-closed 로 중단**하고 아래와 같이 안내합니다:
+#     - 아침(KST 오전): run_phase=PREVIEW (정산이 필요하면 run_phase=SETTLE) — 계획만 생성
+#       ⚠️ hosted 러너의 아침 PREVIEW 산출물은 저녁 실행으로 **이어지지 않습니다** (런이 끝나면
+#          작업 디렉터리가 사라짐). 아침 PREVIEW 는 "계획 미리보기(로그 확인)" 목적입니다.
+#          계획 → 승인 → 실행을 실제로 이어가려면 LIFECYCLE 을 **저녁**에 한 번 실행하세요.
+#     - 저녁(KST 17시 이후): run_phase=LIFECYCLE (real 은 reviewed=true 동반) — 대기 없이 실행
+#       (기본값이 LIFECYCLE 이므로, 아침에 LIVE 로 dispatch 하면 위 대기 시간 게이트에서
+#        중단됩니다. 아침에는 trade_mode=DRY 또는 run_phase=PREVIEW 를 쓰세요.)
+#   self-hosted 러너(키움/토스 real)는 6시간 제한이 없어 이 게이트를 받지 않습니다.
+#   타임아웃은 **2단계**입니다 (사후 단계가 반드시 실행되도록):
+#     · 봇 실행 스텝: step-level `timeout-minutes` (= job timeout − 최소 10분)
+#       — 만료되면 그 스텝만 중단되고 always() 사후 단계(정산 스냅샷·state 캐시 저장·
+#         Evidence 암호화/업로드)가 **계속 실행**됩니다.
+#       기본값: hosted 340 / self-hosted 710. vars.BOT_STEP_TIMEOUT_MINUTES 로 조정 가능하며,
+#       job timeout 보다 10분 이상 짧아야 합니다 (넘으면 자동으로 job−10 으로 조정 + 경고).
+#     · job: `timeout-minutes` 는 그보다 **긴 최후 안전망**입니다. job timeout 이 만료되면
+#       실행 중 스텝과 이후 스텝이 모두 종료되어 사후 단계가 실행되지 않으므로, 실제 방어선은
+#       위 봇 스텝 타임아웃입니다. hosted 기본 350분(vars.JOB_TIMEOUT_MINUTES),
+#       self-hosted(키움/토스 real) 기본 720분(vars.SELF_HOSTED_JOB_TIMEOUT_MINUTES).
+#   세 var 모두 **양의 정수 문자열**만 유효합니다. 봇 스텝/job 값이 정수가 아니면 기본값 +
+#   ::warning:: 으로 대체되고, job timeout 이 10분 이하이면 사후 예산을 만들 수 없어 봇 실행
+#   전에 중단합니다 (job-level 값은 fromJSON 이라 정수가 아니면 잡이 시작 전에 실패 = fail-closed).
+#
+# ── ⚠️ Actions 는 cron 과 같은 시각대를 쓰세요 ──
+#   위 cron 예시(5 10 SETTLE / 15 10 PREVIEW / 20 18 APPROVE / 30 18 EXECUTE / 45 18 VERIFY)
+#   가 정합 기준입니다. Actions 로 옮길 때도 **아침 = SETTLE/PREVIEW**, **저녁 = EXECUTE/VERIFY**
+#   로 나누면 hosted 제한과 승인 TTL(기본 9시간) 안에 들어옵니다.
+#   (repository_dispatch 스케줄러는 이 저장소가 아니라 외부 cron/GitHub schedule 쪽에서
+#    돌리므로, 스케줄 자체를 이 워크플로에 넣지 않습니다 — AGENTS.md 참고.)
+#
+# ── ⚠️ Actions 의 비밀값 배선 ──
+#   ACCOUNT_FINGERPRINT_SECRET 은 **워크플로가 선언·export** 합니다
+#   (.github/workflows/trade_base.yml secrets + 봇 실행 스텝 env). 없으면 LIVE 승인/실행이
+#   fail-closed 로 중단되므로, environment({broker}-{mode}) 비밀값으로 등록하세요.
+#   계좌번호가 없는 브로커(메리츠)는 vars.MERITZ_ACCOUNT_BINDING(또는 BROKER_ACCOUNT_BINDING)
+#   도 함께 등록해야 합니다. 값은 로그에 출력하지 않습니다 (자동 마스킹).
+#
+#   ⚠️ SETTLE 이 보류를 반환하면(애프터아워 미종료·정산 미확정·휴장일 등) SETTLE 단계가
+#      실패로 끝나 체인이 중단됩니다 (fail-closed: 정산 미확정 상태로 주문하지 않음).
+#   ⚠️ 담당자 검토를 반드시 거치려면 이 파일의 cron 5단계(수동 APPROVE)를 쓰세요.
+#      dispatch payload 로도 단계를 지정할 수 있습니다:
+#      · 미리보기만 (아침, 주문 없음)
+#        {"event_type":"trigger_trade_kis_real","client_payload":{"run_phase":"PREVIEW","trade_mode":"DRY"}}
+#      · 실제 주문 (저녁, 사람 검토 표식 포함 — run_phase 는 기본값 LIFECYCLE 이므로 생략 가능)
+#        {"event_type":"trigger_trade_kis_real",
+#         "client_payload":{"run_phase":"LIFECYCLE","trade_mode":"LIVE","reviewed":"true"}}
+

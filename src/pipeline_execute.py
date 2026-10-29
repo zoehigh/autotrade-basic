@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from state import FILL_MARKER_VERSION
+from state import FILL_MARKER_VERSION, mask_odno
 
 from pipeline import (
     _approval_lock,
@@ -50,6 +50,9 @@ def _wait_until_pre_market(tb, now=None):
     EXECUTE 는 승인 검증/선점/전송 **전에** 대기해야 합니다. 대기 후 시세·체결이
     바뀌었을 수 있으므로 모든 게이트(승인/세션/만료/fence/재정산/계획 재계산/
     매도<=보유)를 대기 **뒤에** 다시 실행합니다.
+
+    호출은 `execute_approved_plan()` 이 **전역 실행 잠금을 잡기 전에** 합니다
+    (대기 중 다른 실행이 `.run.lock` 에 막히지 않도록).
 
     Returns:
         datetime | None: 재검증 기준 시각. None 이면 실제 현재 시각을 사용합니다.
@@ -404,33 +407,73 @@ def _assert_execute_phase_allowed():
     )
 
 
+def _precheck_approval_before_wait(approval_or_id, approvals_dir=None):
+    """프리장 대기 **전** 예비 검증 — 없는/이미 소비된 승인을 즉시 걸러냅니다.
+
+    대기는 최대 ~7.5시간입니다. 승인 파일이 없거나 이미 사용/실행된 승인인데도
+    대기부터 하면 몇 시간 뒤에야 실패하므로, 잠금 밖에서 **읽기 전용**으로
+    먼저 확인합니다. 여기서는 어떤 부수효과도 만들지 않으며(승인 소비/기록 없음),
+    대기 후 잠금 안에서 정식 검증(만료·해시·세션·blockers)을 다시 수행합니다.
+    """
+    approval = (
+        approval_or_id
+        if isinstance(approval_or_id, dict)
+        else load_approval(approval_or_id, approvals_dir)
+    )
+    path = str(approval.get("_path") or "")
+    if not path:
+        raise ValueError("승인 파일 경로가 없어 단일 사용 처리를 할 수 없습니다.")
+    blockers = approval_execution_blockers(path, approval)
+    if blockers:
+        raise RuntimeError(
+            "이미 사용/실행된 승인입니다 — 재실행할 수 없습니다: "
+            + " / ".join(blockers)
+        )
+
+
 def execute_approved_plan(
     broker, approval_or_id, approvals_dir=None, now=None, refresh=True,
     state_override=None,
 ):
-    """EXECUTE 진입점 — 전역 실행 잠금 안에서 승인 계획을 실행합니다."""
+    """EXECUTE 진입점 — 프리장 대기는 **잠금 밖**, 검증·선점·전송은 잠금 안.
+
+    프리장 대기는 최대 ~7.5시간입니다. 잠금을 잡은 채 자면 그동안 다른
+    프로세스의 SETTLE/APPROVE/EXECUTE 가 전부 막히므로, 대기를 잠금 획득
+    **전에** 끝내고 재검증·선점·전송만 전역 실행 잠금 안에서 수행합니다.
+    """
     # 승인 로드/잠금/브로커 호출 전에 검사합니다 (승인은 소비되지 않습니다).
     _assert_execute_phase_allowed()
     _assert_refresh_allowed(refresh)
+    # 대기 전 예비 검증: 없는 승인/이미 사용된 승인이면 수 시간을 기다리지 않고
+    # 즉시 실패합니다 (읽기 전용 — 대기 후 잠금 안에서 정식 재검증을 유지).
+    _precheck_approval_before_wait(approval_or_id, approvals_dir)
+    # 대기 중 다른 프로세스가 이 승인을 먼저 선점(consumed=true)하거나 state 를
+    # 바꿀 수 있으므로, 잠금 안에서 디스크 승인/state 를 다시 읽어 blockers
+    # 재검증 + claim 경합으로 걸러냅니다 (게이트 순서는 대기 전과 동일).
+    effective_now = _wait_until_pre_market(_tb(), now)
     with global_lock():
         return _execute_approved_plan(
             broker,
             approval_or_id,
             approvals_dir=approvals_dir,
-            now=now,
+            now=effective_now,
             refresh=refresh,
             state_override=state_override,
+            pre_market_waited=True,
         )
 
 
 def _execute_approved_plan(
     broker, approval_or_id, approvals_dir=None, now=None, refresh=True,
-    state_override=None,
+    state_override=None, pre_market_waited=False,
 ):
     """승인 파일을 검증·새로고침·취소확정한 뒤 1회 실행합니다.
 
     `refresh=False` 는 DRY 전용 escape hatch 이며, LIVE 에서는 진입 즉시
     거부됩니다 (`_assert_refresh_allowed`).
+
+    `pre_market_waited=True` 는 호출자(`execute_approved_plan`)가 프리장 대기를
+    **잠금 밖에서 이미** 마쳤다는 뜻입니다 — 여기서 다시 대기하지 않습니다.
 
     순서:
       1) 승인 파일 로드 + state 재로드 + hash/session/expiry/broker 바인딩 검증
@@ -466,7 +509,13 @@ def _execute_approved_plan(
     # ── 0.5) 프리장 대기 → **대기 후** 전체 게이트 재실행 ─────────────
     # 대기 전에 검증/재조회/전송을 하면 대기 중 바뀐 시세·체결을 반영하지 못합니다.
     # (대기 후에는 추가 대기 없이 검증→선점→전송→주문을 연속 수행합니다.)
-    effective_now = _wait_until_pre_market(tb, now)
+    # 공개 진입점은 이 대기를 전역 실행 잠금 **밖에서** 마치고 들어옵니다
+    # (pre_market_waited=True) — 잠금을 잡은 채 자면 다른 실행이 전부 막힙니다.
+    # 이 함수를 직접 호출하는 경로(방어용)만 여기서 대기합니다.
+    if pre_market_waited:
+        effective_now = now
+    else:
+        effective_now = _wait_until_pre_market(tb, now)
     # 대기 중 다른 프로세스가 승인을 선점/변경했을 수 있으므로 디스크에서 다시 읽습니다.
     approval = load_approval(path)
 
@@ -653,7 +702,8 @@ def _execute_approved_plan(
                 print("\n[Step 4] 주문 실행 중...")
                 print("-" * 60)
 
-                # 프리장 대기는 execute_approved_plan() 진입 시 **이미** 끝냈습니다.
+                # 프리장 대기는 execute_approved_plan() 진입 시(잠금 밖에서)
+                # **이미** 끝냈습니다.
                 # (대기 후 전체 게이트를 다시 통과한 뒤 선점/전송하므로 여기서 또
                 #  기다리면 검증과 주문 사이에 다시 시차가 생깁니다.)
                 order_exchange_code = broker.exchange_code(exchange)
@@ -773,9 +823,16 @@ def _execute_approved_plan(
                                         order_meta[key] = float(order[key])
                                 reverse_mode["active"] = True
                                 reverse_mode["cycle_id"] = cycle_id
-                                reverse_mode["last_planned_session"] = tb.datetime.now(
-                                    ZoneInfo("America/New_York")
-                                ).date().isoformat()
+                                # 중복방지 기준은 **실행 세션**입니다 (전략의
+                                # `_reverse_guard_session` 과 같은 기준). KST 새벽/아침
+                                # 실행에서는 ET 벽시계 날짜가 실행 세션보다 하루 이르므로
+                                # 벽시계로 기록하면 다음 실행이 같은 세션을 중복 제출합니다.
+                                reverse_mode["last_planned_session"] = (
+                                    str(plan.session or "").strip()
+                                    or tb.datetime.now(
+                                        ZoneInfo("America/New_York")
+                                    ).date().isoformat()
+                                )
                             tb.register_order_meta_in_state(state, result.order_id, order_meta)
                             state["pending_order_intent"] = None
                             if tb.TRADE_MODE == "LIVE":
@@ -794,15 +851,26 @@ def _execute_approved_plan(
                                     "order_id": result.order_id,
                                     "order_time": result.order_time,
                                 })
-                                print(f"✓ 예약주문 접수 완료 (주문번호: {result.order_id})")
-                                message = f"""📋 예약주문 접수 {symbol}
+                                print(f"✓ 예약주문 접수 완료 (주문번호: {mask_odno(result.order_id)})")
+                                # 텔레그램 본문은 주문번호 원문을 유지하고(비공개 채널),
+                                # 일반 알림/공개 로그용 message 는 같은 문구에서 번호만 가명 토큰으로 바꿉니다.
+                                telegram_message = f"""📋 예약주문 접수 {symbol}
 
 {order['comment']}
 {tb._order_detail_lines(symbol, order)}
 예약주문번호: {result.order_id}
 예약접수일자: {result.order_time}
 접수 상태: 예약 접수 완료, 체결 여부 미확인"""
-                                tb.notify(message)
+                                message = tb._mask_token_in(telegram_message, result.order_id)
+                                try:
+                                    tb.notify(message, telegram_message=telegram_message)
+                                except Exception as notify_error:
+                                    # 알림은 표시 전용입니다 — 발송 실패가 접수 결과(성공/실패 집계)를
+                                    # 바꾸면 안 되므로 기록만 남깁니다.
+                                    print(
+                                        f"  ⚠️ 접수 알림 발송 실패: "
+                                        f"{tb._safe_error_text(notify_error)}"
+                                    )
                             else:
                                 executed_orders.append({
                                     "comment": order["comment"],
@@ -810,14 +878,23 @@ def _execute_approved_plan(
                                     "order_time": result.order_time,
                                 })
                                 print("✓ 주문 성공")
-                                message = f"""✅ 주문 접수 완료 {symbol}
+                                telegram_message = f"""✅ 주문 접수 완료 {symbol}
 
 {order['comment']}
 {tb._order_detail_lines(symbol, order)}
 주문번호: {result.order_id}
 접수 시각: {result.order_time}
 접수 상태: 체결 여부 미확인"""
-                                tb.notify(message)
+                                message = tb._mask_token_in(telegram_message, result.order_id)
+                                try:
+                                    tb.notify(message, telegram_message=telegram_message)
+                                except Exception as notify_error:
+                                    # 알림은 표시 전용입니다 — 발송 실패가 접수 결과(성공/실패 집계)를
+                                    # 바꾸면 안 되므로 기록만 남깁니다.
+                                    print(
+                                        f"  ⚠️ 접수 알림 발송 실패: "
+                                        f"{tb._safe_error_text(notify_error)}"
+                                    )
                         else:
                             if tb.TRADE_MODE == "LIVE":
                                 raise tb.SymbolScopedError(
@@ -919,13 +996,13 @@ def _execute_approved_plan(
                 if executed_orders:
                     print("\n[성공한 주문]")
                     for order in executed_orders:
-                        print(f"  ✓ {order['comment']}: 주문번호 {order['order_id']} (시각: {order['order_time']})")
+                        print(f"  ✓ {order['comment']}: 주문번호 {mask_odno(order['order_id'])} (시각: {order['order_time']})")
 
                 if reserved_orders:
                     print("\n[예약 주문] - 다음 정규장 시작 시 체결됩니다")
                     for order in reserved_orders:
                         print(
-                            f"  📋 {order['comment']}: 예약번호 {order['order_id']} "
+                            f"  📋 {order['comment']}: 예약번호 {mask_odno(order['order_id'])} "
                             f"(접수일자: {order['order_time']})"
                         )
 

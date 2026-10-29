@@ -181,14 +181,28 @@ def _get_reverse_star_point(symbol, last_price, close_prices):
     return last_price
 
 
+def _reverse_guard_session(session_date=None):
+    """리버스 중복방지 기준 세션(미국 영업일)을 결정합니다.
+
+    파이프라인은 **실행 대상 세션**(`SettledState.session`)을 넘깁니다. KST 아침
+    PREVIEW 시점에는 ET 벽시계가 아직 전일이라, 벽시계로 비교하면 진행 중인
+    리버스를 "이미 이 세션 실행됨"으로 오판해 0건으로 건너뜁니다.
+    `session_date` 를 못 받으면(구 호출부) 기존처럼 ET 오늘로 폴백합니다.
+    """
+    text = str(session_date or "").strip()
+    if text:
+        return text
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
 def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                          position_qty, avg_price, orderable_cash, last_price,
-                         state):
+                         state, session_date=None):
     rev = state.get("reverse_mode", {})
     if rev.get("reconciliation_error") or rev.get("reconciliation_only"):
         print(f"[리버스모드] {symbol} 상태 reconciliation 확인 필요 → 신규 주문을 생성하지 않습니다.")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
-    session_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    session_date = _reverse_guard_session(session_date)
     if rev.get("last_planned_session") == session_date:
         print(f"[리버스모드] {symbol} 이미 {session_date} 실행됨 → 중복 주문을 생성하지 않습니다.")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
@@ -307,7 +321,7 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     return {"orders": orders, "new_T": new_T, "exit": False, "reverse_day": day_count}
 
 
-def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3, state=None):
+def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3, state=None, session_date=None):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -332,6 +346,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         seed (float): 이 종목에 투입할 최대 금액 (달러). 필수.
         T (float): 현재까지의 누적 매수 횟수 (state.py에서 로드)
         additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 3)
+        session_date (str): 주문 대상 미국 영업일(YYYY-MM-DD). 리버스모드
+            중복방지 판정 기준입니다. 미지정 시 ET 오늘로 폴백합니다.
 
     Returns:
         dict: 전략 결과
@@ -482,6 +498,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 broker, symbol, exchange_code, splits, symbol_type,
                 position_qty, avg_price, orderable_cash, last_price,
                 state,
+                session_date=session_date,
             )
             new_T = rev_result["new_T"]
             rev_orders = rev_result["orders"]

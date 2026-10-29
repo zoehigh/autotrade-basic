@@ -1,9 +1,11 @@
 """텔레그램 **주문 접수 상세 알림** 회귀 테스트 (mock 전용 — 실 텔레그램/실 주문 없음).
 
-`trading_bot.run_one_symbol()` 의 주문 접수 알림은 표시 전용입니다. 이 파일은 그 **본문**이
-증권사 / 계좌 환경 / 종목 / 매수·매도 / 주문 유형 / 수량 / 주문가 / 예상 주문금액 /
-주문번호 / 접수 시각 / 접수 상태를 담는지, 그리고 아래 불변식을 고정합니다:
+주문 접수 알림은 파이프라인 EXECUTE 단계(`src/pipeline_execute.py`)에서만 나갑니다.
+예전 `trading_bot.run_one_symbol()` 내부 seam 은 제거되었으므로(P0: 주문 루프 우회 경로
+금지), 이 파일은 **실제 승인 파일을 만들어 `execute_approved_plan()` 을 통과**시키는
+`tests/pipeline_flow.py` 헬퍼로 실행합니다 (evidence mock 대신 실제 커밋 근거 사용).
 
+고정하는 계약:
   (1) 6개 브로커 id + demo/real 계좌 환경 표시
   (2) BUY / SELL 구분 표시
   (3) LIMIT / LOC / MARKET 유형별 가격 표시 (시장가를 "시장가"로 단정하지 않음)
@@ -13,7 +15,7 @@
   (7) 일반 접수 / 예약 접수 상태 문구 구분
   (8) 개인 채팅은 원문 주문번호, (9) 그룹·채널은 가명(`ord#`) 주문번호
   (10) stdout(공개 로그)에는 원문 주문번호가 남지 않음
-  (11) DRY(place_order → None)는 접수 완료 알림을 보내지 않음
+  (11) DRY 는 승인 실행 단계 자체가 거부되어 접수 알림이 나가지 않음
   (12) 동작 불변 — order dict 미변경, place_order 인자·state fence 저장 순서 불변
 
 정적 가드(`tests/test_odno_log_masking.py`)는 그대로 유지하며, 여기서는
@@ -27,13 +29,15 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "src"))
+for _path in (ROOT, ROOT / "src", ROOT / "tests"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 import log_mask  # noqa: E402
 import notifier  # noqa: E402
+import pipeline_flow  # noqa: E402
 import trading_bot  # noqa: E402
-from broker.base import OrderResult  # noqa: E402
+from broker.base import Balance, OrderResult, PurchaseAmount  # noqa: E402
 
 RAW = "0000039445"
 BOT_TOKEN = "123456:FAKE-BOT-TOKEN"
@@ -43,11 +47,14 @@ GROUP_ID = "-1001234567890"
 BROKER_IDS = ["kis", "kiwoom", "ls", "toss", "nhplug", "meritz"]
 
 
-class _FakeBroker:
+class _StubBroker:
     """조회 API 만 흉내내는 브로커 스텁 — 주문은 `place_order` 가 정해진 결과만 돌려줍니다."""
 
-    def __init__(self, result):
+    supports_open_orders_query = False
+
+    def __init__(self, result, balance_qty=0):
         self.result = result
+        self.balance_qty = balance_qty
         self.order_calls = []
 
     # 시장 정보
@@ -58,11 +65,17 @@ class _FakeBroker:
         return "NASD"
 
     # 조회 API
-    def get_order_history(self, symbol, exchange, days=30, verbose=False, limit=100):
+    def get_order_history(self, symbol, exchange, days=30):
         return []
 
     def get_balance(self, symbol, exchange):
-        return SimpleNamespace(quantity=0, avg_price=0.0)
+        return Balance(
+            quantity=self.balance_qty,
+            avg_price=50.0 if self.balance_qty else 0.0,
+        )
+
+    def get_purchase_amount(self, symbol, exchange):
+        return PurchaseAmount(orderable_cash=1000.0)
 
     # 주문 API — 실제 주문은 절대 나가지 않습니다.
     def place_order(self, symbol, exchange, side, quantity, price, order_type):
@@ -92,6 +105,40 @@ def _order(**overrides):
     return order
 
 
+def _symbol_config():
+    return {
+        "symbol": "TQQQ",
+        "exchange": "NAS",
+        "splits": 40,
+        "symbol_type": "TQQQ",
+        "seed": 10000.0,
+        "additional_loc_levels": 3,
+    }
+
+
+def _state():
+    """EXECUTE 재검증을 통과하는 최소 state (정산 근거/세션은 헬퍼가 채웁니다)."""
+    return {
+        "T": 0.0,
+        "last_updated": "2026-10-20T11:14:03+00:00",
+        "cycle_start_date": "",
+        "effective_seed": 0.0,
+        "net_invested": 0.0,
+        "net_invested_status": "valid",
+        "last_processed_ordno": "",
+        "additional_loc_odno": [],
+        "orders_meta": {},
+        "balance_mismatch": {},
+        "state_version": "v2",
+        "close_prices": [],
+        "reverse_mode": {},
+        "pending_order_intent": None,
+        "pending_order_batch": None,
+        "position_qty": None,
+        "sell_t_effects": {},
+    }
+
+
 def _run(
     monkeypatch,
     tmp_path,
@@ -102,8 +149,10 @@ def _run(
     broker_id="kis",
     broker_mode="real",
     real_notify=False,
+    refresh=True,
+    balance_qty=0,
 ):
-    """`run_one_symbol()` 을 mock 환경에서 1회 실행하고 관찰값을 돌려줍니다.
+    """승인 파일을 만들고 `execute_approved_plan()` 을 1회 실행하고 관찰값을 돌려줍니다.
 
     주문 외부 호출(텔레그램 전송·브로커 API·state 파일)은 모두 대체됩니다.
     `real_notify=True` 면 실제 `notifier.notify()`(채널 분리 로직)를 쓰고
@@ -112,6 +161,23 @@ def _run(
     sent = []
     saved = []
     sleeps = []
+    state = _state()
+    approved_orders = [dict(order) for order in orders]
+    # 승인 계획과 실행 직전 재계산 계획이 같아지도록 전략도 같은 주문을 냅니다.
+    strategy_orders = [dict(order) for order in orders]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RUN_ID", "run-telegram-details")
+    monkeypatch.setenv("RUN_PHASE", "EXECUTE")
+    monkeypatch.setenv("RUN_LOCK_PATH", str(tmp_path / ".run.lock"))
+    monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+    monkeypatch.delenv("RUN_LOCK_FD", raising=False)
+    monkeypatch.setenv("APPROVALS_DIR", str(tmp_path / "approvals"))
+    monkeypatch.setenv("PLAN_DIR", str(tmp_path / "plans"))
+    # LIVE 승인 바인딩(계좌 지문/바인딩 라벨)용 테스트 값 — 실제 계좌번호는 쓰지 않습니다.
+    monkeypatch.setenv("ACCOUNT_FINGERPRINT_SECRET", "test-fingerprint-secret")
+    monkeypatch.setenv("BROKER_ACCOUNT_BINDING", "test-account-binding")
+    monkeypatch.setenv("QUIET_HOURS", "false")
     # real+LIVE 는 프리장 오픈까지 대기합니다 — 테스트에서는 실제로 자지 않고 기록만 합니다.
     monkeypatch.setattr(trading_bot.time, "sleep", lambda seconds: sleeps.append(seconds))
 
@@ -130,14 +196,15 @@ def _run(
 
         monkeypatch.setattr(trading_bot, "notify", fake_notify)
 
-    state = {
-        "T": 0.0,
-        "net_invested": 100.0,
-        "net_invested_status": "valid",
-        "last_updated": "",
-        "orders_meta": {},
-        "cycle_start_date": "",
-    }
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", trade_mode)
+    monkeypatch.setattr(trading_bot, "BROKER", broker_id)
+    monkeypatch.setattr(trading_bot, "BROKER_MODE", broker_mode)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+    monkeypatch.setattr(trading_bot, "load_state", lambda symbol: deepcopy(state))
+    monkeypatch.setattr(
+        trading_bot, "save_state", lambda symbol, snapshot: saved.append(deepcopy(snapshot))
+    )
+
     strategy_result = {
         "last_price": 50.0,
         "position_qty": 0,
@@ -145,55 +212,38 @@ def _run(
         "orderable_cash": 1000.0,
         "star_point": 40.0,
         "T": 0.0,
-        "orders": orders,
+        "orders": strategy_orders,
         "reverse_exit": False,
         "price_cap_notes": [],
     }
-
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", trade_mode)
-    monkeypatch.setattr(trading_bot, "BROKER", broker_id)
-    monkeypatch.setattr(trading_bot, "BROKER_MODE", broker_mode)
-    monkeypatch.setattr(trading_bot, "load_state", lambda symbol: deepcopy(state))
-    monkeypatch.setattr(
-        trading_bot, "save_state", lambda symbol, snapshot: saved.append(deepcopy(snapshot))
-    )
-    monkeypatch.setattr(
-        trading_bot,
-        "update_T_from_history",
-        lambda symbol, st, history, balance_qty=None: st,
-    )
-    monkeypatch.setattr(
-        trading_bot, "build_settlement_evidence", lambda *args, **kwargs: {"mode": trade_mode}
-    )
-    monkeypatch.setattr(trading_bot, "_save_settlement_state", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        trading_bot,
-        "compute_position_from_history",
-        lambda *args, **kwargs: {"net_qty": 0, "avg_price": 0.0},
-    )
     monkeypatch.setattr(
         trading_bot, "무한매수법_V4", lambda broker, **kwargs: deepcopy(strategy_result)
     )
-    # 정산 근거 파일(settlement-*.json)이 저장소에 남지 않도록 임시 디렉터리에서 실행합니다.
-    monkeypatch.chdir(tmp_path)
 
-    broker = _FakeBroker(result)
-    summary = trading_bot.run_one_symbol(
-        broker,
-        {
-            "symbol": "TQQQ",
-            "exchange": "NAS",
-            "splits": 40,
-            "symbol_type": "TQQQ",
-            "seed": 10000.0,
-            "additional_loc_levels": 3,
-        },
-    )
+    broker = _StubBroker(result, balance_qty=balance_qty)
+    error = None
+    summary = None
+    approval_path = None
+    try:
+        summary, approval_path, _plan = pipeline_flow.run_approved(
+            tmp_path,
+            broker,
+            state,
+            approved_orders,
+            balance_qty=balance_qty,
+            refresh=refresh,
+        )
+    except RuntimeError as caught:
+        error = caught
+
     return SimpleNamespace(
         sent=sent,
         saved=saved,
         broker=broker,
         summary=summary,
+        error=error,
+        approval_path=approval_path,
+        state=state,
         orders=orders,
         sleeps=sleeps,
     )
@@ -219,6 +269,7 @@ def test_broker_id_and_account_env_are_shown(monkeypatch, tmp_path, broker_id):
             broker_id=broker_id,
             broker_mode=broker_mode,
         )
+        assert run.error is None, run.error
         body = _body(run)
         assert f"증권사: {broker_id}" in body
         assert f"계좌 환경: {broker_mode}" in body
@@ -227,7 +278,14 @@ def test_broker_id_and_account_env_are_shown(monkeypatch, tmp_path, broker_id):
 # ── (2) 매수 / 매도 ──────────────────────────────────────────────────
 @pytest.mark.parametrize("side", ["BUY", "SELL"])
 def test_side_is_shown(monkeypatch, tmp_path, side):
-    run = _run(monkeypatch, tmp_path, orders=[_order(side=side)])
+    # 매도는 보유수량 게이트(매도 합계 <= 잔고)를 통과해야 실행 경로에 도달합니다.
+    run = _run(
+        monkeypatch,
+        tmp_path,
+        orders=[_order(side=side)],
+        balance_qty=3 if side == "SELL" else 0,
+    )
+    assert run.error is None, run.error
     assert f"매수/매도: {side}" in _body(run)
 
 
@@ -235,6 +293,7 @@ def test_side_is_shown(monkeypatch, tmp_path, side):
 @pytest.mark.parametrize("order_type", ["LIMIT", "LOC"])
 def test_price_quoted_types_show_price(monkeypatch, tmp_path, order_type):
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type=order_type, price=12.5)])
+    assert run.error is None, run.error
     body = _body(run)
     assert f"주문 유형: {order_type}" in body
     assert "주문가: $12.5" in body
@@ -244,6 +303,7 @@ def test_price_quoted_types_show_price(monkeypatch, tmp_path, order_type):
 def test_market_order_is_not_labelled_as_fixed_price(monkeypatch, tmp_path):
     """MARKET 은 체결가를 알 수 없으므로 '시장가'로 단정하지 않고 금액도 추정하지 않습니다."""
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="MARKET", price=12.5)])
+    assert run.error is None, run.error
     body = _body(run)
     assert "주문 유형: MARKET" in body
     assert "가격 미확정(체결가 미정)" in body
@@ -254,6 +314,7 @@ def test_market_order_is_not_labelled_as_fixed_price(monkeypatch, tmp_path):
 # ── (4) 예상 주문금액 ────────────────────────────────────────────────
 def test_estimated_amount_is_price_times_quantity(monkeypatch, tmp_path):
     run = _run(monkeypatch, tmp_path, orders=[_order(price=12.5, quantity=4)])
+    assert run.error is None, run.error
     body = _body(run)
     assert "수량: 4주" in body
     assert "예상 주문금액(수수료 제외): $50.00" in body
@@ -263,6 +324,7 @@ def test_estimated_amount_is_price_times_quantity(monkeypatch, tmp_path):
 @pytest.mark.parametrize("price", [None, 0, 0.0, -3.0, "12.5", True, float("inf"), float("-inf"), float("nan")])
 def test_unknown_price_omits_estimate(monkeypatch, tmp_path, price):
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LIMIT", price=price)])
+    assert run.error is None, run.error
     body = _body(run)
     assert "가격 미확정(체결가 미정)" in body
     assert "주문가: $" not in body
@@ -273,6 +335,7 @@ def test_unknown_price_omits_estimate(monkeypatch, tmp_path, price):
 # ── (6) 1달러 미만 정밀도 ────────────────────────────────────────────
 def test_sub_dollar_price_keeps_four_decimals(monkeypatch, tmp_path):
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LOC", price=0.9945, quantity=3)])
+    assert run.error is None, run.error
     body = _body(run)
     assert "주문가: $0.9945" in body, "1달러 미만 주문가가 반올림/절단되면 안 됩니다"
     assert "예상 주문금액(수수료 제외): $2.98" in body
@@ -281,6 +344,7 @@ def test_sub_dollar_price_keeps_four_decimals(monkeypatch, tmp_path):
 # ── (7) 일반 접수 vs 예약 접수 ────────────────────────────────────────
 def test_normal_order_status_text(monkeypatch, tmp_path):
     run = _run(monkeypatch, tmp_path, orders=[_order()])
+    assert run.error is None, run.error
     body = _body(run)
     assert body.startswith("✅ 주문 접수 완료 TQQQ")
     assert f"주문번호: {RAW}" in body
@@ -299,6 +363,7 @@ def test_reservation_order_status_text(monkeypatch, tmp_path):
             order_id=RAW, order_time="2026-10-30", is_reservation=True
         ),
     )
+    assert run.error is None, run.error
     body = _body(run)
     assert body.startswith("📋 예약주문 접수 TQQQ")
     assert f"예약주문번호: {RAW}" in body
@@ -313,6 +378,7 @@ def test_reservation_order_status_text(monkeypatch, tmp_path):
 def test_body_has_single_labelled_order_id_line(monkeypatch, tmp_path):
     """원문 주문번호는 라벨 줄 1곳에만 등장해야 합니다 (마스킹 twin 이 정확히 동작하도록)."""
     run = _run(monkeypatch, tmp_path, orders=[_order()])
+    assert run.error is None, run.error
     body = _body(run)
     assert body.count(RAW) == 1
     assert run.sent[0]["message"].count(RAW) == 0
@@ -326,6 +392,7 @@ def test_personal_chat_gets_raw_order_id(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("QUIET_HOURS", "false")
 
     run = _run(monkeypatch, tmp_path, orders=[_order()], real_notify=True)
+    assert run.error is None, run.error
     assert len(run.sent) == 1
     assert RAW in run.sent[0], "개인 채팅에는 원문 주문번호가 담긴 본문이 가야 합니다"
     out = capsys.readouterr()
@@ -340,6 +407,7 @@ def test_group_channel_gets_masked_order_id(monkeypatch, tmp_path):
     monkeypatch.setenv("QUIET_HOURS", "false")
 
     run = _run(monkeypatch, tmp_path, orders=[_order()], real_notify=True)
+    assert run.error is None, run.error
     assert len(run.sent) == 1
     assert RAW not in run.sent[0], "공용 채널에는 원문 주문번호가 가면 안 됩니다"
     assert log_mask.mask_odno(RAW) in run.sent[0]
@@ -348,6 +416,7 @@ def test_group_channel_gets_masked_order_id(monkeypatch, tmp_path):
 # ── (10) stdout 에는 원문 주문번호가 없음 ────────────────────────────
 def test_stdout_keeps_order_id_masked(monkeypatch, tmp_path, capsys):
     run = _run(monkeypatch, tmp_path, orders=[_order()])
+    assert run.error is None, run.error
     out = capsys.readouterr()
     for stream in (out.out, out.err):
         assert RAW not in stream, "공개 로그에 원문 주문번호가 남았습니다"
@@ -358,10 +427,19 @@ def test_stdout_keeps_order_id_masked(monkeypatch, tmp_path, capsys):
 
 # ── (11) DRY 는 접수 완료 알림을 보내지 않음 ─────────────────────────
 def test_dry_mode_sends_no_completion_alert(monkeypatch, tmp_path):
-    """DRY 는 `place_order()` 가 None 을 돌려주므로 접수/예약 알림이 나가면 안 됩니다."""
-    run = _run(monkeypatch, tmp_path, orders=[_order()], result=None, trade_mode="DRY")
+    """DRY 는 승인 실행(EXECUTE) 단계 자체가 거부되므로 접수/예약 알림이 나갈 수 없습니다.
+
+    (파이프라인 불변식: 주문 API 경로는 TRADE_MODE=LIVE + RUN_PHASE=EXECUTE 에서만 열립니다.)
+    """
+    run = _run(monkeypatch, tmp_path, orders=[_order()], trade_mode="DRY", refresh=False)
+    assert isinstance(run.error, RuntimeError)
+    # EXECUTE 경계 게이트가 거부한 문구 (pipeline_execute._assert_execute_phase_allowed)
+    assert "LIVE" in str(run.error) and "EXECUTE" in str(run.error)
+    assert "승인은 소비하지 않았습니다" in str(run.error)
     assert run.sent == [], f"DRY 에서 접수 알림이 발송되었습니다: {run.sent}"
-    assert run.summary["executed"] == 0 and run.summary["reserved"] == 0
+    assert run.broker.order_calls == []
+    assert run.saved == []
+    assert run.approval_path is None, "거부 시 승인 파일을 만들지 않습니다"
 
 
 # ── (12) 동작 불변 ───────────────────────────────────────────────────
@@ -370,6 +448,7 @@ def test_notification_does_not_change_order_or_fence_state(monkeypatch, tmp_path
     before = deepcopy(order)
 
     run = _run(monkeypatch, tmp_path, orders=[order])
+    assert run.error is None, run.error
 
     # 주문 dict 는 표시 과정에서 절대 변하지 않습니다.
     assert order == before

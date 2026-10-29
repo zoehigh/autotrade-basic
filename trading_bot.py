@@ -876,7 +876,10 @@ def run_one_symbol(broker: Broker, symbol_config, approval=None):
     if settled.halt_reason:
         if settled.halt_reason == "non_trading_day":
             return None
-        print(f"  [{symbol}] 정산 보류: {settled.halt_reason}")
+        # halt_reason 에는 주문번호가 섞일 수 있습니다 (예: `_verify_history_complete`
+        # 의 "orders_meta 주문 {odno} 이 이력에 없습니다"). 공개 로그 규칙에 따라
+        # 출력 직전에 가명 식별자로 바꿉니다 (원문은 비공개 Evidence 에만).
+        print(f"  [{symbol}] 정산 보류: {_mask_odno_references(settled.halt_reason)}")
         return None
 
     plan = build_order_plan(settled, read_only_broker)
@@ -2326,7 +2329,7 @@ def _verify_orders_against_plan(approval, state, history):
         meta_side = str((meta or {}).get("side") or "").upper()
         if not meta_side:
             problems.append(
-                f"주문 {index}({comment}) orders_meta.side 가 없습니다 (odno={odno})"
+                f"주문 {index}({comment}) orders_meta.side 가 없습니다 (odno={mask_odno(odno)})"
             )
         elif meta_side != side:
             problems.append(
@@ -2337,7 +2340,7 @@ def _verify_orders_against_plan(approval, state, history):
         if meta_qty is None:
             problems.append(
                 f"주문 {index}({comment}) orders_meta.total_qty 를 읽을 수 없습니다 "
-                f"(odno={odno})"
+                f"(odno={mask_odno(odno)})"
             )
         elif meta_qty != qty:
             problems.append(
@@ -2350,7 +2353,7 @@ def _verify_orders_against_plan(approval, state, history):
             submitted_session = str((meta or {}).get("submitted_session") or "")
             if submitted_session and submitted_session < today_session:
                 problems.append(
-                    f"주문 {index}({comment}) 가 브로커 이력에 없습니다 (odno={odno})"
+                    f"주문 {index}({comment}) 가 브로커 이력에 없습니다 (odno={mask_odno(odno)})"
                 )
             continue
         row_side = _row_side(row)
@@ -2419,21 +2422,21 @@ def _verify_orders_against_plan(approval, state, history):
                 )
         elif original_qty_present:
             problems.append(
-                f"주문 {index}({comment}) 원주문 수량을 읽을 수 없습니다 (odno={odno})"
+                f"주문 {index}({comment}) 원주문 수량을 읽을 수 없습니다 (odno={mask_odno(odno)})"
             )
         else:
             # 일부 브로커는 원주문 수량을 이력에 노출하지 않습니다.
             # 필드 자체가 없는 것은 실패가 아니며, 체결/잔량으로만 대조합니다.
             print(
                 f"  [정보] 주문 {index}({comment}) 원주문 수량 필드 없음 "
-                f"— 체결/잔량으로만 대조합니다 (odno={odno})"
+                f"— 체결/잔량으로만 대조합니다 (odno={mask_odno(odno)})"
             )
 
         filled = _parse_row_int(row.get("ft_ccld_qty"), None)
         remaining = _parse_row_int(row.get("nccs_qty"), None)
         if filled is None:
             problems.append(
-                f"주문 {index}({comment}) 체결수량을 읽을 수 없습니다 (odno={odno})"
+                f"주문 {index}({comment}) 체결수량을 읽을 수 없습니다 (odno={mask_odno(odno)})"
             )
         elif filled > qty:
             problems.append(
@@ -2452,7 +2455,7 @@ def _verify_orders_against_plan(approval, state, history):
                 sell_filled += filled
         if remaining is None:
             problems.append(
-                f"주문 {index}({comment}) 잔량을 읽을 수 없습니다 (odno={odno})"
+                f"주문 {index}({comment}) 잔량을 읽을 수 없습니다 (odno={mask_odno(odno)})"
             )
         elif filled is not None and filled + remaining < qty:
             problems.append(
@@ -2507,18 +2510,18 @@ def _verify_deferred_evidence_fills(evidence, history, frozen=None):
             problems.append(f"SETTLE 근거 deferred_fills[{index}] 에 odno 가 없습니다")
             continue
         if odno in odnos:
-            problems.append(f"SETTLE 근거에 보류 체결 odno={odno} 가 중복 기록되었습니다")
+            problems.append(f"SETTLE 근거에 보류 체결 odno={mask_odno(odno)} 가 중복 기록되었습니다")
             continue
         odnos.add(odno)
         if not side:
             problems.append(
-                f"SETTLE 근거 보류 체결 odno={odno} 의 side 를 해석할 수 없습니다 "
+                f"SETTLE 근거 보류 체결 odno={mask_odno(odno)} 의 side 를 해석할 수 없습니다 "
                 f"(side={item.get('side')!r})"
             )
             continue
         if qty is None or qty <= 0:
             problems.append(
-                f"SETTLE 근거 보류 체결 odno={odno} 의 수량이 올바르지 않습니다 "
+                f"SETTLE 근거 보류 체결 odno={mask_odno(odno)} 의 수량이 올바르지 않습니다 "
                 f"(qty={item.get('qty')!r})"
             )
             continue
@@ -2530,12 +2533,12 @@ def _verify_deferred_evidence_fills(evidence, history, frozen=None):
             # 정확히 대조합니다 (EXECUTE 이후 증가 = fail-closed).
             if frozen_row["side"] != side:
                 problems.append(
-                    f"보류 체결 odno={odno} side 불일치: "
+                    f"보류 체결 odno={mask_odno(odno)} side 불일치: "
                     f"근거={side}, EXECUTE={frozen_row['side']}"
                 )
             if qty > frozen_row["qty"]:
                 problems.append(
-                    f"보류 체결 odno={odno} 수량 불일치: 근거={qty}, "
+                    f"보류 체결 odno={mask_odno(odno)} 수량 불일치: 근거={qty}, "
                     f"EXECUTE 동결={frozen_row['qty']} (근거가 동결 수량을 넘습니다)"
                 )
             if side == "BUY":
@@ -2547,7 +2550,7 @@ def _verify_deferred_evidence_fills(evidence, history, frozen=None):
         row = by_odno.get(odno)
         if row is None:
             problems.append(
-                f"SETTLE 근거 보류 체결 odno={odno} 가 브로커 주문이력에 없습니다 "
+                f"SETTLE 근거 보류 체결 odno={mask_odno(odno)} 가 브로커 주문이력에 없습니다 "
                 "(누락/변조 의심)"
             )
         else:
@@ -2555,16 +2558,16 @@ def _verify_deferred_evidence_fills(evidence, history, frozen=None):
             live_qty = _parse_row_int(row.get("ft_ccld_qty"), None)
             if live_side != side:
                 problems.append(
-                    f"보류 체결 odno={odno} side 불일치: "
+                    f"보류 체결 odno={mask_odno(odno)} side 불일치: "
                     f"근거={side}, 이력={live_side or '(해석 불가)'}"
                 )
             if live_qty is None:
                 problems.append(
-                    f"보류 체결 odno={odno} 의 브로커 체결수량을 읽을 수 없습니다"
+                    f"보류 체결 odno={mask_odno(odno)} 의 브로커 체결수량을 읽을 수 없습니다"
                 )
             elif live_qty != qty:
                 problems.append(
-                    f"보류 체결 odno={odno} 수량 불일치: 근거={qty}, 이력={live_qty}"
+                    f"보류 체결 odno={mask_odno(odno)} 수량 불일치: 근거={qty}, 이력={live_qty}"
                 )
 
         if side == "BUY":
@@ -2641,37 +2644,37 @@ def _verify_execute_deferred_record(approval, state, history):
             continue
         if odno in normalized:
             problems.append(
-                f"EXECUTE 보류 체결 기록에 odno={odno} 가 중복 기록되었습니다"
+                f"EXECUTE 보류 체결 기록에 odno={mask_odno(odno)} 가 중복 기록되었습니다"
             )
             continue
         if not side:
             problems.append(
-                f"EXECUTE 보류 체결 odno={odno} 의 side 를 해석할 수 없습니다 "
+                f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 side 를 해석할 수 없습니다 "
                 f"(side={item.get('side')!r})"
             )
             continue
         if qty is None or qty <= 0:
             problems.append(
-                f"EXECUTE 보류 체결 odno={odno} 의 수량이 올바르지 않습니다 "
+                f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 수량이 올바르지 않습니다 "
                 f"(qty={item.get('qty')!r})"
             )
             continue
         if sessions_known:
             if session != execution_ymd:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 세션이 실행 세션과 다릅니다: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 세션이 실행 세션과 다릅니다: "
                     f"기록={session or '(없음)'}, execution={execution_ymd}"
                 )
             elif session <= settled_ymd:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 세션이 정산 세션 이전/같습니다: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 세션이 정산 세션 이전/같습니다: "
                     f"기록={session}, settled={settled_ymd}"
                 )
 
         row = by_odno.get(odno)
         if row is None:
             problems.append(
-                f"EXECUTE 보류 체결 odno={odno} 가 브로커 주문이력에 없습니다 "
+                f"EXECUTE 보류 체결 odno={mask_odno(odno)} 가 브로커 주문이력에 없습니다 "
                 "(누락/변조 의심)"
             )
         else:
@@ -2680,16 +2683,16 @@ def _verify_execute_deferred_record(approval, state, history):
             live_session = _session_ymd(_order_us_session_date(row))
             if live_side != side:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} side 불일치: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} side 불일치: "
                     f"기록={side}, 이력={live_side or '(해석 불가)'}"
                 )
             if live_qty is None:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 브로커 체결수량을 읽을 수 없습니다"
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 브로커 체결수량을 읽을 수 없습니다"
                 )
             elif live_qty != qty:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 수량 불일치: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 수량 불일치: "
                     f"기록={qty}, 이력={live_qty}"
                 )
             # live 이력 행이 정말 **이 실행 세션의 동결 체결**인지 확인합니다.
@@ -2697,22 +2700,22 @@ def _verify_execute_deferred_record(approval, state, history):
             # 오인할 수 있으므로, 기록 세션·실행 세션·정산 세션 경계를 모두 봅니다.
             if not live_session:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션을 해석할 수 없습니다 "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 이력 세션을 해석할 수 없습니다 "
                     f"(기록={session or '(없음)'}) — 세션 검증 불가로 중단합니다"
                 )
             elif live_session != session:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 세션 불일치: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 세션 불일치: "
                     f"기록={session or '(없음)'}, 이력={live_session}"
                 )
             elif sessions_known and live_session != execution_ymd:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션이 실행 세션과 다릅니다: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 이력 세션이 실행 세션과 다릅니다: "
                     f"이력={live_session}, execution={execution_ymd}"
                 )
             elif sessions_known and live_session <= settled_ymd:
                 problems.append(
-                    f"EXECUTE 보류 체결 odno={odno} 의 이력 세션이 정산 세션 이전/같습니다: "
+                    f"EXECUTE 보류 체결 odno={mask_odno(odno)} 의 이력 세션이 정산 세션 이전/같습니다: "
                     f"이력={live_session}, settled={settled_ymd}"
                 )
 
@@ -2832,14 +2835,14 @@ def _verify_broker_readonly(approval, state, broker):
                 continue
             if existing["side"] != record_row["side"]:
                 problems.append(
-                    f"보류 체결 odno={odno} 기록 불일치: "
+                    f"보류 체결 odno={mask_odno(odno)} 기록 불일치: "
                     f"SETTLE={existing['side']} {existing['qty']}주, "
                     f"EXECUTE={record_row['side']} {record_row['qty']}주"
                 )
                 continue
             if record_row["qty"] < existing["qty"]:
                 problems.append(
-                    f"보류 체결 odno={odno} 수량 불일치: "
+                    f"보류 체결 odno={mask_odno(odno)} 수량 불일치: "
                     f"SETTLE={existing['qty']}주, EXECUTE 동결={record_row['qty']}주 "
                     "(동결 수량이 SETTLE 근거보다 적습니다)"
                 )
@@ -3020,12 +3023,110 @@ def _run_verify_phase(broker=None):
     return 0
 
 
+def _preview_symbol_plan(symbol_config, read_only_broker, plans_dir):
+    """PREVIEW: 계획 생성 → (AUTO_EXECUTE 면) 승인까지 **잠금 안**에서 수행합니다.
+
+    대기(프리장 개장)는 여기서 하지 않습니다. 계획 생성과 승인 파일 쓰기만
+    state 를 읽고 쓰므로 이 구간만 직렬화하면 충분합니다.
+
+    Returns:
+        tuple: `(plan, approval_file)`. 자동 실행 대상이 아니면 `approval_file`
+               은 None 입니다. 승인 실패 예외는 호출자가 AUTO_BLOCKED 로 처리합니다.
+    """
+    with global_lock():
+        settled = _settled_from_state(symbol_config)
+        plan = build_order_plan(settled, read_only_broker)
+        plan_file = write_order_plan(plan, plans_dir=plans_dir)
+        print(
+            f"[PREVIEW] {plan.symbol} — plan_id={plan.plan_id}, "
+            f"orders={len(plan.orders)}, state_hash={plan.state_hash[:12]}, "
+            f"file={plan_file}"
+        )
+
+        # AUTO_EXECUTE(opt-in): PREVIEW 후 자동 APPROVE → EXECUTE.
+        # 차단 사유(hold/mismatch/tolerance/세션 드리프트 등)가 있으면
+        # 해당 종목만 AUTO_BLOCKED 로 중단하고 다음 종목은 계속 진행합니다.
+        # DRY 는 주문/상태 저장을 하지 않으므로 승인·실행을 건너뛰고
+        # PREVIEW 산출물만 남깁니다 (DRY 검증용).
+        if not AUTO_EXECUTE:
+            return plan, None
+        if str(TRADE_MODE).strip().upper() == "DRY":
+            print(
+                f"[AUTO_EXECUTE] {plan.symbol} DRY 모드라 승인·실행을 건너뜁니다 "
+                f"(PREVIEW 산출물만 저장)."
+            )
+            return plan, None
+
+        approval_file = approve_plan_file(
+            plan_file,
+            approvals_dir=os.getenv("APPROVALS_DIR", "approvals"),
+            plans_dir=plans_dir,
+            broker=read_only_broker,
+        )
+        if approval_file:
+            notify(
+                f"🤖 [AUTO_APPROVE] {plan.symbol} 승인 완료 — "
+                f"plan_id={plan.plan_id}, orders={len(plan.orders)}"
+            )
+        return plan, approval_file
+
+
+def _execute_auto_approved_plan(approval_file, broker):
+    """AUTO_EXECUTE: 자동 승인된 계획을 **잠금 밖에서** 실행합니다.
+
+    `execute_approved_plan()` 은 RUN_PHASE=EXECUTE 만 허용하므로 이 호출
+    범위에서만 일시 변경하고 호출 후 복구합니다. 프리장 대기(최대 ~7.5시간)는
+    그 함수 안에서 잠금을 잡기 **전에** 끝나므로, 여기서 잠금을 잡으면 안 됩니다.
+    """
+    _prev_phase = os.environ.get("RUN_PHASE", "")
+    os.environ["RUN_PHASE"] = "EXECUTE"
+    try:
+        return execute_approved_plan(broker, approval_file)
+    finally:
+        os.environ["RUN_PHASE"] = _prev_phase
+
+
+def _phase_runs_without_outer_lock(run_phase):
+    """이 단계가 프리장 대기(최대 ~7.5시간)를 포함해 **바깥 잠금 없이** 실행돼야 하는지.
+
+    대기 중에 전역 실행 잠금(`.run.lock`)을 들고 있으면 그동안 다른 실행
+    (SETTLE/PREVIEW/APPROVE)이 전부 막히므로, 해당하는 경우에만 바깥 잠금을
+    생략하고 각 단계/`execute_approved_plan()` 이 임계구간만 잡습니다.
+    (기본값은 "잠근다" — fail-closed)
+
+    **판정 규칙의 단일 출처입니다.** 셸 런처(`ops/run_daily.sh`)는 이 규칙을
+    다시 구현하지 않고 항상 잠금을 시도하며, 위임 판정이면 이 프로세스가
+    `_release_inherited_outer_lock()` 으로 상속 잠금만 풉니다. 셸/파이썬에 같은
+    규칙이 이중 구현되면 drift 로 보호가 조용히 약해집니다.
+    """
+    phase = str(run_phase or "").strip().upper()
+    if phase == "EXECUTE":
+        return True
+    if phase == "PREVIEW" and AUTO_EXECUTE:
+        # DRY 는 승인·실행을 건너뛰고 PREVIEW 산출물만 남기므로 대기가 없습니다.
+        return str(TRADE_MODE).strip().upper() != "DRY"
+    return False
+
+
 def _dispatch_pipeline_phase(run_phase, broker):
-    """RUN_PHASE 단계별 실행 — 전역 실행 잠금 안에서 직렬화합니다.
+    """RUN_PHASE 단계별 실행 — 임계구간만 전역 실행 잠금으로 직렬화합니다.
 
     cron 을 거치지 않는 직접 CLI 실행도 `.state.json` read-modify-write 를
     공유하므로, 셸 런처와 같은 `.run.lock` 을 파이썬에서도 잡습니다.
+
+    예외는 프리장 개장 대기(최대 ~7.5시간)를 포함하는 구간입니다. 잠금을 든 채
+    자면 그동안 다른 실행(SETTLE/PREVIEW/APPROVE)이 전부 막히므로 대기는
+    잠금 **밖**에서 합니다 (`_phase_runs_without_outer_lock`).
+
+      - EXECUTE: 여기서 잠그지 않고 `execute_approved_plan()` 에 위임합니다.
+        그 함수가 대기를 마친 뒤 같은 `.run.lock` 을 스스로 잡고 검증·선점·
+        전송을 직렬화합니다.
+      - PREVIEW + AUTO_EXECUTE: 계획 생성·승인까지만 잠그고
+        (`_preview_symbol_plan`), 자동 실행은 `_execute_auto_approved_plan()`
+        이 잠금 밖에서 호출합니다 (내부에서 대기 후 잠금).
     """
+    if _phase_runs_without_outer_lock(run_phase):
+        return _dispatch_pipeline_phase_locked(run_phase, broker)
     with global_lock():
         return _dispatch_pipeline_phase_locked(run_phase, broker)
 
@@ -3064,65 +3165,37 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
         plans_dir = os.getenv("PLAN_DIR", "plans")
         for symbol_config in SYMBOLS:
             try:
-                settled = _settled_from_state(symbol_config)
-                plan = build_order_plan(settled, read_only_broker)
-                plan_file = write_order_plan(plan, plans_dir=plans_dir)
-                print(
-                    f"[PREVIEW] {plan.symbol} — plan_id={plan.plan_id}, "
-                    f"orders={len(plan.orders)}, state_hash={plan.state_hash[:12]}, "
-                    f"file={plan_file}"
+                # 계획 생성·승인은 잠금 안 (`_preview_symbol_plan`).
+                plan, approval_file = _preview_symbol_plan(
+                    symbol_config, read_only_broker, plans_dir
                 )
-
-                # AUTO_EXECUTE(opt-in): PREVIEW 후 자동 APPROVE → EXECUTE.
-                # 차단 사유(hold/mismatch/tolerance/세션 드리프트 등)가 있으면
-                # 해당 종목만 AUTO_BLOCKED 로 중단하고 다음 종목은 계속 진행합니다.
-                # DRY 는 주문/상태 저장을 하지 않으므로 승인·실행을 건너뛰고
-                # PREVIEW 산출물만 남깁니다 (DRY 검증용).
-                if AUTO_EXECUTE and str(TRADE_MODE).strip().upper() != "DRY":
-                    try:
-                        approval_file = approve_plan_file(
-                            plan_file,
-                            approvals_dir=os.getenv("APPROVALS_DIR", "approvals"),
-                            plans_dir=plans_dir,
-                            broker=read_only_broker,
+                if not approval_file:
+                    continue
+                # 자동 실행은 **잠금 밖**에서: 프리장 개장 대기(최대 ~7.5시간)를
+                # 잠금을 든 채 하면 그동안 다른 실행이 전부 막힙니다.
+                # 대기 후 게이트 재검증·선점·전송은 execute_approved_plan() 이
+                # 자체 잠금 안에서 다시 수행하므로 순서는 그대로 유지됩니다.
+                try:
+                    result = _execute_auto_approved_plan(approval_file, broker)
+                except GlobalScopedError:
+                    # 공통 장애(상태 저장 실패 등)는 삼키지 않고 전체 실행을 중단합니다.
+                    raise
+                except Exception as auto_error:
+                    msg = f"[AUTO_BLOCKED] {plan.symbol} {str(auto_error)}"
+                    print(msg)
+                    notify(f"🚫 {msg}", urgent=True)
+                    failures += 1
+                else:
+                    failed = int((result or {}).get("failed", 0))
+                    if failed:
+                        notify(
+                            f"⚠️ [AUTO_EXECUTE] {plan.symbol} 실행 실패 "
+                            f"({failed}건)",
+                            urgent=True,
                         )
-                        if approval_file:
-                            notify(
-                                f"🤖 [AUTO_APPROVE] {plan.symbol} 승인 완료 — "
-                                f"plan_id={plan.plan_id}, orders={len(plan.orders)}"
-                            )
-                            # 자동 EXECUTE: execute_approved_plan 은
-                            # RUN_PHASE=EXECUTE 만 허용하므로 이 호출 범위에서만
-                            # 일시 변경합니다 (호출 후 복구).
-                            _prev_phase = os.environ.get("RUN_PHASE", "")
-                            os.environ["RUN_PHASE"] = "EXECUTE"
-                            try:
-                                result = execute_approved_plan(broker, approval_file)
-                            finally:
-                                os.environ["RUN_PHASE"] = _prev_phase
-                            failed = int((result or {}).get("failed", 0))
-                            if failed:
-                                notify(
-                                    f"⚠️ [AUTO_EXECUTE] {plan.symbol} 실행 실패 "
-                                    f"({failed}건)",
-                                    urgent=True,
-                                )
-                                failures += 1
-                            else:
-                                notify(f"✅ [AUTO_EXECUTE] {plan.symbol} 실행 완료")
-                    except GlobalScopedError:
-                        # 공통 장애(상태 저장 실패 등)는 삼키지 않고 전체 실행을 중단합니다.
-                        raise
-                    except Exception as auto_error:
-                        msg = f"[AUTO_BLOCKED] {plan.symbol} {str(auto_error)}"
-                        print(msg)
-                        notify(f"🚫 {msg}", urgent=True)
                         failures += 1
-                elif AUTO_EXECUTE:
-                    print(
-                        f"[AUTO_EXECUTE] {plan.symbol} DRY 모드라 승인·실행을 건너뜁니다 "
-                        f"(PREVIEW 산출물만 저장)."
-                    )
+                    else:
+                        notify(f"✅ [AUTO_EXECUTE] {plan.symbol} 실행 완료")
             except GlobalScopedError:
                 raise
             except Exception as error:
@@ -3163,13 +3236,84 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
     raise RuntimeError(f"알 수 없는 RUN_PHASE: {run_phase}")
 
 
-def main():
-    """자동매매 봇 메인 진입점 — 전역 실행 잠금 안에서 실행합니다.
+def _phase_waits_outside_lock():
+    """env 의 RUN_PHASE 기준으로 대기 단계인지 판별합니다 (`main()` 진입점용).
 
-    SETTLE/PREVIEW/APPROVE/EXECUTE/VERIFY/REPAIR 는 모두 `.state.json` 을
-    읽고 쓰므로, 같은 `.run.lock` 으로 프로세스 간 직렬화합니다. 셸 런처가
-    이미 잡은 경우(`RUN_LOCK_HELD=1`)에는 재진입합니다.
+    부수효과가 없습니다 (env 읽기만). RUN_PHASE 정규화는 `config.read_run_phase()`
+    한 곳만 사용하고, 판정 규칙은 `_phase_runs_without_outer_lock()` 한 곳에만
+    둡니다.
     """
+    import config as runtime_config
+
+    return _phase_runs_without_outer_lock(runtime_config.read_run_phase())
+
+
+def _release_inherited_outer_lock():
+    """대기 단계에서 셸 런처가 잡은 `.run.lock` 을 **즉시 해제**합니다.
+
+    잠금 보유 판정의 **단일 출처**는 `_phase_runs_without_outer_lock()` 입니다.
+    셸 런처(`ops/run_daily.sh`)는 단계 규칙을 다시 구현하지 않고 **항상** 잠금을
+    시도한 뒤(fail-closed) 이 값을 상속 fd 로 넘깁니다. 여기서 위임 판정이면
+    상속된 flock 만 풀어, 프리장 개장 대기(최대 ~7.5시간) 동안 다른 단계
+    (SETTLE/PREVIEW/APPROVE/VERIFY)가 진행될 수 있게 합니다.
+
+    해제는 **런처가 실제로 물려준 fd** 로만 합니다 — `pipeline._inherited_lock_fd`
+    가 fd 의 st_dev/st_ino 일치와 "그 fd 가 실제 잠금 보유자" 임을 모두 확인한
+    경우에만 풉니다. 상속 증거가 없으면(직접 CLI 실행) 아무것도 하지 않고,
+    잠금은 뒤이어 `global_lock()` 이 정상적으로 잡습니다 (동시 진행 금지).
+
+    Returns:
+        int | None: 해제한 fd 번호. 해제할 상속 잠금이 없으면 None.
+    """
+    try:
+        import fcntl
+    except ImportError:  # fcntl 이 없는 플랫폼에는 위임할 잠금도 없습니다.
+        return None
+    # 순환 참조를 피하려고 함수 안에서 임포트합니다 (모듈 로드 시점 의존 없음).
+    import pipeline as pipeline_module
+
+    target = pipeline_module.run_lock_path()
+    fd = pipeline_module._inherited_lock_fd(target)
+    if fd is None:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as error:
+        # 해제 실패 = 런처 잠금이 그대로 유지됩니다. fail-closed 방향이라 안전합니다.
+        print(
+            f"[잠금] 런처 잠금 해제 실패 (fd {fd}): {error} — 잠금을 유지한 채 진행합니다."
+        )
+        return None
+    # 이 프로세스는 더 이상 바깥 잠금을 들고 있지 않습니다. 플래그를 남기면
+    # global_lock 이 "상속받았는데 증거가 없다" 는 잘못된 안내를 출력하므로 지웁니다
+    # (실제 보유 판정은 fd inode 검증이 담당하므로 플래그 제거로 잠금이 약해지지 않음).
+    os.environ.pop("RUN_LOCK_HELD", None)
+    os.environ.pop("RUN_LOCK_FD", None)
+    print(
+        f"[잠금] 대기 단계 → 런처 잠금(fd {fd}, {target})을 해제했습니다. "
+        "프리장 대기 동안 다른 단계가 진행할 수 있습니다 "
+        "(임계구간은 대기 후 global_lock 이 같은 파일로 다시 잡습니다)."
+    )
+    return fd
+
+
+def main():
+    """자동매매 봇 메인 진입점.
+
+    SETTLE/PREVIEW(자동 실행 제외)/APPROVE/VERIFY/REPAIR 와 레거시 통합 실행은
+    모두 `.state.json` 을 읽고 쓰므로 같은 `.run.lock` 으로 프로세스 간
+    직렬화합니다. 셸 런처가 이미 잡은 경우(`RUN_LOCK_HELD=1` + 상속 fd)에는
+    재진입합니다.
+
+    프리장 개장 대기(최대 ~7.5시간)를 포함하는 단계(EXECUTE, PREVIEW+
+    AUTO_EXECUTE)는 **잠금 밖에서** 대기합니다 (`_phase_waits_outside_lock`).
+    런처는 단계와 무관하게 항상 잠그므로, 이 경우 상속된 잠금을 여기서
+    해제합니다 (`_release_inherited_outer_lock`). 잠금은 대기 후의 임계구간
+    (승인 재검증·선점·state 저장·주문)에서만 잡습니다.
+    """
+    if _phase_waits_outside_lock():
+        _release_inherited_outer_lock()
+        return _main_locked()
     with global_lock():
         return _main_locked()
 
@@ -3241,8 +3385,11 @@ def _main_locked():
     # flush 는 once-flag 을 세우지 않는 원시 호출이라, 일반 실행이 뒤이어
     # 종료 시점에 남기는 전체 원장에 영향을 주지 않습니다 (덮어쓰기 구조).
     # 또한 raise·sys.exit 경로에서도 finally 가 동작해 부분 매핑을 남깁니다.
+    # 전용 모드는 state 를 저장하므로 main() 이 잠금을 생략한 경우(대기 단계)에도
+    # 반드시 잠금 안에서 실행합니다 (fail-closed).
     try:
-        _dispatch_handled = _run_mode_dispatch()
+        with global_lock():
+            _dispatch_handled = _run_mode_dispatch()
     finally:
         flush_odno_ledger()
     if _dispatch_handled:
@@ -3269,9 +3416,12 @@ def _main_locked():
     run_phase = validate_run_phase(os.getenv("RUN_PHASE", ""), TRADE_MODE)
     if run_phase == "VERIFY":
         # VERIFY 도 브로커를 **읽기 전용**으로만 사용합니다 (주문 API 없음).
+        # 대기 단계가 아니지만, main() 이 잠금을 생략한 경우에도 state/근거
+        # 파일을 다른 실행과 동시에 읽지 않도록 잠금 안에서 수행합니다.
         verify_broker = create_broker()
         try:
-            sys.exit(_run_verify_phase(broker=verify_broker))
+            with global_lock():
+                sys.exit(_run_verify_phase(broker=verify_broker))
         finally:
             verify_broker.close()
 
