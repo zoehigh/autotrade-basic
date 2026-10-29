@@ -49,6 +49,8 @@ from broker.base import (
     OrderNotAcceptedError,
 )
 from broker.market_utils import get_kst_now, is_us_trading_day, normalize_order_price
+# 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
+from log_mask import mask_odno
 from broker.meritz.auth import (
     get_access_token,
     invalidate_token,
@@ -435,7 +437,7 @@ class MeritzBroker(Broker):
 
         if not oder_date or len(oder_date) != 8 or not seq:
             raise OrderNotAcceptedError(
-                f"주문번호 형식을 해석할 수 없습니다: odno={odno}"
+                f"주문번호 형식을 해석할 수 없습니다: odno={mask_odno(odno)}"
                 f"(기대 형식: YYYYMMDD:주문번호)"
             )
         return oder_date, str(int(seq))
@@ -1012,7 +1014,7 @@ class MeritzBroker(Broker):
                     kst_str = "(시간없음)"
 
                 print(
-                    f"{header} {date_str} | 한국시각 {kst_str} | odno={item.get('odno','')}"
+                    f"{header} {date_str} | 한국시각 {kst_str} | odno={mask_odno(item.get('odno',''))}"
                     f" | {item.get('sll_buy_dvsn_cd_name','')}"
                     f" | qty={item.get('ft_ccld_qty','0')}"
                     f" | price={self._to_float(item.get('ft_ccld_unpr3')):.2f}"
@@ -1107,7 +1109,7 @@ class MeritzBroker(Broker):
         print(f"종목 코드: {symbol}")
         print(f"거래소 벤더코드: {vendor_code}")
         print(f"주문구분: {order_type} → {cls_code}")
-        print(f"주문번호(합성): {order_id}")
+        print(f"주문번호(합성): {mask_odno(order_id)}")
         print(f"주문수량: {quantity}주")
         print(f"주문가격: ${price}")
         print("==================================================\n")
@@ -1261,7 +1263,7 @@ class MeritzBroker(Broker):
 
         if meta is None:
             raise OrderNotAcceptedError(
-                f"취소할 주문의 주문구분/수량을 확인할 수 없습니다: odno={odno}. "
+                f"취소할 주문의 주문구분/수량을 확인할 수 없습니다: odno={mask_odno(odno)}. "
                 f"주문 시점 캐시가 없고 당일 이력에도 없습니다."
             )
 
@@ -1291,10 +1293,10 @@ class MeritzBroker(Broker):
         if warn_code != _WARN_NONE:
             raise OrderNotAcceptedError(
                 f"메리츠 주문 취소 미접수 [warn_cls_code={warn_code}]: "
-                f"{self._error_message(resp_body)} (odno={odno})"
+                f"{self._error_message(resp_body)} (odno={mask_odno(odno)})"
             )
 
-        print(f"[메리츠] 주문 취소 성공: odno={odno} (oder_date={oder_date})")
+        print(f"[메리츠] 주문 취소 성공: odno={mask_odno(odno)} (oder_date={oder_date})")
 
     def _lookup_order_meta_via_detail(
         self,
@@ -1436,7 +1438,7 @@ class MeritzBroker(Broker):
         if warn_code != _WARN_NONE:
             raise OrderNotAcceptedError(
                 f"메리츠 주문 정정 미접수 [warn_cls_code={warn_code}]: "
-                f"{self._error_message(resp_body)} (odno={odno})"
+                f"{self._error_message(resp_body)} (odno={mask_odno(odno)})"
             )
 
         new_oder_no = str(self._order_no_from(resp_body) or "").strip()
@@ -1457,7 +1459,7 @@ class MeritzBroker(Broker):
         self._submitted_orders.pop(odno, None)
 
         print(
-            f"[메리츠] 주문 정정 성공: {odno} → {new_odno} "
+            f"[메리츠] 주문 정정 성공: {mask_odno(odno)} → {mask_odno(new_odno)} "
             f"({side} {quantity}주 ${send_price}, {order_type}→{cls_code})"
         )
         return new_odno

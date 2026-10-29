@@ -2117,9 +2117,14 @@ def main():
             and r.get("prcs_stat_name") == "미체결"
         ]
         live.sort(key=lambda r: r.get("_order_price") or 0)
+        # 브로커 주문번호는 공개 로그(Actions 콘솔)에 원문으로 남기지 않습니다.
+        # 같은 실행의 Evidence(암호화 artifact)에 log_salt 가 있으므로 가명 식별자로 대조할 수 있습니다.
+        evidence = _load_settlement_evidence(sym, run_id)
+        odno_mask = _evidence_salt_hex(evidence) or os.urandom(16).hex()
         for r in live:
             print(
-                f"    {r.get('odno')} {r.get('sll_buy_dvsn_cd_name')} "
+                f"    {_independent_odno_hash(r.get('odno'), odno_mask)} "
+                f"{r.get('sll_buy_dvsn_cd_name')} "
                 f"{r.get('ft_ord_qty'):>3s}주 @{r.get('_order_price')}"
             )
         filled = [
@@ -2129,7 +2134,8 @@ def main():
         ]
         for r in filled:
             print(
-                f"    체결: {r.get('odno')} {r.get('sll_buy_dvsn_cd_name')} "
+                f"    체결: {_independent_odno_hash(r.get('odno'), odno_mask)} "
+                f"{r.get('sll_buy_dvsn_cd_name')} "
                 f"{r.get('ft_ccld_qty')}주 @{r.get('ft_ccld_unpr3')}"
             )
 
@@ -2154,7 +2160,7 @@ def main():
                 f"{sym} 종목별 실행 결과 라인이 없습니다 — "
                 f"접수 건수는 0 으로 보고 검사합니다"
             )
-        evidence = _load_settlement_evidence(sym, run_id)
+        # evidence 는 위(브로커 주문 출력)에서 run_id 로 이미 읽었습니다 — 같은 파일을 재사용합니다.
         if evidence is None:
             problem(
                 f"{sym} 정산 근거 파일 없음 (run_id={run_id or '없음'}) — T 검산 불가"

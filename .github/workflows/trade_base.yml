@@ -272,6 +272,8 @@ jobs:
           # 텔레그램 (environment에서 주입 — 브로커+모드별로 다른 채널 가능)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 개인 채팅 주문번호 원문 표시용 allowlist (쉼표 구분 chat id, 미설정 시 마스킹 전송)
+          TELEGRAM_PERSONAL_CHAT_IDS: ${{ vars.TELEGRAM_PERSONAL_CHAT_IDS || '' }}
 
           # Finnhub 실시간 시세 fallback (LS 증권 g3101 실패 시)
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
@@ -333,7 +335,14 @@ jobs:
           # GitHub Actions에서 Python 출력이 line-by-line으로 표시되도록 버퍼링 해제
           PYTHONUNBUFFERED: 1
 
-        run: uv run python trading_bot.py
+        run: |
+          # self-hosted runner 작업 디렉터리는 실행 간 재사용됩니다. 이전 실행이 남긴 주문번호 매핑
+          # 원장(odno-map-*.jsonl)은 아래 Evidence 단계의 `odno-map-*.jsonl` 글롭에 그대로 걸려
+          # **이번 실행의 암호화 Evidence 에 섞여** 업로드됩니다 (지난 실행 원문 주문번호가 이번
+          # 실행 근거로 둔갑). 봇을 실행하기 **전**에 지워 이번 실행이 만든 원장만 남깁니다.
+          # ⚠️ 봇 실행 **뒤**에는 절대 지우지 않습니다 — 그 시점의 원장이 이번 실행의 근거입니다.
+          rm -f odno-map-*.jsonl
+          uv run python trading_bot.py
 
       - name: 최종 정산 스냅샷 생성
         if: always()
@@ -400,11 +409,18 @@ jobs:
           # 가장 먼저 이전 실행의 암호문·부분 파일·평문 tgz 를 지웁니다 (self-hosted runner 작업 디렉터리
           # 재사용 시 오래된 Evidence 가 이번 실행 것으로 업로드되는 것을 막기 위해, 존재 검사보다 앞섭니다).
           rm -f "$partial" "$out" evidence.tgz
-          files=(settlement-*.json final-settlement-*.json)
+          # 주문번호 매핑 원장(odno-map-*.jsonl)은 공개 로그의 가명 토큰을 원문으로 되돌리는
+          # 유일한 근거이므로 정산 근거와 함께 암호화합니다. 평문은 남기지 않습니다.
+          files=(settlement-*.json final-settlement-*.json odno-map-*.jsonl)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::warning::이번 실행에 정산 근거 파일이 없어 Evidence 를 업로드하지 않습니다 — 정산 검증 불가 (verify 단계가 실패로 보고합니다)"
             exit 0
           fi
+          # trap 은 전제조건 검사보다 먼저 설치합니다. 패스프레이즈 없음·gpg 없음으로
+          # 실패 종료해도 원문 주문번호가 든 평문 매핑 원장이 러너에 남지 않게 합니다.
+          # 성공(rc=0) 시에는 동작하지 않고, 암호화 뒤 평문은 별도로 지웁니다.
+          # 원문 주문번호가 든 매핑 원장(평문 JSONL)도 함께 지웁니다 (self-hosted runner 잔존 방지).
+          trap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f "$partial" "$out" evidence.tgz; rm -f odno-map-*.jsonl 2>/dev/null || true; fi' EXIT
           if [[ -z "$PASSPHRASE" ]]; then
             echo "::error::EVIDENCE_PASSPHRASE(또는 STATE_BACKUP_PASSPHRASE)가 없어 정산 근거를 업로드하지 않습니다"
             exit 1
@@ -413,7 +429,6 @@ jobs:
 
           # 어떤 이유로든 실패하면 불완전한 암호문(.partial)·최종 산출물·평문 tgz 를 남기지 않습니다.
           # (업로드 단계는 산출물이 없으면 올릴 파일이 없어 경고만 합니다)
-          trap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f "$partial" "$out" evidence.tgz; fi' EXIT
 
           # tar → gpg 스트리밍: 중간 평문 압축파일(evidence.tgz)을 디스크에 만들지 않습니다.
           # 패스프레이즈는 stdin(압축 데이터)과 겹치지 않도록 fd 3 으로 전달합니다.
@@ -430,6 +445,10 @@ jobs:
 
           mv "$partial" "$out"
           test -s "$out"
+
+          # 암호화가 끝났으므로 평문 매핑 원장은 남기지 않습니다 (원문 주문번호 잔존 방지).
+          # nullglob 이라 파일이 없으면 인자가 사라져 rm 이 실패하므로 || true 로 무시합니다.
+          rm -f odno-map-*.jsonl 2>/dev/null || true
 
       - name: 정산 근거 업로드 (암호화본만)
         uses: actions/upload-artifact@v4

@@ -1203,6 +1203,27 @@ def test_modify_order_sends_official_body(make_broker):
     assert new_odno == "20261020:0000004616"
 
 
+def test_modify_success_logs_old_and_new_ids_as_separate_tokens(make_broker, capsys):
+    """정정 성공 로그는 구·신 주문번호를 각각 마스킹하고 화살표는 밖에 둡니다."""
+    import log_mask
+
+    broker, _session = make_broker(
+        [ok(rsp_cd="0001", data={"der_no": "4616", "oder_date": "20261020",
+                                 "warn_cls_code": "0"})]
+    )
+
+    old_odno = "20261020:0000759959"
+    new_odno = broker.modify_order(
+        old_odno, "TQQQ", "NAS", "SELL", 18, 73.74, "LOC"
+    )
+
+    out = capsys.readouterr().out
+    assert old_odno not in out and new_odno not in out
+    old_token = log_mask.mask_odno(old_odno)
+    new_token = log_mask.mask_odno(new_odno)
+    assert f"{old_token} → {new_token}" in out
+
+
 def test_modify_order_allows_quantity_increase(make_broker):
     """수량 증량 정정(1주 → 7주)이 그대로 전달됩니다."""
     broker, session = make_broker(

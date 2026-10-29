@@ -12,6 +12,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from broker.market_utils import resolve_real_kst_from_ord
+# 공개 로그용 주문번호 가명 식별자(salt 포함)는 log_mask 모듈이 단일 소유합니다.
+# 여기서는 같은 이름으로 재노출(re-export)만 하므로 기존 호출자와 토큰이 그대로 유지됩니다.
+from log_mask import _LOG_SALT, log_salt_hex, mask_odno  # noqa: F401
 
 # 상태 파일 위치: 프로젝트 루트의 .state.json
 _STATE_FILE = os.path.join(os.path.dirname(__file__), "..", ".state.json")
@@ -300,7 +303,11 @@ def register_order_meta_in_state(state, odno, meta):
     """
     normalized = str(odno)
     state.setdefault("orders_meta", {})[normalized] = meta
-    print(f"[orders_meta 등록] odno={normalized} (원본={odno}), t_target={meta.get('t_target')}")
+    # 공개 로그 보호: 저장 키(normalized)는 원문 그대로 두고 출력만 가명 토큰으로 바꿉니다.
+    print(
+        f"[orders_meta 등록] odno={mask_odno(normalized)} (원본={mask_odno(odno)}), "
+        f"t_target={meta.get('t_target')}"
+    )
 
 
 def get_order_meta(state, odno):
@@ -591,7 +598,7 @@ def reconcile_reverse_fills(state, order_history):
                     # 이미 일부 반영됐는데 기준선이 없으면 역산하지 않습니다.
                     _mark_settlement_hold(
                         state,
-                        f"리버스 매도 {odno} 기준선(reverse_base_t)이 없고 "
+                        f"리버스 매도 {mask_odno(odno)} 기준선(reverse_base_t)이 없고 "
                         f"{previous_fraction:.2f} 비율이 이미 반영됐습니다",
                     )
                     continue
@@ -626,7 +633,7 @@ def reconcile_reverse_fills(state, order_history):
             if mismatch:
                 _mark_settlement_hold(
                     state,
-                    f"리버스 매도 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"리버스 매도 {mask_odno(odno)} 마커(반영 {previous_fraction:.2f})와 "
                     f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
                 )
                 continue
@@ -700,7 +707,7 @@ def reconcile_reverse_fills(state, order_history):
             if mismatch:
                 _mark_settlement_hold(
                     state,
-                    f"리버스 매수 {odno} 마커(반영 {previous_fraction:.2f})와 "
+                    f"리버스 매수 {mask_odno(odno)} 마커(반영 {previous_fraction:.2f})와 "
                     f"원장(최대 {last_ledger_fraction:.2f})이 일치하지 않습니다",
                 )
                 continue
@@ -1344,7 +1351,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 state["_pending_amount_odnos"] = unconfirmed
                 _mark_settlement_hold(
                     state,
-                    f"FORCE_T_REINFERENCE 추정 불가 주문 {o.get('odno', '')}",
+                    f"FORCE_T_REINFERENCE 추정 불가 주문 {mask_odno(o.get('odno', ''))}",
                 )
                 return state
             o["_ft_ccld_amt_inferred"] = estimated_amount
@@ -2169,7 +2176,7 @@ def _apply_sell_t_effect(state, T, net_qty, odno, cumulative_qty, basis_hint=Non
                     return T, False
                 _mark_settlement_hold(
                     state,
-                    f"매도 {odno} 분류 변경({previous_factor}→{factor})에 대한 "
+                    f"매도 {mask_odno(odno)} 분류 변경({previous_factor}→{factor})에 대한 "
                     f"적용 순서 근거(원장)가 없습니다",
                 )
                 return T, False
@@ -2306,35 +2313,12 @@ def _has_processed_qty_marker(meta):
     return valid
 
 
-# 공개 로그용 주문번호 가명 식별자의 키(salt). **실행(프로세스)마다 무작위**로 만듭니다.
+# 공개 로그용 주문번호 가명 식별자는 `log_mask` 모듈이 단일 소유합니다 (위 import 참고).
 # 주문번호는 짧은 숫자라 salt 없는 해시(예: SHA-256 앞 8자리)는 전수 대입으로 복원됩니다.
-# salt 는 비공개 Evidence(암호화 artifact)에만 기록하므로, 공개 로그만으로는 복원할 수 없고
+# 그래서 salt 를 **실행(프로세스)마다 무작위**로 만들고 공개 로그에는 출력하지 않습니다.
+# salt 는 비공개 Evidence(암호화 artifact)에만 기록되므로, 공개 로그만으로는 원문을 복원할 수 없고
 # 다른 실행의 로그와 같은 주문을 연결할 수도 없습니다.
-_LOG_SALT = os.urandom(16)
-
-
-def log_salt_hex():
-    """이번 실행의 로그 마스킹 salt (Evidence 에만 기록 — 독립 검증기가 대조에 사용)."""
-    return _LOG_SALT.hex()
-
-
-def mask_odno(odno, salt_hex=None):
-    """공개 로그용 주문번호 가명 식별자: `ord#` + HMAC-SHA256(salt, odno) 앞 10자리.
-
-    같은 실행 안에서는 같은 번호가 항상 같은 값이라 로그끼리 대조할 수 있습니다.
-    실제 주문번호는 공개 GitHub Actions 로그·예외 메시지·알림에 남기지 않습니다.
-    목록(list/tuple/set)을 주면 각 원소를 마스킹한 `[a, b]` 문자열을 돌려줍니다.
-    """
-    import hashlib
-    import hmac
-
-    if isinstance(odno, (list, tuple, set, frozenset)):
-        return "[" + ", ".join(mask_odno(o, salt_hex) for o in odno) + "]"
-    text = "" if odno is None else str(odno)
-    if not text:
-        return "ord#-"
-    key = bytes.fromhex(salt_hex) if salt_hex else _LOG_SALT
-    return "ord#" + hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()[:10]
+# (salt 는 log_mask 전역에 하나만 존재 — 여기서 다시 만들면 어댑터 로그와 토큰이 달라집니다.)
 
 
 # 주문 등록 시점에 수량·금액 마커를 함께 0 으로 기록한 신규 메타의 버전 표식.

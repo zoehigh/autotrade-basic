@@ -27,6 +27,8 @@ wheels/
 
 # 정산 근거 파일 (자동 검증용 런타임 산출물)
 settlement-*.json
+# 주문번호 매핑 원장 (원문 주문번호 포함 — Evidence 암호화본에만 담고 평문은 커밋 금지)
+odno-map-*.jsonl
 
 # 운영 백업 디렉터리 (VPS 로컬)
 backup/
