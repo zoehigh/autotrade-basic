@@ -141,3 +141,35 @@ def test_empty_marker_token_is_preserved():
 
     text = "last_processed_ordno=ord#-"
     assert trading_bot._mask_odno_references(text) == text
+
+
+# ── 오탐 방지: 주문번호가 아닌 문자열은 그대로 ──────────────────────
+@pytest.mark.parametrize("text", [
+    "ordno is required",
+    "odno=odno",
+    "odno=None",
+    "odno=unknown",
+    "주문번호: 확인필요",
+    "주문번호\n123",
+    "odno\n456",
+    "에러코드 odno",
+])
+def test_non_order_words_are_preserved(text):
+    """라벨 뒤가 실제 주문번호 후보(숫자 포함)가 아니면 마스킹하지 않습니다."""
+    assert _mask(text) == text
+
+
+@pytest.mark.parametrize("raw", ["mock_order_123", "ord_001", "demo_loc_001", "A1"])
+def test_alphanumeric_ids_with_digits_are_masked(raw):
+    """영숫자 주문번호(숫자 포함)는 계속 마스킹합니다."""
+    assert _mask(f"odno={raw}") == f"odno={mask_odno(raw)}"
+
+
+def test_false_positives_leave_no_ledger_rows(monkeypatch):
+    """오탐 문자열은 원장에 등록되지 않습니다 (불필요한 매핑 방지)."""
+    import log_mask
+
+    monkeypatch.setattr(log_mask, "_LEDGER", {})
+    for text in ("ordno is required", "odno=None", "odno=unknown", "odno=odno"):
+        assert _mask(text) == text
+    assert log_mask._LEDGER == {}
