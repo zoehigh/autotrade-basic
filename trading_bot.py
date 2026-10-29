@@ -2756,19 +2756,13 @@ def _dispatch_repair():
     print(f"[REPAIR] {source} 완료.")
 
 
-def main():
-    """
-    자동매매 봇의 메인 실행 함수입니다.
+def _run_mode_dispatch():
+    """진단·복구 전용 모드를 실행합니다 (브로커 생성 없음).
 
-    SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
-    한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
+    호출부가 `try/finally` 로 원장 finalization 을 보장하므로, 이 안의
+    early-return·`sys.exit(1)`·예외 경로에서도 마스킹 토큰 매핑이 유실되지 않습니다.
+    일반 실행(DRY/LIVE)은 아무 분기도 타지 않고 그대로 반환합니다.
     """
-    # ── 모드 불변식 ──
-    # TRADE_MODE는 DRY(프리뷰, 상태 저장 없음) / LIVE(실주문) / REPAIR(유지보수) 중 하나입니다.
-    # REPAIR는 액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 정확히
-    # 하나일 때만 실행하며, 0개 또는 2개 이상이면 _dispatch_repair()가 sys.exit(1)로 중단합니다.
-    # REPAIR 체크를 레거시 STATE_*_ONLY보다 먼저 수행해 REPAIR 모드의 단일 액션
-    # 불변식을 항상 강제합니다.
     if TRADE_MODE == "REPAIR":
         _dispatch_repair()
         return
@@ -2812,6 +2806,28 @@ def main():
     if STATE_SET_CYCLE_START_ONLY:
         _set_cycle_start_only()
         return
+
+
+def main():
+    """
+    자동매매 봇의 메인 실행 함수입니다.
+
+    SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
+    한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
+    """
+    # ── 모드 불변식 ──
+    # TRADE_MODE는 DRY(프리뷰, 상태 저장 없음) / LIVE(실주문) / REPAIR(유지보수) 중 하나입니다.
+    # REPAIR는 액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 정확히
+    # 하나일 때만 실행하며, 0개 또는 2개 이상이면 _dispatch_repair()가 sys.exit(1)로 중단합니다.
+    # REPAIR 체크를 레거시 STATE_*_ONLY보다 먼저 수행해 REPAIR 모드의 단일 액션
+    # 불변식을 항상 강제합니다.
+    # 진단·복구 전용 모드는 브로커 생성 없이 여기서 끝나며, 공개 로그에 마스킹
+    # 토큰을 남길 수 있습니다. 원장 finalization 이 모든 경로에서 실행되도록
+    # try/finally 로 감쌉니다 (브로커 생성 여부와 무관, 비어 있으면 no-op, 1회만).
+    try:
+        _run_mode_dispatch()
+    finally:
+        _flush_odno_ledger_once()
 
     # 전체 T 재추정은 주문을 절대 발생시키지 않아야 합니다.
     # 브로커 생성 전 config와 이 모듈의 모드를 함께 DRY로 고정합니다.
