@@ -108,6 +108,7 @@ def test_evidence_keeps_raw_odno_and_salt_for_independent_verification():
 # ── 정적 가드: 새 출력이 원문 주문번호를 찍지 않도록 ───────────────────
 # 스캔 범위(공개 Actions 로그에 남는 경로 전부):
 #   브로커 어댑터 6종 + src/broker/base.py(DRY 취소 로그) + src/state.py
+#   + src/pipeline.py(정산·검토·승인) + src/pipeline_execute.py(주문 접수)
 #   + trading_bot.py + ops/verify_run.py(CLI 출력)
 _SCANNED_FILES = [
     "src/broker/base.py",
@@ -118,6 +119,8 @@ _SCANNED_FILES = [
     "src/broker/nhplug/adapter.py",
     "src/broker/meritz/adapter.py",
     "src/state.py",
+    "src/pipeline.py",
+    "src/pipeline_execute.py",
     "trading_bot.py",
     "ops/verify_run.py",
 ]
@@ -382,6 +385,10 @@ _RAW_TELEGRAM_PATTERNS = (
     "예약주문번호: {result.order_id}",    # 예약주문 접수 알림
     r"\n주문번호: {result.order_id}",     # 일반 주문 접수 알림
 )
+# 접수 알림(주문번호 원문 허용)은 **EXECUTE 모듈 한 곳**에서만 만듭니다.
+# trading_bot.py 는 주문 루프를 가지지 않으므로 원문 사이트 0곳이 정상입니다.
+_RAW_TELEGRAM_SITE_OWNER = "src/pipeline_execute.py"
+_RAW_TELEGRAM_SITE_FORBIDDEN = "trading_bot.py"
 
 
 def _sibling_block(node, parents):
@@ -395,6 +402,20 @@ def _sibling_block(node, parents):
     return []
 
 
+def _statements_with_try_body(block):
+    """블록 안 문장 + 같은 블록 `try:` 본문 문장까지 평탄화합니다.
+
+    접수 알림 발송은 표시 전용 실패가 주문 결과를 바꾸지 않도록 `try/except`
+    안에 있으므로, twin/notify 탐색은 그 본문까지 봐야 합니다.
+    """
+    flattened = []
+    for statement in block:
+        flattened.append(statement)
+        if isinstance(statement, ast.Try):
+            flattened.extend(_statements_with_try_body(statement.body))
+    return flattened
+
+
 def _assign_target(statement, name):
     if isinstance(statement, ast.Assign):
         return any(isinstance(t, ast.Name) and t.id == name for t in statement.targets)
@@ -403,22 +424,37 @@ def _assign_target(statement, name):
     return False
 
 
-def test_raw_telegram_message_sites_are_explicitly_paired_with_masked_twin():
-    """개인 채팅용 원문(`telegram_message`)은 **허용된 줄 패턴**에서만 만들고,
-    같은 블록에서 `message = _mask_token_in(telegram_message, <주문번호>)` 로
-    마스킹된 twin 을 반드시 함께 만든 뒤 `notify(message, telegram_message=...)` 로 보냅니다.
-
-    (실수로 새 원문 사이트를 추가하거나 twin 을 지우면 이 테스트가 깨집니다.)
-    """
-    tree = ast.parse((ROOT / "trading_bot.py").read_text(encoding="utf-8"))
+def _raw_telegram_sites(relpath):
+    """해당 파일에서 원문(`telegram_message`) 사이트를 찾습니다 → (parents, sites)."""
+    tree = ast.parse((ROOT / relpath).read_text(encoding="utf-8"))
     parents = _parent_map(tree)
-
-    raw_sites = [
+    sites = [
         node for node in ast.walk(tree)
         if isinstance(node, (ast.Assign, ast.AnnAssign))
         and _assign_target(node, "telegram_message")
         and isinstance(node.value, ast.JoinedStr)
     ]
+    return parents, sites
+
+
+def test_raw_telegram_message_sites_are_explicitly_paired_with_masked_twin():
+    """개인 채팅용 원문(`telegram_message`)은 **허용된 줄 패턴**에서만 만들고,
+    같은 블록에서 `message = _mask_token_in(telegram_message, <주문번호>)` 로
+    마스킹된 twin 을 반드시 함께 만든 뒤 `notify(message, telegram_message=...)` 로 보냅니다.
+
+    주문 루프는 EXECUTE 모듈(`src/pipeline_execute.py`) 한 곳에만 있으므로
+    `trading_bot.py` 의 원문 사이트는 0곳이 정상입니다.
+
+    (실수로 새 원문 사이트를 추가하거나 twin 을 지우면 이 테스트가 깨집니다.)
+    """
+    _parents_forbidden, forbidden_sites = _raw_telegram_sites(_RAW_TELEGRAM_SITE_FORBIDDEN)
+    assert not forbidden_sites, (
+        f"{_RAW_TELEGRAM_SITE_FORBIDDEN} 에 원문 telegram_message 사이트가 "
+        f"{len(forbidden_sites)}곳 생겼습니다 — 주문 접수 알림은 "
+        f"{_RAW_TELEGRAM_SITE_OWNER} 에만 있어야 합니다"
+    )
+
+    parents, raw_sites = _raw_telegram_sites(_RAW_TELEGRAM_SITE_OWNER)
     assert len(raw_sites) == len(_RAW_TELEGRAM_PATTERNS), (
         f"원문 telegram_message 사이트가 {len(raw_sites)}곳입니다 — 허용 목록"
         f"({len(_RAW_TELEGRAM_PATTERNS)}곳)과 맞추고 사유를 기록하세요: "
@@ -454,7 +490,7 @@ def test_raw_telegram_message_sites_are_explicitly_paired_with_masked_twin():
         )
 
         notify_calls = [
-            statement for statement in block
+            statement for statement in _statements_with_try_body(block)
             if isinstance(statement, ast.Expr)
             and isinstance(statement.value, ast.Call)
             and (getattr(statement.value.func, "id", "") or getattr(statement.value.func, "attr", ""))

@@ -32,6 +32,41 @@ on:
         required: false
         type: string
 
+      # ── 단계형 라이프사이클 (SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY) ──
+      # RUN_PHASE 없는 LIVE 는 봇이 브로커 생성 전에 차단(fail-closed)하므로 Actions 는
+      # 반드시 단계를 지정해야 합니다. 기본 LIFECYCLE 은 한 job 안에서
+      # SETTLE → PREVIEW → APPROVE → EXECUTE 를 순서대로 실행합니다(승인 게이트 유지).
+      # 모의 계좌라 LIFECYCLE 자동 체인을 그대로 허용합니다 (사람 검토 표식 reviewed 는
+      # 운영 계좌 real 전용 — trade_base.yml 게이트 참고).
+      # ⚠️ 프리장 개장까지 최대 7.5시간 대기하므로 **아침 dispatch 는 hosted 러너 6시간
+      #    제한을 넘겨 실행 전에 중단**됩니다 (fail-closed + 안내). 저녁(KST 17시 이후)
+      #    dispatch 로 실행하세요.
+      # VERIFY(정산 근거 독립 검산)는 이 워크플로의 verify-settlement job 이 담당합니다.
+      run_phase:
+        description: '실행 단계 (기본: LIFECYCLE)'
+        required: false
+        type: choice
+        default: LIFECYCLE
+        options:
+          - LIFECYCLE
+          - SETTLE
+          - PREVIEW
+          - APPROVE
+          - EXECUTE
+          - VERIFY
+      plan_id:
+        description: 'APPROVE 대상 plan_id (PREVIEW 로그에서 복사, 쉼표로 다중 지정) — LIFECYCLE 은 불필요'
+        required: false
+        type: string
+      approval_plan_id:
+        description: 'EXECUTE/VERIFY 대상 plan_id (승인 파일 기준, 쉼표로 다중 지정) — LIFECYCLE 은 불필요'
+        required: false
+        type: string
+      auto_execute:
+        description: 'PREVIEW 직후 자동 승인·실행 (opt-in, true/false — LIFECYCLE 은 미사용)'
+        required: false
+        type: string
+
 jobs:
   trade_kiwoom_demo:
     uses: ./.github/workflows/trade_base.yml
@@ -42,5 +77,10 @@ jobs:
       symbols: ${{ github.event.inputs.symbols || github.event.client_payload.symbols || '' }}
       run_id: ${{ github.event.inputs.run_id || github.event.client_payload.run_id || '' }}
       retry_num: ${{ github.event.inputs.retry_num || github.event.client_payload.retry_num || '' }}
+      # 단계형 라이프사이클 — dispatch payload 로도 단계/대상을 지정할 수 있습니다.
+      run_phase: ${{ github.event.inputs.run_phase || github.event.client_payload.run_phase || 'LIFECYCLE' }}
+      plan_id: ${{ github.event.inputs.plan_id || github.event.client_payload.plan_id || '' }}
+      approval_plan_id: ${{ github.event.inputs.approval_plan_id || github.event.client_payload.approval_plan_id || '' }}
+      auto_execute: ${{ github.event.inputs.auto_execute || github.event.client_payload.auto_execute || '' }}
 
     secrets: inherit

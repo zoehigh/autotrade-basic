@@ -43,11 +43,14 @@ def validate_run_phase(run_phase=None, trade_mode=None) -> str:
 
     유효하지 않은 조합이면 broker 를 만들기 전에 SystemExit(1) 로 중단합니다.
     RUN_PHASE 미설정("")은 기존 통합 실행(레거시)으로 간주합니다.
+    RUN_PHASE 정규화 규칙은 config.read_run_phase() 한 곳에만 정의되어 있습니다.
     """
     import os
 
+    import config
+
     phase = (
-        run_phase if run_phase is not None else os.getenv("RUN_PHASE", "")
+        run_phase if run_phase is not None else config.read_run_phase()
     ).strip().upper()
     mode = (
         trade_mode if trade_mode is not None else os.getenv("TRADE_MODE", "DRY")

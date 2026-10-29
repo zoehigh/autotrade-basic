@@ -1,4 +1,5 @@
 # API 키, 환경변수 등 설정값을 관리하는 파일
+import math
 import os
 from dotenv import load_dotenv
 
@@ -267,6 +268,68 @@ if _trade_mode not in ("DRY", "LIVE", "REPAIR"):
 else:
 	TRADE_MODE = _trade_mode
 
+# ── 파이프라인 상수 (SETTLE | PREVIEW | APPROVE | EXECUTE | VERIFY) ──────────
+# 이 절은 파이프라인 설정의 **유일한 정의처**입니다. pipeline.py / broker/__init__.py
+# 는 env 를 다시 읽지 말고 여기의 값을 가져다 씁니다.
+# 숫자 값이 잘못되면 어느 환경변수인지 알려주며 중단합니다 (무메시지 traceback 방지).
+
+
+def _env_int(name: str, default: int) -> int:
+	"""환경변수를 정수로 읽습니다. 값이 잘못되면 변수명을 알려주고 중단합니다."""
+	raw = os.getenv(name)
+	if raw is None or not raw.strip():
+		return default
+	try:
+		return int(raw.strip())
+	except ValueError:
+		raise ValueError(
+			f"[config] 환경변수 {name} 는 정수여야 합니다 (현재 값: '{raw}')"
+		) from None
+
+
+def _env_float(name: str, default: float, nonneg: bool = False) -> float:
+	"""환경변수를 실수로 읽습니다. 값이 잘못되면 변수명을 알려주고 중단합니다.
+
+	`float("nan")`·`float("inf")` 는 **문자열 파싱에 성공**하므로 파싱만으로는
+	막을 수 없습니다. 그런 값은 비교를 무력화합니다 — 예를 들어 지연이 NaN 이면
+	`if delay > 0` 이 거짓이 되어 재조회 없이 게이트를 통과하고, 잠금 대기
+	시간이 NaN/Infinity 면 `time.monotonic() >= deadline` 이 영원히 거짓이라
+	대기 루프가 끝나지 않습니다. 그래서 **모든 경로에서 유한한 값만** 허용하고,
+	`nonneg=True` 는 여기에 0 이상 조건을 더합니다.
+	기본값은 바꾸지 않고 **오타만 중단**시킵니다 (숫자 오타는 변수명과 함께 중단).
+	"""
+	raw = os.getenv(name)
+	if raw is None or not raw.strip():
+		return default
+	try:
+		value = float(raw.strip())
+	except ValueError:
+		raise ValueError(
+			f"[config] 환경변수 {name} 는 숫자여야 합니다 (현재 값: '{raw}')"
+		) from None
+	if not math.isfinite(value):
+		raise ValueError(
+			f"[config] 환경변수 {name} 는 유한한 숫자여야 합니다 "
+			f"(nan/infinity 불가, 현재 값: '{raw}')"
+		)
+	if nonneg and value < 0:
+		raise ValueError(
+			f"[config] 환경변수 {name} 는 0 이상이어야 합니다 (현재 값: '{raw}')"
+		)
+	return value
+
+
+# 기본값 — env 미설정 시 쓰는 값 (여기서만 정의합니다)
+DEFAULT_APPROVAL_TTL_SECONDS = 32400
+DEFAULT_APPROVAL_MIN_TTL_SECONDS = 28800
+DEFAULT_PLAN_DIR = "plans"
+DEFAULT_EXECUTION_PRICE_TOLERANCE_ABS = 0.02
+DEFAULT_EXECUTION_PRICE_TOLERANCE_PCT = 0.005
+DEFAULT_EXECUTION_QTY_TOLERANCE = 0
+DEFAULT_HISTORY_SETTLEDNESS_DELAY_SECONDS = 1.0
+DEFAULT_RECENT_ORDER_GUARD_MINUTES = 15
+DEFAULT_RUN_LOCK_TIMEOUT_SECONDS = 300.0
+
 # 파이프라인 단계 (SETTLE | PREVIEW | APPROVE | EXECUTE | VERIFY)
 # 미설정("")이면 기존 통합 실행(정산→계획→주문)으로 동작합니다.
 # 조합 검증은 broker.create_broker() / validate_run_phase() 가 브로커 생성 전에 수행합니다.
@@ -274,25 +337,93 @@ RUN_PHASE = os.getenv("RUN_PHASE", "").strip().upper()
 
 # 승인 파일이 유효한 시간(초) — APPROVE 후 EXECUTE 전까지의 최대 지연
 # 운영 스케줄(SETTLE→PREVIEW→APPROVE→EXECUTE) 간격(약 7.5h)을 덮도록 기본 9h.
-APPROVAL_TTL_SECONDS = int(os.getenv("APPROVAL_TTL_SECONDS", "32400"))
+APPROVAL_TTL_SECONDS = _env_int("APPROVAL_TTL_SECONDS", DEFAULT_APPROVAL_TTL_SECONDS)
 # 너무 짧은 TTL 은 운영 간격을 못 덮으므로 승인 생성 시 거부합니다.
-APPROVAL_MIN_TTL_SECONDS = int(os.getenv("APPROVAL_MIN_TTL_SECONDS", "28800"))
+APPROVAL_MIN_TTL_SECONDS = _env_int(
+	"APPROVAL_MIN_TTL_SECONDS", DEFAULT_APPROVAL_MIN_TTL_SECONDS
+)
 
 # 승인 계획 파일 저장 위치 (PREVIEW 산출물)
-PLAN_DIR = os.getenv("PLAN_DIR", "plans")
+PLAN_DIR = os.getenv("PLAN_DIR") or DEFAULT_PLAN_DIR
 
 # EXECUTE 재확인 허용 오차 (승인 시점 대비 현재 재계산 계획)
 # 가격: max(절대값, 승인가 × 비율) / 수량: 절대값(기본 0 = 정확히 일치)
-EXECUTION_PRICE_TOLERANCE_ABS = float(os.getenv("EXECUTION_PRICE_TOLERANCE_ABS", "0.02"))
-EXECUTION_PRICE_TOLERANCE_PCT = float(os.getenv("EXECUTION_PRICE_TOLERANCE_PCT", "0.005"))
-EXECUTION_QTY_TOLERANCE = int(os.getenv("EXECUTION_QTY_TOLERANCE", "0"))
+# 허용오차는 `normalize_tolerance_policy()` 가 유한·비음수만 통과시키므로,
+# env 가 nan/inf/음수면 그 값이 **정책 기본값까지 오염**됩니다 (전 플랜 거부).
+# 그래서 여기서 읽을 때 변수명을 알려주며 중단합니다.
+EXECUTION_PRICE_TOLERANCE_ABS = _env_float(
+	"EXECUTION_PRICE_TOLERANCE_ABS",
+	DEFAULT_EXECUTION_PRICE_TOLERANCE_ABS,
+	nonneg=True,
+)
+EXECUTION_PRICE_TOLERANCE_PCT = _env_float(
+	"EXECUTION_PRICE_TOLERANCE_PCT",
+	DEFAULT_EXECUTION_PRICE_TOLERANCE_PCT,
+	nonneg=True,
+)
+EXECUTION_QTY_TOLERANCE = _env_int(
+	"EXECUTION_QTY_TOLERANCE", DEFAULT_EXECUTION_QTY_TOLERANCE
+)
 
 # 지연 이력(메리츠 등) 정착성 확인 — 반복 조회로 이력이 바뀌면 정산을 보류합니다.
 HISTORY_SETTLEDNESS_CHECK = os.getenv("HISTORY_SETTLEDNESS_CHECK", "").strip().lower()
-HISTORY_SETTLEDNESS_DELAY_SECONDS = float(
-    os.getenv("HISTORY_SETTLEDNESS_DELAY_SECONDS", "1.0")
+# 재조회 지연은 **정산 게이트** 값입니다. NaN 이면 `delay > 0` 이 거짓이 되어
+# 재조회 없이 통과하므로 유한·비음수만 허용합니다 (음수/NaN 은 변수명과 함께 중단).
+HISTORY_SETTLEDNESS_DELAY_SECONDS = _env_float(
+	"HISTORY_SETTLEDNESS_DELAY_SECONDS",
+	DEFAULT_HISTORY_SETTLEDNESS_DELAY_SECONDS,
+	nonneg=True,
 )
-RECENT_ORDER_GUARD_MINUTES = int(os.getenv("RECENT_ORDER_GUARD_MINUTES", "15"))
+RECENT_ORDER_GUARD_MINUTES = _env_int(
+	"RECENT_ORDER_GUARD_MINUTES", DEFAULT_RECENT_ORDER_GUARD_MINUTES
+)
+
+# ── 호출 시점 env 를 읽는 함수 ──────────────────────────────────────────────
+# 아래 값들은 **실행 시점의 env** 를 반영해야 합니다 (검증 게이트·테스트에서 env 를
+# 바꿔 끼우기 때문). 규칙(이름·기본값·정규화)은 위 상수와 같은 곳에서만 정의합니다.
+
+
+def read_run_phase() -> str:
+	"""호출 시점 env 의 RUN_PHASE (공백 제거 + 대문자, 미설정이면 "")."""
+	return os.getenv("RUN_PHASE", "").strip().upper()
+
+
+def read_history_settledness_flag() -> str:
+	"""호출 시점 env 의 HISTORY_SETTLEDNESS_CHECK (공백 제거 + 소문자)."""
+	return os.getenv("HISTORY_SETTLEDNESS_CHECK", "").strip().lower()
+
+
+def read_history_settledness_delay_seconds() -> float:
+	"""호출 시점 env 의 이력 재조회 지연(초). 잘못된 값이면 변수명과 함께 중단.
+
+	정산 게이트를 좌우하므로 **유한한 0 이상** 값만 허용합니다 (NaN 이면
+	재조회 없이 정착성 검사가 통과합니다).
+	"""
+	return _env_float(
+		"HISTORY_SETTLEDNESS_DELAY_SECONDS",
+		DEFAULT_HISTORY_SETTLEDNESS_DELAY_SECONDS,
+		nonneg=True,
+	)
+
+
+def read_run_lock_timeout_seconds() -> float:
+	"""호출 시점 env 의 전역 실행 잠금 대기 시간(초). 잘못된 값이면 중단.
+
+	NaN/Infinity 는 대기 마감(`time.monotonic() >= deadline`)을 영원히 거짓으로
+	만들어 잠금 루프가 끝나지 않으므로 유한한 0 이상 값만 허용합니다.
+	"""
+	return _env_float(
+		"RUN_LOCK_TIMEOUT_SECONDS",
+		DEFAULT_RUN_LOCK_TIMEOUT_SECONDS,
+		nonneg=True,
+	)
+
+
+def read_recent_order_guard_minutes() -> int:
+	"""호출 시점 env 의 최근 미종결 주문 guard 시간(분)."""
+	return _env_int(
+		"RECENT_ORDER_GUARD_MINUTES", DEFAULT_RECENT_ORDER_GUARD_MINUTES
+	)
 
 # 매매 수수료율
 # 한국투자증권 해외주식 기본 수수료: 0.25% (계좌/이벤트에 따라 다를 수 있음)

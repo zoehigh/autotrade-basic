@@ -29,6 +29,7 @@ try:
 except ImportError:  # pragma: no cover - POSIX 운영 환경 전제
     fcntl = None
 
+import config
 from state import (
     _fill_amount,
     _has_unconfirmed_amount_fills,
@@ -41,7 +42,8 @@ from state import (
 )
 
 APPROVALS_DIR = os.getenv("APPROVALS_DIR", "approvals")
-PLAN_DIR = os.getenv("PLAN_DIR", "plans")
+# 경로/기본값은 config.py 한 곳에서만 정의합니다 (여기서 env 를 다시 읽지 않습니다).
+PLAN_DIR = config.PLAN_DIR
 # v2: created_at_utc/expires_at_utc 를 plan_hash 에 포함하고, account_id 는
 #     원문 대신 HMAC-SHA256 지문 + 마스킹 표시값만 저장합니다.
 #     v1 파일은 명시적으로 거부합니다. (P2-H / P2-D)
@@ -49,8 +51,6 @@ PLAN_DIR = os.getenv("PLAN_DIR", "plans")
 #     v2/v1 파일은 재승인(PREVIEW→APPROVE)이 필요합니다.
 APPROVAL_SCHEMA_VERSION = 3
 PLAN_SCHEMA_VERSION = 3
-DEFAULT_APPROVAL_TTL_SECONDS = int(os.getenv("APPROVAL_TTL_SECONDS", "32400"))
-DEFAULT_MIN_TTL_SECONDS = int(os.getenv("APPROVAL_MIN_TTL_SECONDS", "28800"))
 
 
 def _tb():
@@ -210,9 +210,13 @@ class OrderPlan:
 TOLERANCE_PRICE_PCT_ENV = "EXECUTION_PRICE_TOLERANCE_PCT"
 TOLERANCE_PRICE_ABS_ENV = "EXECUTION_PRICE_TOLERANCE_ABS"
 TOLERANCE_QTY_ENV = "EXECUTION_QTY_TOLERANCE"
-DEFAULT_TOLERANCE_PRICE_PCT = 0.005
-DEFAULT_TOLERANCE_PRICE_ABS = 0.02
-DEFAULT_TOLERANCE_QTY = 0
+# 기본값(env 미설정 시)은 config.py 의 파이프라인 상수 한 곳에서만 정의합니다.
+# ⚠️ env 로 해석된 `config.EXECUTION_*` 이 아니라 **검증된 기본 상수**를 씁니다.
+# 이 값은 `_tolerance_float/int` 의 fallback 이므로, 오염값(nan/inf/음수)이
+# 새어들면 정책이 NaN 이 되어 모든 플랜이 조용히 거부됩니다.
+DEFAULT_TOLERANCE_PRICE_PCT = config.DEFAULT_EXECUTION_PRICE_TOLERANCE_PCT
+DEFAULT_TOLERANCE_PRICE_ABS = config.DEFAULT_EXECUTION_PRICE_TOLERANCE_ABS
+DEFAULT_TOLERANCE_QTY = config.DEFAULT_EXECUTION_QTY_TOLERANCE
 
 
 def _tolerance_float(source, name, default):
@@ -481,9 +485,9 @@ def _broker_identity():
 
 def _resolve_ttl(ttl_seconds=None, min_ttl_seconds=None):
     """승인 TTL 을 결정하고 운영 간격보다 짧으면 fail-closed 합니다."""
-    ttl = DEFAULT_APPROVAL_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    ttl = config.APPROVAL_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
     min_ttl = (
-        DEFAULT_MIN_TTL_SECONDS
+        config.APPROVAL_MIN_TTL_SECONDS
         if min_ttl_seconds is None
         else int(min_ttl_seconds)
     )
@@ -1617,9 +1621,10 @@ RUN_LOCK_HELD_ENV = "RUN_LOCK_HELD"
 # 가리키는지 확인한 뒤에만 "상속된 잠금"으로 인정합니다 (플래그만 신뢰 금지).
 RUN_LOCK_FD_ENV = "RUN_LOCK_FD"
 DEFAULT_RUN_LOCK_FD = 9
-DEFAULT_RUN_LOCK_TIMEOUT_SECONDS = float(
-    os.getenv("RUN_LOCK_TIMEOUT_SECONDS", "300") or 300
-)
+# 잠금 대기 시간의 env 해석·검증(유한·비음수)은 config 한 곳에서 합니다.
+# NaN/Infinity 를 그대로 쓰면 `time.monotonic() >= deadline` 이 영원히 거짓이라
+# 잠금 대기 루프가 끝나지 않습니다 (기본값 300초는 config 가 정의합니다).
+DEFAULT_RUN_LOCK_TIMEOUT_SECONDS = config.read_run_lock_timeout_seconds()
 # 경로별 재진입 깊이 — 같은 프로세스 안에서 상위 래퍼(main/디스패처)가 이미
 # 잡은 잠금을 다시 잡으면 flock 은 자기 자신과 교착합니다.
 _RUN_LOCKS = {}
@@ -1780,6 +1785,11 @@ def global_lock(path=None, timeout_seconds=None):
         if timeout_seconds is None
         else float(timeout_seconds)
     )
+    if not math.isfinite(wait):
+        # env 와 같은 기준: NaN/Infinity 는 대기 마감을 무력화해 무한 대기가 됩니다.
+        raise ValueError(
+            f"global_lock timeout_seconds 는 유한한 숫자여야 합니다 (현재 값: {wait!r})"
+        )
     handle = open(target, "a+", encoding="utf-8")
     deadline = time.monotonic() + max(wait, 0.0)
     try:
@@ -2017,7 +2027,7 @@ def verify_evidence_file_with_ops(path, **kwargs):
 
 
 def _history_settledness_enabled():
-    flag = os.getenv("HISTORY_SETTLEDNESS_CHECK", "").strip().lower()
+    flag = config.read_history_settledness_flag()
     if flag in ("1", "true", "yes", "on"):
         return True
     if flag in ("0", "false", "no", "off"):
@@ -2050,10 +2060,7 @@ def _history_has_recent_open_order(rows, now=None):
     `미체결`로 보이는 브로커(메리츠)는 guard 시간 밖이므로 통과합니다.
     """
     tb = _tb()
-    try:
-        guard_minutes = int(os.getenv("RECENT_ORDER_GUARD_MINUTES", "15"))
-    except ValueError:
-        guard_minutes = 15
+    guard_minutes = config.read_recent_order_guard_minutes()
     if guard_minutes <= 0:
         return False
     current = now or tb.datetime.now(ZoneInfo("UTC"))
@@ -2188,11 +2195,7 @@ def _verify_history_settled(broker, state, symbol, exchange, history, history_da
     """
     if not _history_settledness_enabled():
         return True, ""
-    delay = 1.0
-    try:
-        delay = float(os.getenv("HISTORY_SETTLEDNESS_DELAY_SECONDS", "1.0"))
-    except ValueError:
-        delay = 1.0
+    delay = config.read_history_settledness_delay_seconds()
     if delay > 0:
         _tb().time.sleep(delay)
     try:
@@ -3136,6 +3139,10 @@ def build_order_plan(settled, broker, *, net_invested_overlay=None):
         T=T,
         additional_loc_levels=additional_loc_levels,
         state=strategy_state,
+        # 리버스모드 중복방지는 **벽시계(ET 오늘)가 아니라 실행 대상 세션**으로
+        # 판정합니다. KST 아침 PREVIEW 시점의 ET 벽시계는 아직 전일이라, 벽시계로
+        # 비교하면 진행 중인 리버스가 0건으로 조용히 건너뛰어집니다.
+        session_date=session,
     )
 
     if strategy_result.get("reverse_exit") and tb.TRADE_MODE == "LIVE":

@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# 운영 런처 — cron(KST 17:20)에서 1일 1회 LIVE 실행합니다.
+# 운영 런처 — cron 에서 하루 여러 번(단계별) LIVE 실행합니다.
+#
+# ⚠️ 1일 1회 단일 실행이 아닙니다. SETTLE/PREVIEW 는 KST 아침, APPROVE/EXECUTE/VERIFY 는
+#    KST 18:20~18:45 에 각각 별도 런으로 실행합니다 (스케줄 예시: ops/cron.example).
 #
 # 사용법:
-#   ./run_daily.sh                          # .env 설정 그대로 LIVE
+#   ./run_daily.sh                          # .env 설정 그대로 LIVE (LIVE 는 RUN_PHASE 필수 — 아래 참고)
 #   FORCE_SYMBOLS=TQQQ:NAS ./run_daily.sh   # 단일 종목만
 #   LAUNCH_MODE=DRY ./run_daily.sh          # 주문 없이 프리뷰
+#
+# ⚠️ LIVE 는 RUN_PHASE 를 반드시 지정해야 합니다 (없으면 봇이 브로커 생성 전에 차단).
+#    단계: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY (스케줄 예시는 ops/cron.example).
+#    예) RUN_PHASE=PREVIEW LAUNCH_MODE=LIVE ./run_daily.sh
+#    GitHub Actions 는 워크플로가 같은 단계를 자동으로 이어서 실행합니다
+#    (.github/workflows/trade_base.yml 의 run_phase=LIFECYCLE — 승인 게이트는 유지).
 #
 # 종료 코드
 #   0  정상 (주문 접수 성공 또는 휴장일 등)
@@ -43,9 +52,21 @@ OVERRIDE_LOCK_PATH="${RUN_LOCK_PATH:-}"
 # 2) 상대경로는 APP_DIR 기준으로 절대화합니다.
 # 3) 최종 절대 경로를 RUN_LOCK_PATH 로 export 합니다 — **런처가 해석한 이 값이
 #    자식 파이썬의 기준값**입니다 (직접 CLI 도 .env 를 읽으므로 같은 값).
-# 4) 런처는 이 경로를 fd 9 로 flock 하고 RUN_LOCK_HELD=1 + RUN_LOCK_FD=9 를
-#    export 합니다. 자식 파이썬은 **fd 9 가 실제로 같은 파일을 가리킬 때만**
-#    상속된 잠금으로 인정합니다 (플래그만으로는 우회하지 않음).
+# 4) 런처는 **단계와 무관하게 항상** 이 파일을 fd 9 로 flock 합니다 (fail-closed).
+#    "대기 단계는 잠그지 않는다" 판정은 셸에서 다시 구현하지 않습니다 —
+#    **판정 규칙의 단일 출처는 trading_bot.py `_phase_runs_without_outer_lock()`**
+#    입니다 (셸/파이썬 이중 구현은 drift 시 보호가 조용히 약해집니다).
+#    - 일반 단계: 런처가 잡은 잠금을 자식이 그대로 사용합니다. 자식 파이썬은
+#      fd 9 가 실제로 같은 파일을 가리킬 때만 상속된 잠금으로 인정합니다
+#      (플래그만으로는 우회하지 않음).
+#    - 대기 단계(EXECUTE, PREVIEW+AUTO_EXECUTE): 자식 파이썬이 기동 직후
+#      `_release_inherited_outer_lock()` 으로 **상속 fd 의 flock 만** 풉니다.
+#      프리장 개장 대기(최대 ~7.5시간)를 셸이 잠금을 든 채 보내면 그동안 다른
+#      단계(SETTLE/PREVIEW/APPROVE/VERIFY)가 전부 `flock -w 300` 타임아웃으로
+#      실패하기 때문입니다. 동시실행 보호는 그 뒤 임계구간(계획 생성·승인 재검증·
+#      선점·state 저장·주문 전송)에서 파이썬 `pipeline.global_lock()` 이 같은
+#      파일로 계속 수행합니다. 즉 잠금이 **사라지는 구간은 대기뿐**이고,
+#      주문·상태변경 구간은 항상 잠금 안입니다 (fail-open 아님).
 set -a
 . ./.env
 set +a
@@ -55,6 +76,7 @@ case "$LOCK_PATH" in
     *) LOCK_PATH="$APP_DIR/$LOCK_PATH" ;;
 esac
 export RUN_LOCK_PATH="$LOCK_PATH"
+
 export RUN_LOCK_FD=9
 mkdir -p "$(dirname "$LOCK_PATH")"
 exec 9>"$LOCK_PATH"
@@ -73,7 +95,8 @@ fi
 # 파이썬 쪽 전역 잠금(pipeline.global_lock)도 같은 .run.lock 을 씁니다.
 # 런처가 이미 fd 9 로 잡고 있으므로, 자식 프로세스가 다시 flock 을 시도하면
 # 자기 자신과 교착합니다 → 상속된 fd(9)와 플래그를 env 로 알립니다.
-# 파이썬은 fd 9 가 RUN_LOCK_PATH 와 **같은 파일**일 때만 상속으로 인정합니다.
+# 파이썬은 fd 9 가 RUN_LOCK_PATH 와 **같은 파일**일 때만 상속으로 인정하고,
+# 대기 단계로 판정되면 이 상속 잠금만 스스로 해제합니다.
 export RUN_LOCK_HELD=1
 
 # `.env` 는 위에서 잠금 경로를 정하기 전에 이미 읽었습니다 (RUN_LOCK_PATH 포함).
