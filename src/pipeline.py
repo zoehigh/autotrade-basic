@@ -37,6 +37,7 @@ from state import (
     _parse_processed_qty_marker,
     canonical_state_hash,
     compute_position_from_history,
+    mask_odno,
     reset_settlement_ledger,
     update_T_from_history,
 )
@@ -305,6 +306,304 @@ def price_tolerance(price, policy):
     return max(
         float(policy["price_abs"]), abs(float(price or 0.0)) * float(policy["price_pct"])
     )
+
+
+# ── 계획 비교 기준 (승인 / 실행 / 사후 검증 공용) ────────────────────
+# 승인(APPROVE) → 실행(EXECUTE) → 검증(VERIFY) 세 지점이 **같은 기준**으로 계획을
+# 대조해야 합니다. 한 곳만 느슨하면 승인 범위를 벗어난 계획이 실행되고, 한 곳만
+# 엄격하면 정상 실행이 실패로 기록됩니다. 그래서 비교 규칙은 이 모듈 한 곳에만
+# 두고 `pipeline_execute.compare_order_plans()`(EXECUTE)와
+# `transmitted_plan_problems()`(VERIFY)가 함께 씁니다.
+#
+# 허용오차(승인 시점에 고정된 정책)는 **수량·가격·금액에만** 적용합니다. EXECUTE
+# 는 승인 계획을 게이트로만 쓰고 실행 직전 재계산한 계획을 전송하므로, 시세가
+# 허용오차 안에서 움직인 것은 **정상 드리프트**이며 이걸 막으면 실행 자체가
+# 불가능해집니다.
+#
+# 반면 아래 필드는 **드리프트 대상이 아니라 정합성 대상**입니다. 시세가 움직여도
+# 리버스 단계/배율/T 기준값이 바뀌면 같은 승인으로 다른 주문·다른 정산이 나가므로
+# 허용오차 없이 정확히 일치해야 합니다.
+COMPARE_EXACT_ORDER_FIELDS = ("side", "order_type", "comment")
+COMPARE_EXACT_REVERSE_FIELDS = (
+    "reverse_action",    # 리버스 매수/매도 구분
+    "reverse_day",       # 리버스 일차 (1일차 MOC / 2일차+ LOC 분기)
+    "reverse_base_t",    # 배율 적용 기준 T
+    "reverse_t_factor",  # 매도 배율 (T × factor)
+    "reverse_t_target",  # 리버스 쿼터매수 T 증가분
+)
+# T 반영 기준값(t_target)도 허용오차 없이 비교합니다 (주문별 T 가산 근거).
+COMPARE_EXACT_NUMERIC_ORDER_FIELDS = ("t_target",)
+
+# state_patch 비교 규칙
+# - `reverse_mode` 는 승인에 없으면 실행에서 **추가할 수 없습니다** (승인 없이
+#   전략 상태머신·사이클·리버스 단계가 바뀌는 경로를 막습니다).
+COMPARE_REQUIRED_PATCH_KEYS = ("reverse_mode",)
+# - `close_prices` 의 마지막 원소는 이번 실행의 **현재가**라 정상 드리프트
+#   대상입니다. 이력 부분과 길이는 정확 일치, 마지막 원소만 가격 허용오차를
+#   적용합니다. 승인 패치에 이 키가 없으면 "바인딩되지 않음"으로 보고 추가를
+#   허용합니다 (승인 내용 자체는 plan_hash 가 이미 고정).
+PATCH_DRIFT_TAIL_KEY = "close_prices"
+
+# 비교용 "필드 없음" 표식 — 0/빈 문자열과 구분해야 리버스 필드 누락을 잡습니다.
+_COMPARE_MISSING = object()
+
+
+def _compare_field(record, name):
+    """비교용 필드 조회 — 키 없음과 `None` 을 같은 "값 없음"으로 정규화합니다.
+
+    `apply_state_patch()` 와 주문 메타가 `None` 을 "값 없음"으로 취급하므로 비교
+    에서도 동일하게 봅니다 (None 과 키 부재를 다르게 보면 오탐이 납니다).
+    """
+    if not isinstance(record, dict):
+        return _COMPARE_MISSING
+    value = record.get(name)
+    return _COMPARE_MISSING if value is None else value
+
+
+def strict_equal(left, right):
+    """허용오차 없는 비교 — 숫자 표현(int/float) 차이만 허용합니다.
+
+    bool 은 값 타입까지 구분합니다(`True` 와 `1` 은 다릅니다). 리스트/딕셔너리는
+    길이·키 집합까지 엄격하게 비교하며 **순서는 유지**합니다 (패치 값은 순서가
+    의미를 가지는 배열이므로 무시하면 안 됩니다).
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return float(left) == float(right)
+    if isinstance(left, dict) and isinstance(right, dict):
+        if set(left) != set(right):
+            return False
+        return all(strict_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        if len(left) != len(right):
+            return False
+        return all(strict_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _exact_field_problem(
+    index, approved, rebuilt, field, prefix, approved_label, rebuilt_label
+):
+    """허용오차를 적용하지 않는 주문 필드(리버스/T 기준값)를 비교합니다."""
+    approved_value = _compare_field(approved, field)
+    rebuilt_value = _compare_field(rebuilt, field)
+    if approved_value is _COMPARE_MISSING and rebuilt_value is _COMPARE_MISSING:
+        return None
+    if approved_value is _COMPARE_MISSING or rebuilt_value is _COMPARE_MISSING:
+        # 한쪽에만 있는 경우(예: 일반 주문 → 리버스 주문으로 바뀜)는 정확 일치가
+        # 아니므로 그대로 불일치입니다 (허용오차 대상이 아닙니다).
+        return (
+            f"{prefix}주문 {index} {field} 필드 존재 불일치: "
+            f"{approved_label}="
+            f"{'없음' if approved_value is _COMPARE_MISSING else repr(approved_value)}, "
+            f"{rebuilt_label}="
+            f"{'없음' if rebuilt_value is _COMPARE_MISSING else repr(rebuilt_value)} "
+            "(리버스/T 기준값은 드리프트 대상이 아닙니다)"
+        )
+    if strict_equal(approved_value, rebuilt_value):
+        return None
+    reason = (
+        "T 가산 기준값" if field in COMPARE_EXACT_NUMERIC_ORDER_FIELDS
+        else "리버스 단계/배율"
+    )
+    return (
+        f"{prefix}주문 {index} {field} 불일치: "
+        f"{approved_label}={approved_value!r}, {rebuilt_label}={rebuilt_value!r} "
+        f"(허용오차 없음 — {reason}은 정합성 대상입니다)"
+    )
+
+
+def _close_prices_patch_problem(
+    approved_prices, rebuilt_prices, policy,
+    approved_label="승인", rebuilt_label="재계산",
+):
+    """close_prices 패치 비교 — 이력은 정확 일치, 마지막(현재가)만 허용오차."""
+    approved = list(approved_prices or [])
+    rebuilt = list(rebuilt_prices or [])
+    if len(approved) != len(rebuilt):
+        return (
+            f"길이 불일치: {approved_label} {len(approved)}개 vs "
+            f"{rebuilt_label} {len(rebuilt)}개"
+        )
+    if not approved:
+        return None
+    if not strict_equal(approved[:-1], rebuilt[:-1]):
+        return (
+            f"이력 종가 불일치: {approved_label} {approved[:-1]} vs "
+            f"{rebuilt_label} {rebuilt[:-1]} "
+            "(state 가 잠겨 있으므로 이력은 드리프트 대상이 아닙니다)"
+        )
+    try:
+        approved_last = float(approved[-1])
+        rebuilt_last = float(rebuilt[-1])
+    except (TypeError, ValueError):
+        return (
+            f"현재가를 숫자로 읽을 수 없습니다: {approved_label} {approved[-1]!r}, "
+            f"{rebuilt_label} {rebuilt[-1]!r}"
+        )
+    tolerance = price_tolerance(approved_last, policy) if policy else 0.0
+    if abs(approved_last - rebuilt_last) > tolerance:
+        return (
+            f"현재가 불일치: {approved_label}=${approved_last:.4f}, "
+            f"{rebuilt_label}=${rebuilt_last:.4f} (허용 ±${tolerance:.4f})"
+        )
+    return None
+
+
+def compare_plan_orders(
+    approved_orders, rebuilt_orders, policy,
+    *, prefix="", approved_label="승인", rebuilt_label="재계산",
+):
+    """승인 주문 목록과 재계산(전송/기록) 주문 목록을 **같은 기준**으로 비교합니다.
+
+    - 수량·가격·금액: 승인 시점에 고정된 `policy` 허용오차 안에서만 허용
+      (정상 드리프트).
+    - side/order_type/comment: 정확 일치.
+    - 리버스 필드(reverse_action/day/base_t/factor/t_target)와 t_target: 허용오차
+      없이 정확 일치 — 시세 드리프트로 리버스 단계가 바뀌면 안 됩니다.
+
+    `policy` 가 없으면 개수만 확인하고 주문별 비교는 하지 않습니다 (호출 측이
+    정책 부재를 이미 fail-closed 로 처리합니다).
+    """
+    problems = []
+    approved_orders = list(approved_orders or [])
+    rebuilt_orders = list(rebuilt_orders or [])
+    if len(approved_orders) != len(rebuilt_orders):
+        problems.append(
+            f"{prefix}주문 개수 불일치: {approved_label} {len(approved_orders)} vs "
+            f"{rebuilt_label} {len(rebuilt_orders)}"
+        )
+        return problems
+    if not policy:
+        return problems
+    try:
+        qty_tol = int(policy["qty"])
+    except (KeyError, TypeError, ValueError):
+        qty_tol = 0
+    exact_fields = (
+        COMPARE_EXACT_REVERSE_FIELDS + COMPARE_EXACT_NUMERIC_ORDER_FIELDS
+    )
+    for index, (approved, rebuilt) in enumerate(
+        zip(approved_orders, rebuilt_orders), 1
+    ):
+        for field in COMPARE_EXACT_ORDER_FIELDS:
+            if str(approved.get(field, "")) != str(rebuilt.get(field, "")):
+                problems.append(
+                    f"{prefix}주문 {index} {field} 불일치: "
+                    f"{approved_label}={approved.get(field)!r}, "
+                    f"{rebuilt_label}={rebuilt.get(field)!r}"
+                )
+        a_qty = int(float(approved.get("quantity", 0) or 0))
+        r_qty = int(float(rebuilt.get("quantity", 0) or 0))
+        if abs(a_qty - r_qty) > qty_tol:
+            problems.append(
+                f"{prefix}주문 {index} 수량 불일치: {approved_label}={a_qty}, "
+                f"{rebuilt_label}={r_qty} (허용 {qty_tol})"
+            )
+        a_price = float(approved.get("price") or 0.0)
+        r_price = float(rebuilt.get("price") or 0.0)
+        tolerance = price_tolerance(a_price, policy)
+        if abs(a_price - r_price) > tolerance:
+            problems.append(
+                f"{prefix}주문 {index} 가격 불일치: "
+                f"{approved_label}=${a_price:.4f}, "
+                f"{rebuilt_label}=${r_price:.4f} (허용 ±${tolerance:.4f})"
+            )
+        a_amount = a_price * a_qty
+        r_amount = r_price * r_qty
+        amount_tolerance = max(tolerance * max(a_qty, 1), 0.01)
+        if abs(a_amount - r_amount) > amount_tolerance:
+            problems.append(
+                f"{prefix}주문 {index} 금액 불일치: "
+                f"{approved_label}=${a_amount:.2f}, "
+                f"{rebuilt_label}=${r_amount:.2f} "
+                f"(허용 ±${amount_tolerance:.2f})"
+            )
+        for field in exact_fields:
+            problem = _exact_field_problem(
+                index, approved, rebuilt, field, prefix,
+                approved_label, rebuilt_label,
+            )
+            if problem:
+                problems.append(problem)
+    return problems
+
+
+def _patch_items(patch, label):
+    """state_patch 를 비교용 dict 로 정규화합니다 (`None` 값 키는 "변경 없음")."""
+    if patch is None:
+        return {}, None
+    if not isinstance(patch, dict):
+        return {}, (
+            f"상태 변경(state_patch) 형식이 올바르지 않습니다: "
+            f"{label}={type(patch).__name__}"
+        )
+    return {key: value for key, value in patch.items() if value is not None}, None
+
+
+def compare_state_patches(
+    approved_patch, rebuilt_patch, policy,
+    *, prefix="", approved_label="승인", rebuilt_label="재계산",
+):
+    """승인 시점 state_patch 와 재계산(전송) state_patch 의 의미적 동등성을 검증합니
+    다.
+
+    키 집합으로 비교하고 **순서는 무시**하지만 값은 엄격합니다.
+    - `reverse_mode`: 딕셔너리 전체를 허용오차 없이 정확히 비교 (리버스 단계/사이클/
+      활성 상태가 승인과 달라지면 실행해서는 안 됩니다).
+    - `close_prices`: 길이·이력 부분은 정확 일치, 마지막 원소(이번 실행 현재가)만
+      가격 허용오차를 적용합니다 (정상 드리프트).
+    - 승인 패치에 `close_prices` 가 없으면 바인딩되지 않은 것으로 보고 추가를
+      허용합니다 (구버전 계획 호환 — 승인 내용은 plan_hash 로 이미 고정).
+    """
+    problems = []
+    approved_items, approved_error = _patch_items(approved_patch, approved_label)
+    rebuilt_items, rebuilt_error = _patch_items(rebuilt_patch, rebuilt_label)
+    if approved_error:
+        problems.append(f"{prefix}상태 변경 비교 불가 — {approved_error}")
+    if rebuilt_error:
+        problems.append(f"{prefix}상태 변경 비교 불가 — {rebuilt_error}")
+    if approved_error or rebuilt_error:
+        return problems
+    for key in sorted(set(approved_items) | set(rebuilt_items)):
+        if key in approved_items and key not in rebuilt_items:
+            problems.append(
+                f"{prefix}상태 변경 {key} 누락: {approved_label} 에 있는 변경이 "
+                f"{rebuilt_label} 에 없습니다 "
+                "(승인된 상태 변경은 실행에서 제거할 수 없습니다)"
+            )
+            continue
+        if key not in approved_items:
+            if key == PATCH_DRIFT_TAIL_KEY:
+                # 승인 패치에 없는 close_prices = "바인딩되지 않음" (호환 경로).
+                continue
+            reason = (
+                "전략 상태를 바꾸는 변경은 승인에 없으면 추가할 수 없습니다"
+                if key in COMPARE_REQUIRED_PATCH_KEYS
+                else "승인에 없는 상태 변경입니다"
+            )
+            problems.append(
+                f"{prefix}상태 변경 {key} 추가: {rebuilt_label} 에만 있는 변경입니다 "
+                f"(허용오차 없음 — {reason})"
+            )
+            continue
+        if key == PATCH_DRIFT_TAIL_KEY:
+            detail = _close_prices_patch_problem(
+                approved_items[key], rebuilt_items[key], policy,
+                approved_label=approved_label,
+                rebuilt_label=rebuilt_label,
+            )
+            if detail:
+                problems.append(f"{prefix}상태 변경 close_prices 불일치: {detail}")
+            continue
+        if not strict_equal(approved_items[key], rebuilt_items[key]):
+            problems.append(
+                f"{prefix}상태 변경 {key} 불일치: "
+                f"{approved_label}={approved_items[key]!r}, "
+                f"{rebuilt_label}={rebuilt_items[key]!r} (허용오차 없음)"
+            )
+    return problems
 
 
 def compute_plan_hash(
@@ -1491,54 +1790,31 @@ def transmitted_plan_problems(approval):
         problems.append(
             "승인 파일의 허용오차 정책을 확인할 수 없습니다 (전송 계획 범위 검증 불가)"
         )
-    approved_orders = list(approval.get("orders") or [])
-    recorded_orders = list(data.get("orders") or [])
-    if len(approved_orders) != len(recorded_orders):
-        problems.append(
-            f"전송 계획 주문 개수 불일치: 승인 {len(approved_orders)} vs "
-            f"전송 {len(recorded_orders)}"
+    # 주문 비교 기준은 EXECUTE 와 **같은 함수**를 씁니다 (승인 vs 전송).
+    # 수량/가격/금액만 허용오차, 리버스 필드·t_target 은 허용오차 없이 정확 일치.
+    problems.extend(
+        compare_plan_orders(
+            approval.get("orders") or [],
+            data.get("orders") or [],
+            policy,
+            prefix="전송 ",
+            approved_label="승인",
+            rebuilt_label="전송",
         )
-    elif policy is not None:
-        qty_tol = int(policy["qty"])
-        for index, (approved, recorded) in enumerate(
-            zip(approved_orders, recorded_orders), 1
-        ):
-            for field in ("side", "order_type", "comment"):
-                if str(approved.get(field, "")) != str(recorded.get(field, "")):
-                    problems.append(
-                        f"전송 주문 {index} {field} 불일치: "
-                        f"승인={approved.get(field)!r}, 전송={recorded.get(field)!r}"
-                    )
-            a_qty = int(float(approved.get("quantity", 0) or 0))
-            r_qty = int(float(recorded.get("quantity", 0) or 0))
-            if abs(a_qty - r_qty) > qty_tol:
-                problems.append(
-                    f"전송 주문 {index} 수량 불일치: 승인={a_qty}, 전송={r_qty} "
-                    f"(허용 {qty_tol})"
-                )
-            a_price = float(approved.get("price") or 0.0)
-            r_price = float(recorded.get("price") or 0.0)
-            tolerance = price_tolerance(a_price, policy)
-            if abs(a_price - r_price) > tolerance:
-                problems.append(
-                    f"전송 주문 {index} 가격 불일치: 승인=${a_price:.4f}, "
-                    f"전송=${r_price:.4f} (허용 ±${tolerance:.4f})"
-                )
-            a_amount = a_price * a_qty
-            r_amount = r_price * r_qty
-            amount_tolerance = max(tolerance * max(a_qty, 1), 0.01)
-            if abs(a_amount - r_amount) > amount_tolerance:
-                problems.append(
-                    f"전송 주문 {index} 금액 불일치: 승인=${a_amount:.2f}, "
-                    f"전송=${r_amount:.2f} (허용 ±${amount_tolerance:.2f})"
-                )
-            a_target = approved.get("t_target")
-            r_target = recorded.get("t_target")
-            if a_target is not None and r_target is not None:
-                if abs(float(a_target) - float(r_target)) > 1e-9:
-                    problems.append(
-                        f"전송 주문 {index} t_target 불일치: {a_target} vs {r_target}"
-                    )
+    )
+    # 실제 전송 기록의 state_patch 도 같은 기준으로 대조합니다. EXECUTE 가 재계산
+    # 계획을 전송하므로, 승인에 없던 리버스 상태 변경이나 다른 close_prices 가
+    # 전송됐다면 검증 단계에서 잡아야 합니다 (실행 경로 비교와 동일 기준).
+    problems.extend(
+        compare_state_patches(
+            approval.get("state_patch"),
+            data.get("state_patch"),
+            policy,
+            prefix="전송 ",
+            approved_label="승인",
+            rebuilt_label="전송",
+        )
+    )
     return problems
 
 
@@ -2157,14 +2433,14 @@ def _verify_history_complete(state, history, history_days, now=None):
     ):
         if watermark_ordno not in by_odno:
             problems.append(
-                f"워터마크 주문 {watermark_ordno} 이 이력에 없습니다 "
+                f"워터마크 주문 {mask_odno(watermark_ordno)} 이 이력에 없습니다 "
                 "(이력 누락/정착 지연)"
             )
         else:
             row_ts = _parse_iso(by_odno[watermark_ordno].get("ord_datetime_utc"))
             if row_ts is not None and row_ts.astimezone(timezone.utc) < watermark_ts:
                 problems.append(
-                    f"워터마크 주문 {watermark_ordno} 의 시각이 state 보다 이전입니다 "
+                    f"워터마크 주문 {mask_odno(watermark_ordno)} 의 시각이 state 보다 이전입니다 "
                     f"(history={row_ts.isoformat()}, watermark={state.get('last_updated')})"
                 )
 
@@ -2176,7 +2452,7 @@ def _verify_history_complete(state, history, history_days, now=None):
             continue  # 제출 시각 없음 — 판단 불가 (한계로 문서화)
         if submitted_ts >= window_start:
             problems.append(
-                f"orders_meta 주문 {odno} 이 이력에 없습니다 "
+                f"orders_meta 주문 {mask_odno(odno)} 이 이력에 없습니다 "
                 f"(submitted={submitted_ts.isoformat()})"
             )
     return problems
@@ -2206,7 +2482,8 @@ def _verify_history_settled(broker, state, symbol, exchange, history, history_da
             verbose=False,
         )
     except Exception as error:
-        return False, f"이력 재조회 실패: {error}"
+        # 브로커 사유는 자유 텍스트라 주문번호가 섞일 수 있습니다 (라벨 참조만 마스킹).
+        return False, f"이력 재조회 실패: {_tb()._mask_odno_references(str(error))}"
     if _history_snapshot(repeated) != _history_snapshot(history):
         return False, "이력 반복 조회 결과가 달라졌습니다 (정착 지연 의심)"
     completeness = _verify_history_complete(state, repeated, history_days)

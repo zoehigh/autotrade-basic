@@ -90,6 +90,18 @@ on:
         description: '사람 검토 표식 (운영 계좌 real 의 LIVE LIFECYCLE/EXECUTE 에 필수) — true/1/yes/on 만 허용'
         required: false
         type: string
+      # 수동 승인 경로의 **계획 해시 바인딩** (외부 리뷰 P1).
+      # `reviewed=true` 는 "사람이 검토했다"는 선언일 뿐 **무엇을** 검토했는지 증명하지
+      # 않습니다. PREVIEW 보다 먼저 전달되면 사람이 가격·수량을 보지 않고도 승인·실행까지
+      # 자동 진행됩니다. 그래서 수동 단계(APPROVE/EXECUTE)에서는 PREVIEW 가 만든
+      # `plan_hash` 를 함께 넘겨, 봇이 계획 파일/승인 파일의 plan_hash 와 대조합니다
+      # (불일치 = 승인/실행 중단). 다중 대상은 쉼표로 **같은 개수**만큼 넘깁니다.
+      #  - 운영 계좌(real) + LIVE + APPROVE/EXECUTE: 이 값이 **필수**입니다 (아래 게이트).
+      #  - LIFECYCLE(완전 자동): 바인딩할 사람 검토 값이 없으므로 사용하지 않습니다.
+      plan_hash:
+        description: '사람이 검토한 계획의 plan_hash (수동 APPROVE/EXECUTE 바인딩, 64자리 hex, 다중은 쉼표) — real LIVE 수동 승인은 필수'
+        required: false
+        type: string
       plan_id:
         description: 'APPROVE 대상 계획 (PREVIEW plan_id 또는 plans/*.json 경로, 쉼표로 다중 지정 가능)'
         required: false
@@ -189,6 +201,12 @@ jobs:
     outputs:
       # 검증 호출부가 **실제 실행 job 과 동일한** TRADE_MODE 를 쓰도록 전달합니다.
       trade_mode: ${{ steps.resolve.outputs.trade_mode }}
+      # 주문 실행 검증(RUN_PHASE=VERIFY, 이 job 안에서 EXECUTE 직후 실행)의 결과입니다.
+      # 정산 검증(verify-settlement job)과 **다른 축**이므로 섞지 않고 따로 전달합니다.
+      #   PASS / FAIL / NOT_EXECUTED(승인만 되고 실행 기록 없음) / SKIPPED(검증 대상 없음)
+      #   / 빈 값(게이트에서 중단되어 VERIFY 까지 가지 못함)
+      order_verify_status: ${{ steps.bot.outputs.order_verify_status }}
+      order_verify_summary: ${{ steps.bot.outputs.order_verify_summary }}
     steps:
       # ── 실행 단계 정규화 (체크아웃 **이전**) ─────────────────────────────
       # actions/checkout 은 기본값 clean: true 로 `git clean -ffdx && git reset --hard HEAD` 를
@@ -403,6 +421,9 @@ jobs:
           echo "Environment=$(safe "${IN_BROKER}")-$(safe "${IN_BROKER_MODE}")"
 
       - name: 자동매매 봇 실행
+        # 주문 실행 검증(VERIFY) 결과를 job output 으로 넘기기 위한 id 입니다.
+        # (정산 검증 결과와 구분해 보고하려고 verify-settlement job 으로도 전달합니다)
+        id: bot
         # job-level timeout 보다 **짧은** step-level timeout 입니다. 이것이 실제 방어선이며,
         # 만료되어도 always() 사후 단계(스냅샷·캐시 저장·Evidence)가 실행됩니다.
         # 값은 '실행 시간 예산 검증' 단계가 job timeout - 최소 10분 으로 계산합니다
@@ -562,6 +583,8 @@ jobs:
           AUTO_EXECUTE: ${{ inputs.auto_execute }}
           # 사람 검토 표식 — 운영 계좌(real)의 LIVE 주문 경로(LIFECYCLE/EXECUTE/AUTO_EXECUTE)에 필수.
           REVIEWED: ${{ inputs.reviewed }}
+          # 사람이 검토한 계획 해시 — 수동 APPROVE/EXECUTE 에서 계획/승인 파일과 대조합니다.
+          REVIEWED_PLAN_HASH: ${{ inputs.plan_hash }}
           # 실행 러너 종류 — hosted(github-hosted)는 6시간 제한이 있어 프리장 대기 상한을 적용합니다.
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
           # 프리장 개장까지의 대기 허용 상한(초). 기본 4시간(14400) — SETTLE/PREVIEW/EXECUTE
@@ -599,6 +622,115 @@ jobs:
             | tr '[:lower:]' '[:upper:]')
           export RUN_PHASE="$phase"
 
+          # ══ 주문 실행 검증(RUN_PHASE=VERIFY) 도우미 ═════════════════════════════════
+          # EXECUTE 가 실제로 낸 주문을 승인 파일 + 전송 기록(.transmitted.json) + 브로커
+          # read-only 이력/잔고로 검증합니다. **정산 검증(verify-settlement job)** 과는 다른
+          # 축이므로 결과를 합치지 않고 따로 보고합니다 (정산 검증 성공 ≠ 주문 실행 검증 완료).
+          #
+          # 같은 job·같은 작업 디렉터리에서 돌기 때문에 VERIFY 에 필요한 산출물
+          # (approvals/*.json·settlement-*.json·.state.json·plans/)이 그대로 있습니다 —
+          # hosted fresh 러너에서도 산출물을 artifact 로 넘길 필요가 없습니다
+          # (artifact 로 넘기면 원문 주문번호가 든 원장까지 함께 올려야 해서 채택하지 않았습니다).
+          #
+          # 봇의 VERIFY 종료코드: 0=실행 후 검증 통과, 1=실행 실패/검증 실패,
+          #                        2=승인만 되고 실행되지 않음(검증 통과와 **다른** 상태)
+          order_verify_targets=0
+          order_verify_pass=0
+          order_verify_failed=0
+          order_verify_not_executed=0
+          order_verify_problem_ids=""
+          # 검증을 **명시적으로 요청**받았는지 (RUN_PHASE=VERIFY 단독 실행).
+          # 대상이 0건일 때 "검증 대상이 없어 생략(SKIPPED)"과 "요청받았는데 수행하지 못함(FAIL)"을
+          # 구분하기 위한 표식입니다 — 조용히 SKIPPED 로 덮으면 검증을 안 하고도 통과처럼 보입니다.
+          order_verify_required=0
+          # report_order_verify 가 계산한 종료 판정 (0=정상, 1=FAIL/NOT_EXECUTED/수행 불가)
+          order_verify_exit=0
+
+          # plan_id 하나를 검증합니다 (인자가 비면 상속된 APPROVAL_PLAN_ID 사용).
+          run_order_verify() {
+            local pid="$1"
+            local rc=0
+            order_verify_targets=$((order_verify_targets + 1))
+            echo "[VERIFY] approval_plan_id=${pid:-<환경변수 APPROVAL_PLAN_ID>}"
+            if [[ -n "$pid" ]]; then
+              RUN_PHASE=VERIFY APPROVAL_PLAN_ID="$pid" uv run python trading_bot.py || rc=$?
+            else
+              uv run python trading_bot.py || rc=$?
+            fi
+            case "$rc" in
+              0)
+                order_verify_pass=$((order_verify_pass + 1))
+                ;;
+              2)
+                # 승인만 되고 실행 기록이 없다 — "검증 통과"와 구분되는 상태입니다.
+                order_verify_not_executed=$((order_verify_not_executed + 1))
+                order_verify_problem_ids="$order_verify_problem_ids ${pid:-?}"
+                echo "::error::주문 실행 검증(VERIFY): 실행 안 됨(exit 2) plan_id=${pid:-?} — 승인만 존재하고 실행 기록이 없습니다 (검증 통과가 아닙니다)"
+                ;;
+              *)
+                order_verify_failed=$((order_verify_failed + 1))
+                order_verify_problem_ids="$order_verify_problem_ids ${pid:-?}"
+                echo "::error::주문 실행 검증(VERIFY) 실패(exit $rc) plan_id=${pid:-?}"
+                ;;
+            esac
+            return 0
+          }
+
+          # 검증 대상이 없을 때(DRY 미리보기·계획 없음) 상태를 남깁니다.
+          # job output 은 값이 없으면 "" 이므로, 생략도 명시적으로 기록합니다.
+          mark_order_verify_skipped() { # $1 = 생략 사유
+            echo "::notice::주문 실행 검증(VERIFY) 생략 — $1 (정산 검증은 verify-settlement job 이 별도 수행)"
+            echo "order_verify_status=SKIPPED" >> "$GITHUB_OUTPUT"
+            echo "order_verify_summary=$1" >> "$GITHUB_OUTPUT"
+            return 0
+          }
+
+          # 결과 요약 — 주문 실행 검증과 정산 검증을 **구분해서** 보고합니다.
+          # 판정은 `order_verify_exit` 에 남기므로 호출 측은 이 값만 확인하면 됩니다
+          # (FAIL·NOT_EXECUTED·"요청했지만 대상 0건"은 모두 1).
+          report_order_verify() {
+            local summary
+            order_verify_exit=0
+            order_verify_status=""
+            summary=""
+            if [[ "$order_verify_targets" -eq 0 ]]; then
+              if [[ "$order_verify_required" -eq 1 ]]; then
+                # VERIFY 를 요청받았는데 검증한 계획이 없습니다 (APPROVAL_PLAN_ID/APPROVAL_FILE
+                # 누락·빈 값). 이걸 "생략(SKIPPED)"으로 남기면 검증을 못 했는데도 통과처럼 보입니다.
+                order_verify_status="FAIL"
+                summary="검증 대상 없음 — RUN_PHASE=VERIFY 를 요청했지만 수행한 계획이 없습니다 (APPROVAL_PLAN_ID/APPROVAL_FILE 확인 필요)"
+                order_verify_exit=1
+              else
+                order_verify_status="SKIPPED"
+                summary="검증 대상 없음 (이 실행은 EXECUTE 가 아니어서 주문 실행 검증 대상이 없습니다)"
+              fi
+            elif [[ "$order_verify_failed" -gt 0 ]]; then
+              order_verify_status="FAIL"
+              order_verify_exit=1
+            elif [[ "$order_verify_not_executed" -gt 0 ]]; then
+              order_verify_status="NOT_EXECUTED"
+              order_verify_exit=1
+            else
+              order_verify_status="PASS"
+            fi
+            if [[ "$order_verify_targets" -gt 0 ]]; then
+              summary="통과 ${order_verify_pass}건 / 실패 ${order_verify_failed}건 / 실행안됨 ${order_verify_not_executed}건"
+              if [[ -n "$order_verify_problem_ids" ]]; then
+                summary="$summary (문제 plan_id:$order_verify_problem_ids)"
+              fi
+            fi
+            order_verify_summary="$summary"
+            echo "::group::[주문 실행 검증(VERIFY) 결과]"
+            echo "[주문 실행 검증(VERIFY)] ${order_verify_status} — ${order_verify_summary}"
+            echo "[정산 검증] 이 job 이 아니라 별도 job(verify-settlement)이 담당합니다 —"
+            echo "             두 결과는 서로를 대신하지 않습니다 (합쳐서 '성공'으로 표시하지 않음)."
+            echo "::endgroup::"
+            echo "::notice::주문 실행 검증(VERIFY) 결과 ${order_verify_status} — ${order_verify_summary}"
+            echo "order_verify_status=$order_verify_status" >> "$GITHUB_OUTPUT"
+            echo "order_verify_summary=$order_verify_summary" >> "$GITHUB_OUTPUT"
+            return 0
+          }
+
           # ══ 실행 전 안전 게이트 (봇 실행·브로커 호출·state 변경 전) ══════════════════
           # 1) 운영 계좌(real)의 LIVE 주문 경로에 **사람 검토 표식**을 요구합니다.
           #    LIFECYCLE 은 PREVIEW 산출물을 자동 승인·실행하므로(같은 job 안 연쇄), 사람이
@@ -628,6 +760,43 @@ jobs:
           if [[ "$broker_mode_norm" == "REAL" && "$places_orders" -eq 1 ]] && ! bool_on "${REVIEWED:-}"; then
             echo "::error::운영 계좌(real) LIVE 주문 경로에는 사람 검토 표식이 필요합니다 — RUN_PHASE=${phase:-레거시}, TRADE_MODE=$live_norm. dispatch payload 에 \"reviewed\":\"true\" 를 넣어 명시(권장: 저녁 dispatch)하거나, 아침에는 run_phase=PREVIEW 로 계획만 만들고 저녁 run_phase=EXECUTE 로 실행하세요. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음)."
             exit 1
+          fi
+
+          # 1-b) 수동 승인 경로의 **계획 해시 바인딩** (외부 리뷰 P1).
+          #      reviewed=true 는 "사람이 검토했다"는 선언일 뿐 무엇을 검토했는지 증명하지
+          #      않습니다. LIFECYCLE 처럼 PREVIEW **전에** 전달되면 사람이 가격·수량을 보지
+          #      않고 승인·실행까지 자동 진행됩니다. 그래서 수동 단계(APPROVE/EXECUTE)는
+          #      사람이 본 plan_id 와 plan_hash 를 함께 넘기게 하고, 봇이 계획 파일/승인
+          #      파일의 plan_hash 와 대조합니다 (불일치 = 승인/실행 중단).
+          #      완전 자동 경로(LIFECYCLE + reviewed=true)는 정책상 허용하되, 이 바인딩이
+          #      없으므로 "사람 검토"가 아니라 "자동 진행"입니다 (ops/cron.example 참고).
+          manual_approve=0
+          case "$phase" in
+            APPROVE|EXECUTE) manual_approve=1 ;;
+          esac
+          plan_hashes=()
+          if [[ -n "${REVIEWED_PLAN_HASH:-}" ]]; then
+            while IFS= read -r one_hash; do
+              one_hash=$(printf '%s' "$one_hash" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+              [[ -z "$one_hash" ]] && continue
+              if ! printf '%s' "$one_hash" | grep -Eq '^[0-9a-f]{64}$'; then
+                echo "::error::plan_hash 형식이 올바르지 않습니다 (64자리 hex 필요, 입력 앞 12자: ${one_hash:0:12}…) — PREVIEW 로그/plans/*.json 의 plan_hash 를 그대로 넣으세요. 봇을 실행하지 않고 중단합니다."
+                exit 1
+              fi
+              plan_hashes+=("$one_hash")
+            done < <(printf '%s\n' "$REVIEWED_PLAN_HASH" | tr ',' '\n')
+          fi
+          if [[ "$broker_mode_norm" == "REAL" && "$live_norm" == "LIVE" && "$manual_approve" -eq 1 ]]; then
+            if [[ "${#plan_hashes[@]}" -eq 0 ]]; then
+              echo "::error::운영 계좌(real) LIVE 수동 승인(RUN_PHASE=$phase)에는 사람이 검토한 plan_hash 가 필요합니다 — dispatch 입력 plan_hash 에 PREVIEW 로그/plans/*.json 의 plan_hash 를 넣으세요 (다중 대상은 쉼표로 같은 개수). reviewed=true 만으로는 무엇을 검토했는지 증명되지 않습니다. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음)."
+              exit 1
+            fi
+          fi
+          # LIFECYCLE(완전 자동)에는 바인딩할 사람 검토 값이 없습니다 — 남아 있는 값을
+          # 그대로 쓰면 의미 없는 불일치로 자동 체인이 실패하므로 비웁니다.
+          if [[ "$phase" == "LIFECYCLE" && "${#plan_hashes[@]}" -gt 0 ]]; then
+            echo "::notice::RUN_PHASE=LIFECYCLE 은 완전 자동 경로라 plan_hash 입력을 사용하지 않습니다 (사람 검토 바인딩 없음). 수동 승인은 run_phase=APPROVE/EXECUTE + plan_hash 로 실행하세요."
+            plan_hashes=()
           fi
 
           # 2) hosted 러너 6시간 제한 — 프리장 개장까지 대기하는 단계는 아침 dispatch 에서
@@ -685,38 +854,119 @@ jobs:
               APPROVE) refs="${PLAN_ID:-}" ;;
               EXECUTE|VERIFY) refs="${APPROVAL_PLAN_ID:-}" ;;
             esac
+            if [[ "$phase" == "VERIFY" ]]; then
+              # 검증을 명시적으로 요청했습니다 — 대상이 0건이면 "생략"이 아니라 실패로 기록합니다.
+              order_verify_required=1
+            fi
+            # 검토 해시 개수는 대상 개수와 같아야 합니다 (VERIFY 는 주문이 없어 제외).
+            if [[ "$phase" != "VERIFY" && "${#plan_hashes[@]}" -gt 0 ]]; then
+              ref_count=0
+              while IFS= read -r one; do
+                [[ -n "$(printf '%s' "$one" | tr -d '[:space:]')" ]] && ref_count=$((ref_count + 1))
+              done < <(printf '%s\n' "$refs" | tr ',' '\n')
+              if [[ "$ref_count" -ne "${#plan_hashes[@]}" ]]; then
+                echo "::error::plan_hash 개수(${#plan_hashes[@]})가 승인 대상 개수($ref_count)와 다릅니다 — 대상과 같은 순서로 쉼표 구분해 넘기세요. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음)."
+                exit 1
+              fi
+            fi
+            failed=0
             if [[ "$refs" == *,* ]]; then
-              failed=0
+              idx=0
               while IFS= read -r one <&3; do
                 one=$(printf '%s' "$one" | tr -d '[:space:]')
                 [[ -z "$one" ]] && continue
-                echo "[RUN_PHASE=$phase] 대상=$one"
+                # 대상과 같은 순서의 사람 검토 해시를 그대로 봇에 넘깁니다.
+                one_hash=""
+                if [[ "$phase" != "VERIFY" ]]; then
+                  one_hash="${plan_hashes[$idx]:-}"
+                fi
+                echo "[RUN_PHASE=$phase] 대상=$one (검토 plan_hash=${one_hash:0:12}${one_hash:+…})"
                 if [[ "$phase" == "APPROVE" ]]; then
-                  PLAN_ID="$one" uv run python trading_bot.py || failed=$((failed + 1))
+                  REVIEWED_PLAN_HASH="$one_hash" PLAN_ID="$one" uv run python trading_bot.py || failed=$((failed + 1))
+                elif [[ "$phase" == "EXECUTE" ]]; then
+                  REVIEWED_PLAN_HASH="$one_hash" APPROVAL_PLAN_ID="$one" uv run python trading_bot.py || failed=$((failed + 1))
+                elif [[ "$phase" == "VERIFY" ]]; then
+                  # VERIFY 는 종료코드(0=통과 / 1=실패 / 2=승인만·실행 안 됨)를 **집계**해야
+                  # 하므로 run_order_verify 를 씁니다. `|| failed=...` 로 뭉개면
+                  # "실행 안 됨"과 "검증 실패"를 구분해 보고할 수 없습니다.
+                  run_order_verify "$one"
                 else
                   APPROVAL_PLAN_ID="$one" uv run python trading_bot.py || failed=$((failed + 1))
                 fi
+                idx=$((idx + 1))
               done 3< <(printf '%s\n' "$refs" | tr ',' '\n')
-              if [[ "$failed" -ne 0 ]]; then
-                echo "::error::RUN_PHASE=$phase 실패 ${failed}건"
+            elif [[ "$phase" == "EXECUTE" ]]; then
+              # EXECUTE 는 실패해도 아래 주문 실행 검증(VERIFY)을 실행해 결과를 남깁니다
+              # (실패 원인과 "실행이 검증됐는지"는 다른 정보이므로 뭉개지 않습니다).
+              REVIEWED_PLAN_HASH="${plan_hashes[0]:-}" uv run python trading_bot.py || failed=$((failed + 1))
+            elif [[ "$phase" == "VERIFY" ]]; then
+              # VERIFY 는 주문이 없어 검토 해시를 쓰지 않습니다.
+              # `set -e` 로 스크립트를 죽이면 **상태 기록 전에** 종료되어 job output 이 빈 값이
+              # 되므로(downstream 은 "미완료"인지 "실패"인지 알 수 없음), run_order_verify 로
+              # 종료코드를 집계한 뒤 아래에서 결과를 기록하고 종료합니다.
+              run_order_verify "$(printf '%s' "$refs" | tr -d '[:space:]')"
+            else
+              REVIEWED_PLAN_HASH="${plan_hashes[0]:-}" uv run python trading_bot.py
+            fi
+            # VERIFY 는 실패해도 **상태를 먼저 기록**한 뒤 종료합니다 — 기록 전에 exit 하면
+            # downstream(verify-settlement 표시)이 빈 값만 보게 됩니다.
+            if [[ "$failed" -ne 0 && "$phase" != "EXECUTE" && "$phase" != "VERIFY" ]]; then
+              echo "::error::RUN_PHASE=$phase 실패 ${failed}건"
+              exit 1
+            fi
+
+            # EXECUTE 단독 실행도 끝나면 주문 실행 검증(RUN_PHASE=VERIFY)을 자동 수행합니다.
+            # 같은 job·같은 작업 디렉터리라 승인 파일·정산 근거가 그대로 있습니다.
+            if [[ "$phase" == "EXECUTE" ]]; then
+              echo "::group::[RUN_PHASE=EXECUTE → 주문 실행 검증(VERIFY)]"
+              if [[ "$refs" == *,* ]]; then
+                while IFS= read -r one <&3; do
+                  one=$(printf '%s' "$one" | tr -d '[:space:]')
+                  [[ -z "$one" ]] && continue
+                  run_order_verify "$one"
+                done 3< <(printf '%s\n' "$refs" | tr ',' '\n')
+              else
+                run_order_verify "$(printf '%s' "$refs" | tr -d '[:space:]')"
+              fi
+              echo "::endgroup::"
+              report_order_verify
+              if [[ "$order_verify_exit" -ne 0 ]]; then
+                failed=$((failed + 1))
+              fi
+            elif [[ "$phase" == "VERIFY" ]]; then
+              # 단독 VERIFY — 봇이 실제로 수행한 검증 결과(PASS/FAIL/NOT_EXECUTED)를 그대로
+              # job output 에 남깁니다. (예전에는 검증을 하고도 여기서 SKIPPED 를 덮어써
+              # "검증 생략"으로 잘못 표시됐고, 실패 시에는 기록 전에 종료돼 빈 값이 됐습니다)
+              report_order_verify
+              if [[ "$order_verify_exit" -ne 0 ]]; then
+                echo "::error::RUN_PHASE=VERIFY 실패 — 주문 실행 검증 결과 ${order_verify_status} (${order_verify_summary})"
                 exit 1
               fi
             else
-              uv run python trading_bot.py
+              mark_order_verify_skipped "RUN_PHASE=$phase 단독 실행 (EXECUTE 가 아니므로 주문 실행 검증 대상 없음)"
+            fi
+
+            if [[ "$failed" -ne 0 ]]; then
+              echo "::error::RUN_PHASE=$phase 실패 ${failed}건"
+              exit 1
             fi
             exit 0
           fi
 
-          # ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE ────────────
+          # ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY ───
           # 한 job 안에서 단계를 순서대로(별도 프로세스로) 실행합니다. 각 단계는 봇의 게이트를
           # 그대로 통과해야 하므로, APPROVE 가 남긴 승인 파일(plan_hash·세션·상태해시 바인딩,
           # 허용오차, TTL)을 통과하지 못하면 EXECUTE 는 주문을 내지 않습니다.
           # 승인 파일은 같은 작업 디렉터리에서 PREVIEW → APPROVE 로만 이어지므로
           # plan_id 수동 복사가 필요 없지만, 승인 게이트 자체는 생략되지 않습니다.
-          # VERIFY(정산 근거 독립 검산)는 이 워크플로의 verify-settlement job 이 담당합니다.
+          # 5단계는 주문 실행 검증(RUN_PHASE=VERIFY)입니다 — EXECUTE 가 실제로 낸 주문이
+          # 접수·전송됐는지를 승인 파일·전송 기록·브로커 read-only 대조로 확인합니다.
+          # 정산 검증(ops/verify_run.py)은 이 job 이 아니라 별도 verify-settlement job 이 하며,
+          # 두 결과는 서로를 대신하지 않습니다 (합쳐서 "성공"으로 표시하지 않음).
           if [[ "${TRADE_MODE:-}" != "LIVE" ]]; then
-            echo "::notice::RUN_PHASE=LIFECYCLE + TRADE_MODE=${TRADE_MODE:-} → DRY 미리보기만 실행합니다 (APPROVE/EXECUTE 는 LIVE 전용)"
+            echo "::notice::RUN_PHASE=LIFECYCLE + TRADE_MODE=${TRADE_MODE:-} → DRY 미리보기만 실행합니다 (APPROVE/EXECUTE/VERIFY 는 LIVE 전용)"
             RUN_PHASE= uv run python trading_bot.py
+            mark_order_verify_skipped "TRADE_MODE=${TRADE_MODE:-} (DRY 미리보기 — 승인·실행이 없어 검증 대상 없음)"
             exit 0
           fi
 
@@ -726,11 +976,11 @@ jobs:
           plans_before=$(mktemp)
           ls -1 "$PLAN_DIR_DEFAULT" 2>/dev/null | sort > "$plans_before"
 
-          echo "::group::[LIFECYCLE 1/4] SETTLE"
+          echo "::group::[LIFECYCLE 1/5] SETTLE"
           RUN_PHASE=SETTLE uv run python trading_bot.py
           echo "::endgroup::"
 
-          echo "::group::[LIFECYCLE 2/4] PREVIEW"
+          echo "::group::[LIFECYCLE 2/5] PREVIEW"
           # AUTO_EXECUTE 는 이 경로에서 쓰지 않습니다 (승인·실행은 아래 단계가 담당).
           RUN_PHASE=PREVIEW AUTO_EXECUTE=false uv run python trading_bot.py
           echo "::endgroup::"
@@ -740,7 +990,8 @@ jobs:
           new_plans=$(mktemp)
           comm -13 "$plans_before" "$plans_after" > "$new_plans" || true
           if [[ ! -s "$new_plans" ]]; then
-            echo "::notice::PREVIEW 가 새 계획을 만들지 않았습니다 (이번 세션 주문 없음) — APPROVE/EXECUTE 생략"
+            echo "::notice::PREVIEW 가 새 계획을 만들지 않았습니다 (이번 세션 주문 없음) — APPROVE/EXECUTE/VERIFY 생략"
+            mark_order_verify_skipped "PREVIEW 가 새 계획을 만들지 않음 (이번 세션 주문 없음)"
             exit 0
           fi
 
@@ -754,7 +1005,7 @@ jobs:
               print(json.load(fh).get("plan_id", ""))
           PY
 
-          echo "::group::[LIFECYCLE 3/4] APPROVE"
+          echo "::group::[LIFECYCLE 3/5] APPROVE"
           approved=$(mktemp)
           approve_failed=0
           while IFS= read -r plan_file <&3; do
@@ -766,7 +1017,9 @@ jobs:
               continue
             fi
             echo "[APPROVE] plan_id=$plan_id (file=$plan_file)"
-            if RUN_PHASE=APPROVE PLAN_ID="$plan_id" uv run python trading_bot.py; then
+            # LIFECYCLE 은 완전 자동 경로입니다 — 사람 검토 해시 바인딩을 쓰지 않으므로
+            # env 의 REVIEWED_PLAN_HASH 를 비웁니다 (자동 체인이 불일치로 막히지 않게).
+            if REVIEWED_PLAN_HASH= RUN_PHASE=APPROVE PLAN_ID="$plan_id" uv run python trading_bot.py; then
               if [[ -f "$APPROVALS_DIR_DEFAULT/$plan_id.json" ]]; then
                 printf '%s\n' "$plan_id" >> "$approved"
               else
@@ -779,7 +1032,7 @@ jobs:
           done 3< "$new_plans"
           echo "::endgroup::"
 
-          echo "::group::[LIFECYCLE 4/4] EXECUTE"
+          echo "::group::[LIFECYCLE 4/5] EXECUTE"
           execute_failed=0
           if [[ ! -s "$approved" ]]; then
             echo "::notice::승인된 계획이 없어 EXECUTE 를 생략합니다"
@@ -787,7 +1040,7 @@ jobs:
             while IFS= read -r plan_id <&3; do
               [[ -z "$plan_id" ]] && continue
               echo "[EXECUTE] approval_plan_id=$plan_id"
-              if ! RUN_PHASE=EXECUTE APPROVAL_PLAN_ID="$plan_id" uv run python trading_bot.py; then
+              if ! REVIEWED_PLAN_HASH= RUN_PHASE=EXECUTE APPROVAL_PLAN_ID="$plan_id" uv run python trading_bot.py; then
                 echo "::error::$plan_id EXECUTE 실패 — 다음 종목은 계속 진행합니다"
                 execute_failed=$((execute_failed + 1))
               fi
@@ -795,10 +1048,28 @@ jobs:
           fi
           echo "::endgroup::"
 
+          # ── 5/5: 주문 실행 검증 (EXECUTE 실패와 무관하게 항상 실행) ──────────
+          # EXECUTE 가 실패해도 남은 승인 건의 "실제 접수·전송 여부"는 따로 확인해야 하므로
+          # 이 단계는 execute_failed 와 관계없이 돕니다 (실패 원인과 검증 결과를 구분).
+          echo "::group::[LIFECYCLE 5/5] VERIFY (주문 실행 검증)"
+          if [[ ! -s "$approved" ]]; then
+            echo "::notice::승인된 계획이 없어 주문 실행 검증(VERIFY)을 생략합니다"
+          else
+            while IFS= read -r plan_id <&3; do
+              [[ -z "$plan_id" ]] && continue
+              run_order_verify "$plan_id"
+            done 3< "$approved"
+          fi
+          echo "::endgroup::"
+
           rm -f "$plans_before" "$plans_after" "$new_plans" "$plan_id_reader" "$approved"
 
-          if [[ "$approve_failed" -ne 0 || "$execute_failed" -ne 0 ]]; then
-            echo "::error::라이프사이클 실패 — APPROVE ${approve_failed}건, EXECUTE ${execute_failed}건"
+          # 주문 실행 검증 결과를 정산 검증과 구분해 보고합니다 (job output 포함).
+          report_order_verify
+
+          if [[ "$approve_failed" -ne 0 || "$execute_failed" -ne 0 \
+                || "$order_verify_exit" -ne 0 ]]; then
+            echo "::error::라이프사이클 실패 — APPROVE ${approve_failed}건, EXECUTE ${execute_failed}건, 주문 실행 검증(VERIFY) 실패 ${order_verify_failed}건 / 실행안됨 ${order_verify_not_executed}건 (정산 검증은 별도 job 이며 이 결과와 합치지 않습니다)"
             exit 1
           fi
 
@@ -933,4 +1204,8 @@ jobs:
       retry_num: ${{ inputs.retry_num || '0' }}
       code_version: ${{ github.sha }}
       trade_result: ${{ needs.run-trade.result }}
+      # 주문 실행 검증(RUN_PHASE=VERIFY)은 거래 job 안에서 끝났습니다. 그 결과를 **정산 검증과
+      # 섞지 않고** 나란히 보여주기 위해 전달합니다 (이 job 의 성패는 정산 검증만 나타냅니다).
+      order_verify_status: ${{ needs.run-trade.outputs.order_verify_status }}
+      order_verify_summary: ${{ needs.run-trade.outputs.order_verify_summary }}
       artifact_name: settlement-evidence-${{ github.run_id }}

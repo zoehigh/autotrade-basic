@@ -9,6 +9,7 @@
 프로그램 실행 중 발생하는 모든 에러는 catch되어 출력됩니다.
 """
 
+import hmac
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from pipeline import (
     load_approval,
     price_tolerance,
     read_deferred_record,
+    read_order_plan_file,
     read_transmitted_plan,
     settle_positions,
     transmitted_plan_problems,
@@ -1062,7 +1064,12 @@ def _cancel_open_bot_orders(
     - 수동 주문은 건드리지 않습니다 (orders_meta 에 있는 것만)
     - 리버스 주문/리버스 활성 상태는 건드리지 않습니다 (기간 관리 대상)
     - 이전 세션 주문은 만료 대상이라 취소하지 않습니다 (당일 주문 규칙)
-    - 취소 미지원 브로커는 조용히 건너뜀
+    - 취소 API 미지원 브로커(KIS/KIWOOM/LS/NHPLUG)는 **오늘 세션으로 확정되는**
+      미체결 봇 주문이 남아 있으면 신규 주문을 보류합니다 (fail-closed, 중복 방지).
+      그런 주문이 없으면 그대로 진행합니다.
+      ⚠️ 운영 제약: 잔여 주문이 남은 채 중단된 뒤 재실행하면 **브로커 앱에서 직접
+      미체결 주문을 취소**해야 그 종목의 신규 주문이 재개됩니다 (취소 API 가 없어
+      봇이 정리할 수단이 없음). 세션이 끝나면 주문이 만료되므로 다음 세션은 정상입니다.
 
     Returns:
         int: 취소하고 확정한 주문 수
@@ -1088,8 +1095,6 @@ def _cancel_open_bot_orders(
         return 0
 
     cancel = getattr(broker, "cancel_order", None)
-    if cancel is None:
-        return 0  # 취소를 지원하지 않는 브로커는 건너뜁니다
 
     reverse_state = state.get("reverse_mode") or {}
     if reverse_state.get("active"):
@@ -1149,6 +1154,55 @@ def _cancel_open_bot_orders(
         )
 
     if not targets:
+        return 0
+
+    # ── 취소 API 미지원 브로커 — fail-closed ──────────────────────────
+    # `cancel_order` 가 없는 브로커(KIS/KIWOOM/LS/NHPLUG — 어댑터 전수 확인)는
+    # 잔여 주문을 정리할 방법이 **없습니다**. 예전에는 여기서 조용히 0 을 반환해
+    # 신규 주문을 그대로 냈기 때문에, 같은 세션에서 EXECUTE 가 두 번 돌거나
+    # (재시도·수동 재실행) 이전 실행이 주문을 남긴 채 끝나면 **중복 주문**이
+    # 접수될 수 있었습니다 (매도는 보유량 초과, 매수는 시드 초과 위험).
+    # 그래서 "오늘 세션으로 확정되는" 미체결 봇 주문이 남아 있으면 신규 주문을
+    # 보류합니다 (취소 수단도, 중복을 막을 다른 방법도 없으므로 fail-closed).
+    if not callable(cancel):
+        session_confirmed = []
+        session_unknown = []
+        for odno, _status, _remaining in targets:
+            row = by_odno.get(odno) or {}
+            if _order_us_session_date(row) == today_session:
+                session_confirmed.append(odno)
+            else:
+                # 위 대상 선정이 KST 날짜 호환 경로로만 고른 행 — 세션을 확정할 수 없습니다.
+                session_unknown.append(odno)
+        if session_confirmed:
+            raise SymbolScopedError(
+                f"{symbol} 취소 API 미지원 브로커인데 오늘 세션 미체결 봇 주문이 남아 "
+                f"있어 신규 주문을 보류합니다 "
+                f"({mask_odno(sorted(session_confirmed))}). 이전 주문이 살아 있으면 "
+                "중복 접수되므로, 브로커에서 미체결 주문을 직접 취소한 뒤 재실행하세요."
+            )
+        if session_unknown:
+            # ── 세션 미확정 행은 **막지 않습니다** (의도적, 아래 근거) ────────────
+            # 취소 지원 브로커(TOSS/MERITZ)는 같은 행을 그냥 취소하므로 동작이 다르지만,
+            # 여기서 fail-closed 로 바꾸면 다음 두 가지가 깨집니다.
+            #  1) 세션을 확정할 수 없으면 "아직 살아 있는 오늘 주문"과 "이미 만료된 이전
+            #     주문"을 구분할 수 없습니다. 구분 없이 막으면 실제로는 만료된 주문 때문에
+            #     그 종목의 정상 재시도가 영구 차단됩니다.
+            #  2) 6개 어댑터 모두 주문이력에 ord_tmd 를 채우므로 이 경로는 **방어적 경로**
+            #     입니다(비정상·레거시 행에서만 발생). 계약 테스트
+            #     `test_broker_without_cancel_support_is_ignored` 도 "세션 정보가 없는 행은
+            #     건너뛴다"를 고정하고 있어, 코드를 계약 쪽에 맞춥니다.
+            # 대신 **조용히** 넘어가지 않도록 경고를 남깁니다 (운영자가 상태를 알 수 있게).
+            print(
+                f"[경고] {symbol} 취소 API 미지원 브로커 — 세션을 확정할 수 없는 미체결 "
+                f"후보 {len(session_unknown)}건은 취소도 보류도 하지 않고 건너뜁니다 "
+                f"({mask_odno(sorted(session_unknown))}). 오늘 주문이라면 브로커 앱에서 "
+                "직접 취소하세요 (중복 접수 위험)."
+            )
+        print(
+            "[잔여 주문 정리] 취소 API 미지원 브로커 — 오늘 세션으로 확정되는 미체결 "
+            "주문이 없어 그대로 진행합니다."
+        )
         return 0
 
     print(f"\n[잔여 주문 정리] 봇 소유 미체결 주문 {len(targets)}건 취소")
@@ -3131,6 +3185,45 @@ def _dispatch_pipeline_phase(run_phase, broker):
         return _dispatch_pipeline_phase_locked(run_phase, broker)
 
 
+def _reviewed_plan_hash():
+    """사람이 검토한 계획 해시(`REVIEWED_PLAN_HASH`)를 정규화해 반환합니다.
+
+    비어 있으면 "바인딩 없음"입니다 (자동 경로 — LIFECYCLE/AUTO_EXECUTE).
+    """
+    return str(os.getenv("REVIEWED_PLAN_HASH", "") or "").strip().lower()
+
+
+def _assert_reviewed_plan_hash_matches(actual_hash, context):
+    """사람이 검토한 plan_hash 와 실제 계획/승인 파일의 해시를 대조합니다.
+
+    배경(외부 리뷰 P1): `reviewed=true` 는 "사람이 검토했다"는 **선언**일 뿐
+    "무엇을" 검토했는지 증명하지 않습니다. PREVIEW 보다 먼저 전달되면 사람이
+    가격·수량을 보지 않고도 승인·실행까지 자동으로 진행됩니다. 그래서 수동
+    승인 경로에서는 사람이 본 `plan_id` + `plan_hash` 를 함께 넘겨, 승인 파일을
+    쓰기 **전에** 계획 파일의 plan_hash 와 일치하는지 확인합니다 (불일치 = 중단).
+
+    - `REVIEWED_PLAN_HASH` 가 비어 있으면 아무것도 하지 않습니다 (기존 동작).
+      필수 여부는 워크플로(운영 계좌 real LIVE 수동 APPROVE/EXECUTE)가 강제합니다.
+    - 비교는 대소문자 무시 + constant-time 입니다.
+    """
+    expected = _reviewed_plan_hash()
+    if not expected:
+        return
+    actual = str(actual_hash or "").strip().lower()
+    if not actual:
+        raise RuntimeError(
+            f"{context}: 계획/승인 파일에 plan_hash 가 없어 사람이 검토한 값과 대조할 수 "
+            "없습니다 — PREVIEW 부터 다시 실행하세요."
+        )
+    if not hmac.compare_digest(actual, expected):
+        raise RuntimeError(
+            f"{context}: plan_hash 불일치 — 사람이 검토한 값({expected[:12]}…)과 계획 "
+            f"파일 값({actual[:12]}…)이 다릅니다. 가격·수량이 바뀐 계획은 승인·실행하지 "
+            "않습니다 (PREVIEW 를 다시 실행하고 새 plan_hash 로 승인하세요)."
+        )
+    print(f"{context}: 사람이 검토한 plan_hash 일치 확인 ({expected[:12]}…)")
+
+
 def _dispatch_pipeline_phase_locked(run_phase, broker):
     """RUN_PHASE 단계별 실행. SETTLE/PREVIEW/APPROVE 는 ReadOnlyBroker 만 받습니다."""
     read_only_broker = ReadOnlyBroker(broker)
@@ -3208,11 +3301,20 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
         if not plan_ref:
             print("[APPROVE] PLAN_ID 또는 PLAN_FILE 이 필요합니다 (PREVIEW 산출물).")
             return 1
+        plans_dir = os.getenv("PLAN_DIR", "plans")
+        approvals_dir = os.getenv("APPROVALS_DIR", "approvals")
         try:
+            # 사람이 검토한 plan_hash 바인딩 검증 (외부 리뷰 P1).
+            # 승인 파일을 쓰기 **전에** 대조해야 합니다 — PREVIEW 이후 계획이 바뀌었거나
+            # 사람이 보지 않은 계획을 승인하는 경로를 막습니다 (값이 없으면 기존 동작).
+            plan_data = read_order_plan_file(plan_ref, plans_dir)
+            _assert_reviewed_plan_hash_matches(
+                plan_data.get("plan_hash"), f"[APPROVE] {plan_ref}"
+            )
             approval_file = approve_plan_file(
                 plan_ref,
-                approvals_dir=os.getenv("APPROVALS_DIR", "approvals"),
-                plans_dir=os.getenv("PLAN_DIR", "plans"),
+                approvals_dir=approvals_dir,
+                plans_dir=plans_dir,
                 broker=read_only_broker,
             )
             if approval_file:
@@ -3229,6 +3331,19 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
             return 1
         if not broker.is_trading_day():
             print("[EXECUTE] 미국 증시 휴장일입니다. 주문을 실행하지 않습니다.")
+            return 1
+        # 승인 파일도 같은 해시로 대조합니다 (사람이 검토한 계획 == 실제 실행 계획).
+        # APPROVE 에서 쓴 plan_hash 가 승인 파일에 그대로 복사되므로, 두 단계 모두에
+        # 같은 값을 넘기면 검토→승인→실행 사슬이 하나의 해시로 묶입니다.
+        try:
+            approval_data = load_approval(
+                plan_ref, os.getenv("APPROVALS_DIR", "approvals")
+            )
+            _assert_reviewed_plan_hash_matches(
+                approval_data.get("plan_hash"), f"[EXECUTE] {plan_ref}"
+            )
+        except Exception as error:
+            print(f"[EXECUTE] 실패: {error} — 주문을 실행하지 않습니다.")
             return 1
         result = execute_approved_plan(broker, plan_ref)
         return int((result or {}).get("failed", 0))
