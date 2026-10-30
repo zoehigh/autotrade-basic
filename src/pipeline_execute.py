@@ -21,6 +21,8 @@ from pipeline import (
     assert_reconciliation_current,
     _assert_reconciliation_with_deferred,
     build_order_plan,
+    compare_plan_orders,
+    compare_state_patches,
     compute_plan_hash,
     _deferred_buy_spend,
     _deferred_fills_evidence,
@@ -30,7 +32,6 @@ from pipeline import (
     global_lock,
     load_approval,
     normalize_tolerance_policy,
-    price_tolerance,
     read_approval_outcome,
     settled_from_state,
     transmitted_plan_path,
@@ -132,79 +133,35 @@ def _symbol_config(symbol):
     raise RuntimeError(f"{symbol} 종목 설정을 찾을 수 없습니다.")
 
 
-def _price_tolerance(price, policy):
-    """정책 기준 가격 허용오차. 정책은 승인 시점에 고정된 값입니다."""
-    return price_tolerance(price, policy)
+def compare_order_plans(
+    approved_orders, rebuilt_orders, policy=None,
+    approved_patch=None, rebuilt_patch=None,
+):
+    """승인 계획과 현재 재계산 계획을 **VERIFY 와 같은 기준**으로 비교합니다.
 
-
-def _qty_tolerance(policy):
-    try:
-        return int(policy["qty"])
-    except (KeyError, TypeError, ValueError):
-        return 0
-
-
-def compare_order_plans(approved_orders, rebuilt_orders, policy=None):
-    """승인 계획과 현재 재계산 계획의 주문을 허용 오차 내에서 비교합니다.
+    비교 규칙은 `pipeline.compare_plan_orders()` / `compare_state_patches()` 한
+    곳에 있습니다 (승인 → 실행 → 사후 검증이 어긋나지 않게 하기 위함).
+      - 수량·가격·금액: 승인 시점 정책 허용오차 안에서만 허용 (정상 드리프트)
+      - side/order_type/comment, t_target: 정확 일치
+      - 리버스 필드(reverse_action/day/base_t/factor/t_target): **허용오차 없음**
+        — 시세 드리프트로 리버스 단계/배율이 바뀌면 T·정산이 승인 범위를 벗어납니다
+      - state_patch: `reverse_mode` 는 정확 일치, `close_prices` 는 이력 정확 +
+        마지막 현재가만 가격 허용오차
 
     `policy` 는 **승인 파일에 고정된** 허용오차 정책입니다. EXECUTE 경로는
     반드시 승인 정책(env 로 더 좁힌 유효 정책)을 넘겨야 하며, 없으면
     fail-closed 로 비교하지 않습니다.
+
+    `approved_patch`/`rebuilt_patch` 는 각 계획의 `state_patch` 입니다.
+    `None` 은 "바인딩된 상태 변경 없음"과 같은 의미입니다 (`{}` 로 정규화).
     """
-    problems = []
-    approved_orders = list(approved_orders or [])
-    rebuilt_orders = list(rebuilt_orders or [])
     if policy is None:
-        problems.append(
+        return [
             "승인 파일에 허용오차 정책이 없어 주문 계획을 비교할 수 없습니다 "
             "(재승인 필요)"
-        )
-        return problems
-    if len(approved_orders) != len(rebuilt_orders):
-        problems.append(
-            f"주문 개수 불일치: 승인 {len(approved_orders)} vs 재계산 {len(rebuilt_orders)}"
-        )
-        return problems
-    qty_tol = _qty_tolerance(policy)
-    for index, (approved, rebuilt) in enumerate(
-        zip(approved_orders, rebuilt_orders), 1
-    ):
-        for field in ("side", "order_type", "comment"):
-            if str(approved.get(field, "")) != str(rebuilt.get(field, "")):
-                problems.append(
-                    f"주문 {index} {field} 불일치: "
-                    f"승인={approved.get(field)!r}, 재계산={rebuilt.get(field)!r}"
-                )
-        a_qty = int(float(approved.get("quantity", 0) or 0))
-        r_qty = int(float(rebuilt.get("quantity", 0) or 0))
-        if abs(a_qty - r_qty) > qty_tol:
-            problems.append(
-                f"주문 {index} 수량 불일치: 승인={a_qty}, 재계산={r_qty} "
-                f"(허용 {qty_tol})"
-            )
-        a_price = float(approved.get("price") or 0.0)
-        r_price = float(rebuilt.get("price") or 0.0)
-        tolerance = _price_tolerance(a_price, policy)
-        if abs(a_price - r_price) > tolerance:
-            problems.append(
-                f"주문 {index} 가격 불일치: 승인=${a_price:.4f}, "
-                f"재계산=${r_price:.4f} (허용 ±${tolerance:.4f})"
-            )
-        a_amount = a_price * a_qty
-        r_amount = r_price * r_qty
-        amount_tolerance = max(_price_tolerance(a_price, policy) * max(a_qty, 1), 0.01)
-        if abs(a_amount - r_amount) > amount_tolerance:
-            problems.append(
-                f"주문 {index} 금액 불일치: 승인=${a_amount:.2f}, "
-                f"재계산=${r_amount:.2f} (허용 ±${amount_tolerance:.2f})"
-            )
-        a_target = approved.get("t_target")
-        r_target = rebuilt.get("t_target")
-        if a_target is not None and r_target is not None:
-            if abs(float(a_target) - float(r_target)) > 1e-9:
-                problems.append(
-                    f"주문 {index} t_target 불일치: {a_target} vs {r_target}"
-                )
+        ]
+    problems = compare_plan_orders(approved_orders, rebuilt_orders, policy)
+    problems.extend(compare_state_patches(approved_patch, rebuilt_patch, policy))
     return problems
 
 
@@ -560,9 +517,10 @@ def _execute_approved_plan(
         if str(row.get("odno") or "") not in meta_odnos
     ]
     if unknown_open:
+        # 공개 로그/예외 메시지에는 원문 주문번호를 남기지 않습니다 (가명 토큰만).
         raise tb.SymbolScopedError(
             f"{symbol} 봇 소유가 아닌 미체결 주문이 있어 주문을 실행하지 않습니다: "
-            + ", ".join(unknown_open[:5])
+            + mask_odno(unknown_open[:5])[1:-1]
         )
 
     # ── 3b) 승인 후 새 체결/잔고 불일치 재확인 (계획 재계산보다 먼저) ──
@@ -589,7 +547,8 @@ def _execute_approved_plan(
         if pending_deferred:
             raise tb.SymbolScopedError(
                 f"{symbol} 미룬 매수 체결의 금액이 확정되지 않았거나 방향을 "
-                f"해석할 수 없습니다 (odno: {', '.join(pending_deferred[:5])}) — "
+                "해석할 수 없습니다 "
+                f"(odno: {mask_odno(pending_deferred[:5])[1:-1]}) — "
                 "시드 캡을 정확히 계산할 수 없어 SETTLE 전까지 실행을 중단합니다."
             )
         net_invested_overlay = None
@@ -612,7 +571,11 @@ def _execute_approved_plan(
                 f"{symbol} 실행 전 계획 재계산 실패 — 주문을 실행하지 않습니다: {error}"
             ) from error
         drift = compare_order_plans(
-            approval.get("orders") or [], rebuilt.orders, policy=tolerance_policy
+            approval.get("orders") or [],
+            rebuilt.orders,
+            policy=tolerance_policy,
+            approved_patch=approval.get("state_patch"),
+            rebuilt_patch=getattr(rebuilt, "state_patch", None),
         )
         if drift:
             raise RuntimeError(
@@ -666,10 +629,14 @@ def _execute_approved_plan(
             if rebuilt is not None:
                 # 재로드한 승인(디스크)과 재계산 계획을 다시 대조합니다. 이 시점의
                 # state 는 state_hash 로 승인과 동일함이 보장됩니다 (fail-closed).
+                # 비교 기준은 첫 대조(3c)와 **동일**하며, state_patch 까지 포함합니다
+                # (리버스 상태 변경만 다른 계획이 여기서 통과하면 안 됩니다).
                 drift = compare_order_plans(
                     approval.get("orders") or [],
                     rebuilt.orders,
                     policy=tolerance_policy,
+                    approved_patch=approval.get("state_patch"),
+                    rebuilt_patch=getattr(rebuilt, "state_patch", None),
                 )
                 if drift:
                     raise RuntimeError(
@@ -677,6 +644,9 @@ def _execute_approved_plan(
                         "재승인(PREVIEW→APPROVE)이 필요합니다: " + " / ".join(drift[:4])
                     )
                 # 승인 id/바인딩은 유지하고, 전송 내용만 재계산 계획으로 교체합니다.
+                # state_patch 는 바로 위에서 승인 패치와 동등함(리버스 필드는 정확
+                # 일치, close_prices 는 이력 동일 + 현재가 허용오차)을 확인했으므로
+                # 교체해도 승인된 상태 변경의 의미가 달라지지 않습니다.
                 plan.orders = list(rebuilt.orders)
                 plan.state_patch = dict(getattr(rebuilt, "state_patch", {}) or {})
                 plan.strategy_result = dict(getattr(rebuilt, "strategy_result", {}) or {})

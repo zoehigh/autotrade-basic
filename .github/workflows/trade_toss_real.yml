@@ -78,6 +78,14 @@ on:
         description: '사람 검토 표식 — 운영 계좌(real)의 LIVE LIFECYCLE/EXECUTE/AUTO_EXECUTE 에 "true" 필수'
         required: false
         type: string
+      # 사람이 검토한 계획의 **plan_hash 바인딩** (외부 리뷰 P1).
+      # reviewed=true 는 "사람이 검토했다"는 선언일 뿐 무엇을 검토했는지 증명하지 않습니다.
+      # 수동 단계(APPROVE/EXECUTE)는 PREVIEW 가 만든 plan_hash 를 함께 넘겨 봇이 계획/승인
+      # 파일의 해시와 대조합니다 (불일치 = 승인/실행 중단). 다중 대상은 쉼표로 같은 개수.
+      plan_hash:
+        description: '사람이 검토한 계획의 plan_hash (수동 APPROVE/EXECUTE 바인딩, 64자리 hex, 다중은 쉼표) — real LIVE 수동 승인은 필수'
+        required: false
+        type: string
 
 jobs:
   trade_toss_real:
@@ -96,5 +104,7 @@ jobs:
       auto_execute: ${{ github.event.inputs.auto_execute || github.event.client_payload.auto_execute || '' }}
       # 사람 검토 표식 — real LIVE 주문 경로(LIFECYCLE/EXECUTE/AUTO_EXECUTE)에 필수.
       reviewed: ${{ github.event.inputs.reviewed || github.event.client_payload.reviewed || '' }}
+      # 사람이 검토한 계획 해시 — 수동 APPROVE/EXECUTE 에서 계획/승인 파일과 대조합니다.
+      plan_hash: ${{ github.event.inputs.plan_hash || github.event.client_payload.plan_hash || '' }}
 
     secrets: inherit
