@@ -321,8 +321,13 @@ def test_estimated_amount_is_price_times_quantity(monkeypatch, tmp_path):
 
 
 # ── (5) 가격 경계값 ──────────────────────────────────────────────────
-@pytest.mark.parametrize("price", [None, 0, 0.0, -3.0, "12.5", True, float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("price", [None, 0, 0.0, "12.5"])
 def test_unknown_price_omits_estimate(monkeypatch, tmp_path, price):
+    """가격 미확정(NULL/0/문자열)은 표시에서 추정하지 않습니다.
+
+    비유한(NaN/Infinity)·음수·불리언 가격은 계획 비교 게이트가 fail-closed 로
+    차단하므로(아래 테스트) 여기서는 "값 없음" 표기만 확인합니다.
+    """
     run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LIMIT", price=price)])
     assert run.error is None, run.error
     body = _body(run)
@@ -330,6 +335,25 @@ def test_unknown_price_omits_estimate(monkeypatch, tmp_path, price):
     assert "주문가: $" not in body
     assert "예상 주문금액" not in body
     assert "시장가" not in body
+
+
+@pytest.mark.parametrize(
+    "price", [-3.0, True, float("inf"), float("-inf"), float("nan")]
+)
+def test_non_finite_or_negative_price_blocks_execution(
+    monkeypatch, tmp_path, price
+):
+    """비유한·음수·불리언 가격은 계획 비교에서 차단되어 주문이 나가지 않습니다.
+
+    회귀: `abs(a-b) > tol` 는 NaN 에서 False 라 NaN 가격이 검증을 통과했습니다.
+    """
+    run = _run(monkeypatch, tmp_path, orders=[_order(order_type="LIMIT", price=price)])
+    assert run.error is not None, "비유한/음수 가격이 검증을 통과하면 안 됩니다"
+    message = str(run.error)
+    assert "가격이" in message and (
+        "유한한 숫자가 아닙니다" in message or "음수입니다" in message
+    ), message
+    assert run.broker.order_calls == [], "차단 시 주문 API 를 호출하면 안 됩니다"
 
 
 # ── (6) 1달러 미만 정밀도 ────────────────────────────────────────────

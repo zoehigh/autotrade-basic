@@ -176,13 +176,49 @@ def test_skips_entirely_when_reverse_mode_active():
     assert broker.calls == []
 
 
-def test_broker_without_cancel_support_is_ignored():
-    """취소를 지원하지 않는 브로커(KIS 등)는 오류 없이 건너뜁니다."""
+def test_broker_without_cancel_support_blocks_session_unknown(monkeypatch):
+    """취소 미지원 브로커에서 **세션 미확정** 후보가 있으면 신규 주문을 보류합니다.
+
+    ⚠️ 계약 변경 이력 (외부 리뷰 P1 반영 — 무단 완화 아님):
+    이 테스트는 원래 `test_broker_without_cancel_support_is_ignored` 로
+    "세션 정보가 없는 행은 경고만 하고 건너뛴다(= 0 반환)"를 고정하고 있었습니다.
+    리뷰 지적: 그 행이 **실제로 살아 있는 오늘 주문**이면 신규 주문이 중복 접수됩니다
+    (매도=보유량 초과, 매수=시드 초과). 6개 어댑터 모두 주문이력에 `ord_tmd` 를
+    채우므로 세션 미확정 행은 비정상(필드 누락·레거시) 행이고, 모르면 막는 쪽이
+    안전합니다 (fail-closed). 그래서 계약을 "보류(raise)"로 **강화**했습니다.
+    """
     broker = _BrokerWithoutCancel()
     state = {"orders_meta": {"OD1": {}}}
+    # ord_dt=KST 오늘(= _row 기본값), ord_tmd 없음 → 세션(ET) 확정 불가.
     history = [_row("OD1")]
 
-    assert _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, history) == 0
+    with pytest.raises(SymbolScopedError, match="세션을 확정할 수 없는"):
+        _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, history)
+    assert broker.calls == []
+
+
+def test_broker_without_cancel_support_blocks_confirmed_today_order():
+    """취소 미지원 브로커 + **오늘 세션으로 확정되는** 미체결 봇 주문 → 보류."""
+    broker = _BrokerWithoutCancel()
+    state = {"orders_meta": {"OD1": {}}}
+    et_today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+    history = [_row("OD1", ord_dt=et_today, ord_tmd="120000")]
+
+    with pytest.raises(SymbolScopedError, match="오늘 세션 미체결 봇 주문"):
+        _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, history)
+    assert broker.calls == []
+
+
+def test_broker_without_cancel_support_proceeds_when_nothing_open():
+    """취소 미지원 브로커라도 잔여 후보가 **없으면** 그대로 진행합니다 (0)."""
+    broker = _BrokerWithoutCancel()
+    state = {"orders_meta": {"OD1": {}}}
+    # 이전 세션 주문(만료 대상)은 취소·보류 판정에서 제외됩니다.
+    expired = _row("OD1", ord_dt="20200101", ord_tmd="120000")
+
+    assert _cancel_open_bot_orders(broker, "TQQQ", "NAS", state, [expired]) == 0
+    # 메타가 비어 있고 열린 주문도 없으면 진행합니다.
+    assert _cancel_open_bot_orders(broker, "TQQQ", "NAS", {"orders_meta": {}}, []) == 0
     assert broker.calls == []
 
 
