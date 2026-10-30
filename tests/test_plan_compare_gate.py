@@ -1030,6 +1030,93 @@ class TestNonFiniteNumbersFailClosed:
         assert any("현재가가 음수입니다" in p for p in problems), problems
 
 
+# ── P2(리뷰): 소수 수량 fail-closed ────────────────────────────────
+#
+# 회귀: 수량 비교가 `int(a) - int(b)` 였습니다. 그래서 3.1 과 3.9 가 **둘 다 3** 으로
+# 잘려 "수량 불일치 없음"으로 통과했습니다 (승인 범위를 벗어난 수량이 실행됨).
+# 주문 수량은 정수여야 하므로, 정수가 아닌 수량은 문제로 보고합니다 (fail-closed).
+# 0 은 시장가/미지정 표기라 기존 정책대로 허용합니다.
+
+
+class TestFractionalQuantityFailClosed:
+    def test_int_truncation_bug_is_reproduced(self):
+        # given: 승인 3.1주 / 재계산 3.9주
+        # 회귀 재현: int() 로 자르면 두 값이 같은 3 이 되어 차이가 0 입니다 (수정 전 통과).
+        assert int(3.9) == int(3.1) == 3
+        assert abs(int(3.9) - int(3.1)) == 0
+        # when
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=3.1)], [_loc_buy(qty=3.9)], _policy()
+        )
+        # then: 정수가 아닌 수량은 비교 자체를 신뢰할 수 없으므로 차단합니다.
+        assert any("수량이 정수가 아닙니다" in p for p in problems), problems
+
+    def test_fractional_quantity_is_blocked_on_approved_side_only(self):
+        # given: 승인만 3.1주 (재계산은 3주)
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=3.1)], [_loc_buy(qty=3)], _policy()
+        )
+        # then
+        assert any("수량이 정수가 아닙니다" in p for p in problems), problems
+
+    def test_fractional_quantity_is_blocked_on_rebuilt_side_only(self):
+        # given: 재계산만 2.5주 (승인은 2주)
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=2)], [_loc_buy(qty=2.5)], _policy()
+        )
+        # then
+        assert any("수량이 정수가 아닙니다" in p for p in problems), problems
+
+    def test_integral_float_quantity_passes(self):
+        # given: JSON 왕복 등으로 float 이 된 정수 수량 (3.0 vs 3) — 과차단 금지
+        # when / then
+        assert pipeline.compare_plan_orders(
+            [_loc_buy(qty=3.0)], [_loc_buy(qty=3)], _policy()
+        ) == []
+
+    def test_integral_quantity_string_passes(self):
+        # given: 문자열로 된 정수 수량 ("3" vs 3)
+        # when / then
+        assert pipeline.compare_plan_orders(
+            [_loc_buy(qty="3")], [_loc_buy(qty=3)], _policy()
+        ) == []
+
+    def test_zero_quantity_is_not_overblocked(self):
+        # given: 0 은 "수량 미지정" 표기입니다 (기존 정책 유지).
+        # when / then
+        assert pipeline.compare_plan_orders(
+            [_loc_buy(qty=0)], [_loc_buy(qty=0.0)], _policy()
+        ) == []
+
+    def test_fractional_zero_is_blocked(self):
+        # given: 0.5주 — 0 은 허용하지만 소수는 아닙니다
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=0.5)], [_loc_buy(qty=0)], _policy()
+        )
+        # then
+        assert any("수량이 정수가 아닙니다" in p for p in problems), problems
+
+    def test_negative_fractional_quantity_keeps_negative_message(self):
+        # given: -3.5주 — 음수 검사가 먼저 적용됩니다 (메시지 하위호환)
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=-3.5)], [_loc_buy(qty=3)], _policy()
+        )
+        # then
+        assert any("수량이 음수입니다" in p for p in problems), problems
+        assert not any("수량이 정수가 아닙니다" in p for p in problems), problems
+
+    def test_fractional_quantity_skips_amount_comparison(self):
+        # given: 소수 수량 — 수량 비교가 무효이므로 금액 비교도 신뢰할 수 없습니다
+        problems = pipeline.compare_plan_orders(
+            [_loc_buy(qty=3.5, price=52.0)],
+            [_loc_buy(qty=3.5, price=52.0)],
+            _policy(),
+        )
+        # then: 금액 항목은 계산하지 않고(수량 항목만) 차단합니다.
+        assert any("수량이 정수가 아닙니다" in p for p in problems), problems
+        assert not any("금액" in p for p in problems), problems
+
+
 class TestFiniteNumberHelper:
     """비교 입력 정규화 헬퍼의 경계값 (과차단/과통과 동시 방지)."""
 

@@ -2806,6 +2806,22 @@ class TestOpsCronHandoff:
             if "RUN_PHASE=" in stripped:
                 assert stripped.startswith("#"), line
 
+    def test_cron_documents_evening_preview_as_approval_source(self):
+        """리뷰 후속: 승인 대상은 저녁 PREVIEW(18:15) — 아침 PREVIEW 는 진단/참고용."""
+        cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
+        # 저녁 PREVIEW 가 cron 라인으로 존재하고, EXECUTE(30 18)보다 앞섭니다.
+        assert "15 18 * * 1-5 RUN_PHASE=PREVIEW" in cron
+        assert "15 10 * * 1-5 RUN_PHASE=PREVIEW" in cron
+        # 아침 PREVIEW 는 승인 대상이 아니라는 문구가 남아 있어야 합니다.
+        assert "진단/참고용" in cron
+        assert "저녁 PREVIEW" in cron
+        # plan_id 인계(저녁 PREVIEW 로그 → APPROVE 입력) 흐름 문서화
+        assert "plan_id 인계" in cron
+        assert "plans/<plan_id>.json" in cron
+        # 단독 단계 산출물 단절 제약 문구는 유지 (self-hosted/동일 작업 디렉터리)
+        assert "self-hosted" in cron
+        assert "같은 작업 디렉터리" in cron
+
     def test_cron_documents_morning_settle_and_1830_execute(self):
         cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
         assert "5 10  * * 1-5 RUN_PHASE=SETTLE" in cron

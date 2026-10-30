@@ -6,7 +6,13 @@
 # 서버 TZ가 Asia/Seoul 이므로 CRON_TZ 없이 KST 기준으로 동작합니다.
 #
 # ── 하루 흐름 (기본: 수동 승인) ──
-# 아침 정산 → PREVIEW → [운영자 plan_id + plan_hash 확인] → APPROVE → 18:30 EXECUTE → 18:45 VERIFY
+# 아침 SETTLE → (아침 PREVIEW = 진단/참고용) … 저녁 PREVIEW → [운영자 plan_id + plan_hash 확인]
+#   → APPROVE → 18:30 EXECUTE → 18:45 VERIFY
+#
+# ⚠️ 승인 대상은 **저녁 PREVIEW(KST 18:15)** 산출물입니다.
+#    아침 PREVIEW(KST 10:15)는 세션·정산 진단용 참고 자료이며 승인에 쓰지 않습니다.
+#    (아침 계획을 8시간 뒤 EXECUTE 하면 변동성 종목이 가격 허용오차를 자주 벗어나
+#     승인이 보류됩니다 — 외부 리뷰 권고로 저녁 PREVIEW 를 정식 승인 경로로 둡니다.)
 #
 # ── 하루 흐름 (AUTO_EXECUTE=true opt-in) ──
 # 아침 정산 → PREVIEW → 자동 APPROVE → 자동 EXECUTE → 18:45 VERIFY (별도 런 유지)
@@ -20,21 +26,47 @@
 #     (real 과 동일하게 _wait_until_pre_market 이 동작합니다.)
 #   - VERIFY 는 기존과 같이 **별도 런**으로 유지합니다 (KST 18:45).
 #
-#  1) 아침 SETTLE/PREVIEW (KST 10:05 / 10:15)
+#  1) 아침 SETTLE (KST 10:05) + 아침 PREVIEW (KST 10:15, 진단/참고용)
 #     - SETTLE 은 정규장 마감(16:00 ET)뿐 아니라 **애프터아워 종료(20:00 ET)**
 #       이후에만 정산합니다. 동절기 KST 09:30 = ET 19:30 이라 아직 30분 남아
 #       있으므로, 여유를 두고 10:05 KST 에 실행합니다 (AFTER_HOURS_END_ET_HOUR 로 조정).
 #     - 직전 미국 세션은 KST 아침이면 이미 마감되어 있습니다.
 #     - SETTLE 은 **직전 마감 세션**을 정산하고, 주문 대상은 그 **다음 세션**입니다
-#       (주말·공휴일·서머타임은 XNYS 캘린더로 계산). 그래서 KST 아침(ET 전날 밤)
-#       PREVIEW 와 KST 18:30(ET 같은 날 새벽) EXECUTE 의 세션이 일치합니다.
+#       (주말·공휴일·서머타임은 XNYS 캘린더로 계산). 그래서 KST 저녁(ET 같은 날 새벽)
+#       의 PREVIEW/EXECUTE 와 세션이 일치합니다.
+#     - 아침 PREVIEW 는 **진단/참고용**입니다 (계획·세션·정산 상태를 눈으로 확인).
+#       승인 파일을 만들지 않으며, 이 산출물로 APPROVE 하지 마세요 — 8시간 뒤
+#       EXECUTE 되면 변동성 종목의 가격이 ±허용오차를 벗어나 승인 게이트에서
+#       보류되기 쉽습니다 (외부 리뷰 권고).
+#  1-b) 저녁 PREVIEW (KST 18:15) — **승인 대상 산출물**(plan_id/plan_hash)을 만드는 단계
+#     - EXECUTE(18:30) 15분 전이라 계획 시세와 주문 시점이 거의 같습니다. 그래서
+#       가격 허용오차 이탈로 인한 승인 보류가 아침 PREVIEW 대비 크게 줄어듭니다.
+#     - 출력 예 (로그·plans/<plan_id>.json 그대로):
+#         [PREVIEW] TQQQ — plan_id=TQQQ-2026-10-30-run-20261030-100500-20261030T091500Z-ab12cd34,
+#                   orders=3, state_hash=..., file=plans/TQQQ-2026-10-30-...-ab12cd34.json
+#       (plan_id = {종목}-{세션}-{정산 run_id}-{생성시각 Z}-{uuid8}. 로그의 plan_id 를
+#        그대로 복사하세요 — 손으로 조립하면 오타로 APPROVE 가 실패합니다.)
+#     - 승인 TTL(기본 9시간) 안에 APPROVE(18:20)·EXECUTE(18:30)가 끝나므로 여유롭습니다.
 #  2) APPROVE (수동 또는 AUTO_EXECUTE 자동)
 #     - 수동: PREVIEW 로그/plans/*.json 의 plan_id **와 plan_hash** 를 운영자가 확인해
 #       PLAN_ID + REVIEWED_PLAN_HASH 로 함께 전달합니다. 봇은 승인 파일을 쓰기 **전에**
 #       계획 파일의 plan_hash 와 대조하고, 불일치면 승인하지 않습니다 (외부 리뷰 P1 —
 #       "무엇을 검토했는지"를 해시로 묶음).
+#     - **plan_id 인계(handoff) 흐름** — 사람이 두 값을 그대로 옮깁니다:
+#         ① 저녁 PREVIEW 실행 → 로그에서 `plan_id=` 와 `plan_hash` 를 확인
+#            (또는 `plans/<plan_id>.json` 을 열어 "plan_id"/"plan_hash" 확인)
+#         ② 18:20 APPROVE 에 PLAN_ID + REVIEWED_PLAN_HASH 를 넣어 실행
+#         ③ 18:30 EXECUTE 에 **같은** plan_id/plan_hash 를 APPROVAL_PLAN_ID +
+#            REVIEWED_PLAN_HASH 로 넣어 실행 (승인 파일에 복사된 해시와 대조)
+#         ④ 18:45 VERIFY 는 APPROVAL_PLAN_ID 만 있으면 됩니다.
+#       예) PLAN_IDS=$(grep -h -o 'plan_id=[^ ,]*' logs/run-*.log | sed 's/.*plan_id=//' | paste -sd, -)
+#           → 로그/plans/ 에서 확인한 값과 **같은지 눈으로 대조한 뒤** APPROVE 에 넘깁니다.
+#       ⚠️ plan_id 는 PREVIEW 산출물 파일명과 1:1 이고, 파일이 사라지면(다른 디렉터리·
+#          정리) APPROVE 가 실패합니다 → PREVIEW 와 APPROVE 는 **같은 작업 디렉터리**에서
+#          실행하세요 (아래 "단독 단계 산출물 단절" 주의와 같은 이유).
 #     - 자동(AUTO_EXECUTE=true): PREVIEW 직후 plan 파일을 자동 승인 후 실행합니다.
 #  3) EXECUTE (KST 18:30) — 프리장 개장 이후라 계획 시세와 주문 시점이 어긋나지 않음.
+#     저녁 PREVIEW(18:15)와 15분 간격이므로 계획 가격이 그대로 유효할 가능성이 높습니다.
 #  4) VERIFY (KST 18:45) — 승인 파일 + 커밋된 SETTLE evidence + 브로커 read-only 대조.
 #
 # ⚠️ AUTO_EXECUTE 는 **opt-in** 입니다. 디폴트(미설정/false) 는 기존 수동 승인 방식을
@@ -42,13 +74,23 @@
 #    실전 적용 전 DRY(토스/LS 등)로 1주일 이상 검증하세요.
 #
 #      수동 실행 예 (plan_hash 바인딩 — 사람이 검토한 계획 해시):
-#        RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> REVIEWED_PLAN_HASH=<plan_hash> \
-#          LAUNCH_MODE=LIVE ops/run_daily.sh
+#        # ① 저녁 PREVIEW (18:15) — 승인 대상 plan_id/plan_hash 생산
+#        RUN_PHASE=PREVIEW LAUNCH_MODE=LIVE ops/run_daily.sh
+#        #    → 로그의 plan_id / plans/<plan_id>.json 의 plan_hash 를 확인
+#        # ② APPROVE (18:20) — 검토한 plan_id + plan_hash 바인딩
+#        RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> \
+#          REVIEWED_PLAN_HASH=<plan_hash> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        # ③ EXECUTE (18:30) — 같은 plan_id/plan_hash
 #        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> REVIEWED_PLAN_HASH=<plan_hash> \
 #          LAUNCH_MODE=LIVE ops/run_daily.sh
+#        # ④ VERIFY (18:45)
 #        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
 #        (plan_hash 는 PREVIEW 로그의 plan_hash 또는 plans/<plan_id>.json 의 "plan_hash".
 #         여러 종목은 PLAN_ID 와 **같은 개수**만큼 쉼표로 넘깁니다.)
+#        ⚠️ PLAN_ID 에는 **저녁 PREVIEW** 산출물을 넣으세요. 아침(10:15) PREVIEW 산출물을
+#           18:20 APPROVE 에 넣으면 계획이 8시간 낡아 가격 허용오차에서 자주 보류됩니다.
+#        ⚠️ PREVIEW → APPROVE 는 **같은 작업 디렉터리**에서 실행해야 합니다 (plans/<plan_id>.json
+#           가 그 디렉터리에 있어야 승인할 수 있습니다). 디렉터리가 바뀌면 저녁 PREVIEW 부터 다시.
 #        ⚠️ REVIEWED_PLAN_HASH 없이 APPROVE/EXECUTE 를 실행하면 봇은 바인딩 없이 기존대로
 #           진행합니다(하위호환). GitHub Actions 는 운영 계좌 real + LIVE 의 수동
 #           APPROVE/EXECUTE 에서 이 값을 **필수**로 강제합니다.
@@ -89,8 +131,9 @@
 # RUN_PHASE 없는 LIVE 는 브로커 생성 전에 SystemExit(1) 로 차단됩니다.
 #
 # 5 10  * * 1-5 RUN_PHASE=SETTLE   LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-# 20 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 아침 = 진단/참고용 (승인 대상 아님)
+# 15 18 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 저녁 = 승인 대상 plan_id/plan_hash 생산
+# 20 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # plan_id 는 저녁 PREVIEW 산출물
 # 30 18 * * 1-5 RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
 # 45 18 * * 1-5 RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
 #
@@ -239,9 +282,11 @@
 #   전에 중단합니다 (job-level 값은 fromJSON 이라 정수가 아니면 잡이 시작 전에 실패 = fail-closed).
 #
 # ── ⚠️ Actions 는 cron 과 같은 시각대를 쓰세요 ──
-#   위 cron 예시(5 10 SETTLE / 15 10 PREVIEW / 20 18 APPROVE / 30 18 EXECUTE / 45 18 VERIFY)
-#   가 정합 기준입니다. Actions 로 옮길 때도 **아침 = SETTLE/PREVIEW**, **저녁 = EXECUTE/VERIFY**
+#   위 cron 예시(5 10 SETTLE / 15 10 PREVIEW(진단) / 15 18 PREVIEW(승인 대상) /
+#   20 18 APPROVE / 30 18 EXECUTE / 45 18 VERIFY) 가 정합 기준입니다.
+#   Actions 로 옮길 때도 **아침 = SETTLE(+참고용 PREVIEW)**, **저녁 = PREVIEW/APPROVE/EXECUTE/VERIFY**
 #   로 나누면 hosted 제한과 승인 TTL(기본 9시간) 안에 들어옵니다.
+#   승인·실행 대상 계획은 **저녁 PREVIEW** 산출물입니다 (아침 PREVIEW 는 참고용).
 #   (repository_dispatch 스케줄러는 이 저장소가 아니라 외부 cron/GitHub schedule 쪽에서
 #    돌리므로, 스케줄 자체를 이 워크플로에 넣지 않습니다 — AGENTS.md 참고.)
 #

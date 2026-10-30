@@ -501,6 +501,8 @@ def compare_plan_orders(
       (정상 드리프트). 단 **유한한 숫자**만 인정합니다 — NaN/Infinity/파싱 실패는
       허용오차 비교를 무력화하므로(`abs(NaN-a) > tol == False`) 문제로 보고합니다.
       가격·수량의 유효 범위는 0 이상입니다 (0 은 시장가/미지정 표기라 허용).
+      수량은 **정수**만 인정합니다 — 소수 수량은 `int()` 로 잘려 3.1 과 3.9 가
+      같은 3 으로 비교되므로(비교 무력화) 문제로 보고합니다.
     - side/order_type/comment: 정확 일치.
     - 리버스 필드(reverse_action/day/base_t/factor/t_target)와 t_target: 허용오차
       없이 정확 일치 — 시세 드리프트로 리버스 단계가 바뀌면 안 됩니다.
@@ -562,6 +564,16 @@ def compare_plan_orders(
                 f"{prefix}주문 {index} 수량이 음수입니다: "
                 f"{approved_label}={a_qty_number!r}, {rebuilt_label}={r_qty_number!r} "
                 "(주문 수량은 0 이상이어야 합니다)"
+            )
+            qty_ok = False
+        # 수량은 **정수**여야 합니다. 소수 수량은 아래 `int()` 에서 잘려
+        # 3.1 과 3.9 가 둘 다 3 이 되어 "같은 수량"으로 통과합니다 (비교 무력화).
+        # 0 은 시장가/미지정 표기라 허용하되, 0.5 같은 소수는 차단합니다.
+        elif not (a_qty_number.is_integer() and r_qty_number.is_integer()):
+            problems.append(
+                f"{prefix}주문 {index} 수량이 정수가 아닙니다: "
+                f"{approved_label}={a_qty_number!r}, {rebuilt_label}={r_qty_number!r} "
+                "(소수 수량은 정수로 잘려 비교가 무력화되므로 실행하지 않습니다)"
             )
             qty_ok = False
         a_qty = int(a_qty_number) if qty_ok else 0
