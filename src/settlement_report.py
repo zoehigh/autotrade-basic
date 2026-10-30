@@ -30,6 +30,13 @@
    기록하고, 재전송 순서·최신 스냅샷 선택은 생성 시각을 씁니다. 마지막 시도 시각으로
    정렬하면 오래된 payload 재시도 실패가 그 payload 를 "최신"으로 둔갑시켜 다음 델타 0
    실행이 오정정을 냅니다. 구버전 항목은 `created_at` 이 없어 `at` 으로 물러납니다.
+   - `pending` 이 목표치(`MAX_PENDING_ENTRIES`)를 넘으면 **운영 경고 로그**만 남기고
+     (텔레그램 알림은 보내지 않습니다) 내용은 그대로 보존합니다.
+   - 하드 상한(`MAX_PENDING_HARD_CAP`)을 넘어 자리를 비워야 할 때는 **버리지 않고**
+     `pruned_archive` 로 옮겨 다음 실행에서 `archived_pending_entries()` 로 확인할 수
+     있게 합니다 (아카이브 자체도 건수 상한을 유지해 state 폭증을 막습니다).
+   - 두 경고 모두 로그에 **건수·종목명만** 씁니다. payload 안에는 주문번호가 섞일 수
+     있으므로 값을 출력하지 않습니다 (공개 로그에 원문 주문번호 금지).
 6. **정산 세션 바인딩**: 보류/실패 알림의 억제 키에는 **호출측이 의도한 정산 세션**이 들어갑니다.
    `settled=None`(정산 예외)이나 `session_calendar_unavailable` 처럼 결과 객체에 세션이
    없는 경로에서 세션이 비면, 같은 사유가 **날짜를 넘어 영구 억제**되어 운영자는 첫 실패만
@@ -135,9 +142,13 @@ MAX_SENT_PAYLOAD_HISTORY = 8
 # 미발송(pending) payload — 재시도 전에 사라지면 안 되지만 무한정 쌓이지도 않게 합니다.
 # ⚠️ 정리 기준은 **"이미 발송된 내용의 잔여물"** 뿐입니다(미발송분 보존 불변식).
 #    슬롯 개수만 보고 지우면 아직 못 보낸 정산 반영분이 조용히 사라지므로,
-#    아래 두 값은 "목표치(경고)"와 "마지노선(경고 후 정리)"으로만 씁니다.
-MAX_PENDING_ENTRIES = 10  # 목표치 — 넘으면 경고만 하고 **보존**합니다.
-MAX_PENDING_HARD_CAP = 40  # 마지노선 — 넘으면 오래된 것부터 정리(경고 필수).
+#    아래 두 값은 "목표치(경고)"와 "마지노선(경고 후 아카이브)"으로만 씁니다.
+MAX_PENDING_ENTRIES = 10  # 목표치 — 넘으면 운영 경고만 하고 **보존**합니다.
+MAX_PENDING_HARD_CAP = 40  # 마지노선 — 넘으면 오래된 것부터 `pruned_archive` 로 옮깁니다.
+# 하드 상한에서 밀려난 payload 를 **버리지 않고** 옮겨 두는 자리(`pruned_archive`)의 상한.
+# 아카이브도 상한을 두지 않으면 state 가 무한정 커지므로, 최근 것 위주로만 보관하고
+# 누적 정리 건수(`pruned_total`)는 상한과 무관하게 계속 셉니다.
+MAX_PRUNED_ARCHIVE_ENTRIES = 20
 
 # 한 실행에서 재전송하는 **과거 세션** 그룹 수 상한 (오래된 세션부터).
 # 발송이 여러 날 실패해 쌓여도 한 번에 몰아 보내지 않고, 다음 실행에서 이어서 처리합니다.
@@ -963,6 +974,11 @@ def _normalized_store(raw):
     for key in ("sent", "holds", "pending"):
         entries = store.get(key)
         store[key] = dict(entries) if isinstance(entries, dict) else {}
+    # `pruned_archive`(하드 상한에서 옮겨 둔 payload)는 **있을 때만** dict 로 정규화합니다 —
+    # 비어 있는데도 키를 새로 만들면 기존 state 모양이 불필요하게 바뀝니다.
+    if "pruned_archive" in store:
+        archive = store.get("pruned_archive")
+        store["pruned_archive"] = dict(archive) if isinstance(archive, dict) else {}
     store["version"] = REPORT_VERSION
     return store
 
@@ -1040,6 +1056,150 @@ def _prune(store):
     return _prune_pending(store)
 
 
+def _pending_symbols_summary(pending, limit=5):
+    """`pending` 에 쌓인 종목 이름 요약 (로그용).
+
+    로그에는 **가명/비민감 정보만** 남깁니다. pending 키(report_id+내용 지문)나
+    payload 안의 값(주문번호가 섞일 수 있음)은 출력하지 않고, 종목명과 건수만 씁니다.
+    """
+    symbols = set()
+    for entry in (pending or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if symbol:
+            symbols.add(symbol)
+    ordered = sorted(symbols)
+    if not ordered:
+        return "종목 미상"
+    if len(ordered) > limit:
+        return f"{', '.join(ordered[:limit])} 외 {len(ordered) - limit}종목"
+    return ", ".join(ordered)
+
+
+def archived_pending_entries(store):
+    """하드 상한에서 `pending` 밖으로 **옮겨 둔** 미발송 payload 목록 (오래된 순).
+
+    하드 상한은 state 크기 폭증을 막기 위한 마지노선이라 초과분은 `pending` 에 둘 수
+    없습니다. 그렇다고 버리면 아직 못 보낸 정산 반영분이 조용히 사라지므로, 삭제 대신
+    `pruned_archive` 에 **복구 가능한 형태**(payload 포함)로 보관합니다.
+    이 함수는 다음 실행/수동 점검에서 그 내용을 확인하는 읽기 전용 창구입니다.
+
+    자동 재전송 대상은 아닙니다 (`pending` 이 아님) — 브로커 체결 이력과 대조해
+    실제 반영분을 확인하는 용도입니다.
+    """
+    archive = _normalized_store(store).get("pruned_archive") or {}
+    return [dict(item) for item in archive.get("entries") or [] if isinstance(item, dict)]
+
+
+def _archive_sort_key(item):
+    """아카이브 항목의 정렬 기준 — **생성 시각 → `at` → `key`**.
+
+    아카이브는 상한으로 꼬리(최신)를 남기므로 정렬 기준이 곧 보존 정책입니다.
+    `created_at` 은 payload 생성 시각(불변)이고 `at` 은 마지막 시도 시각이라, 둘 다
+    없는 항목은 가장 오래된 것으로 봅니다(먼저 정리 대상). 시각이 같으면 `at`, 마지막으로
+    `key`(내부 식별자)로 순서를 고정해 실행마다 결과가 흔들리지 않게 합니다.
+    """
+    return (
+        str(item.get("created_at") or item.get("at") or ""),
+        str(item.get("at") or ""),
+        str(item.get("key") or ""),
+    )
+
+
+def _archive_pruned_payloads(store, dropped, *, at_iso=""):
+    """하드 상한에서 밀려난 `pending` 항목을 `pruned_archive` 로 **옮깁니다**.
+
+    삭제 전에 별도 자리로 옮기는 이유: 하드 상한은 "state 가 무한정 커지지 않게"하는
+    마지노선이지만, 그대로 버리면 **아직 발송하지 못한 정산 결과**가 영영 사라집니다
+    (운영 잔여 위험). 옮겨 두면 다음 실행에서 `archived_pending_entries()` 로 확인할 수
+    있습니다.
+
+    아카이브 자체도 상한(`MAX_PRUNED_ARCHIVE_ENTRIES`)으로 잘라 state 폭증을 막습니다.
+    상한 때문에 아카이브에도 남지 못한 건이 생기므로, 누적 정리 건수(`pruned_total`)는
+    상한과 무관하게 계속 누적해 "몇 건이 pending 에서 빠졌는가"를 남깁니다.
+
+    ⚠️ **순서를 호출측에 맡기지 않습니다**: `_prune_pending()` 은 최신순(reverse)으로
+       정렬한 목록의 꼬리를 넘기므로, 넘어온 `dropped` 는 "버려질 것들 중 최신순"입니다.
+       그 순서를 그대로 이어 붙여 상한을 자르면 **가장 최근 항목이 먼저 잘려** 오래된
+       것만 남습니다(최근 우선 보관 정책 위반). 그래서 기존 아카이브와 이번 `dropped` 를
+       합친 뒤 **생성 시각(`created_at`, 없으면 `at`) 기준 오래된 순으로 다시 정렬**하고
+       꼬리(최신)를 남깁니다. 반환 순서(`archived_pending_entries()`)도 이 순서입니다.
+
+    Returns:
+        int: 이번에 아카이브에 보관된 건수 (상한 적용 후). 상한 때문에 아카이브에도
+             남지 못한 건은 여기 포함되지 않고 `pruned_total` 에만 셉니다.
+             호출측이 경고 로그("N건 정리(아카이브 보관 M건)")에 그대로 씁니다.
+    """
+    dropped = [(key, entry) for key, entry in (dropped or []) if isinstance(entry, dict)]
+    if not dropped:
+        return 0
+
+    archive = store.get("pruned_archive")
+    archive = dict(archive) if isinstance(archive, dict) else {}
+    previous = [
+        item for item in (archive.get("entries") or []) if isinstance(item, dict)
+    ]
+    stamp = str(at_iso or "").strip() or _now_iso()
+
+    added = []
+    for key, entry in dropped:
+        payload = entry.get("payload")
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        restored = _report_from_payload(payload) if payload else None
+        added.append(
+            {
+                # 원래 pending 자리(멱등 키 + 내용 지문) — state 안에서만 쓰는 식별자입니다.
+                "key": str(key),
+                "symbol": str(
+                    entry.get("symbol") or getattr(restored, "symbol", "") or ""
+                ),
+                "session": str(
+                    entry.get("session") or getattr(restored, "settled_session", "") or ""
+                ),
+                "session_key": str(
+                    entry.get("session_key") or getattr(restored, "session_key", "") or ""
+                ),
+                "report_id": str(
+                    entry.get("report_id") or getattr(restored, "report_id", "") or ""
+                ),
+                "broker": str(entry.get("broker") or ""),
+                "account": str(entry.get("account") or ""),
+                "created_at": _pending_created_at(entry),
+                "at": str(entry.get("at") or ""),
+                "attempts": _as_int(entry.get("attempts"), 0),
+                # 언제 아카이브로 옮겼는지 (운영 추적용)
+                "archived_at": stamp,
+                # 본문 재료 그대로 — `_report_from_payload()` 로 되살릴 수 있습니다.
+                "payload": payload,
+            }
+        )
+
+    # 이번에 옮긴 건인지(`is_new`)를 항목과 **함께** 들고 다니며 정렬합니다.
+    # 항목 안의 `key` 로 비교하면, 같은 멱등 키가 이전 실행에서 이미 아카이브에 있는 경우
+    # (동일 내용 재적재 → 재정리) 이전 것까지 세어 건수가 부풀려집니다. 객체 식별자
+    # (`id()`)로 세는 방법도 맞긴 하지만 읽는 사람이 "왜 id 인가"를 매번 따져야 하므로,
+    # 출처 표식을 값으로 붙여 두는 쪽이 의도가 드러납니다.
+    tagged = [(item, False) for item in previous] + [(item, True) for item in added]
+    tagged.sort(key=lambda pair: _archive_sort_key(pair[0]))
+    survivors = tagged[-MAX_PRUNED_ARCHIVE_ENTRIES:]
+    # 상한이 이미 찼으면 이번에 옮긴 것도 보관되지 않습니다 (그래도 pruned_total 은 셉니다).
+    # 정렬 후 **실제로 남은** 이번 추가분만 셉니다 — 오래된 것부터 버리므로 단순히
+    # "남은 용량"으로 계산하면 최신 보존 여부를 잘못 셉니다.
+    archived_now = sum(1 for _, is_new in survivors if is_new)
+    entries = [item for item, _ in survivors]
+    store["pruned_archive"] = {
+        "version": REPORT_VERSION,
+        "at": stamp,
+        "entries": entries,
+        # 아카이브 보관 상한(명시) — 운영자가 state 만 보고도 상한을 알 수 있게 합니다.
+        "archive_limit": MAX_PRUNED_ARCHIVE_ENTRIES,
+        # 상한과 무관한 누적 정리 건수 (pending 에서 빠진 총 건수).
+        "pruned_total": _as_int(archive.get("pruned_total"), 0) + len(dropped),
+    }
+    return archived_now
+
+
 def _prune_pending(store):
     """`pending` 정리 — **미발송 내용 보존**이 우선입니다.
 
@@ -1047,9 +1207,14 @@ def _prune_pending(store):
       1. 이미 같은 내용이 발송된 잔여물 (지문 비교로 확인 — 다시 보내면 중복)
       2. payload 가 없거나 깨져 **재전송이 불가능한** 항목
 
+    목표치(`MAX_PENDING_ENTRIES`) 초과는 **운영 경고만** 남기고 그대로 보존합니다
+    (로그 전용 — 텔레그램 알림은 보내지 않습니다).
+
     그래도 하드 상한(`MAX_PENDING_HARD_CAP`)을 넘으면(발송이 오래 실패한 극단 상황)
-    오래된 것부터 줄이되 **경고를 출력**합니다 — 조용히 사라지면 그 반영분은 영영
-    확인할 수 없기 때문입니다. 목표치(`MAX_PENDING_ENTRIES`) 초과는 경고만 합니다.
+    오래된 것부터 줄이되, **버리지 않고** `pruned_archive` 로 옮깁니다
+    (`_archive_pruned_payloads()`). 조용히 사라지면 그 반영분은 영영 확인할 수 없기
+    때문입니다. 로그에는 가명/비민감 정보(건수·종목명)만 남기고 payload 값이나 원문
+    주문번호는 출력하지 않습니다.
     """
     pending = store.get("pending") or {}
     if not pending:
@@ -1088,16 +1253,28 @@ def _prune_pending(store):
         ordered = sorted(
             kept.items(), key=lambda kv: _pending_created_at(kv[1]), reverse=True
         )
-        dropped = len(kept) - MAX_PENDING_HARD_CAP
+        dropped = ordered[MAX_PENDING_HARD_CAP:]
         kept = dict(ordered[:MAX_PENDING_HARD_CAP])
+        # 삭제하지 않고 옮겨 둡니다 — 아직 못 보낸 정산 결과를 잃지 않기 위해서입니다.
+        # 반환값(실제 보관 건수)을 로그에 표면화합니다: 상한 때문에 아카이브에도 못 들어간
+        # 건이 있으면 "옮겼습니다"만으로는 전부 보관된 것처럼 읽히기 때문입니다.
+        archived_now = _archive_pruned_payloads(store, dropped)
+        archive = store.get("pruned_archive") or {}
         print(
             f"[경고] 미발송 payload 가 상한({MAX_PENDING_HARD_CAP}건)을 넘어 오래된 "
-            f"{dropped}건을 정리합니다 — 발송 실패가 길게 이어졌습니다 "
-            "(해당 정산 내용은 브로커 체결 이력에서 확인하세요)"
+            f"{len(dropped)}건을 정리(아카이브 보관 {archived_now}건)했습니다 — "
+            f"아카이브 {len(archive.get('entries') or [])}건/"
+            f"{MAX_PRUNED_ARCHIVE_ENTRIES}건, 누적 정리 {archive.get('pruned_total', 0)}건. "
+            "발송 실패가 길게 이어졌습니다 — state settlement_report.pruned_archive 와 "
+            "브로커 체결 이력에서 해당 정산 내용을 확인하세요"
         )
     elif len(kept) > MAX_PENDING_ENTRIES:
+        # 목표치 초과 — 운영 경고(로그 전용, 텔레그램 아님). 지우지 않고 보존합니다.
         print(
-            f"[정보] 미발송 payload {len(kept)}건 보관 중 — 재시도 전에는 지우지 않습니다"
+            f"[경고] 미발송 정산 payload 가 목표치({MAX_PENDING_ENTRIES}건)를 넘었습니다 "
+            f"(현재 {len(kept)}건, 종목: {_pending_symbols_summary(kept)}) — "
+            "미발송 내용은 지우지 않고 보존하며, 해소되면 다음 실행에서 순서대로 재전송합니다. "
+            "텔레그램 발송 실패(설정/네트워크)가 이어지고 있는지 확인하세요"
         )
     store["pending"] = kept
     return store
