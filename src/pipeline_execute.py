@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from broker.market_utils import us_session_in_progress
 from state import FILL_MARKER_VERSION, mask_odno
 
 from pipeline import (
@@ -55,6 +56,16 @@ def _wait_until_pre_market(tb, now=None):
     호출은 `execute_approved_plan()` 이 **전역 실행 잠금을 잡기 전에** 합니다
     (대기 중 다른 실행이 `.run.lock` 에 막히지 않도록).
 
+    **판정 기준은 KST 시각이 아니라 "미국 정규장 진행 여부" 입니다.**
+    KST 04:10 은 미국 ET 15:10(서머타임) / 14:10(동절기) 으로 **정규장 한복판**
+    이므로, 그때 프리장(17/18시 KST)까지 기다리면 하루를 통째로 놓칩니다.
+    그래서 정규장이 진행 중이면 대기 없이 즉시 진행하고, 주말·휴장일·장 마감
+    뒤(조기폐장 포함)에만 기존 프리장 대기 경로를 탑니다. 요일·휴장일·서머타임
+    판정은 XNYS 캘린더(`us_session_in_progress`)에 위임합니다 (자체 요일 계산 금지).
+
+    `BROKER_MODE=demo` 라는 이유만으로 대기를 끄지 않습니다 — 장이 열리지 않은
+    시각(주말·휴장일·마감 후)에는 모의계좌도 주문할 수 없으므로 대기가 필요합니다.
+
     Returns:
         datetime | None: 재검증 기준 시각. None 이면 실제 현재 시각을 사용합니다.
         테스트/재생처럼 `now` 가 주어지면 대기하지 않고 그대로 반환합니다.
@@ -66,6 +77,11 @@ def _wait_until_pre_market(tb, now=None):
     if tb.TRADE_MODE != "LIVE":
         return None
     now_kst = tb.get_kst_now()
+    # 미국 정규장이 지금 진행 중이면(ET 09:30~16:00, 조기폐장일 포함) 대기하지 않습니다.
+    # 테스트 재현성을 위해 기준 시각은 위에서 읽은 KST 시계를 UTC 로 변환해 넘깁니다.
+    if us_session_in_progress(now_kst.astimezone(timezone.utc)) is not None:
+        print("⏩ 미국 정규장 진행 중 — 프리장 대기를 건너뜁니다.")
+        return None
     pre_market_open_hour = 17 if tb.is_us_dst() else 18
     if now_kst.hour < pre_market_open_hour:
         target = now_kst.replace(
@@ -394,7 +410,8 @@ def execute_approved_plan(
 ):
     """EXECUTE 진입점 — 프리장 대기는 **잠금 밖**, 검증·선점·전송은 잠금 안.
 
-    프리장 대기는 최대 ~7.5시간입니다. 잠금을 잡은 채 자면 그동안 다른
+    프리장 대기는 최대 ~7.5시간입니다 (미국 정규장이 이미 진행 중이면 대기 없음).
+    잠금을 잡은 채 자면 그동안 다른
     프로세스의 SETTLE/APPROVE/EXECUTE 가 전부 막히므로, 대기를 잠금 획득
     **전에** 끝내고 재검증·선점·전송만 전역 실행 잠금 안에서 수행합니다.
     """

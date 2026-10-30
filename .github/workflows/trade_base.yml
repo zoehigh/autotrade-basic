@@ -86,6 +86,7 @@ on:
       #   {"run_phase":"LIFECYCLE","reviewed":"true","trade_mode":"LIVE"}
       # 아침(KST 오전)에는 프리장 개장까지 6시간을 넘게 대기해 hosted 러너가 강제 종료되므로,
       # 저녁 dispatch 로 실행하거나 아침에는 run_phase=PREVIEW 만 쓰세요 (아래 게이트 참고).
+      # 단, KST 04:10 처럼 미국 정규장이 **진행 중**인 시각은 대기하지 않습니다 (아래 게이트).
       reviewed:
         description: '사람 검토 표식 (운영 계좌 real 의 LIVE LIFECYCLE/EXECUTE 에 필수) — true/1/yes/on 만 허용'
         required: false
@@ -804,8 +805,11 @@ jobs:
           #    업로드와 정산 검증 job 이 실행되지 않아 실행 근거가 남지 않습니다.
           #    그래서 대기 예상치가 상한(LIFECYCLE_MAX_WAIT_SECONDS, 기본 4시간)을 넘으면
           #    실행 전에 중단하고 저녁 실행을 안내합니다. self-hosted 러너는 제한이 없어 제외합니다.
-          #    대기 규칙은 봇(src/pipeline_execute._wait_until_pre_market)과 같습니다:
-          #    KST 17시(미국 DST) / 18시(비 DST) 개장, TRADE_MODE=DRY 는 대기 없음.
+          #    대기 규칙은 봇(src/pipeline_execute._wait_until_pre_market)과 **같습니다**:
+          #    미국 정규장(ET 09:30~16:00)이 이미 진행 중이면 대기 0 (KST 04:10 은 ET
+          #    14:10/15:10 으로 정규장 한복판 — 기다리면 하루를 놓칩니다),
+          #    그 외에는 KST 17시(미국 DST) / 18시(비 DST) 개장까지 대기, TRADE_MODE=DRY 는 대기 없음.
+          #    정규장 진행 판정은 봇과 같은 XNYS 캘린더(`us_session_in_progress`)를 씁니다.
           if [[ "$live_norm" == "LIVE" && ( "$phase" == "LIFECYCLE" || "$phase" == "EXECUTE" ) \
                 && "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]]; then
             wait_max="${LIFECYCLE_MAX_WAIT_SECONDS:-14400}"
@@ -814,19 +818,37 @@ jobs:
             esac
             wait_reader=$(mktemp)
             cat > "$wait_reader" <<'PY'
+          import sys
           from datetime import datetime
           from zoneinfo import ZoneInfo
 
+          # 봇과 **같은** 코드 경로를 쓰기 위해 src 를 경로에 추가합니다 (trading_bot.py 와 동일).
+          sys.path.append("src")
+
           now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+          now_utc = now_kst.astimezone(ZoneInfo("UTC"))
+
+          # 1) 미국 정규장이 진행 중이면 대기 예상 = 0 (봇은 그때 즉시 실행합니다).
           try:
-              et = now_kst.astimezone(ZoneInfo("America/New_York"))
-              dst = et.dst() is not None and et.dst().total_seconds() != 0
+              from broker.market_utils import us_session_in_progress
+
+              in_session = us_session_in_progress(now_utc) is not None
           except Exception:
-              # 판단 불가 시 **늦은 개장(18시)** 을 가정합니다 = 대기 시간을 크게 잡는 보수적 방향.
-              dst = False
-          open_hour = 17 if dst else 18
-          target = now_kst.replace(hour=open_hour, minute=0, second=0, microsecond=0)
-          print(int(max(0, (target - now_kst).total_seconds())))
+              # 판단 불가 시 대기 규칙(KST 17/18시)으로 넘깁니다 — 보수적 방향.
+              in_session = False
+
+          if in_session:
+              print(0)
+          else:
+              try:
+                  et = now_utc.astimezone(ZoneInfo("America/New_York"))
+                  dst = et.dst() is not None and et.dst().total_seconds() != 0
+              except Exception:
+                  # 판단 불가 시 **늦은 개장(18시)** 을 가정합니다 = 대기 시간을 크게 잡는 보수적 방향.
+                  dst = False
+              open_hour = 17 if dst else 18
+              target = now_kst.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+              print(int(max(0, (target - now_kst).total_seconds())))
           PY
             wait_seconds=$(uv run python "$wait_reader" 2>/dev/null || true)
             rm -f "$wait_reader"

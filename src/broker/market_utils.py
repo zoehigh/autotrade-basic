@@ -217,7 +217,9 @@ def us_session_in_progress(now_utc: datetime | None = None) -> str | None:
     """현재 **정규장이 진행 중**인 세션 날짜를 반환합니다 (없으면 None).
 
     정산 대상 선택에서 "진행 중인 세션"을 실수로 포함하지 않도록 확인하는
-    진단용 helper 입니다. `us_session_last_closed_date()` 는 정규장이 닫힌
+    용도로 시작했으나, 현재는 EXECUTE 대기 판정(`pipeline_execute._wait_until_pre_market`)
+    과 Actions 대기 예산 게이트의 **프로덕션 판정 기준**으로도 사용합니다.
+    `us_session_last_closed_date()` 는 정규장이 닫힌
     세션만 반환하므로, 진행 중 세션의 체결은 그 대상에 포함되지 않습니다.
     """
     cal = _get_xnys_calendar()
