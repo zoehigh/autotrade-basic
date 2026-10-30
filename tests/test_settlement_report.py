@@ -1448,6 +1448,263 @@ class TestPendingPreservation:
             "가장 오래된(생성 시각 기준) 3건이 정리되고 최근 것만 남아야 합니다"
         )
 
+    # ── 운영 경고 + 삭제 대신 아카이브 보존 ──────────────────────────
+    def _fill_pending(self, count):
+        """서로 다른 payload `count` 건을 `_apply_mark()` 로 pending 에 쌓습니다.
+
+        시각은 분 단위로 증가시켜 **생성 시각 정렬**이 실제와 같게 동작하도록 합니다
+        (60분을 넘어가면 시(hour)를 올립니다).
+        """
+        store = {}
+        for index in range(1, count + 1):
+            at_iso = f"2026-10-29T{9 + index // 60:02d}:{index % 60:02d}:00Z"
+            store = sr._apply_mark(
+                store,
+                _report_for(
+                    qty=index,
+                    amount=index * 10.0,
+                    T=3.5 + index * 0.1,
+                    net=320.0 + index,
+                ),
+                ok=False,
+                at_iso=at_iso,
+            )
+        return store
+
+    def _fill_pending_at_once(self, count, monkeypatch):
+        """state 로드처럼 여러 건을 **한꺼번에** pending 에 채웁니다 (일괄 정리 경로).
+
+        `_apply_mark()` 는 저장할 때마다 `_prune()` 을 부르므로, 그 경로로 쌓으면 한 번에
+        1건씩만 밀려나 "아카이브 상한(20건)을 넘는 일괄 이동"이 재현되지 않습니다
+        (수정 전 버그가 이 경로에서만 드러납니다). 실제 운영에서는 캐시에서 읽은 state
+        처럼 이미 쌓인 pending 을 한 번에 정리하므로, **쌓는 동안의 prune 만** 건너뜁니다.
+        """
+        with monkeypatch.context() as patch:
+            patch.setattr(sr, "_prune", lambda store: store)
+            store = {}
+            for index in range(1, count + 1):
+                at_iso = f"2026-10-29T{9 + index // 60:02d}:{index % 60:02d}:00Z"
+                store = sr._apply_mark(
+                    store,
+                    _report_for(
+                        qty=index,
+                        amount=index * 10.0,
+                        T=3.5 + index * 0.1,
+                        net=320.0 + index,
+                    ),
+                    ok=False,
+                    at_iso=at_iso,
+                )
+        return store
+
+    def test_over_target_warns_but_keeps_everything(self, capsys, monkeypatch):
+        """목표치(`MAX_PENDING_ENTRIES`) 초과는 **운영 경고만** — 내용·알림은 그대로."""
+        sent = []
+        monkeypatch.setattr(sr, "notify", lambda *a, **k: sent.append(a) or True)
+        count = sr.MAX_PENDING_ENTRIES + 2
+        store = self._fill_pending(count)
+        capsys.readouterr()  # 쌓는 과정의 출력은 버립니다 (경고 조건만 봅니다)
+
+        pruned = sr._prune(store)
+        out = capsys.readouterr().out
+
+        assert len(pruned["pending"]) == count, (
+            "목표치를 넘어도 미발송 payload 는 지우지 않습니다"
+        )
+        assert "[경고]" in out and "목표치" in out, (
+            "목표치 초과는 조용히 넘기지 말고 운영 경고를 남겨야 합니다"
+        )
+        assert str(sr.MAX_PENDING_ENTRIES) in out
+        assert sr.archived_pending_entries(pruned) == [], (
+            "목표치 초과는 보존 대상 — 아카이브로 옮기지 않습니다"
+        )
+        assert sent == [], "경고는 로그 전용입니다 (텔레그램 발송 금지)"
+
+    def test_warning_log_has_no_raw_odno(self, capsys):
+        """경고 로그에는 가명/비민감 정보만 — 원문 주문번호·pending 키 금지."""
+        store = self._fill_pending(sr.MAX_PENDING_ENTRIES + 1)
+        key = list(store["pending"])[0]
+        # payload 에 주문번호가 섞여 들어온 상황 (호출측이 원문을 넣었을 수 있음)
+        store["pending"][key]["payload"]["odno"] = "12345678"
+        capsys.readouterr()
+
+        sr._prune(store)
+        out = capsys.readouterr().out
+
+        assert "[경고]" in out
+        assert "12345678" not in out, "공개 로그에 원문 주문번호를 남기면 안 됩니다"
+        assert key not in out, "pending 키(내부 식별자)도 로그에 쓰지 않습니다"
+
+    def test_hard_cap_archives_instead_of_dropping(self, capsys):
+        """하드 상한에서 밀려난 payload 는 **삭제가 아니라 아카이브**로 보존합니다."""
+        total = sr.MAX_PENDING_HARD_CAP + 3
+        store = self._fill_pending(total)
+        out = capsys.readouterr().out
+
+        kept = sr._prune(store)["pending"]
+        assert len(kept) == sr.MAX_PENDING_HARD_CAP, "상한은 유지합니다 (state 폭증 방지)"
+        assert "pruned_archive" in out, "삭제 대신 아카이브로 옮겼음을 경고해야 합니다"
+
+        archived = sr.archived_pending_entries(store)
+        assert [entry["payload"]["buy_qty"] for entry in archived] == [1, 2, 3], (
+            "밀려난 3건이 아카이브에 남아야 합니다 (다음 실행에서 확인 가능)"
+        )
+        restored = sr._report_from_payload(archived[0]["payload"])
+        assert restored is not None and restored.buy_qty == 1, (
+            "아카이브 payload 는 원래 리포트로 되살릴 수 있어야 합니다"
+        )
+        assert archived[0]["archived_at"], "언제 옮겼는지 남겨야 추적할 수 있습니다"
+        archive = store["pruned_archive"]
+        assert archive["archive_limit"] == sr.MAX_PRUNED_ARCHIVE_ENTRIES
+        assert archive["pruned_total"] == 3
+        # state 파일에 저장돼도(JSON round-trip) 그대로 확인할 수 있어야 합니다.
+        reloaded = json.loads(json.dumps(store))
+        assert len(sr.archived_pending_entries(reloaded)) == 3
+
+    def test_pruned_archive_keeps_count_cap(self):
+        """아카이브도 상한이 있어 state 가 무한정 커지지 않습니다."""
+        over = sr.MAX_PRUNED_ARCHIVE_ENTRIES + 5
+        total = sr.MAX_PENDING_HARD_CAP + over
+        store = self._fill_pending(total)
+
+        archived = sr.archived_pending_entries(store)
+        assert len(archived) == sr.MAX_PRUNED_ARCHIVE_ENTRIES, (
+            "아카이브는 건수 상한까지만 보관합니다"
+        )
+        # 최근 것 위주로 보관 — 가장 오래된 5건은 상한 때문에 아카이브에서도 빠집니다.
+        assert archived[0]["payload"]["buy_qty"] == over - sr.MAX_PRUNED_ARCHIVE_ENTRIES + 1
+        assert archived[-1]["payload"]["buy_qty"] == over
+        assert store["pruned_archive"]["pruned_total"] == over, (
+            "누적 정리 건수는 아카이브 상한과 무관하게 계속 셉니다"
+        )
+
+    def test_bulk_move_over_cap_keeps_newest_and_orders_return(self, capsys, monkeypatch):
+        """**20건 초과 일괄 이동**에서도 최신 것부터 보관·오래된 것부터 정리 (재현).
+
+        `_prune_pending()` 은 최신순 정렬 목록의 꼬리를 넘기므로 넘어온 목록은 "최신순"입니다.
+        그 순서를 그대로 이어 붙여 상한을 자르면 **가장 최근 항목이 먼저 잘려** 오래된
+        것만 아카이브에 남습니다 (최근 우선 보관 정책 위반). 생성 시각으로 다시 정렬해야
+        최신이 보존되고, 반환 순서도 문서(오래된 순)와 일치합니다.
+        """
+        over = sr.MAX_PRUNED_ARCHIVE_ENTRIES + 5  # 아카이브 상한을 넘는 일괄 이동분
+        total = sr.MAX_PENDING_HARD_CAP + over
+        store = self._fill_pending_at_once(total, monkeypatch)
+        assert len(store["pending"]) == total, "일괄 정리 전 상태를 먼저 확인합니다"
+        capsys.readouterr()
+
+        kept = sr._prune(store)["pending"]
+        capsys.readouterr()  # 경고 출력은 이 테스트의 관심사가 아닙니다
+
+        assert len(kept) == sr.MAX_PENDING_HARD_CAP, "pending 상한은 유지합니다"
+        assert sorted(entry["payload"]["buy_qty"] for entry in kept.values()) == list(
+            range(over + 1, total + 1)
+        ), "pending 에는 최신 40건이 남아야 합니다"
+
+        archived = sr.archived_pending_entries(store)
+        archived_qty = [entry["payload"]["buy_qty"] for entry in archived]
+        assert archived_qty == list(
+            range(over - sr.MAX_PRUNED_ARCHIVE_ENTRIES + 1, over + 1)
+        ), (
+            "아카이브는 밀려난 것 중 **최신 20건**을 생성 시각(오래된 순)으로 보관해야 합니다 "
+            "(수정 전에는 최신 항목이 먼저 잘려 오래된 것만 남았습니다)"
+        )
+        assert archived_qty[-1] == over, "가장 최근에 밀려난 항목이 살아남아야 합니다"
+        created = [str(entry["created_at"]) for entry in archived]
+        assert created == sorted(created), "반환 순서는 생성 시각 오름차순(오래된 순)입니다"
+        assert store["pruned_archive"]["pruned_total"] == over, (
+            "상한으로 아카이브에 못 들어간 건도 누적 정리 건수에는 포함합니다"
+        )
+
+        # 아카이브가 이미 찬 뒤 다시 정리해도 최신 우선 보관이 유지돼야 합니다.
+        # 이번 실행에서 새로 밀려나는 건 pending 의 **가장 오래된** 항목(qty=over+1)입니다.
+        store = sr._apply_mark(
+            store,
+            _report_for(qty=999, amount=9990.0, T=99.0, net=9999.0),
+            ok=False,
+            at_iso="2026-10-30T09:00:00Z",
+        )
+        rearchived = sr.archived_pending_entries(store)
+        assert len(rearchived) == sr.MAX_PRUNED_ARCHIVE_ENTRIES
+        assert [entry["payload"]["buy_qty"] for entry in rearchived] == list(
+            range(over - sr.MAX_PRUNED_ARCHIVE_ENTRIES + 2, over + 2)
+        ), (
+            "이미 찬 아카이브에 새 정리분을 합쳐도 가장 오래된 1건만 빠지고 "
+            "최신 것이 남아야 합니다"
+        )
+        assert [str(e["created_at"]) for e in rearchived] == sorted(
+            str(e["created_at"]) for e in rearchived
+        ), "이전 아카이브와 합쳐도 생성 시각 순서가 유지돼야 합니다"
+
+    def test_hard_cap_log_reports_archived_count(self, capsys, monkeypatch):
+        """경고 로그는 "정리 N건"과 "아카이브 보관 M건"을 **구분해서** 씁니다.
+
+        상한 때문에 아카이브에도 못 들어간 건이 있는데 "N건을 옮겼습니다"로만 쓰면
+        전부 보관된 것처럼 읽힙니다 — 실제 보관 건수(반환값)를 로그에 표면화합니다.
+        """
+        over = sr.MAX_PRUNED_ARCHIVE_ENTRIES + 5  # 아카이브 상한을 넘는 일괄 이동분
+        total = sr.MAX_PENDING_HARD_CAP + over
+        store = self._fill_pending_at_once(total, monkeypatch)
+        capsys.readouterr()
+
+        sr._prune(store)
+        out = capsys.readouterr().out
+
+        assert (
+            f"{over}건을 정리(아카이브 보관 {sr.MAX_PRUNED_ARCHIVE_ENTRIES}건)" in out
+        ), (
+            "정리 건수와 실제 아카이브 보관 건수를 함께 표기해야 합니다 "
+            f"(출력: {out!r})"
+        )
+        assert f"아카이브 {sr.MAX_PRUNED_ARCHIVE_ENTRIES}건/" in out
+        assert "옮겼습니다" not in out, (
+            "상한 때문에 못 들어간 건까지 옮긴 것처럼 읽히는 문구는 쓰지 않습니다"
+        )
+
+    def test_archive_pruned_payloads_returns_survivor_count(self, capsys):
+        """반환값은 **상한 적용 후 실제로 보관된** 이번 추가분만 셉니다."""
+        dropped = [
+            (
+                f"key-{index}",
+                {
+                    "payload": sr._report_payload(
+                        _report_for(
+                            qty=index, amount=index * 10.0, T=3.5, net=320.0 + index
+                        )
+                    ),
+                    "created_at": f"2026-10-29T09:{index:02d}:00Z",
+                },
+            )
+            for index in range(1, sr.MAX_PRUNED_ARCHIVE_ENTRIES + 6)
+        ]
+        store = {}
+
+        archived_now = sr._archive_pruned_payloads(store, dropped)
+        capsys.readouterr()
+
+        assert archived_now == sr.MAX_PRUNED_ARCHIVE_ENTRIES, (
+            "상한을 넘는 건은 보관 건수에 포함되지 않습니다"
+        )
+        assert store["pruned_archive"]["pruned_total"] == len(dropped), (
+            "누적 정리 건수는 상한과 무관하게 전부 셉니다"
+        )
+
+        # 아카이브가 이미 최신으로 가득 찬 상태에서 **더 오래된** 건은 보관되지 않습니다.
+        older = [
+            (
+                "key-old",
+                {
+                    "payload": sr._report_payload(
+                        _report_for(qty=999, amount=9990.0, T=9.9, net=9999.0)
+                    ),
+                    "created_at": "2026-10-01T00:00:00Z",
+                },
+            )
+        ]
+        assert sr._archive_pruned_payloads(store, older) == 0, (
+            "아카이브 상한이 이미 찼고 더 오래된 건이면 보관 건수는 0 입니다"
+        )
+        assert store["pruned_archive"]["pruned_total"] == len(dropped) + 1
+
 
 class TestLatestPendingComparison:
     """정정 여부 판단은 **가장 최근** 보관분과 비교해야 합니다 (델타 0 정정 소음 방지)."""
