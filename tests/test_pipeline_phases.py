@@ -147,6 +147,23 @@ def _deferred_fill(odno="DEF1", side="매수", qty="1", amount="100", **extra):
     return row
 
 
+def _bot_order_meta(odno="DEF1", *, side="BUY", qty=1, **extra):
+    """`orders_meta` 등록 항목 — 보류 체결이 **봇 주문**임을 증명합니다.
+
+    APPROVE/EXECUTE 는 실행 세션 보류 체결을 재정산 허용 목록에 넣기 전에
+    `state["orders_meta"]` 등록 여부를 확인합니다 (수동 체결 배제 — P2 리뷰).
+    그래서 봇 주문을 흉내내는 테스트는 메타를 함께 넣어야 합니다.
+    """
+    meta = {
+        "side": side,
+        "total_qty": qty,
+        "t_target": 0.0,
+        "processed_filled_qty": 0,
+    }
+    meta.update(extra)
+    return {odno: meta}
+
+
 def _make_broker(balance_qty=0, history=None):
     broker = MagicMock()
     broker.name = "mock"
@@ -818,7 +835,7 @@ class TestExecute:
         구현은 `allowed_fill_odnos` 로 넘기되, `position_qty` + 미룬 순변동이
         브로커 잔고와 **정확히 일치**할 때만 허용합니다 (조용한 통과 금지).
         """
-        state = _base_state(position_qty=0)
+        state = _base_state(position_qty=0, orders_meta=_bot_order_meta("DEF1"))
         state, _plan, path = _approve(tmp_path, state=state)
         io["load"]("TQQQ", deepcopy(state))
         fill = {
@@ -844,7 +861,7 @@ class TestExecute:
 
     def test_execute_deferred_fill_balance_mismatch_fails_closed(self, io, tmp_path):
         """미룬 체결로 설명되지 않는 잔고 차이는 EXECUTE 를 중단해야 합니다."""
-        state = _base_state(position_qty=0)
+        state = _base_state(position_qty=0, orders_meta=_bot_order_meta("DEF1"))
         state, _plan, path = _approve(tmp_path, state=state)
         io["load"]("TQQQ", deepcopy(state))
         fill = {
@@ -877,7 +894,10 @@ class TestExecute:
         재계산 시 남은 시드는 $0 이므로 승인된 매수 주문을 낼 수 없습니다.
         수량 reconciliation 만으로는 이 달러 초과를 막지 못합니다.
         """
-        state = _base_state(T=10.0, net_invested=9900.0, position_qty=198)
+        state = _base_state(
+            T=10.0, net_invested=9900.0, position_qty=198,
+            orders_meta=_bot_order_meta("DEF1"),
+        )
         state, _plan, path = _approve(tmp_path, state=state)
         io["load"]("TQQQ", deepcopy(state))
         monkeypatch.setattr(
@@ -900,7 +920,10 @@ class TestExecute:
         self, io, monkeypatch, tmp_path
     ):
         """P1: 금액 미확정 미룬 매수는 추정하지 않고 EXECUTE 를 차단합니다."""
-        state = _base_state(T=10.0, net_invested=9900.0, position_qty=198)
+        state = _base_state(
+            T=10.0, net_invested=9900.0, position_qty=198,
+            orders_meta=_bot_order_meta("DEF1"),
+        )
         state, _plan, path = _approve(tmp_path, state=state)
         io["load"]("TQQQ", deepcopy(state))
         monkeypatch.setattr(
@@ -927,7 +950,10 @@ class TestExecute:
         남은 시드 $40 에 미룬 매도 $100 을 더해 $140 으로 인정하면
         $50 매수가 허용되어 버립니다. 매도 회수액은 인정하지 않아야 합니다.
         """
-        state = _base_state(T=10.0, net_invested=9960.0, position_qty=10)
+        state = _base_state(
+            T=10.0, net_invested=9960.0, position_qty=10,
+            orders_meta=_bot_order_meta("DEFSELL", side="SELL", qty=1),
+        )
         state, _plan, path = _approve(tmp_path, state=state)
         io["load"]("TQQQ", deepcopy(state))
         monkeypatch.setattr(
@@ -2453,7 +2479,9 @@ class TestVerifyExecuteDeferredRecord:
         시점 누적(`deferred_qty`)이 더 크면 "SETTLE 스냅샷 → EXECUTE 수용" 증가
         흐름이 됩니다.
         """
-        state = _base_state(position_qty=0)
+        state = _base_state(
+            position_qty=0, orders_meta=_bot_order_meta("DEF1")
+        )
         state, _plan, path = _approve(tmp_path, state=state)
         evidence_path = tmp_path / "settlement-TQQQ-20261024T120000Z.json"
         if evidence_qty is not None:
@@ -4613,3 +4641,150 @@ class TestAutoExecuteDefectRepro:
         monkeypatch.setattr(trading_bot, 'approve_plan_file', lambda *a, **k: 'approval.json')
         monkeypatch.setattr(trading_bot, 'TRADE_MODE', 'DRY')
         assert trading_bot._dispatch_pipeline_phase('PREVIEW', _make_broker()) == 0
+
+
+# ── P2(리뷰): 보류 체결 소유권(orders_meta) 검증 ──────────────────────
+#
+# 회귀: `_deferred_execution_session_fills()` 는 **날짜 조건만** 보고 실행 세션
+# 체결을 모읍니다. 그 집합을 재정산 허용 목록에 그대로 넣으면, 봇이 내지 않은
+# **수동 체결**도 (날짜·잔고만 맞으면) 봇 실행 결과로 흡수됩니다. 그래서 허용
+# 목록에 넣기 전에 `state["orders_meta"]` 등록 여부를 확인하고, 미등록(수동)
+# 체결은 fail-closed 로 중단합니다.
+
+
+class TestDeferredFillOwnership:
+    """보류 체결이 봇 주문인지 확인한 뒤에만 허용 목록에 넣습니다."""
+
+    def _run_execute(self, io, tmp_path, *, history, balance_qty, state):
+        state, _plan, path = _approve(tmp_path, state=state)
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=balance_qty, history=history)
+        broker.place_order.return_value = OrderResult(
+            order_id="EXEC1",
+            order_time="2026-10-26T17:00:00+09:00",
+            is_reservation=False,
+        )
+        return state, broker, path
+
+    def test_manual_deferred_fill_is_not_admitted(self, io, tmp_path):
+        """수동 체결만 있으면 허용 목록에 넣지 않고 중단합니다 (조용한 통과 금지)."""
+        # given: state 에 등록된 봇 주문이 하나도 없고, 실행 세션에 수동 매수 1주 체결
+        manual = _deferred_fill(odno="MANUAL-77", qty="1", amount="50")
+        state = _base_state(position_qty=0)
+        state, broker, path = self._run_execute(
+            io, tmp_path, history=[manual], balance_qty=1, state=state
+        )
+        # and: 날짜 조건만 보는 수집 함수는 이 행을 그대로 담습니다 (회귀 지점)
+        assert [row["odno"] for row in pipeline._deferred_execution_session_fills(
+            state, [manual]
+        )] == ["MANUAL-77"]
+        # when: EXECUTE
+        with pytest.raises(
+            trading_bot.SymbolScopedError, match="등록되어 있지 않습니다"
+        ) as error:
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        # then: 주문을 내지 않고 승인도 소비하지 않습니다.
+        assert "수동 체결" in str(error.value)
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+        # and: 공개 메시지에는 원문 주문번호를 남기지 않습니다 (가명 토큰만).
+        assert "MANUAL-77" not in str(error.value)
+
+    def test_mixed_bot_and_manual_deferred_fills_blocks(self, io, tmp_path):
+        """봇 체결과 수동 체결이 섞이면 수동 건 때문에 전체를 중단합니다."""
+        # given: 봇 주문 DEF1 등록 + 실행 세션 체결 2건 (봇 1주 매수 / 수동 2주 매수)
+        bot_fill = _deferred_fill(odno="DEF1", qty="1", amount="50")
+        manual_fill = _deferred_fill(odno="MANUAL-88", qty="2", amount="100")
+        state = _base_state(
+            position_qty=0, orders_meta=_bot_order_meta("DEF1")
+        )
+        state, broker, path = self._run_execute(
+            io, tmp_path,
+            history=[bot_fill, manual_fill],
+            balance_qty=3,  # 잔고는 두 체결을 정확히 설명합니다 (소유권만 문제)
+            state=state,
+        )
+        # when
+        with pytest.raises(
+            trading_bot.SymbolScopedError, match="등록되어 있지 않습니다"
+        ) as error:
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now()
+            )
+        # then: 잔고 교차검증 실패가 아니라 **소유권** 사유로 중단됩니다.
+        assert "보류 체결 검증 실패" not in str(error.value)
+        assert "1건" in str(error.value)
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_manual_fill_that_balance_explains_used_to_be_admitted(self):
+        """수정 전에는 날짜·잔고만 맞으면 수동 체결이 허용 목록에 들어갔습니다.
+
+        수정 후에도 수집 함수는 행을 반환하지만(날짜 조건만), 소유권 검사가
+        그 행을 걸러내는지 함께 고정합니다.
+        """
+        manual = _deferred_fill(odno="MANUAL-99", qty="1", amount="50")
+        state = _base_state(position_qty=0)
+        # given: 날짜 조건만 보면 "보류 체결"로 수집됩니다
+        collected = pipeline._deferred_execution_session_fills(state, [manual])
+        assert len(collected) == 1
+        # when / then: 소유권 검사가 수동 체결로 분류합니다
+        assert pipeline._unregistered_deferred_fills(state, collected) == collected
+
+    def test_registered_bot_fill_is_allowed(self, io, tmp_path):
+        """등록된 봇 주문 체결은 기존처럼 허용 목록에 들어가 실행됩니다."""
+        fill = _deferred_fill(odno="DEF1", qty="1", amount="50")
+        state = _base_state(
+            position_qty=0, orders_meta=_bot_order_meta("DEF1")
+        )
+        state, broker, path = self._run_execute(
+            io, tmp_path, history=[fill], balance_qty=1, state=state
+        )
+        result = pipeline_execute.execute_approved_plan(
+            broker, str(path), now=_fixed_now()
+        )
+        assert result["outcome"] == "executed"
+        assert broker.place_order.call_count == 1
+
+    def test_int_key_orders_meta_is_normalized(self):
+        """orders_meta 키가 int 여도 봇 주문으로 인정합니다 (문자열 정규화)."""
+        # given: 손으로 만든/구버전 state 처럼 int 키로 저장된 주문 메타
+        state = _base_state(orders_meta={4615: {"side": "BUY", "total_qty": 1}})
+        row = _deferred_fill(odno="4615", qty="1", amount="50")
+        # when / then: 문자열로 맞춰 비교하므로 수동 체결로 오판하지 않습니다.
+        assert pipeline._unregistered_deferred_fills(state, [row]) == []
+        # and: 이력 주문번호가 int 인 경우도 같은 기준으로 매칭됩니다.
+        assert pipeline._unregistered_deferred_fills(
+            state, [_deferred_fill(odno=4615, qty="1", amount="50")]
+        ) == []
+
+    def test_reverse_order_meta_is_not_manual(self):
+        """리버스 주문(orders_meta 에 reverse_* 메타로 등록)도 봇 주문입니다."""
+        reverse_meta = _bot_order_meta(
+            "REV1", side="SELL",
+            reverse_action="sell",
+            reverse_day=1,
+            cycle_id="c1",
+            reverse_base_t=19.0,
+            reverse_t_factor=0.9,
+        )
+        state = _base_state(orders_meta=reverse_meta)
+        row = _deferred_fill(odno="REV1", side="매도", qty="8", amount="400")
+        assert pipeline._unregistered_deferred_fills(state, [row]) == []
+
+    def test_row_without_odno_is_manual(self):
+        """주문번호를 읽을 수 없는 체결은 소유를 증명할 수 없어 수동 취급입니다."""
+        state = _base_state(orders_meta=_bot_order_meta("DEF1"))
+        broken = _deferred_fill(odno="", qty="1", amount="50")
+        assert pipeline._unregistered_deferred_fills(state, [broken]) == [broken]
+
+    def test_empty_orders_meta_makes_every_fill_manual(self):
+        """orders_meta 가 비면 어떤 실행 세션 체결도 허용할 수 없습니다."""
+        state = _base_state(orders_meta={})
+        rows = [
+            _deferred_fill(odno="A1", qty="1", amount="50"),
+            _deferred_fill(odno="A2", side="매도", qty="1", amount="50"),
+        ]
+        assert pipeline._unregistered_deferred_fills(state, rows) == rows

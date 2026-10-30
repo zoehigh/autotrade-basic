@@ -871,3 +871,186 @@ class TestExecutePhaseHashGate:
         # then
         assert result == 0
         assert len(executed) == 1
+
+
+# ── P1(리뷰): 비유한(NaN/Infinity) 가격·금액 fail-closed ─────────────
+#
+# 회귀: `abs(a - b) > tolerance` 는 NaN 에서 항상 False 입니다. 그래서 승인·재계산
+# 주문 가격이 NaN 이면 **허용오차 비교를 그대로 통과**했습니다 (검증 우회).
+# `float()` 파싱 실패도 비교 대신 예외로 터져 "문제 보고"가 아니었습니다.
+# 지금은 비교 입력(가격·수량·금액·close_prices 현재가)을 **유한한 실수**로
+# 제한하고, 아니면 문제로 보고합니다 (fail-closed).
+
+
+class TestNonFiniteNumbersFailClosed:
+    def test_nan_price_used_to_pass_and_is_now_blocked(self):
+        # given: 승인 가격이 NaN, 재계산 가격은 정상 (수정 전에는 통과)
+        approved = [_loc_buy(price=float("nan"))]
+        rebuilt = [_loc_buy(price=52.0)]
+        policy = _policy()
+        # 회귀 재현: 수정 전 비교식은 NaN 을 통과시켰습니다 (False = 초과 아님).
+        tolerance = pipeline.price_tolerance(52.0, policy)
+        assert not (abs(float("nan") - 52.0) > tolerance)
+        # when
+        problems = pipeline.compare_plan_orders(approved, rebuilt, policy)
+        # then: 가격을 숫자로 확정할 수 없으므로 차단합니다.
+        assert any("가격이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_nan_price_on_both_sides_is_blocked(self):
+        # given: 양쪽 모두 NaN — 수정 전에는 "차이 없음"으로 보였습니다
+        assert not (abs(float("nan") - float("nan")) > 0.05)
+        approved = [_loc_buy(price=float("nan"))]
+        rebuilt = [_loc_buy(price=float("nan"))]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("가격이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_infinite_price_is_blocked(self):
+        # given: 무한대 가격 (브로커가 받아줄 수 없는 값)
+        approved = [_loc_buy(price=float("inf"))]
+        rebuilt = [_loc_buy(price=52.0)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("가격이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_non_numeric_price_is_reported_not_raised(self):
+        # given: 숫자로 읽을 수 없는 가격 문자열
+        approved = [_loc_buy(price="52.0abc")]
+        rebuilt = [_loc_buy(price=52.0)]
+        # when: 예외가 아니라 문제 보고여야 합니다 (조용한 통과·크래시 금지)
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        # then
+        assert any("가격이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_numeric_string_price_is_accepted(self):
+        # given: JSON 왕복 등으로 문자열이 된 숫자 가격 (과차단 금지)
+        approved = [_loc_buy(price="52.34")]
+        rebuilt = [_loc_buy(price=52.35)]
+        # when / then: 허용오차 안이면 통과합니다.
+        assert pipeline.compare_plan_orders(approved, rebuilt, _policy()) == []
+
+    def test_nan_quantity_is_blocked(self):
+        # given: 수량이 NaN (금액 = 가격×수량도 NaN 이 되어 비교가 무력화됨)
+        approved = [_loc_buy(qty=float("nan"))]
+        rebuilt = [_loc_buy(qty=3)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("수량이 유한한 숫자가 아닙니다" in p for p in problems), problems
+        assert any("금액이 유한한 숫자가 아닙니다" in p or "수량이 유한한" in p
+                   for p in problems)
+
+    def test_infinite_quantity_is_blocked(self):
+        # given: 수량 무한대 (int() 변환에서 OverflowError 가 나던 값)
+        approved = [_loc_buy(qty=float("inf"))]
+        rebuilt = [_loc_buy(qty=3)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("수량이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_negative_price_is_blocked(self):
+        # given: 음수 가격 (허용 범위 밖)
+        approved = [_loc_buy(price=-52.0)]
+        rebuilt = [_loc_buy(price=52.0)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("가격이 음수입니다" in p for p in problems), problems
+
+    def test_negative_quantity_is_blocked(self):
+        # given: 음수 수량
+        approved = [_loc_buy(qty=-3)]
+        rebuilt = [_loc_buy(qty=3)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("수량이 음수입니다" in p for p in problems), problems
+
+    def test_zero_price_market_order_is_not_overblocked(self):
+        # given: 가격 0 은 "시장가/미지정" 표기입니다 (build_order_plan 출력 규칙).
+        approved = [_loc_buy(price=0)]
+        rebuilt = [_loc_buy(price=0.0)]
+        # when / then: 정상 케이스를 과차단하지 않습니다.
+        assert pipeline.compare_plan_orders(approved, rebuilt, _policy()) == []
+
+    def test_zero_price_does_not_swallow_a_real_price(self):
+        # given: 가격 0 → 52 (시장가가 지정가로 바뀐 드리프트는 차단)
+        approved = [_loc_buy(price=0)]
+        rebuilt = [_loc_buy(price=52.0)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("가격 불일치" in p for p in problems), problems
+
+    def test_decimal_prices_within_tolerance_pass(self):
+        # given: 정상 소수 가격의 미세 드리프트 ($0.01)
+        approved = [_loc_buy(price=52.34)]
+        rebuilt = [_loc_buy(price=52.35)]
+        # when / then
+        assert pipeline.compare_plan_orders(approved, rebuilt, _policy()) == []
+
+    def test_overflowing_amount_is_blocked(self):
+        # given: 유한한 가격·수량이지만 금액이 무한대로 넘칩니다
+        approved = [_loc_buy(qty=3, price=1e308)]
+        rebuilt = [_loc_buy(qty=3, price=1e308)]
+        # when / then
+        problems = pipeline.compare_plan_orders(approved, rebuilt, _policy())
+        assert any("금액이 유한한 숫자가 아닙니다" in p for p in problems), problems
+
+    def test_nan_current_close_price_is_blocked(self):
+        # given: close_prices 마지막 원소(이번 실행 현재가)가 NaN
+        approved = _state_patch()
+        rebuilt = _state_patch(close_prices=[50.0, 50.5, 51.0, 50.25, float("nan")])
+        # when
+        problems = pipeline.compare_state_patches(approved, rebuilt, _policy())
+        # then: 허용오차 비교를 통과하지 못하고 차단됩니다.
+        text = _joined(problems)
+        assert "현재가를 유한한 숫자로 읽을 수 없습니다" in text, problems
+
+    def test_infinite_current_close_price_is_blocked(self):
+        # given: 현재가가 무한대
+        approved = _state_patch()
+        rebuilt = _state_patch(close_prices=[50.0, 50.5, 51.0, 50.25, float("inf")])
+        # when / then
+        problems = pipeline.compare_state_patches(approved, rebuilt, _policy())
+        assert any(
+            "현재가를 유한한 숫자로 읽을 수 없습니다" in p for p in problems
+        ), problems
+
+    def test_nan_history_close_price_is_blocked(self):
+        # given: 이력 종가에 NaN (정확 일치 대상)
+        approved = _state_patch()
+        rebuilt = _state_patch(close_prices=[50.0, float("nan"), 51.0, 50.25, 52.0])
+        # when / then: NaN 은 자기 자신과도 같지 않으므로 이력 불일치로 차단됩니다.
+        problems = pipeline.compare_state_patches(approved, rebuilt, _policy())
+        assert any("이력 종가 불일치" in p for p in problems), problems
+
+    def test_negative_current_close_price_is_blocked(self):
+        # given: 음수 현재가
+        approved = _state_patch()
+        rebuilt = _state_patch(close_prices=[50.0, 50.5, 51.0, 50.25, -52.0])
+        # when / then
+        problems = pipeline.compare_state_patches(approved, rebuilt, _policy())
+        assert any("현재가가 음수입니다" in p for p in problems), problems
+
+
+class TestFiniteNumberHelper:
+    """비교 입력 정규화 헬퍼의 경계값 (과차단/과통과 동시 방지)."""
+
+    def test_missing_values_become_default(self):
+        # given: "값 없음" 표기들 (시장가 price 0, 수량 미지정)
+        # when / then: 기존처럼 0 으로 봅니다.
+        assert pipeline._finite_number(None) == 0.0
+        assert pipeline._finite_number("") == 0.0
+        assert pipeline._finite_number("   ") == 0.0
+        assert pipeline._finite_number(None, 1.5) == 1.5
+
+    def test_finite_values_are_returned(self):
+        assert pipeline._finite_number(52) == 52.0
+        assert pipeline._finite_number("52.34") == 52.34
+        assert pipeline._finite_number(0) == 0.0
+
+    def test_non_finite_and_bool_are_rejected(self):
+        # given: 비유한 값/불리언/파싱 불가
+        # when / then: 모두 None (fail-closed 신호)
+        assert pipeline._finite_number(float("nan")) is None
+        assert pipeline._finite_number(float("inf")) is None
+        assert pipeline._finite_number("abc") is None
+        assert pipeline._finite_number(True) is None
+        assert pipeline._finite_number(False) is None

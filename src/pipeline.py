@@ -360,6 +360,29 @@ def _compare_field(record, name):
     return _COMPARE_MISSING if value is None else value
 
 
+def _finite_number(value, default=0.0):
+    """비교 입력 숫자를 **유한한 실수**로 파싱합니다 (해석 불가/비유한이면 `None`).
+
+    `abs(a - b) > tolerance` 는 NaN/Infinity 에서 항상 False 라, 비유한 가격은
+    허용오차 비교를 **그대로 통과**합니다. 그래서 비교 입력은 유한한 실수만
+    인정하고, 아니면 `None` 을 돌려 호출 측이 fail-closed 로 문제를 보고하게
+    합니다 (`float()` 파싱 실패도 같은 취급).
+
+    `None`/빈 문자열은 "값 없음" 표기이므로 `default` 로 봅니다 — 시장가 주문의
+    `price` 0, 수량 미지정 같은 기존 케이스를 과차단하지 않기 위함입니다.
+    bool 은 숫자로 보지 않습니다 (`True` 를 1주/1달러로 읽으면 안 됩니다).
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return float(default)
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def strict_equal(left, right):
     """허용오차 없는 비교 — 숫자 표현(int/float) 차이만 허용합니다.
 
@@ -434,15 +457,32 @@ def _close_prices_patch_problem(
             f"{rebuilt_label} {rebuilt[:-1]} "
             "(state 가 잠겨 있으므로 이력은 드리프트 대상이 아닙니다)"
         )
-    try:
-        approved_last = float(approved[-1])
-        rebuilt_last = float(rebuilt[-1])
-    except (TypeError, ValueError):
+    approved_last = _finite_number(approved[-1])
+    rebuilt_last = _finite_number(rebuilt[-1])
+    if approved_last is None or rebuilt_last is None:
         return (
-            f"현재가를 숫자로 읽을 수 없습니다: {approved_label} {approved[-1]!r}, "
-            f"{rebuilt_label} {rebuilt[-1]!r}"
+            f"현재가를 유한한 숫자로 읽을 수 없습니다: {approved_label} {approved[-1]!r}, "
+            f"{rebuilt_label} {rebuilt[-1]!r} "
+            "(비유한 값은 허용오차 비교를 통과하므로 신뢰할 수 없습니다)"
         )
-    tolerance = price_tolerance(approved_last, policy) if policy else 0.0
+    if approved_last < 0 or rebuilt_last < 0:
+        return (
+            f"현재가가 음수입니다: {approved_label}=${approved_last:.4f}, "
+            f"{rebuilt_label}=${rebuilt_last:.4f} "
+            "(종가는 0 이상이어야 합니다)"
+        )
+    try:
+        tolerance = price_tolerance(approved_last, policy) if policy else 0.0
+    except (KeyError, TypeError, ValueError):
+        return (
+            f"가격 허용오차를 계산할 수 없습니다: policy={policy!r} "
+            "(승인 정책이 손상되었으므로 비교 대신 중단합니다)"
+        )
+    if not math.isfinite(tolerance):
+        return (
+            f"가격 허용오차가 유효한 숫자가 아닙니다: {tolerance!r} "
+            "(정책 값이 손상되었습니다)"
+        )
     if abs(approved_last - rebuilt_last) > tolerance:
         return (
             f"현재가 불일치: {approved_label}=${approved_last:.4f}, "
@@ -458,7 +498,9 @@ def compare_plan_orders(
     """승인 주문 목록과 재계산(전송/기록) 주문 목록을 **같은 기준**으로 비교합니다.
 
     - 수량·가격·금액: 승인 시점에 고정된 `policy` 허용오차 안에서만 허용
-      (정상 드리프트).
+      (정상 드리프트). 단 **유한한 숫자**만 인정합니다 — NaN/Infinity/파싱 실패는
+      허용오차 비교를 무력화하므로(`abs(NaN-a) > tol == False`) 문제로 보고합니다.
+      가격·수량의 유효 범위는 0 이상입니다 (0 은 시장가/미지정 표기라 허용).
     - side/order_type/comment: 정확 일치.
     - 리버스 필드(reverse_action/day/base_t/factor/t_target)와 t_target: 허용오차
       없이 정확 일치 — 시세 드리프트로 리버스 단계가 바뀌면 안 됩니다.
@@ -494,32 +536,97 @@ def compare_plan_orders(
                     f"{approved_label}={approved.get(field)!r}, "
                     f"{rebuilt_label}={rebuilt.get(field)!r}"
                 )
-        a_qty = int(float(approved.get("quantity", 0) or 0))
-        r_qty = int(float(rebuilt.get("quantity", 0) or 0))
-        if abs(a_qty - r_qty) > qty_tol:
+        a_qty_value = approved.get("quantity", 0)
+        r_qty_value = rebuilt.get("quantity", 0)
+        a_price_value = approved.get("price", 0)
+        r_price_value = rebuilt.get("price", 0)
+
+        # 수량·가격은 **유한한 숫자**여야 합니다. NaN/Infinity 는 허용오차 비교를
+        # 통과하고( abs(a-b) > tol == False ), 파싱 실패는 비교를 예외로 터뜨립니다.
+        # 둘 다 조용히 통과시키면 승인 범위를 벗어난 주문이 실행되므로 fail-closed.
+        a_qty_number = _finite_number(a_qty_value)
+        r_qty_number = _finite_number(r_qty_value)
+        a_price = _finite_number(a_price_value)
+        r_price = _finite_number(r_price_value)
+
+        qty_ok = True
+        if a_qty_number is None or r_qty_number is None:
+            problems.append(
+                f"{prefix}주문 {index} 수량이 유한한 숫자가 아닙니다: "
+                f"{approved_label}={a_qty_value!r}, {rebuilt_label}={r_qty_value!r} "
+                "(수량·금액을 비교할 수 없어 실행하지 않습니다)"
+            )
+            qty_ok = False
+        elif a_qty_number < 0 or r_qty_number < 0:
+            problems.append(
+                f"{prefix}주문 {index} 수량이 음수입니다: "
+                f"{approved_label}={a_qty_number!r}, {rebuilt_label}={r_qty_number!r} "
+                "(주문 수량은 0 이상이어야 합니다)"
+            )
+            qty_ok = False
+        a_qty = int(a_qty_number) if qty_ok else 0
+        r_qty = int(r_qty_number) if qty_ok else 0
+        if qty_ok and abs(a_qty - r_qty) > qty_tol:
             problems.append(
                 f"{prefix}주문 {index} 수량 불일치: {approved_label}={a_qty}, "
                 f"{rebuilt_label}={r_qty} (허용 {qty_tol})"
             )
-        a_price = float(approved.get("price") or 0.0)
-        r_price = float(rebuilt.get("price") or 0.0)
-        tolerance = price_tolerance(a_price, policy)
-        if abs(a_price - r_price) > tolerance:
+
+        price_ok = True
+        tolerance = 0.0
+        if a_price is None or r_price is None:
+            problems.append(
+                f"{prefix}주문 {index} 가격이 유한한 숫자가 아닙니다: "
+                f"{approved_label}={a_price_value!r}, {rebuilt_label}={r_price_value!r} "
+                "(허용오차 비교가 불가능하므로 실행하지 않습니다)"
+            )
+            price_ok = False
+        elif a_price < 0 or r_price < 0:
+            problems.append(
+                f"{prefix}주문 {index} 가격이 음수입니다: "
+                f"{approved_label}={a_price!r}, {rebuilt_label}={r_price!r} "
+                "(주문 가격은 0 이상이어야 합니다)"
+            )
+            price_ok = False
+        if price_ok:
+            try:
+                tolerance = price_tolerance(a_price, policy)
+            except (KeyError, TypeError, ValueError):
+                tolerance = float("nan")
+            if not math.isfinite(tolerance):
+                problems.append(
+                    f"{prefix}주문 {index} 가격 허용오차가 유효한 숫자가 아닙니다: "
+                    f"{tolerance!r} (승인 정책이 손상되어 비교할 수 없습니다)"
+                )
+                price_ok = False
+        if price_ok and abs(a_price - r_price) > tolerance:
             problems.append(
                 f"{prefix}주문 {index} 가격 불일치: "
                 f"{approved_label}=${a_price:.4f}, "
                 f"{rebuilt_label}=${r_price:.4f} (허용 ±${tolerance:.4f})"
             )
-        a_amount = a_price * a_qty
-        r_amount = r_price * r_qty
-        amount_tolerance = max(tolerance * max(a_qty, 1), 0.01)
-        if abs(a_amount - r_amount) > amount_tolerance:
-            problems.append(
-                f"{prefix}주문 {index} 금액 불일치: "
-                f"{approved_label}=${a_amount:.2f}, "
-                f"{rebuilt_label}=${r_amount:.2f} "
-                f"(허용 ±${amount_tolerance:.2f})"
-            )
+        # 금액은 가격×수량 파생값이라, 두 입력이 유한할 때만 계산합니다.
+        if qty_ok and price_ok:
+            a_amount = a_price * a_qty
+            r_amount = r_price * r_qty
+            amount_tolerance = max(tolerance * max(a_qty, 1), 0.01)
+            if not (
+                math.isfinite(a_amount)
+                and math.isfinite(r_amount)
+                and math.isfinite(amount_tolerance)
+            ):
+                problems.append(
+                    f"{prefix}주문 {index} 금액이 유한한 숫자가 아닙니다: "
+                    f"{approved_label}={a_amount!r}, {rebuilt_label}={r_amount!r} "
+                    "(금액을 신뢰할 수 없어 실행하지 않습니다)"
+                )
+            elif abs(a_amount - r_amount) > amount_tolerance:
+                problems.append(
+                    f"{prefix}주문 {index} 금액 불일치: "
+                    f"{approved_label}=${a_amount:.2f}, "
+                    f"{rebuilt_label}=${r_amount:.2f} "
+                    f"(허용 ±${amount_tolerance:.2f})"
+                )
         for field in exact_fields:
             problem = _exact_field_problem(
                 index, approved, rebuilt, field, prefix,
@@ -1065,6 +1172,33 @@ def _deferred_fills_evidence(deferred_rows):
     return rows
 
 
+def _bot_registered_odnos(state):
+    """봇이 접수해 `orders_meta` 에 등록한 주문번호 집합 (문자열로 정규화).
+
+    `register_order_meta_in_state()` 는 `str(odno)` 키로 저장하지만, 손으로 만든
+    state·구버전 파일/브로커 응답에 따라 키가 int 일 수 있습니다. 비교는 항상
+    문자열로 맞춥니다 (리버스 주문도 같은 `orders_meta` 에 등록됩니다).
+    """
+    return {str(key) for key in (state.get("orders_meta") or {})}
+
+
+def _unregistered_deferred_fills(state, deferred_rows):
+    """보류 체결 중 **봇 주문이 아닌**(수동) 체결 행을 골라냅니다.
+
+    보류 체결을 재정산 허용 목록에 넣는 판단은 "봇이 낸 주문이 아직 정산되지
+    않았다"는 뜻입니다. `orders_meta` 에 없는 주문은 봇 소유가 아니므로, 그
+    체결(수동 주문)의 포지션·지출을 봇 실행 결과로 흡수해서는 안 됩니다.
+    주문번호를 읽을 수 없는 행도 소유를 증명할 수 없어 같은 취급입니다.
+    """
+    bot_odnos = _bot_registered_odnos(state)
+    manual = []
+    for row in deferred_rows or []:
+        odno = str((row or {}).get("odno") or "")
+        if not odno or odno not in bot_odnos:
+            manual.append(row)
+    return manual
+
+
 def _deferred_execution_session_fills(state, order_history):
     """SETTLE 이 실행 세션으로 미룬 체결 행을 반환합니다.
 
@@ -1072,6 +1206,10 @@ def _deferred_execution_session_fills(state, order_history):
     SETTLE 이 워터마크를 그 앞에 멈춘 채 T/순투입/원장에서 제외한 체결입니다.
     이 체결은 그 세션의 이후 SETTLE 에서 반영되며, 그 전까지 EXECUTE 의
     재정산 비교에서는 "설명된 새 체결"로 취급해야 합니다.
+
+    ⚠️ 이 함수는 **날짜 조건만** 봅니다. 허용 목록에 넣으려면 그 체결이 봇 주문
+    (`state["orders_meta"]`)인지 반드시 별도로 확인해야 합니다
+    (`_unregistered_deferred_fills` — 수동 체결은 허용 대상이 아닙니다).
     """
     settled_ymd = _session_ymd(state.get("settled_session"))
     execution_ymd = _session_ymd(state.get("execution_session"))
@@ -1136,8 +1274,11 @@ def _assert_reconciliation_with_deferred(
     """미룬 실행 세션 체결을 허용 목록에 넣어 재정산을 확인합니다.
 
     `assert_reconciliation_current(allowed_fill_odnos=...)` 는 새 체결이 모두
-    허용 목록에 속할 때만 통과시킵니다. 여기서는 그 전에 잔고 교차검증을 먼저
-    수행해, 미룬 체결이 실제 포지션 변화를 정확히 설명하는 경우에만 허용합니다.
+    허용 목록에 속할 때만 통과시킵니다. 그래서 허용 목록에 넣기 전에 두 가지를
+    확인합니다:
+      1. 그 체결이 **봇 주문**(`state["orders_meta"]` 등록)인지 — 수동 체결은
+         봇 실행 결과가 아니므로 허용하면 안 됩니다 (fail-closed 중단).
+      2. 그 체결이 현재 잔고 변화를 정확히 설명하는지.
 
     Returns:
         list[dict]: 허용 목록에 실제로 넘긴 보류 체결 행. EXECUTE 는 이 집합을
@@ -1145,6 +1286,18 @@ def _assert_reconciliation_with_deferred(
     """
     deferred_rows = _deferred_execution_session_fills(state, order_history)
     if deferred_rows:
+        manual_rows = _unregistered_deferred_fills(state, deferred_rows)
+        if manual_rows:
+            # 수동 체결은 날짜·잔고만 맞으면 예전에는 허용 목록에 들어가 봇 소유가
+            # 아닌 포지션·지출이 승인 실행 결과로 흡수됐습니다. 조용히 통과시키지
+            # 않고 중단합니다 (주문번호는 가명 토큰으로만 출력).
+            manual_odnos = [str(row.get("odno") or "") for row in manual_rows]
+            raise _tb().SymbolScopedError(
+                f"{symbol} 실행 세션 보류 체결 {len(manual_rows)}건이 봇 주문"
+                "(orders_meta)에 등록되어 있지 않습니다 — 수동 체결은 재정산 허용 "
+                "대상이 아니므로 진행할 수 없습니다 "
+                f"(odno: {mask_odno(manual_odnos[:5])[1:-1]})."
+            )
         _assert_deferred_fills_explained(symbol, state, deferred_rows, balance)
         allowed = {str(row.get("odno") or "") for row in deferred_rows}
         allowed.discard("")
