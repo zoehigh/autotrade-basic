@@ -1311,6 +1311,105 @@ class TestSettlementEvidenceBinding:
             )
 
 
+class TestEvidenceCommitFailure:
+    """외부 리뷰 P2: evidence `committed=true` 승격 실패는 **정산 보류**입니다.
+
+    state 는 이미 저장됐으므로 되돌리지 않습니다(되돌리면 거래 상태/워터마크 유실).
+    대신 halt_reason 을 명시해 SETTLE 디스패처가 성공으로 집계하지 않게 합니다.
+    """
+
+    def _fail_commit(self, monkeypatch):
+        """committed=True 승격만 OSError 로 실패시킵니다 (hold 기록은 정상)."""
+        original = pipeline._mark_evidence_committed
+        calls = []
+
+        def _mark(path, evidence, committed, failure_reason=""):
+            calls.append(bool(committed))
+            if committed:
+                raise OSError("디스크 가득참 (테스트 주입)")
+            return original(path, evidence, committed, failure_reason)
+
+        monkeypatch.setattr(pipeline, "_mark_evidence_committed", _mark)
+        return calls
+
+    def test_commit_failure_halts_settle_and_keeps_saved_state(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        calls = self._fail_commit(monkeypatch)
+
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+            _symbol_config(),
+        )
+
+        assert True in calls, "committed=true 승격 시도가 있어야 합니다 (전제)"
+        assert settled.halt_reason == pipeline.HALT_EVIDENCE_COMMIT_FAILED
+        assert settled.halt_reason == "evidence_commit_failed"
+        # state 는 저장된 채 유지 — 되돌리지 않습니다.
+        assert len(io["saved"]) == 1, "LIVE SETTLE 은 state 를 1회 저장합니다"
+        assert io["saved"][0]["last_settlement_id"] == "run-test"
+        # 근거는 커밋되지 않았으므로 PREVIEW 는 fail-closed 입니다.
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+        evidence = json.loads(
+            Path(settled.evidence_path).read_text(encoding="utf-8")
+        )
+        assert evidence["committed"] is False
+        assert evidence["failure_reason"] == "evidence_commit_failed"
+
+    def test_commit_failure_sets_halt_reason_without_saving_twice(
+        self, io, monkeypatch
+    ):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        self._fail_commit(monkeypatch)
+
+        first = pipeline.settle_positions(
+            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+            _symbol_config(),
+        )
+        io["load"]("TQQQ", deepcopy(first.state))
+        second = pipeline.settle_positions(
+            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+            _symbol_config(),
+        )
+        assert first.halt_reason == "evidence_commit_failed"
+        assert second.halt_reason == "evidence_commit_failed"
+        assert len(io["saved"]) == 2, "재실행도 각 1회씩만 저장해야 합니다"
+
+    def test_settle_phase_counts_commit_failure_as_failure(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        self._fail_commit(monkeypatch)
+        monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+        captured = {}
+
+        def _capture(entries):
+            captured["entries"] = entries
+
+        monkeypatch.setattr(trading_bot, "_notify_settlement_report", _capture)
+
+        failures = trading_bot._dispatch_pipeline_phase(
+            "SETTLE", _make_broker(balance_qty=10, history=[buyer])
+        )
+
+        # halt_reason 이 있으므로 디스패처는 **실패(보류)로 집계**해야 합니다.
+        assert failures == 1
+        entry = captured["entries"][0]
+        assert entry["settled"].halt_reason == "evidence_commit_failed"
+        assert len(io["saved"]) == 1
+
+        # 리포트 후크는 보류 경로 — 성공 리포트 금지 + 사유 알림.
+        import settlement_report
+
+        assert trading_bot._settlement_evidence_committed(entry["settled"]) is False
+        report = settlement_report.build_symbol_report(
+            entry["settled"], committed=False
+        )
+        assert report.halted is True
+        assert report.committed is False
+        assert "evidence_commit_failed" in report.halt_reason
+
+
 class TestForceTSettleRefusal:
     """P2: SETTLE 경로에서는 FORCE_T 를 적용하지 않습니다 (REPAIR 단독 경로)."""
 
@@ -4199,6 +4298,117 @@ class TestLauncherEnvOverride:
             assert "AUTO_EXECUTE=false" in line, line
         assert "과거 결함(수정됨)" in cron, (
             "AUTO_EXECUTE 오버라이드 결함 수정 주석이 문서에 남아야 합니다"
+        )
+
+
+class TestLauncherRunPhaseOverride:
+    """P1(조건부): 호출자가 넘긴 RUN_PHASE 는 `.env` 값보다 우선해야 합니다.
+
+    `.env` 를 읽는 `set -a; . ./.env` 는 셸 변수 대입이라 export 된 호출자 값까지
+    덮어씁니다. 런처가 보존하지 않으면 `.env` 의 `RUN_PHASE=EXECUTE` 가 오전 cron 의
+    `RUN_PHASE=PREVIEW` 를 뒤집어 진단용 미리보기가 실제 주문 단계로 바뀝니다.
+    """
+
+    def _run_launcher(self, tmp_path, dotenv_body, caller_env):
+        home = tmp_path / "home"
+        app_dir = home / "investment" / "muhan-v4"
+        app_dir.mkdir(parents=True)
+        (home / ".local" / "bin").mkdir(parents=True)
+        (app_dir / ".env").write_text(dotenv_body, encoding="utf-8")
+        record = tmp_path / "child-env.txt"
+        # 자식 파이썬(`uv run python trading_bot.py`) 자리에 fake uv 를 두고
+        # 그 프로세스가 받은 환경을 그대로 기록합니다.
+        fake_uv = home / ".local" / "bin" / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'env > "$RECORD"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_uv.chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["RECORD"] = str(record)
+        env["PATH"] = str(home / ".local" / "bin") + ":" + env.get("PATH", "")
+        for key in ("RUN_LOCK_PATH", "RUN_LOCK_FD", "RUN_LOCK_HELD",
+                    "TELEGRAM_BOT_TOKEN", "RUN_PHASE", "AUTO_EXECUTE",
+                    "FORCE_SYMBOLS", "LAUNCH_MODE"):
+            env.pop(key, None)
+        env.update(caller_env)
+        result = subprocess.run(
+            ["bash", str(_repo_root / "ops" / "run_daily.sh")],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        log_text = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in sorted((app_dir / "logs").glob("run-*.log"))
+        )
+        return record.read_text(encoding="utf-8").splitlines(), log_text
+
+    def test_caller_preview_beats_dotenv_execute(self, tmp_path):
+        """호출자 PREVIEW + .env EXECUTE → 자식 env 도 PREVIEW (회귀 방지)."""
+        lines, log_text = self._run_launcher(
+            tmp_path,
+            "RUN_PHASE=EXECUTE\nRUN_LOCK_PATH=.run.lock\n",
+            {"RUN_PHASE": "PREVIEW"},
+        )
+        assert "RUN_PHASE=PREVIEW" in lines
+        assert "RUN_PHASE=EXECUTE" not in lines
+        # [launcher] start 로그의 phase 는 **복원 후** 값이어야 합니다.
+        assert "phase=PREVIEW" in log_text
+        assert "phase=EXECUTE" not in log_text
+
+    def test_empty_caller_value_is_preserved(self, tmp_path):
+        """빈 값도 "호출자가 단계를 비우겠다"는 의도 → .env EXECUTE 를 이깁니다."""
+        lines, _ = self._run_launcher(
+            tmp_path,
+            "RUN_PHASE=EXECUTE\nRUN_LOCK_PATH=.run.lock\n",
+            {"RUN_PHASE": ""},
+        )
+        assert "RUN_PHASE=" in lines
+        assert "RUN_PHASE=EXECUTE" not in lines
+
+    def test_caller_value_not_normalized(self, tmp_path):
+        """값 정규화(strip+upper)는 봇의 몫 — 런처는 호출자 값을 그대로 보존합니다."""
+        lines, _ = self._run_launcher(
+            tmp_path,
+            "RUN_PHASE=PREVIEW\nRUN_LOCK_PATH=.run.lock\n",
+            {"RUN_PHASE": " preview "},
+        )
+        assert "RUN_PHASE= preview " in lines
+
+    def test_dotenv_value_kept_when_caller_unset(self, tmp_path):
+        """호출자가 지정하지 않으면 .env 값이 그대로 유지됩니다."""
+        lines, log_text = self._run_launcher(
+            tmp_path,
+            "RUN_PHASE=EXECUTE\nRUN_LOCK_PATH=.run.lock\n",
+            {},
+        )
+        assert "RUN_PHASE=EXECUTE" in lines
+        assert "phase=EXECUTE" in log_text
+
+    def test_launcher_captures_before_dotenv_and_restores_after(self):
+        """정적 가드: 보관은 `.env` 로드 전, 복원은 자식 실행 전이어야 합니다."""
+        launcher = (_repo_root / "ops" / "run_daily.sh").read_text(encoding="utf-8")
+        capture_pos = launcher.index("OVERRIDE_RUN_PHASE=")
+        env_pos = launcher.index(". ./.env")
+        restore_pos = launcher.index('export RUN_PHASE="$OVERRIDE_RUN_PHASE"')
+        run_pos = launcher.index("uv run python trading_bot.py")
+        assert capture_pos < env_pos < restore_pos < run_pos
+        # unset 과 빈 값을 구분하는 sentinel 이 있어야 .env 우선을 유지할 수 있습니다.
+        assert "${RUN_PHASE+x}" in launcher
+
+    def test_cron_documents_caller_run_phase_precedence(self):
+        """문서 가드: cron 예시가 호출자 RUN_PHASE 우선을 설명해야 합니다."""
+        cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
+        assert "호출자" in cron and "RUN_PHASE" in cron
+        assert ".env` 의 RUN_PHASE 보다 **우선**" in cron, (
+            "RUN_PHASE 오버라이드 우선순위 설명이 문서에서 사라졌습니다"
         )
 
 

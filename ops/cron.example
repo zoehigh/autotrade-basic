@@ -140,6 +140,9 @@
 #
 # ── LIVE 는 RUN_PHASE 단계 실행이 필수입니다 ──
 # RUN_PHASE 없는 LIVE 는 브로커 생성 전에 SystemExit(1) 로 차단됩니다.
+# ⚠️ 호출자(cron 라인/셸)가 넘긴 RUN_PHASE 는 `.env` 의 RUN_PHASE 보다 **우선**합니다.
+#    `.env` 에 RUN_PHASE=EXECUTE 가 있어도 아래 아침 `RUN_PHASE=PREVIEW` 는 PREVIEW 로
+#    실행됩니다 (호출자가 미지정일 때만 `.env` 값 사용, 빈 값도 "호출자 지정"으로 보존).
 #
 # 5 10  * * 1-5 RUN_PHASE=SETTLE   LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
 # 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE AUTO_EXECUTE=false /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 아침 = 진단/참고용 (승인 대상 아님, 자동주문 금지 — AUTO_EXECUTE=false 명시)
