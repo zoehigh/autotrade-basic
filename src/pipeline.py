@@ -53,6 +53,10 @@ PLAN_DIR = config.PLAN_DIR
 APPROVAL_SCHEMA_VERSION = 3
 PLAN_SCHEMA_VERSION = 3
 
+# SETTLE 보류 사유: state 는 저장됐지만 evidence `committed=true` 승격에 실패한 경우.
+# PREVIEW 는 근거 부재로 fail-closed 되고, SETTLE 디스패처는 halt_reason 으로 보류 집계합니다.
+HALT_EVIDENCE_COMMIT_FAILED = "evidence_commit_failed"
+
 
 def _tb():
     """trading_bot 모듈을 지연 import 합니다 (테스트 monkeypatch 호환)."""
@@ -3433,12 +3437,30 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
         try:
             _mark_evidence_committed(evidence_path, settlement_evidence, True)
         except OSError as commit_error:
-            # state 는 저장됐지만 evidence 승격에 실패했습니다. 이 경우 PREVIEW 의
-            # settled_from_state() 가 evidence 부재로 거부하므로 fail-closed 입니다.
+            # state 는 **이미 저장**됐습니다. 되돌리면 실제 거래 상태/워터마크가
+            # 유실돼 더 위험하므로 state 는 그대로 둡니다.
+            # 다만 근거 승격에 실패했다면 이 SETTLE 은 확정이 아닙니다:
+            # - PREVIEW 의 settled_from_state() 는 committed 근거가 없어 거부(fail-closed)
+            # - 상위 SETTLE 디스패처는 halt_reason 이 없으면 **성공으로 집계**하므로,
+            #   경고만 남기고 성공으로 반환하면 "정산 완료" 오판이 됩니다.
+            # 그래서 명시적 halt_reason 으로 보류/실패 집계되게 합니다 (리포트도
+            # 보류 경로 — 성공 리포트 금지 + 사유 알림).
             print(
                 f"[경고] {symbol} 정산 근거 committed 표시 실패 — "
-                f"PREVIEW/VERIFY 가 보류됩니다: {str(commit_error)[:160]}"
+                f"SETTLE 을 보류로 집계합니다 (PREVIEW/VERIFY 는 근거 부재로 거부): "
+                f"{str(commit_error)[:160]}"
             )
+            try:
+                # 왜 커밋되지 않았는지 근거 파일에 남깁니다 (실패해도 무시).
+                _mark_evidence_committed(
+                    evidence_path,
+                    settlement_evidence,
+                    False,
+                    HALT_EVIDENCE_COMMIT_FAILED,
+                )
+            except OSError:
+                pass
+            return _settled(HALT_EVIDENCE_COMMIT_FAILED)
     else:
         # DRY/미저장 실행: 근거를 사용할 수 없게 표시합니다.
         try:

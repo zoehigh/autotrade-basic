@@ -56,6 +56,21 @@ else
     OVERRIDE_AUTO_EXECUTE=""
 fi
 
+# RUN_PHASE 도 같은 결함이 있습니다 (외부 리뷰 P1 — 조건부).
+# `.env` 에 RUN_PHASE=EXECUTE 가 있으면 오전 cron 의 RUN_PHASE=PREVIEW 가 뒤집혀
+# 진단용 PREVIEW 가 주문 단계로 바뀝니다. AUTO_EXECUTE 와 동일한 sentinel 패턴으로
+# 호출자 값을 보존합니다 — unset 이면 `.env` 값을 그대로 쓰고, 빈 값(`RUN_PHASE=`)도
+# "호출자가 단계를 비우겠다"는 의도이므로 보존합니다.
+# 단계 값 정규화(strip + 대문자, 유효 단계 판정)는 봇(`config.read_run_phase()`)이
+# 하므로 런처는 값을 **보존만** 합니다 (셸에 두 번째 판정 규칙을 만들지 않습니다).
+if [[ -n "${RUN_PHASE+x}" ]]; then
+    OVERRIDE_RUN_PHASE_SET=1
+    OVERRIDE_RUN_PHASE="$RUN_PHASE"
+else
+    OVERRIDE_RUN_PHASE_SET=0
+    OVERRIDE_RUN_PHASE=""
+fi
+
 # 같은 시각에 두 번 돌지 않도록 잠급니다.
 # - DRY: 다른 RUN이 있으면 즉시 종료합니다 (조회성 작업이라 지연할 이유가 없습니다).
 # - LIVE: 다른 RUN이 있으면 최대 5분 기다립니다. 즉시 종료하면 "성공한 것처럼 조용히
@@ -133,6 +148,13 @@ export TRADE_MODE="${OVERRIDE_MODE:-LIVE}"
 # 이겨 아침 진단 PREVIEW 가 자동 주문(PREVIEW→APPROVE→EXECUTE)으로 이어집니다.
 if [[ "$OVERRIDE_AUTO_EXECUTE_SET" == "1" ]]; then
     export AUTO_EXECUTE="$OVERRIDE_AUTO_EXECUTE"
+fi
+
+# RUN_PHASE: 호출자가 넘겼을 때만 복원합니다 (unset 이면 .env 값 유지).
+# 아래 [launcher] start 로그의 phase= 필드는 이 복원 **후** 값입니다 — 로그만 보고
+# "어느 단계로 돌았는지" 판단하므로 .env 값이 찍히면 안 됩니다.
+if [[ "$OVERRIDE_RUN_PHASE_SET" == "1" ]]; then
+    export RUN_PHASE="$OVERRIDE_RUN_PHASE"
 fi
 
 # 일회성 복구 플래그가 남아 있으면 사고가 나므로 항상 지웁니다.
