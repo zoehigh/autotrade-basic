@@ -143,6 +143,8 @@ def load_state(symbol):
     # 세션 검증이 `_et_today()`(KST 아침=ET 전날) 대신 이 값을 씁니다.
     settled_session = state.get("settled_session", "")
     execution_session = state.get("execution_session", "")
+    # 일일 정산 리포트(텔레그램) 발송 상태 — 거래 원장과 분리된 부수 기록입니다.
+    settlement_report = state.get("settlement_report", {})
 
     print(f"[상태] {symbol} 상태 로드 완료 → T={T}, 마지막 갱신: {last_updated}")
     return {
@@ -170,6 +172,8 @@ def load_state(symbol):
         "last_settlement_committed_at_utc": last_settlement_committed_at_utc,
         "settled_session": settled_session,
         "execution_session": execution_session,
+        # 정산 리포트 발송 상태 (부수 기록 — T/순투입/원장과 무관)
+        "settlement_report": settlement_report,
         "_net_invested_missing": net_invested_missing,
     }
 
@@ -229,6 +233,12 @@ def _state_record(state_dict):
         # SETTLE 대상 세션 / 실행 대상 세션 — 파이프라인 세션 검증 바인딩
         "settled_session": state_dict.get("settled_session", ""),
         "execution_session": state_dict.get("execution_session", ""),
+        # 일일 정산 리포트(텔레그램) 발송 상태 — 거래 원장과 분리된 부수 기록.
+        # GitHub hosted 러너는 매 실행이 새 디렉터리라 재시작 후 유지되는 곳이
+        # .state.json 캐시뿐이므로 여기에만 남깁니다. T/순투입/원장에는 영향이 없고
+        # canonical_state_hash() 에도 넣지 않습니다 (복구용 CAS 지문이 발송 때문에
+        # 흔들리면 안 됨 — AGENTS: 발송은 정산의 부수 기능).
+        "settlement_report": state_dict.get("settlement_report", {}),
     }
 
 
@@ -292,10 +302,21 @@ def save_states(updates):
 
 
 def canonical_state_hash(state):
-    """save_state()가 저장하는 필드만으로 계산한 SHA-256 해시를 반환합니다.
+    """**거래 원장 필드만**으로 계산한 SHA-256 해시를 반환합니다 (감사/CAS용 지문).
 
-    상태 파일의 canonical 형태(저장 관점)에 대한 지문으로, 일회성 복구(fence/T/net_invested)
-    CAS 검증과 audit 출력에 사용합니다. 상태 저장 후 재계산하면 값이 달라짐을 보장합니다.
+    계약:
+      - **포함**: `save_state()` 가 저장하는 **거래 원장 필드** — T, 순투입(net_invested
+        및 status), 워터마크(`last_updated`/`last_processed_ordno`), `orders_meta`,
+        `settlement_ledger`, `sell_t_effects`, `pending_order_*` fence, 사이클/세션
+        필드(`cycle_start_date`/`settled_session`/`execution_session`), 커밋된 정산 id,
+        `close_prices` 등. 즉 이 지문이 바뀌면 **거래 상태가 바뀐 것**입니다.
+      - **제외**: 부수·파생 기록. 대표적으로 `settlement_report`(텔레그램 발송 상태
+        — 알림이 CAS 지문을 흔들면 복구 검증이 실패함), 내부 임시 키(`_` 접두),
+        표시용/감사용 필드. 제외 자체에는 동작 영향이 없고, 발송·진단 때문에
+        복구용 지문이 달라지지 않게 하려는 **의도적 제외**입니다.
+
+    ⚠️ 그러므로 "state 파일이 같다"의 증거로 쓰지 마세요. 복구 CAS 비교는 이 지문으로,
+    파일 전체 동일성 비교는 별도 직렬화 비교로 판단해야 합니다.
     """
     payload = {
         "T": float(state.get("T", 0.0)),

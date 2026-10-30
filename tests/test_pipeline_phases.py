@@ -4092,6 +4092,116 @@ class TestLockPathUnification:
         assert "busy" in child.stdout
 
 
+class TestLauncherEnvOverride:
+    """P1: 호출자가 export 한 AUTO_EXECUTE 는 `.env` 값보다 우선해야 합니다.
+
+    `.env` 를 읽는 `set -a; . ./.env` 는 셸 변수 대입이라 export 된 호출자 값까지
+    덮어씁니다. 런처가 OVERRIDE_* 로 보존하지 않으면 `AUTO_EXECUTE=false` 로 실행한
+    아침 진단 PREVIEW 가 `.env` 의 true 로 뒤집혀 자동 주문으로 이어집니다.
+    """
+
+    def _run_launcher(self, tmp_path, dotenv_body, caller_env):
+        home = tmp_path / "home"
+        app_dir = home / "investment" / "muhan-v4"
+        app_dir.mkdir(parents=True)
+        (home / ".local" / "bin").mkdir(parents=True)
+        (app_dir / ".env").write_text(dotenv_body, encoding="utf-8")
+        record = tmp_path / "child-env.txt"
+        # 자식 파이썬(`uv run python trading_bot.py`) 자리에 fake uv 를 두고
+        # 그 프로세스가 받은 환경을 그대로 기록합니다.
+        fake_uv = home / ".local" / "bin" / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'env > "$RECORD"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_uv.chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["RECORD"] = str(record)
+        env["PATH"] = str(home / ".local" / "bin") + ":" + env.get("PATH", "")
+        for key in ("RUN_LOCK_PATH", "RUN_LOCK_FD", "RUN_LOCK_HELD",
+                    "TELEGRAM_BOT_TOKEN", "RUN_PHASE", "AUTO_EXECUTE",
+                    "FORCE_SYMBOLS", "LAUNCH_MODE"):
+            env.pop(key, None)
+        env.update(caller_env)
+        result = subprocess.run(
+            ["bash", str(_repo_root / "ops" / "run_daily.sh")],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return record.read_text(encoding="utf-8").splitlines()
+
+    def test_caller_false_beats_dotenv_true(self, tmp_path):
+        """호출자 false + .env true → 자식 env 도 false (회귀 방지)."""
+        lines = self._run_launcher(
+            tmp_path,
+            "AUTO_EXECUTE=true\nRUN_LOCK_PATH=.run.lock\n",
+            {"AUTO_EXECUTE": "false"},
+        )
+        assert "AUTO_EXECUTE=false" in lines
+        assert "AUTO_EXECUTE=true" not in lines
+
+    def test_non_boolean_caller_value_is_preserved_not_normalized(self, tmp_path):
+        """값 해석(정규화)은 봇의 몫 — 런처는 호출자 값을 그대로 보존합니다."""
+        lines = self._run_launcher(
+            tmp_path,
+            "AUTO_EXECUTE=true\nRUN_LOCK_PATH=.run.lock\n",
+            {"AUTO_EXECUTE": " 0 "},
+        )
+        assert "AUTO_EXECUTE= 0 " in lines
+
+    def test_empty_caller_value_means_off(self, tmp_path):
+        """빈 값도 "호출자가 끄겠다"는 의도이므로 .env true 를 이깁니다."""
+        lines = self._run_launcher(
+            tmp_path,
+            "AUTO_EXECUTE=true\nRUN_LOCK_PATH=.run.lock\n",
+            {"AUTO_EXECUTE": ""},
+        )
+        assert "AUTO_EXECUTE=" in lines
+        assert "AUTO_EXECUTE=true" not in lines
+
+    def test_dotenv_value_kept_when_caller_unset(self, tmp_path):
+        """호출자가 지정하지 않으면 .env 값이 그대로 유지됩니다 (opt-in 보존)."""
+        lines = self._run_launcher(
+            tmp_path,
+            "AUTO_EXECUTE=true\nRUN_LOCK_PATH=.run.lock\n",
+            {},
+        )
+        assert "AUTO_EXECUTE=true" in lines
+
+    def test_launcher_captures_before_dotenv_and_restores_after(self):
+        """정적 가드: 보관은 `.env` 로드 전, 복원은 자식 실행 전이어야 합니다."""
+        launcher = (_repo_root / "ops" / "run_daily.sh").read_text(encoding="utf-8")
+        capture_pos = launcher.index("OVERRIDE_AUTO_EXECUTE=")
+        env_pos = launcher.index(". ./.env")
+        restore_pos = launcher.index('export AUTO_EXECUTE="$OVERRIDE_AUTO_EXECUTE"')
+        run_pos = launcher.index("uv run python trading_bot.py")
+        assert capture_pos < env_pos < restore_pos < run_pos
+        # unset 과 빈 값을 구분하는 sentinel 이 있어야 .env 우선을 유지할 수 있습니다.
+        assert "${AUTO_EXECUTE+x}" in launcher
+
+    def test_cron_morning_preview_explicitly_disables_auto_execute(self):
+        """문서 가드: 아침 진단 PREVIEW 줄은 AUTO_EXECUTE=false 를 명시해야 합니다."""
+        cron = (_repo_root / "ops" / "cron.example").read_text(encoding="utf-8")
+        morning = [
+            line for line in cron.splitlines()
+            if line.lstrip("#").strip().startswith("15 10 ")
+            and "RUN_PHASE=PREVIEW" in line
+        ]
+        assert morning, "아침 PREVIEW cron 줄이 사라졌습니다"
+        for line in morning:
+            assert "AUTO_EXECUTE=false" in line, line
+        assert "과거 결함(수정됨)" in cron, (
+            "AUTO_EXECUTE 오버라이드 결함 수정 주석이 문서에 남아야 합니다"
+        )
+
+
 class TestCycleSeedIndependentRecompute:
     """HOLD 5: 사이클 시드를 원시 체결/경계/수수료/직전 시드로 독립 재계산."""
 
