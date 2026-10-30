@@ -73,6 +73,17 @@
 #    그대로 유지합니다. 전체 종목에 적용되며, 심볼별 예외는 없습니다.
 #    실전 적용 전 DRY(토스/LS 등)로 1주일 이상 검증하세요.
 #
+# ⚠️ 아침 진단 PREVIEW 줄에는 `AUTO_EXECUTE=false` 를 **명시**하세요 (외부 리뷰 P1).
+#    `.env` 에 AUTO_EXECUTE=true 가 있으면, 그 값만 믿는 아침 PREVIEW 는 "진단"이 아니라
+#    자동 APPROVE → EXECUTE 연쇄(= 실제 주문)로 이어집니다. 아침 계획은 8시간 뒤 세션이라
+#    승인 대상도 아닙니다 — 아침 자동 실행을 원치 않으면 cron 라인에서 끄세요.
+#      과거 결함(수정됨): run_daily.sh 가 `.env` 를 읽을 때(`set -a; . ./.env`) export 된
+#      호출자 값을 덮어써 `AUTO_EXECUTE=false ops/run_daily.sh` 가 `.env` 의 true 로
+#      뒤집혔습니다. SYMBOLS/LAUNCH_MODE/RUN_LOCK_PATH 만 OVERRIDE_* 로 보존하고
+#      AUTO_EXECUTE 만 누락된 탓입니다. 지금은 AUTO_EXECUTE 도 호출자 값이 .env 보다
+#      우선하며, 빈 값(`AUTO_EXECUTE=`)도 "끄기"로 보존됩니다(미지정일 때만 .env 사용).
+#      값 해석(1/true/yes/on)은 봇이 하므로 `false`/`0`/빈 값 모두 끄기입니다.
+#
 #      수동 실행 예 (plan_hash 바인딩 — 사람이 검토한 계획 해시):
 #        # ① 저녁 PREVIEW (18:15) — 승인 대상 plan_id/plan_hash 생산
 #        RUN_PHASE=PREVIEW LAUNCH_MODE=LIVE ops/run_daily.sh
@@ -131,7 +142,7 @@
 # RUN_PHASE 없는 LIVE 는 브로커 생성 전에 SystemExit(1) 로 차단됩니다.
 #
 # 5 10  * * 1-5 RUN_PHASE=SETTLE   LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 아침 = 진단/참고용 (승인 대상 아님)
+# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE AUTO_EXECUTE=false /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 아침 = 진단/참고용 (승인 대상 아님, 자동주문 금지 — AUTO_EXECUTE=false 명시)
 # 15 18 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 저녁 = 승인 대상 plan_id/plan_hash 생산
 # 20 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # plan_id 는 저녁 PREVIEW 산출물
 # 30 18 * * 1-5 RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
@@ -144,6 +155,34 @@
 # VERIFY 종료코드: 0=정상(executed), 1=실행 실패/검증 실패, 2=승인만 되고 미실행.
 # run_daily.sh 는 LIVE 에서 exit 2 를 **실행 실패(exit 1)와 다른 문구**로 알립니다
 # (exit 2 = 승인만 됨, 운영자 확인 필요 / exit 1 = 주문·검증 실패, 긴급).
+#
+# ── 일일 정산 리포트 (텔레그램, SETTLE 종료 시 1회) ──
+# SETTLE 단계가 끝나면 종목별 정산 요약을 텔레그램으로 한 번 보냅니다
+# (`src/settlement_report.py`, 후크는 `trading_bot._dispatch_pipeline_phase_locked` 의 SETTLE 지점).
+#   · 내용: 종목별 "이번 정산 반영분"(매수/매도 수량·금액), T 와 순투입 변화, 확정 보유수량,
+#     그리고 전체 요약(완료/보류 종목 수, 미확정 체결금액 건수).
+#     실현손익·평가손익은 넣지 않습니다 (정산 원장 범위 밖).
+#   · ⚠️ 집계는 **델타**입니다 — 정산이 남기는 `qty_delta`/`amount_delta`(이번에 새로 반영된
+#     증가분)만 더합니다. 누적 체결을 더하면 부분체결(누적 7주 중 이번 2주)이 중복 집계됩니다.
+#     초기 전체 재추정(`full_reinference`)과 지연 체결(`late`)은 같은 델타 규칙으로 합산하되
+#     메시지에 "전체 재추정"/"지연 체결 N건"으로 따로 표시합니다.
+#   · ⚠️ 주문이력의 `ord_dt` 는 **주문일**(미국 영업일)이라 "전일 체결"로 단정할 수 없습니다.
+#     그래서 리포트는 "전일 체결" 대신 **"이번 정산 반영분"** 으로 표기합니다.
+#   · 발송 조건: **커밋된 정산 근거(committed=true)** 가 있는 종목만 "반영 완료"로 보냅니다.
+#     보류/검증 실패 종목은 성공 리포트 대신 **사유 + "신규 주문 차단"** 으로 알립니다
+#     (정산이 확정되지 않았는데 완료처럼 보이면 운영자가 다음 단계를 진행합니다).
+#   · 중복 방지 키 = broker + 계좌 지문 + 종목 + 정산 세션 + 리포트 버전.
+#     발송 상태는 거래 원장과 분리된 `.state.json` 의 종목별 `settlement_report` 키에 남깁니다.
+#     hosted 러너는 매 실행이 새 디렉터리라 **재시작 후 유지되는 유일한 저장소가 state 캐시**이기
+#     때문입니다 (별도 로컬 JSON 은 사라짐). 이 키는 `canonical_state_hash()` 에 포함되지 않아
+#     복구용 CAS 지문을 흔들지 않고, state 캐시 저장 가드(LIVE/REPAIR 만 저장)와도 일치합니다.
+#   · 발송 실패는 **정산에 영향을 주지 않습니다**: 발송은 state 저장이 끝난 뒤 부수 기능으로
+#     실행되고 예외를 흡수합니다. 실패하면 "발송 실패(재시도 가능)"만 기록하고 T·순투입·원장은
+#     건드리지 않으며, 같은 세션의 다음 실행에서 재시도합니다.
+#   · ⚠️ Telegram Bot API 에는 멱등 키가 없습니다. "전송 성공 → 발송 상태 저장" 사이에 프로세스가
+#     죽으면 같은 세션에서 **한 번 더** 발송될 수 있습니다(중복 알림 1건, 문서화된 한계).
+#   · DRY/REPAIR 는 발송하지 않습니다 (state 를 저장하지 않아 중복 방지 근거가 남지 않음).
+#   · 메시지에는 원문 주문번호·계좌번호를 넣지 않습니다 (집계·마스킹된 사유만).
 
 # ── GitHub Actions (repository_dispatch) 는 같은 5단계를 워크플로 안에서 수행합니다 ──
 # .github/workflows/trade_base.yml 이 run_phase 입력으로 단계를 받습니다

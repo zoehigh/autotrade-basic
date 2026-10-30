@@ -41,6 +41,21 @@ OVERRIDE_MODE="${LAUNCH_MODE:-}"
 # 프로세스 환경변수 RUN_LOCK_PATH 는 .env 보다 우선합니다 (python-dotenv 와 동일).
 OVERRIDE_LOCK_PATH="${RUN_LOCK_PATH:-}"
 
+# AUTO_EXECUTE 도 호출자 값이 .env 보다 우선해야 합니다 (외부 리뷰 P1).
+# 아래 `.env` 로드(`set -a` 로 소싱)는 **셸 변수 대입**이므로 export 된 호출자 값까지 덮어씁니다.
+# 그래서 SYMBOLS/LAUNCH_MODE 처럼 미리 보관했다가 .env 로드 뒤 되돌립니다.
+# 호출자가 지정하지 않은 경우(unset)는 그대로 .env 값을 씁니다 — 값을 **없는 것**과
+# **빈 값**으로 구분해야 하므로 `${AUTO_EXECUTE+x}` sentinel 을 씁니다
+# (빈 값 `AUTO_EXECUTE=` 도 "호출자가 끄겠다"는 의도이므로 보존).
+# 값 해석(1/true/yes/on, strip+lower)은 봇(trading_bot.py)이 하므로 런처는 보존만 합니다.
+if [[ -n "${AUTO_EXECUTE+x}" ]]; then
+    OVERRIDE_AUTO_EXECUTE_SET=1
+    OVERRIDE_AUTO_EXECUTE="$AUTO_EXECUTE"
+else
+    OVERRIDE_AUTO_EXECUTE_SET=0
+    OVERRIDE_AUTO_EXECUTE=""
+fi
+
 # 같은 시각에 두 번 돌지 않도록 잠급니다.
 # - DRY: 다른 RUN이 있으면 즉시 종료합니다 (조회성 작업이라 지연할 이유가 없습니다).
 # - LIVE: 다른 RUN이 있으면 최대 5분 기다립니다. 즉시 종료하면 "성공한 것처럼 조용히
@@ -113,13 +128,20 @@ fi
 [[ -n "$OVERRIDE_SYMBOLS" ]] && export SYMBOLS="$OVERRIDE_SYMBOLS"
 export TRADE_MODE="${OVERRIDE_MODE:-LIVE}"
 
+# AUTO_EXECUTE: 호출자가 export 했을 때만 복원합니다 (unset 이면 .env 값 유지).
+# 복원하지 않으면 `.env` 의 AUTO_EXECUTE=true 가 호출자의 `AUTO_EXECUTE=false` 를
+# 이겨 아침 진단 PREVIEW 가 자동 주문(PREVIEW→APPROVE→EXECUTE)으로 이어집니다.
+if [[ "$OVERRIDE_AUTO_EXECUTE_SET" == "1" ]]; then
+    export AUTO_EXECUTE="$OVERRIDE_AUTO_EXECUTE"
+fi
+
 # 일회성 복구 플래그가 남아 있으면 사고가 나므로 항상 지웁니다.
 unset STATE_REPAIR_ONLY STATE_DIAGNOSTIC_ONLY STATE_CLEAR_FENCE_ONLY \
       STATE_REVERSE_AUDIT_ONLY STATE_REVERSE_RECONCILE_ONLY \
       STATE_NET_INVESTED_REPAIR_ONLY STATE_ASSUME_REVERSE_EXPIRY_ONLY \
       STATE_SET_CYCLE_START_ONLY STATE_REPAIR_ONLY REPAIR_ACTION FORCE_T_REINFERENCE
 
-echo "[launcher] start $(date '+%F %T %Z') mode=$TRADE_MODE phase=${RUN_PHASE:-} symbols=${SYMBOLS:-} rev=$(git rev-parse --short HEAD 2>/dev/null)" >> "$LOG"
+echo "[launcher] start $(date '+%F %T %Z') mode=$TRADE_MODE phase=${RUN_PHASE:-} symbols=${SYMBOLS:-} auto=${AUTO_EXECUTE:-} rev=$(git rev-parse --short HEAD 2>/dev/null)" >> "$LOG"
 
 # 알림 채널(텔레그램) 생존 확인 — 거래는 막지 않고 상태만 기록합니다.
 # (토큰이 죽으면 실패 알림도 함께 사라지므로, 여기서 드러내야 합니다)

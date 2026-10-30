@@ -30,6 +30,7 @@ from broker.base import Broker, OrderResult, OrderNotAcceptedError, ReadOnlyBrok
 from pipeline import (
     SettledState,
     _session_ymd,
+    _broker_identity,
     approve_plan_file,
     assert_no_pending_fence,
     assert_reconciliation_current,
@@ -44,6 +45,7 @@ from pipeline import (
     read_order_plan_file,
     read_transmitted_plan,
     settle_positions,
+    settlement_sessions,
     transmitted_plan_problems,
     settled_from_state,
     verify_approval,
@@ -51,6 +53,7 @@ from pipeline import (
     write_order_plan,
 )
 from pipeline_execute import execute_approved_plan
+from settlement_report import build_symbol_report, send_settlement_report
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
 from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
@@ -3230,15 +3233,135 @@ def _assert_reviewed_plan_hash_matches(actual_hash, context):
     print(f"{context}: 사람이 검토한 plan_hash 일치 확인 ({expected[:12]}…)")
 
 
+def _settlement_evidence_committed(settled):
+    """커밋된 정산 근거(committed=true + run_id 일치)인지 확인합니다.
+
+    정산 리포트는 **커밋된 정산**에 대해서만 "완료"를 알립니다. 보류/DRY/승격 실패
+    근거(committed=false)로 성공 리포트를 만들면 운영자가 정산이 끝난 줄 압니다.
+    """
+    if settled is None:
+        return False
+    run_id = str(getattr(settled, "settlement_run_id", "") or "")
+    if not run_id:
+        return False
+    path = str(getattr(settled, "evidence_path", "") or "") or evidence_file_for_run(
+        settled.symbol, run_id
+    )
+    if not path:
+        return False
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("committed") is not True:
+        return False
+    return str(data.get("run_id") or "") == run_id
+
+
+def _report_broker_identity():
+    """정산 리포트 멱등 키에 쓸 브로커/계좌 지문 — 실패하면 None.
+
+    `_broker_identity()` 는 LIVE 에서 계좌 지문 비밀값(`ACCOUNT_FINGERPRINT_SECRET`)이
+    없으면 예외를 던집니다. 리포트는 부수 기능이므로 발송만 생략하고 정산 결과에는
+    영향을 주지 않습니다.
+    """
+    try:
+        identity = _broker_identity()
+    except Exception as error:
+        print(
+            f"[정산 리포트] 계좌 식별자 확보 실패({type(error).__name__}) — "
+            "발송을 생략합니다 (정산 결과에는 영향 없음)"
+        )
+        return None
+    return identity or None
+
+
+def _report_settled_session():
+    """정산 리포트 키에 바인딩할 **의도된 정산 세션** — 계산 불가면 "".
+
+    `settled=None`(정산 예외)·`session_calendar_unavailable` 처럼 결과 객체에 세션이
+    없는 경로도 있으므로, 호출측이 "이번 SETTLE 이 정산하려던 세션"을 직접 넘겨
+    같은 사유가 날짜를 넘어 영구 억제되는 것을 막습니다.
+    """
+    try:
+        settled_session, _execution_session = settlement_sessions()
+    except Exception as error:
+        print(
+            f"[정산 리포트] 정산 세션 계산 실패({type(error).__name__}) — "
+            "날짜 버킷으로 억제합니다"
+        )
+        return ""
+    return str(settled_session or "")
+
+
+def _notify_settlement_report(entries):
+    """SETTLE 완료 지점 후크 — 일일 정산 리포트 발송 (실패해도 정산 무영향).
+
+    entries: [{"symbol", "exchange", "settled": SettledState|None, "error": str}]
+    """
+    if str(TRADE_MODE).strip().upper() != "LIVE":
+        print("[정산 리포트] LIVE 실행이 아니므로 발송을 생략합니다 (DRY/REPAIR)")
+        return
+    identity = _report_broker_identity()
+    if not identity:
+        return
+    broker_name = str(identity.get("broker") or "")
+    account_fingerprint = str(identity.get("account_id") or "")
+    settled_session = _report_settled_session()
+    reports = []
+    for entry in entries or []:
+        settled = entry.get("settled")
+        if str(getattr(settled, "halt_reason", "") or "") == "non_trading_day":
+            # 휴장은 "정산 보류"가 아니라 대상 없음입니다 (알림/리포트 없음).
+            print(f"[정산 리포트] {entry.get('symbol', '')} 휴장 — 리포트 대상에서 제외")
+            continue
+        # 보류(halt_reason)는 근거가 커밋되지 않았으므로 committed=False 입니다.
+        committed = bool(_settlement_evidence_committed(settled))
+        # 사유 문자열에 주문번호가 섞일 수 있으므로 공개 규칙대로 가명 처리합니다.
+        error = _mask_odno_references(entry.get("error", ""))
+        report = build_symbol_report(
+            settled,
+            symbol=entry.get("symbol", ""),
+            exchange=entry.get("exchange", ""),
+            error=error,
+            committed=committed,
+            broker=broker_name,
+            account_fingerprint=account_fingerprint,
+            # 결과 객체에 세션이 없어도(예외/캘린더 미확인) 억제 키에 세션을 바인딩합니다.
+            settled_session=settled_session,
+        )
+        # halt_reason 에도 주문번호가 섞일 수 있습니다 (예: "orders_meta 주문 odno=…").
+        # 리포트 본문은 공개 알림 채널로 나가므로 원문 주문번호를 남기지 않습니다.
+        report.halt_reason = _mask_odno_references(report.halt_reason)
+        reports.append(report)
+    send_settlement_report(
+        reports,
+        trade_mode=TRADE_MODE,
+        broker=broker_name,
+        account_fingerprint=account_fingerprint,
+        settled_session=settled_session,
+    )
+
+
 def _dispatch_pipeline_phase_locked(run_phase, broker):
     """RUN_PHASE 단계별 실행. SETTLE/PREVIEW/APPROVE 는 ReadOnlyBroker 만 받습니다."""
     read_only_broker = ReadOnlyBroker(broker)
     failures = 0
 
     if run_phase == "SETTLE":
+        # 일일 정산 리포트(텔레그램)용 재료 — 정산이 끝난 뒤 한 번에 구성합니다.
+        report_entries = []
         for symbol_config in SYMBOLS:
             try:
                 settled = settle_positions(read_only_broker, symbol_config)
+                report_entries.append(
+                    {
+                        "symbol": symbol_config["symbol"],
+                        "exchange": symbol_config.get("exchange", ""),
+                        "settled": settled,
+                        "error": "",
+                    }
+                )
                 if settled.halt_reason:
                     # 정산이 확정되지 않았는데 성공(exit 0)으로 끝나면, 운영자는
                     # 정산이 끝난 줄 알고 다음 단계를 진행합니다. 보류는 실패입니다.
@@ -3256,8 +3379,25 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
                 # 상태 파일 공통 장애 — 다른 종목을 계속 진행하면 안 됩니다.
                 raise
             except Exception as error:
+                report_entries.append(
+                    {
+                        "symbol": symbol_config["symbol"],
+                        "exchange": symbol_config.get("exchange", ""),
+                        "settled": None,
+                        "error": str(error),
+                    }
+                )
                 print(f"[SETTLE] {symbol_config['symbol']} 실패: {error}")
                 failures += 1
+        # 일일 정산 리포트 — 정산의 **부수 기능**입니다. 발송 실패/예외가 정산 결과나
+        # 실패 집계(failures)에 영향을 주면 안 되므로 여기서 한 번 더 감쌉니다.
+        try:
+            _notify_settlement_report(report_entries)
+        except Exception as report_error:
+            print(
+                f"[정산 리포트] 발송 중 예외({type(report_error).__name__}) — "
+                "정산 결과/주문에는 영향 없음"
+            )
         return failures
 
     if run_phase == "PREVIEW":
