@@ -37,6 +37,7 @@ import pipeline
 import pipeline_execute
 from broker import create_broker, validate_run_phase
 from broker.base import Balance, OrderResult, PurchaseAmount, ReadOnlyBroker
+from broker.market_utils import us_session_in_progress
 from state import canonical_state_hash
 
 
@@ -4917,6 +4918,119 @@ def test_dry_never_waits_for_pre_market():
         get_kst_now=MagicMock(side_effect=AssertionError('clock accessed')),
     )
     assert pipeline_execute._wait_until_pre_market(tb) is None
+
+
+# ── 프리장 대기 판정 기준 = "미국 정규장 진행 여부" (KST 시각 아님) ──────────
+# KST 04:10 = ET 15:10(서머타임)/14:10(동절기) → 정규장 한복판이라 대기하면
+# 그 세션을 통째로 놓칩니다. 반대로 주말·휴장일·마감 후에는 기존 대기 경로입니다.
+
+def _kst(year, month, day, hour, minute):
+    return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo('Asia/Seoul'))
+
+
+def _make_live_wait_probe(now, mode='real'):
+    """LIVE 대기 판정용 가짜 trading_bot — sleep 을 관찰할 수 있게 합니다."""
+    sleep = MagicMock()
+    et_now = now.astimezone(ZoneInfo('America/New_York'))
+    tb = SimpleNamespace(
+        BROKER_MODE=mode,
+        TRADE_MODE='LIVE',
+        get_kst_now=lambda: now,
+        # 서머타임 여부는 실제 나라 시간대(DST)에서 그대로 가져옵니다 (10월 말 전환 반영).
+        is_us_dst=lambda: et_now.dst() is not None and et_now.dst() != timedelta(0),
+        time=SimpleNamespace(sleep=sleep),
+    )
+    return tb, sleep
+
+
+@pytest.mark.parametrize('mode', ['demo', 'real'])
+def test_in_session_run_does_not_wait(mode):
+    """2026-10-30 04:10 KST = ET 15:10(서머타임 정규장 중) → 즉시 진행 (모의/실전 공통)."""
+    now = _kst(2026, 10, 30, 4, 10)
+    tb, sleep = _make_live_wait_probe(now, mode=mode)
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    sleep.assert_not_called()
+
+
+def test_standard_time_in_session_run_does_not_wait():
+    """2026-11-03 04:10 KST = ET 14:10(동절기 정규장 중) → 즉시 진행."""
+    now = _kst(2026, 11, 3, 4, 10)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is not None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    sleep.assert_not_called()
+
+
+def test_after_close_still_waits_for_pre_market():
+    """2026-10-30 10:15 KST = ET 21:15(마감 후) → 기존 대기 경로 (17:00 KST 까지)."""
+    now = _kst(2026, 10, 30, 10, 15)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    # DST 기준 프리장(17:00 KST)까지 6시간 45분 — 시간 예산 게이트가 차단하는 흐름 유지.
+    sleep.assert_called_once_with(6 * 3600 + 45 * 60)
+
+
+def test_weekend_is_not_in_session():
+    """미국 주말(ET 토요일)은 정규장 아님 → 대기 경로 (즉시 진행으로 오판 금지)."""
+    now = _kst(2026, 10, 31, 14, 0)  # ET 2026-10-31 01:00 (토요일)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    sleep.assert_called_once_with(3 * 3600)
+
+
+def test_monday_dawn_is_us_sunday_so_it_waits():
+    """월요일 04:10 KST = 미국 일요일(휴장) → 대기해야 합니다 (요일 계산은 캘린더에 위임)."""
+    now = _kst(2026, 11, 2, 4, 10)  # ET 2026-11-01 14:10 (일요일, DST 종료 후 = EST)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    # 동절기 프리장(18:00 KST)까지 13시간 50분.
+    sleep.assert_called_once_with(13 * 3600 + 50 * 60)
+
+
+def test_us_holiday_is_not_in_session():
+    """미국 휴장일(추수감사절 2026-11-26 ET) → 정규장 아님 → 대기 경로."""
+    now = _kst(2026, 11, 27, 3, 0)  # ET 2026-11-26 13:00 (휴장일)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    # 동절기 프리장(18:00 KST)까지 15시간.
+    sleep.assert_called_once_with(15 * 3600)
+
+
+def test_early_close_is_not_in_session_after_close():
+    """조기폐장일(2026-11-27 ET 13:00 마감) 이후는 진행 중으로 오판하지 않습니다."""
+    now = _kst(2026, 11, 28, 4, 10)  # ET 2026-11-27 14:10 (조기폐장 후)
+    tb, sleep = _make_live_wait_probe(now)
+    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+
+    assert pipeline_execute._wait_until_pre_market(tb) is None
+
+    sleep.assert_called_once_with(13 * 3600 + 50 * 60)
+
+
+def test_injected_now_skips_wait_without_reading_clock():
+    """테스트/재생용 `now` 주입은 시계·캘린더를 읽지 않고 그대로 반환합니다."""
+    sentinel = _kst(2026, 10, 30, 10, 15)
+    tb = SimpleNamespace(
+        TRADE_MODE='LIVE',
+        get_kst_now=MagicMock(side_effect=AssertionError('clock accessed')),
+    )
+    assert pipeline_execute._wait_until_pre_market(tb, now=sentinel) is sentinel
 
 
 def test_morning_demo_auto_executes_after_wait(io, monkeypatch):
