@@ -34,6 +34,7 @@ from broker.base import (
     OrderNotAcceptedError,
 )
 from broker.market_utils import (
+    select_recent_history,
     get_kst_now,
     is_us_trading_day,
     normalize_order_price,
@@ -731,8 +732,8 @@ class LSBroker(Broker):
                 except Exception:
                     n = 100
                 n = min(n, len(order_history))
-                print(f"[주문이력 요약] {symbol} 최근 {n}건")
-                for item in order_history[:n]:
+                print(f"[주문이력 요약] {symbol} 최근 {n}건(전체 {len(order_history)}건 중, 시간순)")
+                for item in select_recent_history(order_history, n):
                     ord_dt = item.get("ord_dt", "")
                     ord_tmd = (item.get("ord_tmd") or "").zfill(6)
 

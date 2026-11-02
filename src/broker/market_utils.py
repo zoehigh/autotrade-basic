@@ -44,6 +44,39 @@ def resolve_real_kst_from_ord(ord_dt: str, ord_tmd: str):
         return None
 
 
+def _history_sort_key(item: dict) -> str:
+    """주문이력 한 건의 시간순 정렬 키(숫자 문자열)를 만듭니다. 시각을 알 수 없으면 빈 문자열."""
+    ord_dt = str(item.get("ord_dt") or "")
+    if len(ord_dt) == 8 and ord_dt.isdigit():
+        ord_tmd = "".join(ch for ch in str(item.get("ord_tmd") or "") if ch.isdigit())
+        ord_tmd = ord_tmd.zfill(6)[:6]
+        # KIS/LS/키움: ord_dt=미국 영업일, ord_tmd=KST 시각 → 같은 영업일 안에서 KST 자정을 넘기면
+        # (23:00 뒤에 04:00) 단순 이어붙이기는 순서가 뒤집히므로 실제 KST 시각으로 복원해 정렬합니다.
+        # Toss/Meritz 는 ord_dt 가 이미 KST 일자(_ord_dt_is_kst_date)라 복원하지 않습니다.
+        if not item.get("_ord_dt_is_kst_date"):
+            real_kst = resolve_real_kst_from_ord(ord_dt, ord_tmd)
+            if real_kst is not None:
+                return real_kst.strftime("%Y%m%d%H%M%S")
+        return ord_dt + ord_tmd
+    kst_iso = str(item.get("ord_datetime_kst") or "")
+    digits = "".join(ch for ch in kst_iso[:19] if ch.isdigit())
+    return digits.ljust(14, "0") if digits else ""
+
+
+def select_recent_history(order_history: list, n: int) -> list:
+    """[주문이력 요약] 출력용으로 가장 최근 n건을 시간 오름차순으로 돌려줍니다.
+
+    일부 어댑터는 날짜를 오래된 순으로 이어 붙여 이력을 만들기 때문에 앞에서 n건을
+    자르면 최신 주문이 요약에서 빠집니다(100건 초과 시). 표시 전용이며 원본 리스트의
+    순서와 내용은 바꾸지 않습니다(정산은 전체 이력을 그대로 사용).
+    시각을 알 수 없는 항목은 가장 오래된 것으로 취급하고, 같은 시각은 원래 순서를 유지합니다.
+    """
+    if n <= 0:
+        return []
+    ordered = sorted(order_history, key=_history_sort_key)  # 안정 정렬: 동률은 원래 순서
+    return ordered[-n:]
+
+
 def normalize_order_price(price) -> float:
     """
     미국 주식 호가 단위 규칙에 맞춰 주문가를 정규화합니다 (버림).

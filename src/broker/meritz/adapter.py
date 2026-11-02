@@ -48,7 +48,12 @@ from broker.base import (
     OrderError,
     OrderNotAcceptedError,
 )
-from broker.market_utils import get_kst_now, is_us_trading_day, normalize_order_price
+from broker.market_utils import (
+    get_kst_now,
+    is_us_trading_day,
+    normalize_order_price,
+    select_recent_history,
+)
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
 from broker.meritz.auth import (
@@ -992,8 +997,8 @@ class MeritzBroker(Broker):
                 n = 100
             n = min(n, len(order_history))
 
-            print(f"[주문이력 요약] {symbol} 최근 {n}건")
-            for item in order_history[:n]:
+            print(f"[주문이력 요약] {symbol} 최근 {n}건(전체 {len(order_history)}건 중, 시간순)")
+            for item in select_recent_history(order_history, n):
                 ord_dt = item.get("ord_dt", "")
                 if ord_dt and len(ord_dt) == 8:
                     date_str = f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:8]}"
