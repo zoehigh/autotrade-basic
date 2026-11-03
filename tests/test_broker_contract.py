@@ -2294,11 +2294,10 @@ class TestLSBrokerContract:
         assert amt is None
 
     def test_parse_cash_outblock3_single_no_currency(self):
-        """COSOQ02701 단일 행에 CrcyCode 가 없어도 amt 가 있으면 반환해야 합니다."""
+        """COSOQ02701 단일 행에 CrcyCode 가 없어도 amt 가 있으면 반환해야 한다 (allow_currency_missing=True)."""
         broker = self._create_broker()
-        # 요청에서 통화를 고정하므로 응답에 CrcyCode echo 가 없을 수 있음
         out_block3 = {"FcurrOrdAbleAmt": "300.50"}
-        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        amt = broker._parse_cash_outblock3(out_block3, "USD", allow_currency_missing=True)
         assert amt == 300.50
 
     def test_parse_cash_outblock3_empty(self):
@@ -2349,3 +2348,39 @@ class TestLSBrokerContract:
 
         self._mock_post.side_effect = _post_side_effect
         assert broker.get_balance("TQQQ", "NAS") is None
+
+    # ── R2/R3 후속 보완 검증 ──────────────────────────────────────────
+
+    def test_parse_cash_outblock3_currency_mismatch_reject(self):
+        """COSOQ00201 단일 행에서 통화 불일치면 None 을 반환해야 한다 (allow_currency_missing=False)."""
+        broker = self._create_broker()
+        out_block3 = [{"CrcyCode": "KRW", "FcurrOrdAbleAmt": "1000000"}]
+        amt = broker._parse_cash_outblock3(out_block3, "USD")  # allow_currency_missing=False 기본값
+        assert amt is None
+
+    def test_parse_cash_outblock3_single_negative_amount(self):
+        """단일 행 FcurrOrdAbleAmt 가 음수면 None 을 반환해야 한다."""
+        broker = self._create_broker()
+        out_block3 = {"FcurrOrdAbleAmt": "-10"}
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt is None
+
+    def test_get_purchase_amount_cosq02701_currency_mismatch_passes_through(self):
+        """COSOQ02701 단일 행에 CrcyCode 가 없어도 amt 가 있으면 채택한다 (allow_currency_missing=True)."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ02701":
+                return _make_response({
+                    "rsp_cd": "00136",
+                    "rsp_msg": "조회가 완료되었습니다.",
+                    "COSOQ02701OutBlock3": [{
+                        "FcurrOrdAbleAmt": "300.50",  # CrcyCode 누락
+                    }]
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        result = broker.get_purchase_amount("TQQQ", "NAS")
+        assert result.orderable_cash == 300.50

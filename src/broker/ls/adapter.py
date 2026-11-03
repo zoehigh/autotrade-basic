@@ -534,21 +534,25 @@ class LSBroker(Broker):
                 resp_info = ""
             raise BrokerError(f"잔고 조회 실패: {str(e)}{resp_info}")
 
-    def _parse_cash_outblock3(self, out_block3: object, currency: str) -> Optional[float]:
+    def _parse_cash_outblock3(
+        self, out_block3: object, currency: str,
+        allow_currency_missing: bool = False,
+    ) -> Optional[float]:
         """
         COSOQ00201OutBlock3 / COSOQ02701OutBlock3 에서 통화별 FcurrOrdAbleAmt 를 파싱합니다.
 
         out_block3 는 리스트(dict 배열) 또는 단일 dict 일 수 있습니다.
         - 통화 일치 항목의 FcurrOrdAbleAmt 가 실제 존재하면(0 포함) 해당 금액을 반환합니다.
-        - COSOQ02701 은 요청에서 통화를 고정하므로 응답에 CrcyCode 가 누락될 수 있습니다.
-          이 경우 단일 행이고 FcurrOrdAbleAmt 가 있으면 채택합니다.
         - 필드 자체가 누락되면 None 을 반환하여 폴백 대상으로 처리합니다.
+        - allow_currency_missing=True 이고 단일 행이면 CrcyCode 가 없어도
+          FcurrOrdAbleAmt 가 있으면 채택합니다 (COSOQ02701 요청에서 통화를 고정하므로
+          응답에 CrcyCode echo 가 없을 수 있음).
         """
         if not out_block3:
             return None
 
         items = out_block3 if isinstance(out_block3, list) else [out_block3]
-        single_item_amt = None  # COSOQ02701 단일 행 후보 (CrcyCode 미매칭 대응)
+        single_item_amt: Optional[str] = None
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -560,11 +564,17 @@ class LSBroker(Broker):
                 amt = float(amt_raw or 0)
                 if amt >= 0:
                     return amt  # 0도 정상 결과로 반환
-            # 단일 행이면 CrcyCode 미매칭이라도 후보로 보관 (02701 대응)
-            if single_item_amt is None and len(items) == 1:
+            # 단일 행이면 CrcyCode 미매칭이라도 후보로 보관 (COSOQ02701 대응)
+            if (
+                allow_currency_missing
+                and single_item_amt is None
+                and len(items) == 1
+            ):
                 single_item_amt = amt_raw
         if single_item_amt is not None:
-            return float(single_item_amt or 0)
+            amt = float(single_item_amt or 0)
+            if amt >= 0:
+                return amt  # 후보도 음수 검사 적용
         return None
 
     def _get_cash_from_cosq02701(
@@ -595,7 +605,7 @@ class LSBroker(Broker):
 
             if rsp_cd in LS_SUCCESS_RSP_CDS:
                 out_block3 = data.get("COSOQ02701OutBlock3", [])
-                amt = self._parse_cash_outblock3(out_block3, currency)
+                amt = self._parse_cash_outblock3(out_block3, currency, allow_currency_missing=True)
                 if amt is not None:
                     print(
                         f"[매수가능] {symbol} COSOQ02701: 외화주문가능금액=${amt:,.2f}"
