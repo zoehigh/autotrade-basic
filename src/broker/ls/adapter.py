@@ -13,6 +13,7 @@ LS증권 OPEN API (REST)를 통해 미국 주식 자동매매를 실행합니다
 
 DRY 모드는 DryBroker 래퍼로 처리 — LSBroker 자체는 항상 LIVE로 동작.
 """
+import math
 import random
 import time
 from datetime import datetime, timedelta
@@ -563,9 +564,11 @@ class LSBroker(Broker):
             if amt_raw is None or amt_raw == "":
                 continue  # 필드 누락 -> 실패(폴백 대상)
             item_currency = item.get("CrcyCode", "")
+            if not isinstance(item_currency, str):
+                continue  # 잘못된 통화 타입 (null 등) -> 거부
             if item_currency.upper() == currency.upper():
                 amt = float(amt_raw or 0)
-                if amt >= 0:
+                if amt >= 0 and math.isfinite(amt):
                     return amt  # 0도 정상 결과로 반환
             # 단일 행이면 CrcyCode 가 진짜 누락("")인 경우만 후보로 보관 (COSOQ02701 대응)
             if (
@@ -577,8 +580,8 @@ class LSBroker(Broker):
                 single_item_amt = amt_raw
         if single_item_amt is not None:
             amt = float(single_item_amt or 0)
-            if amt >= 0:
-                return amt  # 후보도 음수 검사 적용
+            if amt >= 0 and math.isfinite(amt):
+                return amt  # 후보도 음수·무한대 검사 적용
         return None
 
     def _get_cash_from_cosq02701(
