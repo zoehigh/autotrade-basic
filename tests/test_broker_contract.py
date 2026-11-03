@@ -2365,6 +2365,13 @@ class TestLSBrokerContract:
         amt = broker._parse_cash_outblock3(out_block3, "USD", allow_currency_missing=True)
         assert amt is None
 
+    def test_parse_cash_outblock3_single_currency_mismatch_reject(self):
+        """단일 행에 CrcyCode 가 다른 통화면 None 을 반환해야 한다 (allow_currency_missing=True)."""
+        broker = self._create_broker()
+        out_block3 = {"CrcyCode": "KRW", "FcurrOrdAbleAmt": "1000000"}
+        amt = broker._parse_cash_outblock3(out_block3, "USD", allow_currency_missing=True)
+        assert amt is None
+
     def test_get_purchase_amount_cosq02701_currency_mismatch_passes_through(self):
         """COSOQ02701 단일 행에 CrcyCode 가 없어도 amt 가 있으면 채택한다 (allow_currency_missing=True)."""
         broker = self._create_broker()
