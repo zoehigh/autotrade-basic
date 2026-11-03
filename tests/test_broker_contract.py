@@ -2108,3 +2108,244 @@ class TestNHPlugBrokerContract(BrokerContractTest):
             assert isinstance(result.order_id, str)
             assert isinstance(result.order_time, str)
             assert isinstance(result.is_reservation, bool)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TestLSBrokerContract — LS 증권 예수금/매수가능금액 조회 계약 테스트
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestLSBrokerContract:
+    """
+    LSBroker 인터페이스 계약 테스트 — 예수금·매수가능금액 조회 (COSOQ02701 / COSOQ00201).
+
+    requests.Session.post를 mock하여 실제 API 호출 없이
+    COSOQ02701(예수금 전용) → COSOQ00201(종합잔고평가) 폴백 체인을 검증합니다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_ls_dependencies(self, request):
+        """
+        LSBroker가 의존하는 모듈들을 patch합니다.
+
+        - get_access_token → 가짜 토큰 반환
+        - get_kst_now → 고정 시각 (BaseDt 고정)
+        - config.BROKER_CONFIG / BROKER_MODE / HTTP_TIMEOUT → 가짜 값
+        - requests.Session.post → mock (실제 HTTP 호출 차단)
+        """
+        fixed_kst = datetime(2026, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+        target = "broker.ls.adapter"
+        patches = [
+            patch(f"{target}.get_access_token", return_value={"access_token": "mock_token"}),
+            patch(f"{target}.get_kst_now", return_value=fixed_kst),
+            patch("config.BROKER_CONFIG", {
+                "app_key": "test_app_key",
+                "app_secret": "test_app_secret",
+                "domain": "https://openapi.ls-sec.co.kr:8080",
+            }),
+            patch("config.BROKER_MODE", "real"),
+            patch("config.HTTP_TIMEOUT", (10, 30)),
+            patch("requests.Session.post"),
+        ]
+
+        for p in patches:
+            p.start()
+            request.addfinalizer(p.stop)
+
+        self._mock_post = sys.modules[f"{target}"].requests.Session.post
+        self._setup_default_responses()
+
+    def _setup_default_responses(self):
+        """mock post에 경로/TR 기반 기본 성공 응답을 설정합니다."""
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+
+            if tr_id == "COSOQ02701":
+                return _make_response({
+                    "rsp_cd": "00136",
+                    "rsp_msg": "조회가 완료되었습니다.",
+                    "COSOQ02701OutBlock3": [{
+                        "CrcyCode": "USD",
+                        "FcurrOrdAbleAmt": "126.35",
+                    }]
+                })
+            if tr_id == "COSOQ00201":
+                return _make_response({
+                    "rsp_cd": "00000",
+                    "rsp_msg": "정상",
+                    "COSOQ00201OutBlock3": [{
+                        "CrcyCode": "USD",
+                        "FcurrOrdAbleAmt": "5000.00",
+                    }],
+                    "COSOQ00201OutBlock4": [],
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+
+    def _create_broker(self):
+        """mock이 주입된 LSBroker 인스턴스를 반환."""
+        from broker.ls.adapter import LSBroker
+        return LSBroker()
+
+    def _set_mock_response(self, json_data, status_code=200, headers=None):
+        """side_effect를 제거하고 return_value로 단일 응답을 설정합니다."""
+        self._mock_post.side_effect = None
+        self._mock_post.return_value = _make_response(json_data, status_code, headers)
+
+    # ── COSOQ02701 1차 / COSOQ00201 폴백 ─────────────────────────────
+
+    def test_get_purchase_amount_cosq02701_success(self):
+        """COSOQ02701 1차 호출 성공 시 orderable_cash 를 반환해야 합니다."""
+        broker = self._create_broker()
+        result = broker.get_purchase_amount("TQQQ", "NAS")
+        assert isinstance(result, PurchaseAmount)
+        assert result.orderable_cash == 126.35
+
+    def test_get_purchase_amount_cosq02701_fallback_to_cosq00201(self):
+        """COSOQ02701 실패 시 COSOQ00201 로 폴백해야 합니다."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ02701":
+                return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+            if tr_id == "COSOQ00201":
+                return _make_response({
+                    "rsp_cd": "00000",
+                    "rsp_msg": "정상",
+                    "COSOQ00201OutBlock3": [{
+                        "CrcyCode": "USD",
+                        "FcurrOrdAbleAmt": "5000.00",
+                    }],
+                    "COSOQ00201OutBlock4": [],
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        result = broker.get_purchase_amount("TQQQ", "NAS")
+        assert result.orderable_cash == 5000.0
+
+    def test_get_purchase_amount_both_fail_brokererror(self):
+        """두 TR 모두 실패 시 BrokerError 가 발생해야 합니다."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        with pytest.raises(BrokerError, match="매수가능금액 조회 실패"):
+            broker.get_purchase_amount("TQQQ", "NAS")
+
+    def test_get_purchase_amount_amt_zero_normal(self):
+        """FcurrOrdAbleAmt=0 도 정상 결과로 반환해야 합니다 (리버스 MOC 매도 차단 방지)."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ02701":
+                return _make_response({
+                    "rsp_cd": "00136",
+                    "rsp_msg": "조회가 완료되었습니다.",
+                    "COSOQ02701OutBlock3": [{
+                        "CrcyCode": "USD",
+                        "FcurrOrdAbleAmt": "0",
+                    }]
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        result = broker.get_purchase_amount("TQQQ", "NAS")
+        assert result.orderable_cash == 0.0
+
+    # ── _parse_cash_outblock3 단위 테스트 ─────────────────────────────
+
+    def test_parse_cash_outblock3_list(self):
+        """리스트 형태의 OutBlock3 에서 통화 일치 항목을 반환해야 합니다."""
+        broker = self._create_broker()
+        out_block3 = [
+            {"CrcyCode": "KRW", "FcurrOrdAbleAmt": "1000.00"},
+            {"CrcyCode": "USD", "FcurrOrdAbleAmt": "5000.00"},
+        ]
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt == 5000.0
+
+    def test_parse_cash_outblock3_single_dict(self):
+        """단일 dict 형태의 OutBlock3 에서 금액을 반환해야 합니다."""
+        broker = self._create_broker()
+        out_block3 = {"CrcyCode": "USD", "FcurrOrdAbleAmt": "750.25"}
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt == 750.25
+
+    def test_parse_cash_outblock3_amt_zero(self):
+        """FcurrOrdAbleAmt=0 도 정상 결과로 반환해야 합니다."""
+        broker = self._create_broker()
+        out_block3 = {"CrcyCode": "USD", "FcurrOrdAbleAmt": "0"}
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt == 0.0
+
+    def test_parse_cash_outblock3_missing_field(self):
+        """FcurrOrdAbleAmt 필드 누락 시 None 을 반환해야 합니다."""
+        broker = self._create_broker()
+        out_block3 = [{"CrcyCode": "USD"}]
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt is None
+
+    def test_parse_cash_outblock3_single_no_currency(self):
+        """COSOQ02701 단일 행에 CrcyCode 가 없어도 amt 가 있으면 반환해야 합니다."""
+        broker = self._create_broker()
+        # 요청에서 통화를 고정하므로 응답에 CrcyCode echo 가 없을 수 있음
+        out_block3 = {"FcurrOrdAbleAmt": "300.50"}
+        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        assert amt == 300.50
+
+    def test_parse_cash_outblock3_empty(self):
+        """빈 OutBlock3 시 None 을 반환해야 합니다."""
+        broker = self._create_broker()
+        assert broker._parse_cash_outblock3([], "USD") is None
+        assert broker._parse_cash_outblock3(None, "USD") is None
+
+    # ── get_balance COSOQ00201 ────────────────────────────────────────
+
+    def test_get_balance_success(self):
+        """COSOQ00201 성공 시 Balance 를 반환해야 합니다."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ00201":
+                return _make_response({
+                    "rsp_cd": "00000",
+                    "rsp_msg": "정상",
+                    "COSOQ00201OutBlock4": [{
+                        "ShtnIsuNo": "TQQQ",
+                        "AstkBalQty": "100",
+                        "FcstckUprc": "50.00",
+                    }],
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        result = broker.get_balance("TQQQ", "NAS")
+        assert isinstance(result, Balance)
+        assert result.quantity == 100
+        assert result.avg_price == 50.00
+
+    def test_get_balance_no_position_none(self):
+        """보유 종목이 없으면 None 을 반환해야 합니다."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ00201":
+                return _make_response({
+                    "rsp_cd": "00000",
+                    "rsp_msg": "정상",
+                    "COSOQ00201OutBlock4": [],
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        assert broker.get_balance("TQQQ", "NAS") is None

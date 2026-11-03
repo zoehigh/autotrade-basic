@@ -474,6 +474,13 @@ class LSBroker(Broker):
         TR: COSOQ00201 (해외주식 종합잔고평가)
         OutBlock4: 개별 종목별 보유 수량/평단가
         조회할 데이터가 없으면 None을 반환합니다.
+
+        [BaseDt 변경 근거]
+        기존 BaseDt="" 는 LS 서버에서 rsp_cd=02679(조회내역 없음)를 반환하는 원인 중 하나였습니다.
+        KST 오늘 날짜(YYYYMMDD)를 주입하여 조회 대상을 특정하도록 변경했습니다.
+        주의: 봇은 KST 새벽(ET 전일 저녁~당일 새벽)에 실행되므로, KST 오늘 ≠ ET 영업일인 구간이
+        있을 수 있습니다. 월요일 새벽(KST 화요일) 실행 시 LS가 ET 기준일을 기대한다면
+        거부되거나 다른 의미로 해석될 수 있습니다. 월요일 1회 실행 로그로 검증 필요.
         """
         body = {
             "COSOQ00201InBlock1": {
@@ -533,23 +540,31 @@ class LSBroker(Broker):
 
         out_block3 는 리스트(dict 배열) 또는 단일 dict 일 수 있습니다.
         - 통화 일치 항목의 FcurrOrdAbleAmt 가 실제 존재하면(0 포함) 해당 금액을 반환합니다.
+        - COSOQ02701 은 요청에서 통화를 고정하므로 응답에 CrcyCode 가 누락될 수 있습니다.
+          이 경우 단일 행이고 FcurrOrdAbleAmt 가 있으면 채택합니다.
         - 필드 자체가 누락되면 None 을 반환하여 폴백 대상으로 처리합니다.
         """
         if not out_block3:
             return None
 
         items = out_block3 if isinstance(out_block3, list) else [out_block3]
+        single_item_amt = None  # COSOQ02701 단일 행 후보 (CrcyCode 미매칭 대응)
         for item in items:
             if not isinstance(item, dict):
-                continue
-            if item.get("CrcyCode", "").upper() != currency.upper():
                 continue
             amt_raw = item.get("FcurrOrdAbleAmt")
             if amt_raw is None or amt_raw == "":
                 continue  # 필드 누락 → 실패(폴백 대상)
-            amt = float(amt_raw or 0)
-            if amt >= 0:
-                return amt  # 0도 정상 결과로 반환
+            item_currency = item.get("CrcyCode", "")
+            if item_currency.upper() == currency.upper():
+                amt = float(amt_raw or 0)
+                if amt >= 0:
+                    return amt  # 0도 정상 결과로 반환
+            # 단일 행이면 CrcyCode 미매칭이라도 후보로 보관 (02701 대응)
+            if single_item_amt is None and len(items) == 1:
+                single_item_amt = amt_raw
+        if single_item_amt is not None:
+            return float(single_item_amt or 0)
         return None
 
     def _get_cash_from_cosq02701(
