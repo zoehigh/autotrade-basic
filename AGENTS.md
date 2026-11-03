@@ -48,7 +48,7 @@ autotrade-basic/
 |--------|----------|----------|------------|----------|
 | KIS | `rt_cd == "0"` | `msg_cd` | `msg1` | 각 메서드 |
 | KIWOOM | `return_code == 0` | `return_code` | `return_msg` | `_check_response()` |
-| LS | `rsp_cd == "00000"` | `rsp_cd` | `rsp_msg` | 각 메서드 |
+| LS | `rsp_cd in {"00000","00001","00136"}` | `rsp_cd` | `rsp_msg` | 각 메서드 (src/broker/ls/order_types.py `LS_SUCCESS_RSP_CDS`) |
 | TOSS | `error` 없음 | `error.code` | `error.message` | `_request_with_rate_retry()` |
 | NHPLUG | `rsp_cd in {"00000","00166","00221","13578","XA102","00048"} or "완료" in rsp_msg/usr_msg` | `rsp_cd`/`msg_code` | `rsp_msg`/`usr_msg` | `_request_with_rate_retry()` |
 | MERITZ | 주문 `rsp_cd=="0001"` AND `data.warn_cls_code==0`, 조회 계열별 상이 (시세 `0000` / 잔고·매수가능 `5766` / 이력·당일 `5766`·`5762`(다음페이지) / 취소 `0001`) — 5820은 data 유무로 판단, EGW00200은 조회만 제한 재시도 | `rsp_cd` | `rsp_msg`+`rsp_sub_msg` | `_check_rsp_cd()` |

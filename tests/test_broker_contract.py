@@ -2384,3 +2384,60 @@ class TestLSBrokerContract:
         self._mock_post.side_effect = _post_side_effect
         result = broker.get_purchase_amount("TQQQ", "NAS")
         assert result.orderable_cash == 300.50
+
+    # ── get_balance COSOQ00201 추가 검증 (R3) ───────────────────────────
+
+    def test_get_balance_00136_success(self):
+        """COSOQ00201 rsp_cd=00136 도 정상 응답으로 처리 (LS_SUCCESS_RSP_CDS 포함)."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ00201":
+                return _make_response({
+                    "rsp_cd": "00136",
+                    "rsp_msg": "조회가 완료되었습니다.",
+                    "COSOQ00201OutBlock4": [{
+                        "ShtnIsuNo": "TQQQ",
+                        "AstkBalQty": "50",
+                        "FcstckUprc": "60.00",
+                    }],
+                })
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        result = broker.get_balance("TQQQ", "NAS")
+        assert isinstance(result, Balance)
+        assert result.quantity == 50
+        assert result.avg_price == 60.00
+
+    def test_get_balance_02679_none(self):
+        """COSOQ00201 rsp_cd=02679 시 None 반환 (조회내역 없음)."""
+        broker = self._create_broker()
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ00201":
+                return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+            return _make_response({"rsp_cd": "00000", "rsp_msg": "정상"})
+
+        self._mock_post.side_effect = _post_side_effect
+        assert broker.get_balance("TQQQ", "NAS") is None
+
+    def test_get_balance_basedt_injection(self):
+        """BaseDt 가 KST 오늘 날짜(YYYYMMDD)로 주입되는지 단언."""
+        broker = self._create_broker()
+
+        captured = {}
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            tr_id = (headers or {}).get("tr_cd", "")
+            if tr_id == "COSOQ00201":
+                captured["body"] = json
+            return _make_response({"rsp_cd": "02679", "rsp_msg": "조회내역이 없습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        broker.get_balance("TQQQ", "NAS")
+        body = captured.get("body", {})
+        in_block = body.get("COSOQ00201InBlock1", {})
+        assert in_block.get("BaseDt") == "20260615", f"예상 BaseDt=20260615, 실제={in_block.get('BaseDt')}"
