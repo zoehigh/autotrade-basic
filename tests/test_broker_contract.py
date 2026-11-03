@@ -2359,10 +2359,10 @@ class TestLSBrokerContract:
         assert amt is None
 
     def test_parse_cash_outblock3_single_negative_amount(self):
-        """단일 행 FcurrOrdAbleAmt 가 음수면 None 을 반환해야 한다."""
+        """단일 행 FcurrOrdAbleAmt 가 음수면 None 을 반환해야 한다 (allow_currency_missing=True)."""
         broker = self._create_broker()
         out_block3 = {"FcurrOrdAbleAmt": "-10"}
-        amt = broker._parse_cash_outblock3(out_block3, "USD")
+        amt = broker._parse_cash_outblock3(out_block3, "USD", allow_currency_missing=True)
         assert amt is None
 
     def test_get_purchase_amount_cosq02701_currency_mismatch_passes_through(self):
