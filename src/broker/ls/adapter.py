@@ -57,6 +57,7 @@ from broker.ls.order_types import (
     TR_ID_CASH_BALANCE,
     TR_ID_ORDER_HISTORY,
     TR_ID_ORDER,
+    TR_ID_ORDER_CANCEL,
     TR_ID_DAILY_CLOSE,
     LS_SUCCESS_RSP_CDS,
 )
@@ -976,9 +977,10 @@ class LSBroker(Broker):
             )
             data = resp.json()
 
-            if data.get("rsp_cd") != "00000":
-                rsp_cd = data.get("rsp_cd", "")
-                rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
+            rsp_cd = data.get("rsp_cd", "")
+            rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
+            # LS 해외주식 주문 성공 코드: 00000(정상), 00040(매수주문 완료), 00050(매도주문 완료)
+            if rsp_cd not in ("00000", "00040", "00050"):
                 raise OrderNotAcceptedError(f"주문 실패 (응답코드: {rsp_cd}): {rsp_msg}")
 
             output = data.get("COSAT00301OutBlock1", {})
@@ -1041,7 +1043,7 @@ class LSBroker(Broker):
         try:
             resp = self._post(
                 "/overseas-stock/order",
-                tr_id=TR_ID_ORDER,
+                tr_id=TR_ID_ORDER_CANCEL,
                 body=body,
                 retry_network=False,
             )
@@ -1050,7 +1052,7 @@ class LSBroker(Broker):
             rsp_cd = data.get("rsp_cd", "")
             rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
 
-            if rsp_cd in LS_SUCCESS_RSP_CDS:
+            if rsp_cd in LS_SUCCESS_RSP_CDS or rsp_cd in ("00000", "00040", "00050"):
                 print(f"[LS] 주문 취소 성공: odno={mask_odno(odno)}")
                 return None
 
