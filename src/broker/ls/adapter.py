@@ -479,7 +479,7 @@ class LSBroker(Broker):
         [BaseDt 변경 근거]
         기존 BaseDt="" 는 LS 서버에서 rsp_cd="02679"(조회내역 없음)를 반환하는 원인 중 하나였습니다.
         KST 오늘 날짜(YYYYMMDD)를 주입하여 조회 대상을 특정하도록 변경했습니다.
-        주의: 봇은 KST 새벽(ET 전일 저녁~당일 새벽)에 실행되므로, KST 오늘 ≠ ET 영업일인 구간이
+        주의: 봇은 KST 새벽(ET 전일 오후~당일 새벽)에 실행되므로, KST 오늘 ≠ ET 영업일인 구간이
         있을 수 있습니다. 특히 KST 새벽(예: 화요일 04:10)에 실행할 때는 KST "오늘"이 ET 기준 월요일
         14:10(표준시)/15:10(서머타임)이 될 수 있어, LS가 ET 영업일을 기대하면 거부되거나 다른 의미로
         해석될 수 있습니다. 월요일(화요일 전날) 오후~화요일 새벽 실행 시 BaseDt 후보 2개(직전 ET
@@ -564,8 +564,10 @@ class LSBroker(Broker):
             if amt_raw is None or amt_raw == "":
                 continue  # 필드 누락 -> 실패(폴백 대상)
             item_currency = item.get("CrcyCode", "")
+            if item_currency is None:
+                item_currency = ""  # null -> 누락("")으로 간주
             if not isinstance(item_currency, str):
-                continue  # 잘못된 통화 타입 (null 등) -> 거부
+                continue  # 잘못된 통화 타입 -> 거부
             if item_currency.upper() == currency.upper():
                 amt = float(amt_raw or 0)
                 if amt >= 0 and math.isfinite(amt):
