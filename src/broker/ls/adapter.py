@@ -1000,6 +1000,73 @@ class LSBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise OrderError(f"주문 실행 실패: {str(e)}")
 
+    def cancel_order(
+        self,
+        odno: str,
+        symbol: str | None = None,
+        exchange: str | None = None,
+    ) -> None:
+        """
+        LS 해외주식 주문을 취소합니다.
+
+        TR: COSAT00301 (미국시장주문) — OrdPtnCode=03(취소)로 호출합니다.
+        OrgOrdNo에 원주문번호를 지정합니다.
+
+        - rsp_cd != "00000" → OrderNotAcceptedError (취소 미접수)
+        - 네트워크 오류 → OrderError (취소 여부 불확실)
+        - 이미 취소된 주문은 idempotent하게 성공으로 처리
+        """
+        odno = str(odno).strip() if odno else ""
+        if not odno:
+            raise OrderNotAcceptedError("취소할 주문번호가 비어있습니다")
+
+        ls_exch = ""
+        if exchange:
+            ls_exch = self.exchange_code(exchange)
+
+        body = {
+            "COSAT00301InBlock1": {
+                "RecCnt": 1,
+                "OrdPtnCode": "03",
+                "OrgOrdNo": int(odno) if odno.isdigit() else odno,
+                "OrdMktCode": ls_exch,
+                "IsuNo": (symbol or "").upper(),
+                "OrdQty": 0,
+                "OvrsOrdPrc": 0.0,
+                "OrdprcPtnCode": "00",
+                "BrkTpCode": "",
+            }
+        }
+
+        try:
+            resp = self._post(
+                "/overseas-stock/order",
+                tr_id=TR_ID_ORDER,
+                body=body,
+                retry_network=False,
+            )
+            data = resp.json()
+
+            rsp_cd = data.get("rsp_cd", "")
+            rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
+
+            if rsp_cd in LS_SUCCESS_RSP_CDS:
+                print(f"[LS] 주문 취소 성공: odno={mask_odno(odno)}")
+                return None
+
+            if "취소" in rsp_msg and ("완료" in rsp_msg or "이미" in rsp_msg):
+                print(f"[LS] 주문 이미 취소됨 (idempotent): odno={mask_odno(odno)}")
+                return None
+
+            raise OrderNotAcceptedError(
+                f"LS 주문 취소 실패 (응답코드: {rsp_cd}): {rsp_msg}"
+            )
+
+        except requests.exceptions.RequestException as e:
+            raise OrderError(
+                f"LS 주문 취소 실패 (취소 여부 불확실): {str(e)}"
+            )
+
     # ══════════════════════════════════════════════════════════════════
     # 유틸리티
     # ══════════════════════════════════════════════════════════════════
