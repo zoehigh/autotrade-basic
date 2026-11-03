@@ -13,6 +13,7 @@ LS증권 OPEN API (REST)를 통해 미국 주식 자동매매를 실행합니다
 
 DRY 모드는 DryBroker 래퍼로 처리 — LSBroker 자체는 항상 LIVE로 동작.
 """
+import math
 import random
 import time
 from datetime import datetime, timedelta
@@ -57,6 +58,8 @@ from broker.ls.order_types import (
     TR_ID_ORDER,
     TR_ID_ORDER_CANCEL,
     TR_ID_DAILY_CLOSE,
+    LS_SUCCESS_RSP_CDS,
+    TR_ID_CASH_BALANCE,
 )
 from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT, FINNHUB_API_KEY, LS_DEMO_BYPASS_BUGS
 
@@ -468,16 +471,25 @@ class LSBroker(Broker):
 
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """
-        해외주식 보유 잔고를 조회합니다 → Balance(quantity, avg_price).
+        해외주식 보유 잔고를 조회합니다 -> Balance(quantity, avg_price).
 
         TR: COSOQ00201 (해외주식 종합잔고평가)
         OutBlock4: 개별 종목별 보유 수량/평단가
         조회할 데이터가 없으면 None을 반환합니다.
+
+        [BaseDt 변경 근거]
+        기존 BaseDt="" 는 LS 서버에서 rsp_cd="02679"(조회내역 없음)를 반환하는 원인 중 하나였습니다.
+        KST 오늘 날짜(YYYYMMDD)를 주입하여 조회 대상을 특정하도록 변경했습니다.
+        주의: 봇은 KST 새벽(ET 전일 오후~당일 새벽)에 실행되므로, KST 오늘 ≠ ET 영업일인 구간이
+        있을 수 있습니다. 특히 KST 새벽(예: 화요일 04:10)에 실행할 때는 KST "오늘"이 ET 기준 월요일
+        14:10(표준시)/15:10(서머타임)이 될 수 있어, LS가 ET 영업일을 기대하면 거부되거나 다른 의미로
+        해석될 수 있습니다. 월요일(화요일 전날) 오후~화요일 새벽 실행 시 BaseDt 후보 2개(직전 ET
+        영업일 vs KST 오늘)을 나란히 probe해 비교 검증할 것.
         """
         body = {
             "COSOQ00201InBlock1": {
                 "RecCnt": 1,
-                "BaseDt": "",
+                "BaseDt": get_kst_now().strftime("%Y%m%d"),
                 "CrcyCode": "USD",
                 "AstkBalTpCode": "00",
             }
@@ -491,7 +503,7 @@ class LSBroker(Broker):
 
             rsp_cd = data.get("rsp_cd", "")
             rsp_msg = data.get("rsp_msg", "")
-            if rsp_cd in ("00000", "00001"):
+            if rsp_cd in LS_SUCCESS_RSP_CDS:
                 pass  # 정상 응답
             elif rsp_cd in ("00200", "00707", "02679"):
                 print(f"[잔고] {symbol} COSOQ00201: {rsp_msg} (None 반환)")
@@ -526,25 +538,118 @@ class LSBroker(Broker):
                 resp_info = ""
             raise BrokerError(f"잔고 조회 실패: {str(e)}{resp_info}")
 
-    def get_purchase_amount(self, symbol: str, exchange: str) -> PurchaseAmount:
+    def _parse_cash_outblock3(
+        self, out_block3: object, currency: str,
+        allow_currency_missing: bool = False,
+    ) -> Optional[float]:
         """
-        해외주식 매수가능금액을 조회합니다 → PurchaseAmount(orderable_cash).
+        COSOQ00201OutBlock3 / COSOQ02701OutBlock3 에서 통화별 FcurrOrdAbleAmt 를 파싱합니다.
 
-        TR: COSOQ00201 (해외주식 종합잔고평가) OutBlock3 → FcurrOrdAbleAmt
-        조회 실패 시 시드 기반 fallback.
+        out_block3 는 리스트(dict 배열) 또는 단일 dict 일 수 있습니다.
+        - 통화 일치 항목의 FcurrOrdAbleAmt 가 실제 존재하면(0 포함) 해당 금액을 반환합니다.
+        - 필드 자체가 누락되면 None 을 반환하여 폴백 대상으로 처리합니다.
+        - allow_currency_missing=True 이고 단일 행이면 CrcyCode 가 빈 문자열("")인 경우만
+          FcurrOrdAbleAmt 가 있으면 채택합니다. CrcyCode 가 다른 통화로 설정된 행은
+          후보에서 제외합니다 (COSOQ02701 요청에서 통화를 고정하므로 응답에
+          CrcyCode echo 가 없을 수 있으나, 존재하면 다른 통화로 간주).
         """
+        if not out_block3:
+            return None
 
-        def _seed_fallback(msg: str = ""):
-            reason = f" ({msg})" if msg else ""
-            print(f"[매수가능] {symbol} COSOQ00201 조회 불가{reason} — 시드 기반으로 진행")
-            return PurchaseAmount(orderable_cash=1_000_000.0)
+        items = out_block3 if isinstance(out_block3, list) else [out_block3]
+        single_item_amt: Optional[str] = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            amt_raw = item.get("FcurrOrdAbleAmt")
+            if amt_raw is None or amt_raw == "":
+                continue  # 필드 누락 -> 실패(폴백 대상)
+            item_currency = item.get("CrcyCode", "")
+            if item_currency is None:
+                item_currency = ""  # null -> 누락("")으로 간주
+            if not isinstance(item_currency, str):
+                continue  # 잘못된 통화 타입 -> 거부
+            if item_currency.upper() == currency.upper():
+                amt = float(amt_raw or 0)
+                if amt >= 0 and math.isfinite(amt):
+                    return amt  # 0도 정상 결과로 반환
+            # 단일 행이면 CrcyCode 가 진짜 누락("")인 경우만 후보로 보관 (COSOQ02701 대응)
+            if (
+                allow_currency_missing
+                and single_item_amt is None
+                and len(items) == 1
+                and item_currency == ""
+            ):
+                single_item_amt = amt_raw
+        if single_item_amt is not None:
+            amt = float(single_item_amt or 0)
+            if amt >= 0 and math.isfinite(amt):
+                return amt  # 후보도 음수·무한대 검사 적용
+        return None
 
-        _, currency = convert_exchange_code(exchange)
+    def _get_cash_from_cosq02701(
+        self, symbol: str, currency: str
+    ) -> Optional[PurchaseAmount]:
+        """
+        COSOQ02701 (해외주식 예수금 조회) 1차 호출 -> 외화주문가능금액 반환.
+
+        예수금 전용 TR이므로 BaseDt 파라미터가 없어
+        COSOQ00201 의 BaseDt 관련 실패("02679" 등)를 원천 회피합니다.
+        성공 시 PurchaseAmount 반환, 실패 시 None.
+        """
+        body = {
+            "COSOQ02701InBlock1": {
+                "RecCnt": 1,
+                "CrcyCode": currency,
+            }
+        }
+
+        try:
+            resp = self._post(
+                "/overseas-stock/accno",
+                tr_id=TR_ID_CASH_BALANCE,
+                body=body,
+            )
+            data = resp.json()
+            rsp_cd = data.get("rsp_cd", "")
+
+            if rsp_cd in LS_SUCCESS_RSP_CDS:
+                out_block3 = data.get("COSOQ02701OutBlock3", [])
+                amt = self._parse_cash_outblock3(out_block3, currency, allow_currency_missing=True)
+                if amt is not None:
+                    print(
+                        f"[매수가능] {symbol} COSOQ02701: 외화주문가능금액=${amt:,.2f}"
+                    )
+                    return PurchaseAmount(orderable_cash=amt)
+                print(
+                    f"[매수가능] {symbol} COSOQ02701: 통화={currency} "
+                    f"FcurrOrdAbleAmt 미발견 (OutBlock3={out_block3})"
+                )
+            else:
+                print(
+                    f"[매수가능] {symbol} COSOQ02701: rsp_cd={rsp_cd} "
+                    f"rsp_msg={data.get('rsp_msg','')} — COSOQ00201 시도"
+                )
+        except (BrokerError, requests.exceptions.RequestException, ValueError) as e:
+            print(f"[매수가능] {symbol} COSOQ02701 호출 실패: {str(e)[:60]} — COSOQ00201 시도")
+
+        return None
+
+    def _get_cash_from_cosq00201(
+        self, symbol: str, currency: str, today_kst: str
+    ) -> Optional[PurchaseAmount]:
+        """
+        COSOQ00201 (해외주식 종합잔고평가) 2차 폴백 호출 -> 외화주문가능금액 반환.
+
+        BaseDt 가 필요하므로 today_kst 를 인자로 받습니다.
+        보유 종목이 없는 계좌 등에서 rsp_cd="02679"(조회내역 없음)가 나올 수 있음.
+        성공 시 PurchaseAmount 반환, 실패 시 None.
+        """
         body = {
             "COSOQ00201InBlock1": {
                 "RecCnt": 1,
-                "BaseDt": "",
-                "CrcyCode": "USD",
+                "BaseDt": today_kst,
+                "CrcyCode": currency,
                 "AstkBalTpCode": "00",
             }
         }
@@ -554,27 +659,56 @@ class LSBroker(Broker):
                 "/overseas-stock/accno", tr_id=TR_ID_BALANCE, body=body
             )
             data = resp.json()
-
             rsp_cd = data.get("rsp_cd", "")
-            if rsp_cd not in ("00000", "00001"):
-                return _seed_fallback(data.get("rsp_msg", rsp_cd))
 
-            out_block3 = data.get("COSOQ00201OutBlock3", [])
-            if not out_block3:
-                return _seed_fallback("OutBlock3 없음")
-
-            for item in out_block3:
-                if item.get("CrcyCode", "").upper() == currency.upper():
-                    amt = float(item.get("FcurrOrdAbleAmt", "0"))
-                    if amt > 0:
-                        return PurchaseAmount(orderable_cash=amt)
-                    return _seed_fallback(f"FcurrOrdAbleAmt={amt}")
-
-            return _seed_fallback(f"{currency} 통화 없음")
-
+            if rsp_cd in LS_SUCCESS_RSP_CDS:
+                out_block3 = data.get("COSOQ00201OutBlock3", [])
+                amt = self._parse_cash_outblock3(out_block3, currency)
+                if amt is not None:
+                    print(
+                        f"[매수가능] {symbol} COSOQ00201: 외화주문가능금액=${amt:,.2f}"
+                    )
+                    return PurchaseAmount(orderable_cash=amt)
+                print(
+                    f"[매수가능] {symbol} COSOQ00201: 정상 응답이나 "
+                    f"FcurrOrdAbleAmt 미발견"
+                )
+            else:
+                print(
+                    f"[매수가능] {symbol} COSOQ00201: rsp_cd={rsp_cd} "
+                    f"rsp_msg={data.get('rsp_msg','')}"
+                )
         except (BrokerError, requests.exceptions.RequestException, ValueError) as e:
-            return _seed_fallback(str(e)[:60])
+            print(f"[매수가능] {symbol} COSOQ00201 호출 실패: {str(e)[:60]}")
 
+        return None
+
+    def get_purchase_amount(self, symbol: str, exchange: str) -> PurchaseAmount:
+        """
+        해외주식 매수가능금액을 조회합니다 -> PurchaseAmount(orderable_cash).
+
+        1차: COSOQ02701 (해외주식 예수금 조회) OutBlock3 -> FcurrOrdAbleAmt
+        2차: COSOQ00201 (해외주식 종합잔고평가) OutBlock3 -> FcurrOrdAbleAmt
+        모두 실패 시 BrokerError 발생 (fallback 없음).
+        """
+
+        _, currency = convert_exchange_code(exchange)
+        today_kst = get_kst_now().strftime("%Y%m%d")
+
+        # 1차: COSOQ02701 (예수금 전용) — BaseDt 불필요
+        result = self._get_cash_from_cosq02701(symbol, currency)
+        if result is not None:
+            return result
+
+        # 2차: COSOQ00201 (종합잔고평가) — BaseDt 필요, "02679" 가능성 있음
+        result = self._get_cash_from_cosq00201(symbol, currency, today_kst)
+        if result is not None:
+            return result
+
+        raise BrokerError(
+            f"매수가능금액 조회 실패: {symbol}@{exchange} "
+            f"(COSOQ02701+COSOQ00201 모두 실패)"
+        )
     def get_order_history(
         self,
         symbol: str,
