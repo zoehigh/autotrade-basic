@@ -2448,3 +2448,87 @@ class TestLSBrokerContract:
         body = captured.get("body", {})
         in_block = body.get("COSOQ00201InBlock1", {})
         assert in_block.get("BaseDt") == "20260615", f"예상 BaseDt=20260615, 실제={in_block.get('BaseDt')}"
+
+    # ── cancel_order (COSAT00301 OrdPtnCode=08) ──────────────────────────
+    # 실측 근거: 2026-11-03 실계좌 — 주문 1054/1055 → 취소 1152/1147 "취소완료",
+    # 취소 성공 rsp_cd=00156, 원주문 ExecQty=0·UnercQty=0.
+
+    def test_cancel_order_success_00156(self):
+        """rsp_cd=00156(취소주문 완료) 시 None 반환 + 요청 body 검증."""
+        broker = self._create_broker()
+        captured = {}
+
+        def _post_side_effect(url, headers=None, json=None, **kwargs):
+            captured["tr_id"] = (headers or {}).get("tr_cd", "")
+            captured["body"] = json
+            return _make_response({"rsp_cd": "00156", "rsp_msg": "취소주문이 완료되었습니다."})
+
+        self._mock_post.side_effect = _post_side_effect
+        assert broker.cancel_order("1055", "TQQQ", "NAS") is None
+        assert captured["tr_id"] == "COSAT00301"
+        in_block = (captured.get("body") or {}).get("COSAT00301InBlock1", {})
+        assert in_block.get("OrdPtnCode") == "08", f"취소 OrdPtnCode=08이어야 함: {in_block}"
+        assert in_block.get("OrgOrdNo") == 1055, f"OrgOrdNo=원주문번호이어야 함: {in_block}"
+
+    def test_cancel_order_success_00000(self):
+        """rsp_cd=00000 시 None 반환."""
+        broker = self._create_broker()
+        self._mock_post.side_effect = lambda *a, **k: _make_response(
+            {"rsp_cd": "00000", "rsp_msg": "정상"})
+        assert broker.cancel_order("1054", "TQQQ", "NAS") is None
+
+    def test_cancel_order_requires_symbol_exchange(self):
+        """symbol·exchange 누락 시 TypeError (빈 IsuNo/OrdMktCode 전송 방지)."""
+        broker = self._create_broker()
+        with pytest.raises(TypeError):
+            broker.cancel_order("1055")
+        with pytest.raises(TypeError):
+            broker.cancel_order("1055", "TQQQ", None)
+
+    def test_cancel_order_rejects_non_numeric_odno(self):
+        """비숫자 주문번호는 OrderNotAcceptedError."""
+        broker = self._create_broker()
+        with pytest.raises(OrderNotAcceptedError):
+            broker.cancel_order("ABC", "TQQQ", "NAS")
+        with pytest.raises(OrderNotAcceptedError):
+            broker.cancel_order("", "TQQQ", "NAS")
+
+    def test_cancel_order_rejection(self):
+        """거부 rsp_cd 시 OrderNotAcceptedError (문자열 매칭 없음)."""
+        broker = self._create_broker()
+        self._mock_post.side_effect = lambda *a, **k: _make_response(
+            {"rsp_cd": "02201", "rsp_msg": "이미 체결된 주문은 취소할 수 없습니다."})
+        with pytest.raises(OrderNotAcceptedError, match="02201"):
+            broker.cancel_order("1055", "TQQQ", "NAS")
+
+    def test_cancel_order_network_error(self):
+        """네트워크 오류 시 OrderError (취소 여부 불확실)."""
+        broker = self._create_broker()
+        self._mock_post.side_effect = requests.exceptions.ConnectionError("연결 실패")
+        with pytest.raises(OrderError):
+            broker.cancel_order("1055", "TQQQ", "NAS")
+
+    def test_place_order_reads_ordno_from_outblock2_first(self):
+        """성공 응답의 주문번호는 OutBlock2(결과) 우선, OutBlock1(에코) 폴백으로 읽는다."""
+        broker = self._create_broker()
+        self._mock_post.side_effect = lambda *a, **k: _make_response({
+            "rsp_cd": "00000",
+            "rsp_msg": "정상",
+            "COSAT00301OutBlock1": {"OrdPtnCode": "02", "OrgOrdNo": 0},
+            "COSAT00301OutBlock2": {"OrdNo": 1055},
+        })
+        result = broker.place_order("TQQQ", "82", "BUY", 1, 57.03, "LIMIT")
+        assert result is not None
+        assert str(result.order_id) == "1055"
+
+    def test_place_order_falls_back_to_outblock1_ordno(self):
+        """OutBlock2가 비어 있으면 OutBlock1에서 주문번호를 읽는다."""
+        broker = self._create_broker()
+        self._mock_post.side_effect = lambda *a, **k: _make_response({
+            "rsp_cd": "00000",
+            "rsp_msg": "정상",
+            "COSAT00301OutBlock1": {"OrdNo": "0000001234"},
+        })
+        result = broker.place_order("TQQQ", "82", "BUY", 1, 57.03, "LIMIT")
+        assert result is not None
+        assert str(result.order_id) == "0000001234"
