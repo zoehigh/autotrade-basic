@@ -218,14 +218,10 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS",
             else:
                 print(f"  [정보] 이력에서 odno={odno} 미발견 — 미체결 주문은 CLOSED 이력에 없을 수 있음 (정상)")
 
-            # 취소
+            # 취소 (3-arg 우선 + 1-arg 폴백은 _attempt_cancel이 처리)
             print(f"  cancel_order odno={odno}")
-            # cancel_order 시그니처는 브로커별 상이할 수 있어 위치 인자 1개 우선 시도
             try:
-                broker.cancel_order(odno)  # type: ignore
-                cancel_attempted = True
-            except TypeError:
-                broker.cancel_order(odno, symbol, exchange)  # type: ignore
+                _attempt_cancel(broker, odno, symbol, exchange)
                 cancel_attempted = True
             except Exception as e:
                 print(f"  cancel_order 1차 실패: {e}")
@@ -234,10 +230,7 @@ def run_preflight(broker_name: str, symbol: str = "TQQQ", exchange: str = "NAS",
             if not cancel_attempted:
                 time.sleep(1.0)
                 try:
-                    broker.cancel_order(odno)  # type: ignore
-                    cancel_attempted = True
-                except TypeError:
-                    broker.cancel_order(odno, symbol, exchange)  # type: ignore
+                    _attempt_cancel(broker, odno, symbol, exchange)
                     cancel_attempted = True
                 except Exception as e:
                     print(f"  ⚠️ [경고] 주문 취소 실패 — 수동 취소 필요: odno={odno} ({e})")
@@ -338,6 +331,22 @@ def _is_fill_related_cancel_error(message) -> bool:
     return any(ind in msg for ind in _FILL_CANCEL_INDICATORS)
 
 
+def _attempt_cancel(broker, odno: str, symbol: str, exchange: str) -> None:
+    """
+    cancel_order 3-arg 우선 호출, TypeError 시 1-arg로 재시도.
+
+    두 호출 방식을 하나의 호출로 묶어, 어느 쪽에서 발생한 예외든
+    호출부의 단일 except 범위로 전파되도록 합니다.
+    (except TypeError 안의 재호출이 바깥 except Exception을 우회해
+    "filled" 판정 대신 예외 종료되던 문제 방지)
+    성공 시 복귀, 실패 시 예외를 그대로 전파합니다.
+    """
+    try:
+        broker.cancel_order(odno, symbol, exchange)  # type: ignore
+    except TypeError:
+        broker.cancel_order(odno)  # type: ignore
+
+
 def _cancel_order_guaranteed(broker, odno: str, symbol: str, exchange: str) -> str:
     """
     취소 보장 — try/finally + 1초 후 1회 재시도.
@@ -352,10 +361,7 @@ def _cancel_order_guaranteed(broker, odno: str, symbol: str, exchange: str) -> s
 
     try:
         try:
-            broker.cancel_order(odno)  # type: ignore
-            cancel_attempted = True
-        except TypeError:
-            broker.cancel_order(odno, symbol, exchange)  # type: ignore
+            _attempt_cancel(broker, odno, symbol, exchange)
             cancel_attempted = True
         except Exception as e:
             if _is_fill_related_cancel_error(str(e)):
@@ -367,10 +373,7 @@ def _cancel_order_guaranteed(broker, odno: str, symbol: str, exchange: str) -> s
         if not cancel_attempted:
             time.sleep(1.0)
             try:
-                broker.cancel_order(odno)  # type: ignore
-                cancel_attempted = True
-            except TypeError:
-                broker.cancel_order(odno, symbol, exchange)  # type: ignore
+                _attempt_cancel(broker, odno, symbol, exchange)
                 cancel_attempted = True
             except Exception as e:
                 if _is_fill_related_cancel_error(str(e)):
@@ -468,10 +471,7 @@ def _run_collar_probe(
     if marketable:
         if has_cancel:
             try:
-                broker.cancel_order(odno, symbol, exchange)  # type: ignore
-                result["note"] = "시장성 지정가 — 체결 전제, 미체결 시 취소됨"
-            except TypeError:
-                broker.cancel_order(odno)  # type: ignore
+                _attempt_cancel(broker, odno, symbol, exchange)
                 result["note"] = "시장성 지정가 — 체결 전제, 미체결 시 취소됨"
             except Exception as e:
                 result["note"] = f"시장성 지정가 — 즉시 체결 전제 (취소 시도 무해: {str(e)[:50]})"
@@ -716,6 +716,71 @@ def test_non_meritz_cancel_absent_still_fails(monkeypatch):
 
     with pytest.raises(AssertionError, match="취소 후 이력에서 odno="):
         run_preflight("kis", "TQQQ", "NAS")
+
+
+class _FakeCancelBroker:
+    """_attempt_cancel/_cancel_order_guaranteed 회귀 테스트용 최소 브로커."""
+
+    def __init__(self, mode="ok", calls=None):
+        self.mode = mode  # ok | reject-fill | reject-other
+        self.calls = calls if calls is not None else []
+
+    def cancel_order(self, odno, symbol=None, exchange=None):
+        self.calls.append((odno, symbol, exchange))
+        if self.mode == "reject-fill":
+            raise OrderNotAcceptedError("이미 체결된 주문은 취소할 수 없습니다.")
+        if self.mode == "reject-other":
+            raise OrderNotAcceptedError("취소 불가 (rsp_cd=02201)")
+        return None
+
+
+class _FakeCancelBroker1Arg:
+    """1-arg 시그니처 브로커 (TypeError 폴백 경로 검증용)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def cancel_order(self, odno):
+        self.calls.append((odno,))
+        raise OrderNotAcceptedError("already-filled: 취소 불가")
+
+
+def test_attempt_cancel_passes_3_args_first():
+    """3-arg 우선 호출 + 성공 시 예외 없음."""
+    fake = _FakeCancelBroker(mode="ok")
+    _attempt_cancel(fake, "123", "TQQQ", "NAS")
+    assert fake.calls == [("123", "TQQQ", "NAS")]
+
+
+def test_guaranteed_returns_filled_on_3_arg_rejection(monkeypatch):
+    """3-arg 취소 거부(체결) → "filled" 반환 (예외 종료 회귀 방지)."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    fake = _FakeCancelBroker(mode="reject-fill")
+    assert _cancel_order_guaranteed(fake, "123", "TQQQ", "NAS") == "filled"
+
+
+def test_guaranteed_returns_filled_on_1_arg_rejection(monkeypatch):
+    """1-arg 브로커의 취소 거부(체결) → 폴백 후 "filled" 반환."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    fake = _FakeCancelBroker1Arg()
+    assert _cancel_order_guaranteed(fake, "123", "TQQQ", "NAS") == "filled"
+    # 1차 실패 후 finally 재시도까지 2회 호출
+    assert fake.calls == [("123",), ("123",)]
+
+
+def test_guaranteed_returns_canceled_on_success(monkeypatch):
+    """취소 성공 → "canceled" 반환."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    fake = _FakeCancelBroker(mode="ok")
+    assert _cancel_order_guaranteed(fake, "123", "TQQQ", "NAS") == "canceled"
+
+
+def test_guaranteed_returns_failed_on_other_rejection(monkeypatch, capsys):
+    """체결 무관 거부 → "failed" 반환 + 수동 취소 경고."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    fake = _FakeCancelBroker(mode="reject-other")
+    assert _cancel_order_guaranteed(fake, "123", "TQQQ", "NAS") == "failed"
+    assert "수동 취소 필요" in capsys.readouterr().out
 
 
 # 콜라 경계 probe — 자격증명 없으면 skip, 있으면 실 API 호출
