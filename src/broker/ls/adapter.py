@@ -56,7 +56,6 @@ from broker.ls.order_types import (
     TR_ID_BALANCE,
     TR_ID_ORDER_HISTORY,
     TR_ID_ORDER,
-    TR_ID_ORDER_CANCEL,
     TR_ID_DAILY_CLOSE,
     LS_SUCCESS_RSP_CDS,
     TR_ID_CASH_BALANCE,
@@ -981,11 +980,14 @@ class LSBroker(Broker):
 
             rsp_cd = data.get("rsp_cd", "")
             rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
-            # LS 해외주식 주문 성공 코드: 00000(정상), 00040(매수주문 완료), 00050(매도주문 완료)
+            # LS 해외주식 주문 성공 코드 (실측):
+            #   00000 = 정상, 00040 = 매수주문 완료, 00050 = 매도주문 완료(추정)
+            #   (2026-11-03 preflight 실측: rsp_cd=00040 + "매수 주문이 완료되었습니다" + 실제 주문 접수됨)
             if rsp_cd not in ("00000", "00040", "00050"):
                 raise OrderNotAcceptedError(f"주문 실패 (응답코드: {rsp_cd}): {rsp_msg}")
 
-            output = data.get("COSAT00301OutBlock1", {})
+            # 성공 응답의 주문번호: OutBlock2(결과) 우선, OutBlock1(에코) 폴백
+            output = data.get("COSAT00301OutBlock2", {}) or data.get("COSAT00301OutBlock1", {})
             order_id = output.get("OrdNo", "") or output.get("ODNO", "")
 
             print("\n========== [LIVE 모드] 주문 성공 ==========")
@@ -1013,26 +1015,46 @@ class LSBroker(Broker):
         """
         LS 해외주식 주문을 취소합니다.
 
-        TR: COSAT00301 (미국시장주문) — OrdPtnCode=03(취소)로 호출합니다.
-        OrgOrdNo에 원주문번호를 지정합니다.
+        TR: COSAT00301 (미국시장주문) + OrdPtnCode="08" (취소주문).
+        OrgOrdNo에 원주문번호를 지정합니다 (취소 시 필수).
 
-        - rsp_cd != "00000" → OrderNotAcceptedError (취소 미접수)
+        근거: ~/ls-openapi-tr-guides.json [해외주식] 주문 카탈로그
+          - COSAT00301 OrdPtnCode: 01=매도 / 02=매수 / 08=취소
+          - OrgOrdNo: "취소주문인 경우만 필수 입력"
+          - COSMT00300은 "해외증권 매도상환주문"으로 취소와 무관 (사용 금지)
+          - COSAT00311은 정정(07) 전용, COSAT00400은 예약주문 등록·취소 전용
+
+        - 성공 rsp_cd → None 반환 (취소 접수)
+        - 명시적 거부 rsp_cd → OrderNotAcceptedError (취소 미접수 확정)
         - 네트워크 오류 → OrderError (취소 여부 불확실)
-        - 이미 취소된 주문은 idempotent하게 성공으로 처리
         """
         odno = str(odno).strip() if odno else ""
         if not odno:
             raise OrderNotAcceptedError("취소할 주문번호가 비어있습니다")
 
-        ls_exch = ""
-        if exchange:
-            ls_exch = self.exchange_code(exchange)
+        # 취소 요청에는 종목(IsuNo)·거래소(OrdMktCode)가 필요하므로 둘 다 요구합니다.
+        # (P2-3: 빈 값 전송 방지) 1-arg 호출자와의 호환을 위해 TypeError로 알려주면
+        # preflight의 except TypeError 폴백이 symbol·exchange과 함께 재시도합니다.
+        if not symbol or not exchange:
+            raise TypeError(
+                "LS cancel_order에는 symbol과 exchange이 필요합니다 "
+                f"(odno={mask_odno(odno)})"
+            )
+
+        ls_exch = self.exchange_code(exchange)
+
+        try:
+            org_ord_no = int(odno)
+        except (ValueError, TypeError):
+            raise OrderNotAcceptedError(
+                f"취소할 주문번호가 숫자가 아닙니다: odno={mask_odno(odno)}"
+            )
 
         body = {
             "COSAT00301InBlock1": {
                 "RecCnt": 1,
-                "OrdPtnCode": "03",
-                "OrgOrdNo": int(odno) if odno.isdigit() else odno,
+                "OrdPtnCode": "08",       # 08 = 취소주문
+                "OrgOrdNo": org_ord_no,    # 취소 대상 원주문번호 (필수)
                 "OrdMktCode": ls_exch,
                 "IsuNo": (symbol or "").upper(),
                 "OrdQty": 0,
@@ -1045,7 +1067,7 @@ class LSBroker(Broker):
         try:
             resp = self._post(
                 "/overseas-stock/order",
-                tr_id=TR_ID_ORDER_CANCEL,
+                tr_id=TR_ID_ORDER,
                 body=body,
                 retry_network=False,
             )
@@ -1054,12 +1076,11 @@ class LSBroker(Broker):
             rsp_cd = data.get("rsp_cd", "")
             rsp_msg = data.get("rsp_msg", "알 수 없는 에러")
 
-            if rsp_cd in LS_SUCCESS_RSP_CDS or rsp_cd in ("00000", "00040", "00050"):
+            # LS 해외주식 취소 성공 코드 (실측):
+            #   00156 = 취소주문 완료 (2026-11-03 실측: "취소주문이 완료되었습니다")
+            #   00000 = 정상 (공통 성공 코드, 실측 미확인이나 관용적으로 포함)
+            if rsp_cd in ("00000", "00156"):
                 print(f"[LS] 주문 취소 성공: odno={mask_odno(odno)}")
-                return None
-
-            if "취소" in rsp_msg and ("완료" in rsp_msg or "이미" in rsp_msg):
-                print(f"[LS] 주문 이미 취소됨 (idempotent): odno={mask_odno(odno)}")
                 return None
 
             raise OrderNotAcceptedError(
