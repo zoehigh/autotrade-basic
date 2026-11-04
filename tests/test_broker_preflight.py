@@ -27,8 +27,10 @@
     데모는 기존 자격증명 게이팅만 따릅니다.
   - 매수 하단 ×0.90 (1주, 비시장성): 접수 → 이력 매칭 → cancel → 0체결 terminal 확인
   - 매도 상단 ×1.50 / 매도 하단 ×0.80 (1주, 비시장성): 보유 수량 있을 때만 접수 → cancel
-  - cancel 미구현 브로커(KIS/KIWOOM/LS/NHPLUG)는 비정상 주문(99999주/$0.01) 거부
+  - cancel 미구현 브로커(KIS/KIWOOM/NHPLUG)는 비정상 주문(99999주/$0.01) 거부
     확인으로 대체 (AGENTS.md PREFLIGHT 규칙)
+    ※ LS는 COSAT00301 OrdPtnCode=08 취소 경로 실측 완료 (2026-11-03, 주문 1054/1055 → 취소 1152/1147 "취소완료",
+      ExecQty=0, UnercQty=0). 취소 성공 rsp_cd=00156 ("취소주문이 완료되었습니다")
 
 단일 계좌·이력 최소화를 위해 비시장성 가격을 사용합니다. 취소 이력의 0체결은
 state.py에서 ft_ccld_qty<=0 제외라 T/net_invested에 영향 없습니다.
@@ -466,6 +468,9 @@ def _run_collar_probe(
     if marketable:
         if has_cancel:
             try:
+                broker.cancel_order(odno, symbol, exchange)  # type: ignore
+                result["note"] = "시장성 지정가 — 체결 전제, 미체결 시 취소됨"
+            except TypeError:
                 broker.cancel_order(odno)  # type: ignore
                 result["note"] = "시장성 지정가 — 체결 전제, 미체결 시 취소됨"
             except Exception as e:

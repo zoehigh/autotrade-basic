@@ -89,7 +89,6 @@ TR_ID_BALANCE = "COSOQ00201"         # 해외주식 종합잔고평가 (실전 �
 TR_ID_CASH_BALANCE = "COSOQ02701"    # 해외주식 예수금 조회 (매수가능금액 전용)
 TR_ID_ORDER_HISTORY = "COSAQ00102"   # 해외주식 계좌주문체결내역조회 (모의투자 01900 미지원)
 TR_ID_ORDER = "COSAT00301"           # 해외주식 신규주문 (또는 정정주문)
-TR_ID_ORDER_CANCEL = "COSMT00300"     # 해외주식 취소주문
 
 # LS 증권 API 성공 응답 코드
 #   "00000": 정상, "00001": 정상(경고 포함), "00136": 조회 완료 (조회 TR 성공 코드)

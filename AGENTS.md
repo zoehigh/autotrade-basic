@@ -48,7 +48,7 @@ autotrade-basic/
 |--------|----------|----------|------------|----------|
 | KIS | `rt_cd == "0"` | `msg_cd` | `msg1` | 각 메서드 |
 | KIWOOM | `return_code == 0` | `return_code` | `return_msg` | `_check_response()` |
-| LS | `rsp_cd in {"00000","00001","00136"}` | `rsp_cd` | `rsp_msg` | 각 메서드 (src/broker/ls/order_types.py `LS_SUCCESS_RSP_CDS`) |
+| LS | 조회 `rsp_cd in {"00000","00001","00136"}` / 주문 `{"00000","00040","00050"}`(00050 미실측 추정) / 취소 `{"00000","00156"}` | `rsp_cd` | `rsp_msg` | 조회: `LS_SUCCESS_RSP_CDS`, 주문/취소: 각 메서드 |
 | TOSS | `error` 없음 | `error.code` | `error.message` | `_request_with_rate_retry()` |
 | NHPLUG | `rsp_cd in {"00000","00166","00221","13578","XA102","00048"} or "완료" in rsp_msg/usr_msg` | `rsp_cd`/`msg_code` | `rsp_msg`/`usr_msg` | `_request_with_rate_retry()` |
 | MERITZ | 주문 `rsp_cd=="0001"` AND `data.warn_cls_code==0`, 조회 계열별 상이 (시세 `0000` / 잔고·매수가능 `5766` / 이력·당일 `5766`·`5762`(다음페이지) / 취소 `0001`) — 5820은 data 유무로 판단, EGW00200은 조회만 제한 재시도 | `rsp_cd` | `rsp_msg`+`rsp_sub_msg` | `_check_rsp_cd()` |
@@ -410,3 +410,4 @@ uv run pytest tests/test_broker_preflight.py -v
   - KIWOOM: usa06012 → `POST /api/us/chart` (최신순 → 역순)
   - TOSS: `GET /api/v1/candles?interval=1d` (최신순 → `reversed()`)
   - 리버스모드 `_get_reverse_star_point()`에서 close_prices 보강용으로 사용 가능
+- **LS 해외주식 취소** (`src/broker/ls/adapter.py::cancel_order`, 2026-11-03 실측): COSAT00301 + OrdPtnCode=`08`(취소) + OrgOrdNo=원주문번호(필수). 성공 `{"00000","00156"}` (00156="취소주문이 완료되었습니다"). 취소주문도 신규 주문번호를 발급받으며(OrgOrdNo로 원주문 연결), 원주문은 잔량 0·0체결로 확정. **COSMT00300은 "해외증권 매도상환주문"으로 취소와 무관 — 사용 금지**. Place_order 성공 `{"00000","00040","00050"}` (00040 실측="매수 주문이 완료되었습니다", 00050은 매도 대칭 추정 — 첫 실전 매도 시 rsp_cd 확인 필요). 주문번호는 OutBlock2(결과) 우선·OutBlock1(에코) 폴백으로 읽기.
