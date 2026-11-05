@@ -51,6 +51,7 @@ APPROVAL_SCHEMA_VERSION = 3
 PLAN_SCHEMA_VERSION = 3
 DEFAULT_APPROVAL_TTL_SECONDS = int(os.getenv("APPROVAL_TTL_SECONDS", "32400"))
 DEFAULT_MIN_TTL_SECONDS = int(os.getenv("APPROVAL_MIN_TTL_SECONDS", "28800"))
+HALT_EVIDENCE_COMMIT_FAILED = "evidence_commit_failed"
 
 
 def _tb():
@@ -2404,7 +2405,7 @@ def _verify_history_settled(broker, state, symbol, exchange, history, history_da
     return True, ""
 
 
-def _settle_positions(broker, symbol_config, *, persist=True, now=None):
+def _settle_positions(broker, symbol_config, *, persist=True, now=None, settlement_run_id=None):
     """  T// .
 
     LIVE  persist=True  ** 1**  .
@@ -2429,7 +2430,8 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
             "(  1 )."
         )
 
-    settlement_run_id = _resolve_settlement_run_id()
+    if settlement_run_id is None:
+        settlement_run_id = _resolve_settlement_run_id()
     #  (  )  ( ) .
     # `_et_today()`  KST   ET      .
     settled_session, execution_session = settlement_sessions(now)
@@ -2495,10 +2497,8 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
         - LIVE:    
         - DRY: /   (FORCE_T  REPAIR  ).
         """
-        if persist and tb.TRADE_MODE == "LIVE":
-            tb.save_state(symbol, state)
-            return True
-        return False
+        # state 저장은 settle_positions()에서 1회만 수행 (검증 후, 이중 저장 방지)
+        return bool(persist and tb.TRADE_MODE == "LIVE")
 
     #  Step 1: T      
     print("\n[Step 1] T  ...")
@@ -2770,7 +2770,7 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
     evidence_problems = [] if hold else _verify_settlement_evidence(settlement_evidence)
     if evidence_problems:
         raise tb.SymbolScopedError(
-            f"{symbol}      - / : "
+            f"{symbol} 독립 검증 실패: "
             + " / ".join(evidence_problems[:3])
         )
     #    committed=false  , state   
@@ -3175,12 +3175,17 @@ def _settle_positions(broker, symbol_config, *, persist=True, now=None):
         try:
             _mark_evidence_committed(evidence_path, settlement_evidence, True)
         except OSError as commit_error:
-            # state   evidence  .   PREVIEW 
+            # state   evidence  .   PREVIEW
             # settled_from_state()  evidence   fail-closed .
             print(
                 f"[] {symbol}   committed   - "
                 f"PREVIEW/VERIFY  : {str(commit_error)[:160]}"
             )
+            # state는 저장된 채 유지 (되돌리지 않음). 저장은 여기서 1회만 수행하고
+            # settle_positions() halt 경로는 저장하지 않는다.
+            if live_persist:
+                tb.save_state(symbol, state)
+            return _settled(HALT_EVIDENCE_COMMIT_FAILED)
     else:
         # DRY/ :     .
         try:
@@ -3205,7 +3210,7 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
     with global_lock():
         settled = _settle_positions(broker, symbol_config, settlement_run_id=_resolve_settlement_run_id(), persist=persist, now=now)
         if settled.halt_reason:
-            #  :    (committed=False), state   
+            #  :    (committed=False), state
             evidence_path = _write_settlement_evidence(
                 symbol_config["symbol"],
                 {
@@ -3218,6 +3223,7 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
                     "T": settled.T,
                 },
                 committed=False,
+                failure_reason=settled.halt_reason,
             )
             #  :     SymbolScopedError 
             problems = _verify_settlement_evidence(
@@ -3234,7 +3240,7 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
             real_problems = [p for p in problems if " " not in p]
             if real_problems:
                 raise _tb().SymbolScopedError(
-                    f"{symbol_config['symbol']}   : " + " / ".join(real_problems)
+                    f"{symbol_config['symbol']} 독립 검증 실패: " + " / ".join(real_problems)
                 )
             settled.evidence_path = evidence_path
             settled.evidence_id = settled.settlement_run_id
@@ -3267,7 +3273,7 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
         real_problems = [p for p in problems if " " not in p]
         if real_problems:
             raise _tb().SymbolScopedError(
-                f"{symbol_config['symbol']}   : " + " / ".join(real_problems)
+                f"{symbol_config['symbol']} 독립 검증 실패: " + " / ".join(real_problems)
             )
         if not _tb().TRADE_MODE == "DRY":
             _tb().save_state(symbol_config["symbol"], settled.state)
