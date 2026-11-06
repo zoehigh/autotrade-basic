@@ -976,8 +976,10 @@ def _is_authoritative_evidence(scope):
 
     scope 는 2차 방어선입니다 — 승격 실패 시 내부 근거를 되돌리지만(demote),
     되돌리기까지 실패한 경우에도 상세 근거는 확정 근거로 쓰이지 않습니다.
+    화이트리스트 방식을 씁니다: 장래에 새 scope 값이 추가돼도 조용히
+    authoritative 로 승격되지 않습니다.
     """
-    return scope != "settlement_detail"
+    return scope in ("", "settlement_summary")
 
 
 def latest_evidence_run_id(symbol=None):
@@ -2894,12 +2896,24 @@ def _settle_positions(
         history_days = 30
 
     # DRY 모드 또는 ORDER_HISTORY_VERBOSE=true 시 주문 이력 요약을 로그에 출력합니다.
-    order_history = broker.get_order_history(
-        symbol,
-        exchange,
-        days=history_days,
-        verbose=(tb.TRADE_MODE == "DRY" or tb.ORDER_HISTORY_VERBOSE),
-    )
+    try:
+        order_history = broker.get_order_history(
+            symbol,
+            exchange,
+            days=history_days,
+            verbose=(tb.TRADE_MODE == "DRY" or tb.ORDER_HISTORY_VERBOSE),
+        )
+    except Exception as e:
+        # 이력 조회 실패(타임아웃 등) → 정산 보류 (fail-closed).
+        # 잔고 조회 실패(balance_unavailable)와 대칭: 저장 없이 보류하고
+        # urgent 알림으로 즉시 인지합니다. 예외를 그대로 전파하지 않습니다.
+        print(f"[보류] {symbol} 주문 이력 조회 실패로 정산을 보류합니다: {e}")
+        tb.notify(
+            f"[보류] {symbol} 주문 이력 조회 실패로 SETTLE 를 보류했습니다. "
+            "브로커 API 상태를 확인한 뒤 재실행하세요.",
+            urgent=True,
+        )
+        return _settled("history_unavailable")
 
     # ── 진행 중(정규장) 세션 체결 차단 ──────────────────────────────
     # 정산 대상은 "직전 마감 세션"이지만, 장중에 SETTLE 을 수동 실행하면

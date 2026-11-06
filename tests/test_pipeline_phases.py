@@ -1484,6 +1484,44 @@ class TestPartialEvidenceCommit:
         assert pipeline.evidence_file_for_run("TQQQ", "run-test") == str(detail)
         assert pipeline.latest_evidence_run_id("TQQQ") == "run-test"
 
+    def test_hard_crash_between_promotions_is_not_settled(self, io):
+        """승격 사이 하드 크래시(SIGKILL): 내부만 committed여도 미확정.
+
+        저장→내부승격 후 프로세스가 죽어 외부 승격이 일어나지 않은 디스크
+        상태를 수동으로 조성합니다. demote 로직이 실행될 기회조차 없을 때
+        scope 표식만으로 확정 오인을 막는지 확인합니다.
+        """
+        state, buyer = TestSettle()._processed_state()
+        state["last_settlement_id"] = "run-test"
+        io["load"]("TQQQ", deepcopy(state))
+        inner = Path("settlement-TQQQ-20261026T093000Z.json")
+        inner.write_text(
+            json.dumps(
+                {
+                    "symbol": "TQQQ",
+                    "run_id": "run-test",
+                    "committed": True,
+                    "scope": "settlement_detail",
+                }
+            ),
+            encoding="utf-8",
+        )
+        outer = Path("settlement-TQQQ-20261026T093000Z-2.json")
+        outer.write_text(
+            json.dumps(
+                {
+                    "symbol": "TQQQ",
+                    "run_id": "run-test",
+                    "committed": False,
+                    "scope": "settlement_summary",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+        with pytest.raises(RuntimeError, match="커밋된 정산 근거 파일"):
+            pipeline.settled_from_state(_symbol_config())
+
 
 class TestStrictSettlementVerification:
     """P1: 정상 경로(detailed=True)는 "검증 불가"도 실패로 승격합니다.
@@ -5432,30 +5470,29 @@ class TestBrokerTimeoutDuringSettle:
     def test_history_read_timeout_never_saves_partial_settlement(
         self, io, monkeypatch
     ):
-        """주문 이력 조회 타임아웃 — 정산 미확정, state 저장 0회.
+        """주문 이력 조회 타임아웃 — `history_unavailable` 보류 + 저장 0회.
 
-        현재 구현은 이력 조회 실패를 `halt_reason` 으로 바꾸지 않고 예외를
-        그대로 올려보냅니다(SETTLE 계산에 필요한 데이터가 없으므로 부분 확정
-        자체가 불가). 그래서 두 층을 함께 고정합니다:
-          1) `settle_positions()` — 예외 전파 + 저장 0회 (부분 정산 금지)
-          2) 디스패처(`trading_bot`) — 해당 종목 실패로 집계(성공 아님) + 저장 0회
+        잔고 조회 실패(`balance_unavailable`)와 대칭: 예외를 그대로 전파하지
+        않고 halt 로 보류합니다. 저장 없이 보류 + urgent 알림 + 디스패처가
+        종목 실패(1)로 집계합니다.
         """
         state, buyer = TestSettle()._processed_state()
         io["load"]("TQQQ", deepcopy(state))
         broker = _make_broker(balance_qty=10, history=[buyer])
         broker.get_order_history.side_effect = TimeoutError("읽기 시간 초과")
 
-        with pytest.raises(TimeoutError, match="읽기 시간 초과"):
-            pipeline.settle_positions(
-                ReadOnlyBroker(broker),
-                _symbol_config(),
-                now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
-            )
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+        )
 
+        assert settled.halt_reason == "history_unavailable"
         assert io["saved"] == [], "이력 조회 실패 시 state 를 저장하면 안 됩니다"
         assert broker.place_order.call_count == 0
+        assert io["notifications"], "보류는 운영자 알림으로 남아야 합니다"
 
-        # 디스패처 계층: 예외를 삼키지 않고 종목 실패(1)로 집계합니다 (exit 0 금지).
+        # 디스패처 계층: 보류를 삼키지 않고 종목 실패(1)로 집계합니다.
         monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
         timed_out = _make_broker(balance_qty=10, history=[buyer])
         timed_out.get_order_history.side_effect = TimeoutError("읽기 시간 초과")
