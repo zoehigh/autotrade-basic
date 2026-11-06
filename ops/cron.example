@@ -5,35 +5,112 @@
 #
 # 서버 TZ가 Asia/Seoul 이므로 CRON_TZ 없이 KST 기준으로 동작합니다.
 #
-# ── 하루 흐름: 아침 정산 → (수동) 승인 → 18:30 실행 → 18:45 검증 ──
+# ── 하루 흐름 (기본: 수동 승인) ──
+# 아침 SETTLE → (아침 PREVIEW = 진단/참고용) … 저녁 PREVIEW → [운영자 plan_id + plan_hash 확인]
+#   → APPROVE → 18:30 EXECUTE → 18:45 VERIFY
 #
-#  1) 아침 SETTLE/PREVIEW (KST 10:05 / 10:15)
+# ⚠️ 승인 대상은 **저녁 PREVIEW(KST 18:15)** 산출물입니다.
+#    아침 PREVIEW(KST 10:15)는 세션·정산 진단용 참고 자료이며 승인에 쓰지 않습니다.
+#    (아침 계획을 8시간 뒤 EXECUTE 하면 변동성 종목이 가격 허용오차를 자주 벗어나
+#     승인이 보류됩니다 — 외부 리뷰 권고로 저녁 PREVIEW 를 정식 승인 경로로 둡니다.)
+#
+# ── 하루 흐름 (AUTO_EXECUTE=true opt-in) ──
+# 아침 정산 → PREVIEW → 자동 APPROVE → 자동 EXECUTE → 18:45 VERIFY (별도 런 유지)
+#   - AUTO_EXECUTE=true 이면 PREVIEW 직후 승인 파일(APPROVE)과 주문 실행(EXECUTE)을
+#     연속으로 수행합니다. plan_id 수동 복사가 불필요합니다.
+#   - 차단 사유(정산 보류/잔고 불일치/허용오차 이탈/세션 드리프트/펜스 등)가 있으면
+#     해당 종목만 AUTO_BLOCKED 로 중단하고 텔레그램(긴급) 알림을 보냅니다.
+#     다른 종목은 계속 진행합니다.
+#   - 모의투자(demo)도 자동 실행 시 프리장 개장(KST 17:00/18:00)까지 **자동 대기**합니다.
+#     따라서 아침(KST 10:15)에 실행해도 세션 날짜가 맞춰집니다.
+#     (real 과 동일하게 _wait_until_pre_market 이 동작합니다.)
+#   - VERIFY 는 기존과 같이 **별도 런**으로 유지합니다 (KST 18:45).
+#
+#  1) 아침 SETTLE (KST 10:05) + 아침 PREVIEW (KST 10:15, 진단/참고용)
 #     - SETTLE 은 정규장 마감(16:00 ET)뿐 아니라 **애프터아워 종료(20:00 ET)**
 #       이후에만 정산합니다. 동절기 KST 09:30 = ET 19:30 이라 아직 30분 남아
 #       있으므로, 여유를 두고 10:05 KST 에 실행합니다 (AFTER_HOURS_END_ET_HOUR 로 조정).
 #     - 직전 미국 세션은 KST 아침이면 이미 마감되어 있습니다.
 #     - SETTLE 은 **직전 마감 세션**을 정산하고, 주문 대상은 그 **다음 세션**입니다
-#       (주말·공휴일·서머타임은 XNYS 캘린더로 계산). 그래서 KST 아침(ET 전날 밤)
-#       PREVIEW 와 KST 18:30(ET 같은 날 새벽) EXECUTE 의 세션이 일치합니다.
-#  2) APPROVE (수동, EXECUTE 전)
-#     - PREVIEW 로그의 plan_id 를 운영자가 확인해 PLAN_ID 로 전달합니다.
+#       (주말·공휴일·서머타임은 XNYS 캘린더로 계산). 그래서 KST 저녁(ET 같은 날 새벽)
+#       의 PREVIEW/EXECUTE 와 세션이 일치합니다.
+#     - 아침 PREVIEW 는 **진단/참고용**입니다 (계획·세션·정산 상태를 눈으로 확인).
+#       승인 파일을 만들지 않으며, 이 산출물로 APPROVE 하지 마세요 — 8시간 뒤
+#       EXECUTE 되면 변동성 종목의 가격이 ±허용오차를 벗어나 승인 게이트에서
+#       보류되기 쉽습니다 (외부 리뷰 권고).
+#  1-b) 저녁 PREVIEW (KST 18:15) — **승인 대상 산출물**(plan_id/plan_hash)을 만드는 단계
+#     - EXECUTE(18:30) 15분 전이라 계획 시세와 주문 시점이 거의 같습니다. 그래서
+#       가격 허용오차 이탈로 인한 승인 보류가 아침 PREVIEW 대비 크게 줄어듭니다.
+#     - 출력 예 (로그·plans/<plan_id>.json 그대로):
+#         [PREVIEW] TQQQ — plan_id=TQQQ-2026-10-30-run-20261030-100500-20261030T091500Z-ab12cd34,
+#                   orders=3, state_hash=..., file=plans/TQQQ-2026-10-30-...-ab12cd34.json
+#       (plan_id = {종목}-{세션}-{정산 run_id}-{생성시각 Z}-{uuid8}. 로그의 plan_id 를
+#        그대로 복사하세요 — 손으로 조립하면 오타로 APPROVE 가 실패합니다.)
+#     - 승인 TTL(기본 9시간) 안에 APPROVE(18:20)·EXECUTE(18:30)가 끝나므로 여유롭습니다.
+#  2) APPROVE (수동 또는 AUTO_EXECUTE 자동)
+#     - 수동: PREVIEW 로그/plans/*.json 의 plan_id **와 plan_hash** 를 운영자가 확인해
+#       PLAN_ID + REVIEWED_PLAN_HASH 로 함께 전달합니다. 봇은 승인 파일을 쓰기 **전에**
+#       계획 파일의 plan_hash 와 대조하고, 불일치면 승인하지 않습니다 (외부 리뷰 P1 —
+#       "무엇을 검토했는지"를 해시로 묶음).
+#     - **plan_id 인계(handoff) 흐름** — 사람이 두 값을 그대로 옮깁니다:
+#         ① 저녁 PREVIEW 실행 → 로그에서 `plan_id=` 와 `plan_hash` 를 확인
+#            (또는 `plans/<plan_id>.json` 을 열어 "plan_id"/"plan_hash" 확인)
+#         ② 18:20 APPROVE 에 PLAN_ID + REVIEWED_PLAN_HASH 를 넣어 실행
+#         ③ 18:30 EXECUTE 에 **같은** plan_id/plan_hash 를 APPROVAL_PLAN_ID +
+#            REVIEWED_PLAN_HASH 로 넣어 실행 (승인 파일에 복사된 해시와 대조)
+#         ④ 18:45 VERIFY 는 APPROVAL_PLAN_ID 만 있으면 됩니다.
+#       예) PLAN_IDS=$(grep -h -o 'plan_id=[^ ,]*' logs/run-*.log | sed 's/.*plan_id=//' | paste -sd, -)
+#           → 로그/plans/ 에서 확인한 값과 **같은지 눈으로 대조한 뒤** APPROVE 에 넘깁니다.
+#       ⚠️ plan_id 는 PREVIEW 산출물 파일명과 1:1 이고, 파일이 사라지면(다른 디렉터리·
+#          정리) APPROVE 가 실패합니다 → PREVIEW 와 APPROVE 는 **같은 작업 디렉터리**에서
+#          실행하세요 (아래 "단독 단계 산출물 단절" 주의와 같은 이유).
+#     - 자동(AUTO_EXECUTE=true): PREVIEW 직후 plan 파일을 자동 승인 후 실행합니다.
 #  3) EXECUTE (KST 18:30) — 프리장 개장 이후라 계획 시세와 주문 시점이 어긋나지 않음.
+#     저녁 PREVIEW(18:15)와 15분 간격이므로 계획 가격이 그대로 유효할 가능성이 높습니다.
 #  4) VERIFY (KST 18:45) — 승인 파일 + 커밋된 SETTLE evidence + 브로커 read-only 대조.
 #
-# ⚠️ PLAN_ID / APPROVAL_PLAN_ID 는 **PREVIEW 1회마다 새로 생성되는 값**이라
-#    crontab 에 고정할 수 없습니다. 운영자가 PREVIEW 로그에서 복사해 수동 전달합니다:
+# ⚠️ AUTO_EXECUTE 는 **opt-in** 입니다. 디폴트(미설정/false) 는 기존 수동 승인 방식을
+#    그대로 유지합니다. 전체 종목에 적용되며, 심볼별 예외는 없습니다.
+#    실전 적용 전 DRY(토스/LS 등)로 1주일 이상 검증하세요.
 #
-#      1) RUN_PHASE=PREVIEW 실행 → 로그의 plan_id 확인
-#         "[PREVIEW] TQQQ — plan_id=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34, orders=2, ..."
-#         (plan_id 에 생성시각+uuid 가 포함되어 PREVIEW 를 다시 돌려도 이전 계획 파일을
-#          덮어쓰지 않습니다. APPROVE 는 그 plan_id 의 파일 내용+해시만 승인합니다.)
-#      2) 그 값을 APPROVE 의 PLAN_ID, EXECUTE/VERIFY 의 APPROVAL_PLAN_ID 로 복사
-#         (who: 당일 운영 담당자 / 값이 실행마다 달라 자동 cron 으로는 불가)
+# ⚠️ 아침 진단 PREVIEW 줄에는 `AUTO_EXECUTE=false` 를 **명시**하세요 (외부 리뷰 P1).
+#    `.env` 에 AUTO_EXECUTE=true 가 있으면, 그 값만 믿는 아침 PREVIEW 는 "진단"이 아니라
+#    자동 APPROVE → EXECUTE 연쇄(= 실제 주문)로 이어집니다. 아침 계획은 8시간 뒤 세션이라
+#    승인 대상도 아닙니다 — 아침 자동 실행을 원치 않으면 cron 라인에서 끄세요.
+#      과거 결함(수정됨): run_daily.sh 가 `.env` 를 읽을 때(`set -a; . ./.env`) export 된
+#      호출자 값을 덮어써 `AUTO_EXECUTE=false ops/run_daily.sh` 가 `.env` 의 true 로
+#      뒤집혔습니다. SYMBOLS/LAUNCH_MODE/RUN_LOCK_PATH 만 OVERRIDE_* 로 보존하고
+#      AUTO_EXECUTE 만 누락된 탓입니다. 지금은 AUTO_EXECUTE 도 호출자 값이 .env 보다
+#      우선하며, 빈 값(`AUTO_EXECUTE=`)도 "끄기"로 보존됩니다(미지정일 때만 .env 사용).
+#      값 해석(1/true/yes/on)은 봇이 하므로 `false`/`0`/빈 값 모두 끄기입니다.
 #
-#      수동 실행 예:
-#        RUN_PHASE=APPROVE PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
-#        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
-#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=TQQQ-2026-10-26-20261026T010000Z-run-...-ab12cd34 LAUNCH_MODE=LIVE ops/run_daily.sh
+#      수동 실행 예 (plan_hash 바인딩 — 사람이 검토한 계획 해시):
+#        # ① 저녁 PREVIEW (18:15) — 승인 대상 plan_id/plan_hash 생산
+#        RUN_PHASE=PREVIEW LAUNCH_MODE=LIVE ops/run_daily.sh
+#        #    → 로그의 plan_id / plans/<plan_id>.json 의 plan_hash 를 확인
+#        # ② APPROVE (18:20) — 검토한 plan_id + plan_hash 바인딩
+#        RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> \
+#          REVIEWED_PLAN_HASH=<plan_hash> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        # ③ EXECUTE (18:30) — 같은 plan_id/plan_hash
+#        RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> REVIEWED_PLAN_HASH=<plan_hash> \
+#          LAUNCH_MODE=LIVE ops/run_daily.sh
+#        # ④ VERIFY (18:45)
+#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        (plan_hash 는 PREVIEW 로그의 plan_hash 또는 plans/<plan_id>.json 의 "plan_hash".
+#         여러 종목은 PLAN_ID 와 **같은 개수**만큼 쉼표로 넘깁니다.)
+#        ⚠️ PLAN_ID 에는 **저녁 PREVIEW** 산출물을 넣으세요. 아침(10:15) PREVIEW 산출물을
+#           18:20 APPROVE 에 넣으면 계획이 8시간 낡아 가격 허용오차에서 자주 보류됩니다.
+#        ⚠️ PREVIEW → APPROVE 는 **같은 작업 디렉터리**에서 실행해야 합니다 (plans/<plan_id>.json
+#           가 그 디렉터리에 있어야 승인할 수 있습니다). 디렉터리가 바뀌면 저녁 PREVIEW 부터 다시.
+#        ⚠️ REVIEWED_PLAN_HASH 없이 APPROVE/EXECUTE 를 실행하면 봇은 바인딩 없이 기존대로
+#           진행합니다(하위호환). GitHub Actions 는 운영 계좌 real + LIVE 의 수동
+#           APPROVE/EXECUTE 에서 이 값을 **필수**로 강제합니다.
+#
+#      자동 실행 예 (AUTO_EXECUTE=true, PLAN_ID 불필요):
+#        RUN_PHASE=PREVIEW AUTO_EXECUTE=true LAUNCH_MODE=LIVE ops/run_daily.sh
+#        (PREVIEW → 자동 APPROVE → 자동 EXECUTE 를 한 번에 수행)
+#        RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE ops/run_daily.sh
+#        (VERIFY 는 여전히 APPROVAL_PLAN_ID 필요, 별도 런)
 #
 # ⚠️ LIVE 에서 계좌 지문을 쓰는 브로커(KIS/NHPLUG 등 account_no 설정)는 서버 환경변수
 #    ACCOUNT_FINGERPRINT_SECRET 이 **필수**입니다. 없으면 승인/실행이 fail-closed 로
@@ -63,10 +140,14 @@
 #
 # ── LIVE 는 RUN_PHASE 단계 실행이 필수입니다 ──
 # RUN_PHASE 없는 LIVE 는 브로커 생성 전에 SystemExit(1) 로 차단됩니다.
+# ⚠️ 호출자(cron 라인/셸)가 넘긴 RUN_PHASE 는 `.env` 의 RUN_PHASE 보다 **우선**합니다.
+#    `.env` 에 RUN_PHASE=EXECUTE 가 있어도 아래 아침 `RUN_PHASE=PREVIEW` 는 PREVIEW 로
+#    실행됩니다 (호출자가 미지정일 때만 `.env` 값 사용, 빈 값도 "호출자 지정"으로 보존).
 #
 # 5 10  * * 1-5 RUN_PHASE=SETTLE   LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
-# 20 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
+# 15 10 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE AUTO_EXECUTE=false /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 아침 = 진단/참고용 (승인 대상 아님, 자동주문 금지 — AUTO_EXECUTE=false 명시)
+# 15 18 * * 1-5 RUN_PHASE=PREVIEW  LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # 저녁 = 승인 대상 plan_id/plan_hash 생산
+# 20 18 * * 1-5 RUN_PHASE=APPROVE PLAN_ID=<PREVIEW plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh   # plan_id 는 저녁 PREVIEW 산출물
 # 30 18 * * 1-5 RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
 # 45 18 * * 1-5 RUN_PHASE=VERIFY  APPROVAL_PLAN_ID=<plan_id> LAUNCH_MODE=LIVE /home/ubuntu/investment/muhan-v4/ops/run_daily.sh
 #
@@ -77,3 +158,202 @@
 # VERIFY 종료코드: 0=정상(executed), 1=실행 실패/검증 실패, 2=승인만 되고 미실행.
 # run_daily.sh 는 LIVE 에서 exit 2 를 **실행 실패(exit 1)와 다른 문구**로 알립니다
 # (exit 2 = 승인만 됨, 운영자 확인 필요 / exit 1 = 주문·검증 실패, 긴급).
+#
+# ── 일일 정산 리포트 (텔레그램, SETTLE 종료 시 1회) ──
+# SETTLE 단계가 끝나면 종목별 정산 요약을 텔레그램으로 한 번 보냅니다
+# (`src/settlement_report.py`, 후크는 `trading_bot._dispatch_pipeline_phase_locked` 의 SETTLE 지점).
+#   · 내용: 종목별 "이번 정산 반영분"(매수/매도 수량·금액), T 와 순투입 변화, 확정 보유수량,
+#     그리고 전체 요약(완료/보류 종목 수, 미확정 체결금액 건수).
+#     실현손익·평가손익은 넣지 않습니다 (정산 원장 범위 밖).
+#   · ⚠️ 집계는 **델타**입니다 — 정산이 남기는 `qty_delta`/`amount_delta`(이번에 새로 반영된
+#     증가분)만 더합니다. 누적 체결을 더하면 부분체결(누적 7주 중 이번 2주)이 중복 집계됩니다.
+#     초기 전체 재추정(`full_reinference`)과 지연 체결(`late`)은 같은 델타 규칙으로 합산하되
+#     메시지에 "전체 재추정"/"지연 체결 N건"으로 따로 표시합니다.
+#   · ⚠️ 주문이력의 `ord_dt` 는 **주문일**(미국 영업일)이라 "전일 체결"로 단정할 수 없습니다.
+#     그래서 리포트는 "전일 체결" 대신 **"이번 정산 반영분"** 으로 표기합니다.
+#   · 발송 조건: **커밋된 정산 근거(committed=true)** 가 있는 종목만 "반영 완료"로 보냅니다.
+#     보류/검증 실패 종목은 성공 리포트 대신 **사유 + "신규 주문 차단"** 으로 알립니다
+#     (정산이 확정되지 않았는데 완료처럼 보이면 운영자가 다음 단계를 진행합니다).
+#   · 중복 방지 키 = broker + 계좌 지문 + 종목 + 정산 세션 + 리포트 버전.
+#     발송 상태는 거래 원장과 분리된 `.state.json` 의 종목별 `settlement_report` 키에 남깁니다.
+#     hosted 러너는 매 실행이 새 디렉터리라 **재시작 후 유지되는 유일한 저장소가 state 캐시**이기
+#     때문입니다 (별도 로컬 JSON 은 사라짐). 이 키는 `canonical_state_hash()` 에 포함되지 않아
+#     복구용 CAS 지문을 흔들지 않고, state 캐시 저장 가드(LIVE/REPAIR 만 저장)와도 일치합니다.
+#   · 발송 실패는 **정산에 영향을 주지 않습니다**: 발송은 state 저장이 끝난 뒤 부수 기능으로
+#     실행되고 예외를 흡수합니다. 실패하면 "발송 실패(재시도 가능)"만 기록하고 T·순투입·원장은
+#     건드리지 않으며, 같은 세션의 다음 실행에서 재시도합니다.
+#   · ⚠️ Telegram Bot API 에는 멱등 키가 없습니다. "전송 성공 → 발송 상태 저장" 사이에 프로세스가
+#     죽으면 같은 세션에서 **한 번 더** 발송될 수 있습니다(중복 알림 1건, 문서화된 한계).
+#   · DRY/REPAIR 는 발송하지 않습니다 (state 를 저장하지 않아 중복 방지 근거가 남지 않음).
+#   · 메시지에는 원문 주문번호·계좌번호를 넣지 않습니다 (집계·마스킹된 사유만).
+
+# ── GitHub Actions (repository_dispatch) 는 같은 5단계를 워크플로 안에서 수행합니다 ──
+# .github/workflows/trade_base.yml 이 run_phase 입력으로 단계를 받습니다
+# (RUN_PHASE 없는 LIVE 는 봇이 브로커 생성 전에 차단하므로 Actions 는 단계 지정이 필수).
+#
+#   run_phase 의 **기본값은 real/demo 모두 LIFECYCLE** 입니다 — 한 job 안에서
+#   SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY(주문 실행 검증) 를 연속 실행하므로
+#   PREVIEW 산출물이 같은 러너 작업 디렉터리에 남아 APPROVE/EXECUTE/VERIFY 가 그대로
+#   이어집니다 (산출물은 job 밖으로 안 넘어감).
+#     - real(운영 계좌): 기본 LIFECYCLE 이지만 **LIVE 주문에는 reviewed=true 표식이 필수** 입니다
+#       (아래 "사람 검토 표식"). 아침 dispatch 는 대기 시간 게이트에 걸리므로 실제 주문은 저녁 실행.
+#     - demo(모의 계좌): 기본 LIFECYCLE, reviewed 표식 불필요.
+#
+#   run_phase=LIFECYCLE: 한 job 안에서 SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY 를
+#     순서대로 실행합니다. 승인 파일은 PREVIEW 산출물에서 자동으로 이어지지만, 봇의 승인 게이트
+#     (plan_hash·세션·상태해시 바인딩, 허용오차, TTL)를 통과해야만 주문이 나갑니다.
+#
+#   ⚠️ 검증은 **두 축**이고 서로를 대신하지 않습니다 (결과를 섞어 "성공"으로 뭉개지 않음):
+#     · 주문 실행 검증 = `RUN_PHASE=VERIFY` — 거래 job 안에서 EXECUTE 직후 **자동** 실행.
+#       승인 파일 + 전송 기록(.transmitted.json) + 브로커 read-only 이력/잔고를 대조해
+#       "승인한 주문이 실제로 접수·전송됐는가"를 확인합니다.
+#       상태: PASS / FAIL / NOT_EXECUTED(승인만 되고 실행 기록 없음, 봇 exit 2) / SKIPPED(대상 없음).
+#       FAIL·NOT_EXECUTED 는 거래 job 실패입니다. 결과는 job output
+#       `order_verify_status`/`order_verify_summary` 로 넘어가 verify-settlement job 로그에도
+#       **별도 라벨**로 표시됩니다.
+#     · 정산 검증 = 같은 워크플로의 verify-settlement job (ops/verify_run.py) — settlement-*.json
+#       을 브로커 API 없이 독립 재계산합니다.
+#     → 정산 검증 성공은 주문 실행 검증 완료를 뜻하지 않습니다 (반대도 마찬가지).
+#     → 그래서 VERIFY 를 **같은 job** 에서 실행합니다: hosted fresh 러너는 매 실행이 새
+#       디렉터리라 VERIFY 에 필요한 산출물(approvals/·settlement-*.json·.state.json)을 artifact
+#       로 넘겨야 하고, 그 경로에는 원문 주문번호가 든 원장(odno-map)까지 올라갑니다
+#       (Evidence 는 gpg 암호화본만 업로드한다는 원칙과 충돌). 같은 job 이면 전달 자체가
+#       불필요하고 self-hosted 전용으로 제한할 이유도 없습니다.
+#   run_phase=SETTLE|PREVIEW|APPROVE|EXECUTE|VERIFY: 단일 단계만 실행 (진단·수동 확인용).
+#     EXECUTE 단독 실행도 끝나면 주문 실행 검증(RUN_PHASE=VERIFY)을 같은 job 에서 이어서
+#     수행합니다. `run_phase=VERIFY` 단독 실행은 봇이 수행한 결과(PASS/FAIL/NOT_EXECUTED)를
+#     그대로 job output(`order_verify_status`)에 남깁니다 — 검증했는데 "SKIPPED(생략)"로
+#     표시되거나 실패 시 빈 값이 되지 않습니다. 그 밖의 단독 단계(SETTLE/PREVIEW/APPROVE)는
+#     주문 실행 검증 대상이 없어 SKIPPED 로 기록됩니다.
+#     ⚠️ **앞 단계 산출물이 디스크에 남아 있어야** 동작합니다. 그래서 다음 환경 전용입니다:
+#        · self-hosted runner (작업 디렉터리가 실행 간 재사용됨), 또는
+#        · 로컬 (.state.json·plans/·approvals/ 가 있는 작업 디렉터리)
+#     ⚠️ self-hosted 에서도 `actions/checkout` 기본값(clean: true)은 `git clean -ffdx` 로
+#        **gitignore 산출물**(plans/, approvals/, settlement-*.json, odno-map-*.jsonl)을 지워
+#        체인을 끊습니다. 그래서 워크플로는 **단독 단계일 때만 `clean: false`** 로 산출물을
+#        보존하고(첫 단계 '실행 단계 정규화' 가 run_phase 를 보고 판정), LIFECYCLE·레거시는
+#        clean: true 입니다 (이전 실행 산출물이 이번 자동 체인에 섞이지 않도록).
+#        → 단독 단계는 **같은 self-hosted 러너의 같은 작업 디렉터리**에서 앞 단계를 먼저
+#          실행했을 때만 이어집니다. 러너/디렉터리가 바뀌면 앞 단계부터 다시 실행하세요.
+#     GitHub hosted(fresh) 러너는 매 실행이 새 디렉터리이고 캐시로 `.state.json` 만 복원하므로
+#     plans//approvals/, settlement-*.json 이 없습니다. 그래서 hosted 단독 실행은 **봇 실행
+#     전에 fail-closed 로 중단**합니다 ('실행 시간 예산 검증' 단계: 근거 없는 실행·검증을
+#     조용히 통과시키지 않습니다). 산출물을 job artifact 로 넘기는 방식은 정산 근거·주문번호
+#     원장의 **평문 원문 주문번호**를 artifact storage 에 올려야 해서 채택하지 않았습니다
+#     (Evidence 는 gpg 암호화본만 업로드한다는 기존 원칙과 충돌).
+#     hosted 의 정식 경로는 LIFECYCLE + 같은 워크플로의 verify-settlement 입니다.
+#     사람이 승인하는 정식 경로는 이 파일의 cron 5단계(수동 APPROVE, 작업 디렉터리 유지)입니다.
+#     ⚠️ 알려진 한계 — 산출물이 작업 디렉터리에 **누적**됩니다: 보존된 이전 실행의
+#        settlement-*.json 이 Evidence 에 함께 암호화되어 올라가고, verify-settlement job 은
+#        그 실행(run_id) 기준으로 검증하므로 **단독 단계 dispatch 의 검증 job 은 실패로 보일 수
+#        있습니다** (검증 기준 실행은 LIFECYCLE). 정산 검증까지 통과해야 하는 실행은
+#        LIFECYCLE 로 돌리세요.
+#   run_phase 를 비우면 레거시 단일 실행입니다 (DRY 미리보기 전용 — LIVE 는 봇이 차단).
+#
+# ── ⚠️ 사람 검토 표식 (운영 계좌 real 전용) ──
+#   LIFECYCLE 은 사람 개입 없이 계획을 자동 승인·자동 실행합니다. 그래서 운영 계좌(real)의
+#   **LIVE 주문 경로**(run_phase=LIFECYCLE, run_phase=EXECUTE, PREVIEW+AUTO_EXECUTE=true)는
+#   dispatch payload 에 "reviewed":"true" 표식을 **명시해야** 실행됩니다. 없으면 봇을 실행하지
+#   않고 중단합니다 (브로커 호출·주문·state 변경 없음).
+#     {"event_type":"trigger_trade_kis_real",
+#      "client_payload":{"run_phase":"LIFECYCLE","trade_mode":"LIVE","reviewed":"true"}}
+#   즉 "기계적 승인 게이트(plan_hash·세션·TTL)는 통과했고, 운영자가 이 실행을 승인했다" 는
+#   두 번째 서명입니다. 없으면 주문이 나가지 않습니다.
+#   demo(모의 계좌)는 표식이 필요하지 않습니다.
+#
+#   ── 두 경로를 구분하세요 (외부 리뷰 P1) ──
+#   ① 완전 자동 — run_phase=LIFECYCLE (+ reviewed=true)
+#      SETTLE → PREVIEW → APPROVE → EXECUTE 를 사람 개입 없이 연속 실행합니다.
+#      reviewed 는 PREVIEW **전에** 전달되므로 "사람이 이 계획의 가격·수량을 봤다"는
+#      증거가 아니라 "자동 진행을 정책적으로 승인한다"는 표식입니다. 정책상 허용하되
+#      "담당자 검토"라고 부르지 마세요 (봇의 기계적 게이트만 통과).
+#   ② 수동 승인 — run_phase=APPROVE/EXECUTE + plan_id + **plan_hash**
+#      사람이 본 계획(plan_id + plan_hash)을 승인 대상에 명시적으로 바인딩합니다.
+#      봇은 승인 파일을 쓰기 전(APPROVE)과 주문 직전(EXECUTE)에 plan_hash 를 대조하고,
+#      불일치면 중단합니다. Actions 는 운영 계좌 real + LIVE 의 수동 APPROVE/EXECUTE 에서
+#      plan_hash 를 **필수**로 요구합니다 (없으면 봇 실행 전 중단). 진짜 검토가 필요한
+#      경우 이 경로를 쓰세요.
+#
+# ── ⚠️ 잔여(미체결) 주문 정리 — 취소 API 지원 여부에 따라 다릅니다 ──
+#   봇은 새 주문을 내기 **전에** 자기가 낸 미체결 주문을 취소합니다 (중복 접수 방지).
+#   · 취소 API 지원: TOSS · MERITZ · LS — 오늘 세션 미체결 봇 주문을 취소하고 **확정까지**
+#     확인한 뒤 신규 주문을 냅니다.
+#   · 취소 API 미지원: KIS · KIWOOM · NHPLUG — 정리할 수단이 없으므로, **오늘 세션으로
+#     확정되는** 미체결 봇 주문이 남아 있으면 그 종목의 신규 주문을 **보류(fail-closed)** 합니다
+#     (매도=보유량 초과, 매수=시드 초과 중복 접수 위험). 같은 세션에서 EXECUTE 를 재실행하거나
+#     중단된 실행을 다시 돌릴 때 이 보류를 만날 수 있습니다.
+#     → 해소: 브로커 앱/웹에서 해당 종목의 미체결 주문을 **직접 취소**한 뒤 재실행하세요.
+#       (세션이 끝나면 주문은 만료되므로 다음 세션 실행은 정상입니다. 이전 세션 주문은
+#        만료 대상이라 취소·보류 판정에서 제외됩니다.)
+#     → 세션을 확정할 수 없는 이력 행(ord_tmd 등 시각 정보 없음)도 **보류(fail-closed)**
+#       합니다 (외부 리뷰 P1). 그 행이 실제로 살아 있는 오늘 주문이면 신규 주문이 중복
+#       접수되기 때문입니다. 6개 어댑터 모두 `ord_tmd` 를 채우므로 이 경로는 비정상(필드
+#       누락·레거시) 행에서만 발생합니다 — 그런 행이 보이면 이력 파싱 이상을 의심하세요.
+#     → 복구 절차(공통): ① 브로커 앱/웹에서 해당 종목의 미체결 주문을 **직접 확인**하고
+#       살아 있으면 **취소** → ② 같은 EXECUTE 를 재실행 (봇은 주문을 새로 내지 않고
+#       보류만 하므로 state·승인은 그대로입니다. 승인 TTL 이 지났으면 APPROVE 부터).
+#       ③ 이전 세션에서 남은 만료 주문이 원인이면 세션이 끝난 뒤 실행은 정상입니다
+#       (이전 세션 주문은 만료 대상이라 판정에서 제외).
+#
+# ── ⚠️ 실행 시각 (hosted 러너 6시간 제한) ──
+#   EXECUTE 는 프리장 개장(KST 17시/18시) **전이면 그때까지 대기**합니다. 아침 dispatch
+#   (예: KST 10시)는 최대 7.5시간을 기다려 GitHub hosted 러너의 6시간 제한을 넘고, 그러면
+#   job 이 강제 종료되어 **Evidence 업로드·정산 검증이 실행되지 않습니다**.
+#   그래서 워크플로는 대기 예상치가 상한(기본 4시간, vars.LIFECYCLE_MAX_WAIT_SECONDS)을
+#   넘으면 **실행 전에 fail-closed 로 중단**하고 아래와 같이 안내합니다:
+#     - 아침(KST 오전): run_phase=PREVIEW (정산이 필요하면 run_phase=SETTLE) — 계획만 생성
+#       ⚠️ hosted 러너의 아침 PREVIEW 산출물은 저녁 실행으로 **이어지지 않습니다** (런이 끝나면
+#          작업 디렉터리가 사라짐). 아침 PREVIEW 는 "계획 미리보기(로그 확인)" 목적입니다.
+#          계획 → 승인 → 실행을 실제로 이어가려면 LIFECYCLE 을 **저녁**에 한 번 실행하세요.
+#     - 저녁(KST 17시 이후): run_phase=LIFECYCLE (real 은 reviewed=true 동반) — 대기 없이 실행
+#       (기본값이 LIFECYCLE 이므로, 아침에 LIVE 로 dispatch 하면 위 대기 시간 게이트에서
+#        중단됩니다. 아침에는 trade_mode=DRY 또는 run_phase=PREVIEW 를 쓰세요.)
+#   self-hosted 러너(키움/토스 real)는 6시간 제한이 없어 이 게이트를 받지 않습니다.
+#   타임아웃은 **2단계**입니다 (사후 단계가 반드시 실행되도록):
+#     · 봇 실행 스텝: step-level `timeout-minutes` (= job timeout − 최소 10분)
+#       — 만료되면 그 스텝만 중단되고 always() 사후 단계(정산 스냅샷·state 캐시 저장·
+#         Evidence 암호화/업로드)가 **계속 실행**됩니다.
+#       기본값: hosted 340 / self-hosted 710. vars.BOT_STEP_TIMEOUT_MINUTES 로 조정 가능하며,
+#       job timeout 보다 10분 이상 짧아야 합니다 (넘으면 자동으로 job−10 으로 조정 + 경고).
+#     · job: `timeout-minutes` 는 그보다 **긴 최후 안전망**입니다. job timeout 이 만료되면
+#       실행 중 스텝과 이후 스텝이 모두 종료되어 사후 단계가 실행되지 않으므로, 실제 방어선은
+#       위 봇 스텝 타임아웃입니다. hosted 기본 350분(vars.JOB_TIMEOUT_MINUTES),
+#       self-hosted(키움/토스 real) 기본 720분(vars.SELF_HOSTED_JOB_TIMEOUT_MINUTES).
+#   세 var 모두 **양의 정수 문자열**만 유효합니다. 봇 스텝/job 값이 정수가 아니면 기본값 +
+#   ::warning:: 으로 대체되고, job timeout 이 10분 이하이면 사후 예산을 만들 수 없어 봇 실행
+#   전에 중단합니다 (job-level 값은 fromJSON 이라 정수가 아니면 잡이 시작 전에 실패 = fail-closed).
+#
+# ── ⚠️ Actions 는 cron 과 같은 시각대를 쓰세요 ──
+#   위 cron 예시(5 10 SETTLE / 15 10 PREVIEW(진단) / 15 18 PREVIEW(승인 대상) /
+#   20 18 APPROVE / 30 18 EXECUTE / 45 18 VERIFY) 가 정합 기준입니다.
+#   Actions 로 옮길 때도 **아침 = SETTLE(+참고용 PREVIEW)**, **저녁 = PREVIEW/APPROVE/EXECUTE/VERIFY**
+#   로 나누면 hosted 제한과 승인 TTL(기본 9시간) 안에 들어옵니다.
+#   승인·실행 대상 계획은 **저녁 PREVIEW** 산출물입니다 (아침 PREVIEW 는 참고용).
+#   (repository_dispatch 스케줄러는 이 저장소가 아니라 외부 cron/GitHub schedule 쪽에서
+#    돌리므로, 스케줄 자체를 이 워크플로에 넣지 않습니다 — AGENTS.md 참고.)
+#
+# ── ⚠️ Actions 의 비밀값 배선 ──
+#   ACCOUNT_FINGERPRINT_SECRET 은 **워크플로가 선언·export** 합니다
+#   (.github/workflows/trade_base.yml secrets + 봇 실행 스텝 env). 없으면 LIVE 승인/실행이
+#   fail-closed 로 중단되므로, environment({broker}-{mode}) 비밀값으로 등록하세요.
+#   계좌번호가 없는 브로커(메리츠)는 vars.MERITZ_ACCOUNT_BINDING(또는 BROKER_ACCOUNT_BINDING)
+#   도 함께 등록해야 합니다. 값은 로그에 출력하지 않습니다 (자동 마스킹).
+#
+#   ⚠️ SETTLE 이 보류를 반환하면(애프터아워 미종료·정산 미확정·휴장일 등) SETTLE 단계가
+#      실패로 끝나 체인이 중단됩니다 (fail-closed: 정산 미확정 상태로 주문하지 않음).
+#   ⚠️ 담당자 검토를 반드시 거치려면 이 파일의 cron 5단계(수동 APPROVE + **plan_hash**)를
+#      쓰세요. reviewed=true 만 넘기는 LIFECYCLE 은 자동 진행(정책 승인)이며, 사람이 특정
+#      계획을 봤다는 증거가 없습니다. dispatch payload 로도 단계를 지정할 수 있습니다:
+#      · 미리보기만 (아침, 주문 없음)
+#        {"event_type":"trigger_trade_kis_real","client_payload":{"run_phase":"PREVIEW","trade_mode":"DRY"}}
+#      · 실제 주문 (저녁, 자동 진행 — 사람 검토 증거 없음)
+#        {"event_type":"trigger_trade_kis_real",
+#         "client_payload":{"run_phase":"LIFECYCLE","trade_mode":"LIVE","reviewed":"true"}}
+#      · 실제 주문 (수동 승인 — 사람이 검토한 계획 해시 바인딩, real LIVE 는 plan_hash 필수)
+#        {"event_type":"trigger_trade_kis_real",
+#         "client_payload":{"run_phase":"APPROVE","trade_mode":"LIVE",
+#                           "plan_id":"<PREVIEW plan_id>","plan_hash":"<64자리 hex>"}}
+#        {"event_type":"trigger_trade_kis_real",
+#         "client_payload":{"run_phase":"EXECUTE","trade_mode":"LIVE",
+#                           "approval_plan_id":"<plan_id>","plan_hash":"<같은 값>"}}
+
