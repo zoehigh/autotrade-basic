@@ -1411,6 +1411,182 @@ class TestEvidenceCommitFailure:
         assert "evidence_commit_failed" in report.halt_reason
 
 
+class TestPartialEvidenceCommit:
+    """P0: 내부 근거만 커밋되고 외부 근거 커밋이 실패하면 정산 확정이 아닙니다.
+
+    SETTLE 은 근거를 내부(상세) → 외부(요약) 순서로 승격하며 **외부가 마지막 =
+    커밋 시점**입니다. 내부만 커밋된 상태를 확정으로 인정하면, 외부 근거 기록이
+    실패한 SETTLE 을 PREVIEW 가 정상으로 받아들입니다.
+    """
+
+    def _fail_external_commit(self, monkeypatch):
+        """committed=True 두 번째 호출(외부 승격)만 OSError 로 실패시킵니다."""
+        original = pipeline._mark_evidence_committed
+        committed_calls = []
+
+        def _mark(path, evidence, committed, failure_reason=""):
+            if committed:
+                committed_calls.append(str(path))
+                if len(committed_calls) == 2:
+                    raise OSError("외부 근거 승격 실패 (테스트 주입)")
+            return original(path, evidence, committed, failure_reason)
+
+        monkeypatch.setattr(pipeline, "_mark_evidence_committed", _mark)
+        return committed_calls
+
+    def test_partial_commit_is_not_a_settled_evidence(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        committed_calls = self._fail_external_commit(monkeypatch)
+
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+            _symbol_config(),
+            now=datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc),
+        )
+
+        assert len(committed_calls) == 2, "내부 → 외부 순서로 승격을 시도해야 합니다"
+        assert settled.halt_reason == pipeline.HALT_EVIDENCE_COMMIT_FAILED
+        assert len(io["saved"]) == 1, "state 는 이미 저장된 채로 유지합니다"
+        # 내부 상세 근거는 best-effort 로 되돌립니다 (부분 커밋 금지).
+        internal = json.loads(Path(committed_calls[0]).read_text(encoding="utf-8"))
+        assert internal["scope"] == "settlement_detail"
+        assert internal["committed"] is False
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+
+        # 후속 PREVIEW 는 커밋된 외부 근거가 없어 fail-closed 로 거부합니다.
+        io["load"]("TQQQ", deepcopy(io["saved"][0]))
+        with pytest.raises(RuntimeError, match="정산 근거 파일"):
+            trading_bot._settled_from_state(_symbol_config())
+
+    def test_only_detail_scope_is_not_authoritative(self, io):
+        """내부 상세 근거만 커밋된 파일은 확정 근거가 아닙니다 (구버전은 인정)."""
+        detail = Path("settlement-TQQQ-20261026T093000Z.json")
+        detail.write_text(
+            json.dumps(
+                {
+                    "symbol": "TQQQ",
+                    "run_id": "run-test",
+                    "committed": True,
+                    "scope": "settlement_detail",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+        assert pipeline.latest_evidence_run_id("TQQQ") == ""
+
+        # 구버전 파일(scope 없음)은 하위 호환으로 authoritative 입니다.
+        detail.write_text(
+            json.dumps({"symbol": "TQQQ", "run_id": "run-test", "committed": True}),
+            encoding="utf-8",
+        )
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == str(detail)
+        assert pipeline.latest_evidence_run_id("TQQQ") == "run-test"
+
+
+class TestStrictSettlementVerification:
+    """P1: 정상 경로(detailed=True)는 "검증 불가"도 실패로 승격합니다.
+
+    검증기 입력 부족(판정 불가)을 통과시키면 잘못된 T/순투입이 커밋됩니다.
+    보류 경로(detailed=False, 저장 없음)만 "기록 존재 확인" 별도 계약입니다.
+    """
+
+    def test_verification_unavailable_blocks_live_save(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        calls = []
+
+        def _verify(evidence):
+            calls.append(evidence)
+            # 1번째 = 저장 전 내부 검증(정상), 2번째 = 정상 경로 상세 검증
+            if len(calls) == 1:
+                return []
+            return ["정산 전 T 기준이 근거에 없습니다 (검증 불가)"]
+
+        monkeypatch.setattr(pipeline, "_verify_settlement_evidence", _verify)
+
+        with pytest.raises(trading_bot.SymbolScopedError, match="독립 검증 실패"):
+            pipeline.settle_positions(
+                ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+                _symbol_config(),
+                now=datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc),
+            )
+
+        assert len(calls) == 2, "정상 경로 상세 검증까지 실행되어야 합니다 (전제)"
+        assert io["saved"] == [], "판정 불가 정산은 저장하면 안 됩니다"
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+
+    def test_evidence_write_failure_blocks_settle(self, io, monkeypatch):
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+
+        def _write(*args, **kwargs):
+            raise OSError("디스크 가득참 (테스트 주입)")
+
+        monkeypatch.setattr(pipeline, "_write_settlement_evidence", _write)
+
+        with pytest.raises(trading_bot.SymbolScopedError, match="정산 근거 기록 실패"):
+            pipeline.settle_positions(
+                ReadOnlyBroker(_make_broker(balance_qty=10, history=[buyer])),
+                _symbol_config(),
+                now=datetime(2026, 10, 26, 9, 30, tzinfo=timezone.utc),
+            )
+
+        assert io["saved"] == [], "근거 없는 정산은 저장하면 안 됩니다"
+        assert pipeline.evidence_file_for_run("TQQQ", "run-test") == ""
+        assert list(Path(".").glob("settlement-*.json")) == []
+
+
+class TestMixedSideFillSigns:
+    """P0: 매수/매도 혼합 행의 체결 순변동 부호 계산."""
+
+    @staticmethod
+    def _row(odno, side, qty, ord_dt="20261026"):
+        return {
+            "odno": odno,
+            "ord_dt": ord_dt,
+            "ord_tmd": "040000",
+            "sll_buy_dvsn_cd_name": side,
+            "ft_ccld_qty": str(qty),
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+
+    def test_split_session_fills_mixed_sides_net_qty(self):
+        history = [
+            self._row("IN1", "매수", 3, ord_dt="20261023"),
+            self._row("D_BUY", "매수", 10),
+            self._row("D_SELL", "매도", 4),
+            self._row("D_UNKNOWN", "", 7),
+        ]
+        scoped, deferred, net_qty = pipeline._split_settlement_session_fills(
+            history, "2026-10-23"
+        )
+        assert [row["odno"] for row in scoped] == ["IN1"]
+        assert [row["odno"] for row in deferred] == ["D_BUY", "D_SELL", "D_UNKNOWN"]
+        assert net_qty == 6, "매수 +10, 매도 -4, 방향 미해석 행은 부호 계산 제외"
+
+    def test_deferred_fills_explained_uses_mixed_side_signs(self):
+        deferred = [
+            self._row("D_BUY", "매수", 10),
+            self._row("D_SELL", "매도", 4),
+        ]
+        state = {"position_qty": 10}
+
+        # 워터마크 10주 + 순변동 +6 = 잔고 16주 → 통과
+        pipeline._assert_deferred_fills_explained(
+            "TQQQ", state, deferred, Balance(quantity=16, avg_price=50.0)
+        )
+        # 부호를 반대로 계산하면 4주가 되어 잔고 12주에서도 어긋납니다 → fail-closed
+        with pytest.raises(
+            trading_bot.SymbolScopedError, match="보류 체결 검증 실패"
+        ):
+            pipeline._assert_deferred_fills_explained(
+                "TQQQ", state, deferred, Balance(quantity=12, avg_price=50.0)
+            )
+
+
 class TestForceTSettleRefusal:
     """P2: SETTLE 경로에서는 FORCE_T 를 적용하지 않습니다 (REPAIR 단독 경로)."""
 

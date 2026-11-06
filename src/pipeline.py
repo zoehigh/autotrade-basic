@@ -945,14 +945,39 @@ def _evidence_candidates(symbol=None):
 
 
 def _load_evidence_candidate(path):
-    """evidence 파일을 읽고 (run_id, committed) 를 반환합니다."""
+    """evidence 파일을 읽고 (run_id, committed, scope) 를 반환합니다.
+
+    `scope` 는 근거의 종류 표식입니다. SETTLE 은 같은 run_id 로 **내부 상세 근거**
+    (`settlement_detail`)와 **외부 요약 근거**(`settlement_summary`)를 각각
+    기록합니다. 구버전 파일에는 scope 가 없으며, 그때는 요약 근거로 취급합니다
+    (하위 호환 — 기존 운영 파일이 계속 PREVIEW 근거로 인정되어야 합니다).
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return "", False
+        return "", False, ""
     if not isinstance(data, dict):
-        return "", False
-    return str(data.get("run_id") or "").strip(), data.get("committed") is True
+        return "", False, ""
+    return (
+        str(data.get("run_id") or "").strip(),
+        data.get("committed") is True,
+        str(data.get("scope") or "").strip(),
+    )
+
+
+def _is_authoritative_evidence(scope):
+    """PREVIEW/APPROVE/VERIFY 가 신뢰할 수 있는 **정산 확정 근거**인지 판정합니다.
+
+    SETTLE 은 근거를 내부(상세) → 외부(요약) 순서로 `committed=true` 로
+    승격합니다. 내부 상세 근거만 커밋된 상태를 정산 확정으로 인정하면, 외부
+    근거 기록이 실패해도 PREVIEW 가 실패한 정산을 정상으로 받아들입니다
+    (부분 커밋). 그래서 **외부 요약 근거(또는 scope 가 없는 구버전 파일)만**
+    authoritative 로 인정합니다.
+
+    scope 는 2차 방어선입니다 — 승격 실패 시 내부 근거를 되돌리지만(demote),
+    되돌리기까지 실패한 경우에도 상세 근거는 확정 근거로 쓰이지 않습니다.
+    """
+    return scope != "settlement_detail"
 
 
 def latest_evidence_run_id(symbol=None):
@@ -960,21 +985,30 @@ def latest_evidence_run_id(symbol=None):
 
     committed=true 는 SETTLE 이 실제로 state 를 저장한 뒤 기록됩니다.
     실패/보류/DRY evidence 는 committed=false 이므로 사용하지 않습니다 (P1-E).
+    내부 상세 근거(scope=settlement_detail)만 커밋된 부분 커밋도 제외합니다.
     """
     for path in _evidence_candidates(symbol):
-        run_id, committed = _load_evidence_candidate(path)
-        if run_id and committed:
+        run_id, committed, scope = _load_evidence_candidate(path)
+        if run_id and committed and _is_authoritative_evidence(scope):
             return run_id
     return ""
 
 
 def evidence_file_for_run(symbol, run_id):
-    """run_id 가 일치하는 **커밋된** 정산 evidence 파일 경로 (없으면 '')."""
+    """run_id 가 일치하는 **커밋된 외부 요약** 정산 evidence 파일 경로 (없으면 '').
+
+    내부 상세 근거(`scope=settlement_detail`)만 커밋된 파일은 반환하지 않습니다
+    — 외부 요약 근거 커밋이 곧 정산 확정 시점입니다 (부분 커밋 방지).
+    """
     if not run_id:
         return ""
     for path in _evidence_candidates(symbol):
-        candidate_run_id, committed = _load_evidence_candidate(path)
-        if candidate_run_id == str(run_id) and committed:
+        candidate_run_id, committed, scope = _load_evidence_candidate(path)
+        if (
+            candidate_run_id == str(run_id)
+            and committed
+            and _is_authoritative_evidence(scope)
+        ):
             return str(path)
     return ""
 
@@ -3049,6 +3083,10 @@ def _settle_positions(
     # 뒤 기대 잔고에 순변동을 더해야 합니다. 목록이 없는 구버전 근거는 기존의
     # 엄격한 동작을 그대로 유지합니다.
     settlement_evidence["deferred_fills"] = _deferred_fills_evidence(deferred_fills)
+    # 근거 종류 표식: 내부 **상세** 근거입니다. 외부 요약 근거(감사용)와 파일명이
+    # 같은 초에 겹칠 수 있고 run_id 도 같으므로, "정산 확정 근거" 판정에서 상세
+    # 근거를 제외하려면 이 표식이 필요합니다 (`evidence_file_for_run`).
+    settlement_evidence["scope"] = "settlement_detail"
 
     hold = bool(state.get("_pending_amount_odnos") or state.get("_settlement_hold"))
     # 저장 **전** 독립 재계산 + 잔고 교차검증을 통과해야 합니다.
@@ -3490,6 +3528,9 @@ def _settlement_evidence_summary(settled, *, include_detail=False):
     summary = {
         "symbol": settled.symbol,
         "run_id": settled.settlement_run_id,
+        # 외부(디스패처 감사용) **요약** 근거 표식입니다. 내부 상세 근거
+        # (`settlement_detail`)와 구분해 "정산 확정 근거" 판정에 씁니다.
+        "scope": "settlement_summary",
         "mode": _tb().TRADE_MODE,
         "halt_reason": settled.halt_reason or "",
         "settled_session": settled.settled_session,
@@ -3505,18 +3546,28 @@ def _settlement_evidence_summary(settled, *, include_detail=False):
 
 
 def _verify_settlement_record(symbol, settled, evidence_path, *, detailed):
-    """기록한 정산 근거를 독립 검증합니다 (인프라 "검증 불가"만 제외).
+    """기록한 정산 근거를 독립 검증합니다.
 
-    - detailed=True: 내부 정산 내역을 포함한 근거를 검증 (실제 독립 재계산)
-    - detailed=False: 요약 근거의 **기록 여부**만 확인 (보류 경로)
-
-    "검증 불가"는 검증기 입력 부재(구버전 근거·log_salt 등)로 **판정 불가**라는
-    뜻이므로 실패로 승격하지 않습니다. 그 밖의 불일치는 그대로 실패입니다.
+    - detailed=True (**정상 경로**): 내부 정산 내역을 포함한 근거를 실제로 독립
+      재계산합니다. "검증 불가"(검증기 입력 부재 = 판정 불가)도 **실패**입니다.
+      판정할 수 없는 정산을 확정하면 잘못된 T/순투입이 state 에 커밋되므로,
+      문제가 하나라도 있으면 전부 예외로 승격합니다.
+    - detailed=False (**보류 경로**, state 저장 없음): 요약 근거의 **기록 여부**만
+      확인하는 별도 계약입니다. 이 경로는 저장·승격이 없어 확정 위험이 없으므로
+      "검증 불가"는 제외합니다 (기존 동작 유지).
     """
     evidence = _settlement_evidence_summary(settled, include_detail=detailed)
     evidence["evidence_path"] = evidence_path
     evidence["committed"] = False
     problems = _verify_settlement_evidence(evidence)
+    if detailed:
+        if problems:
+            raise _tb().SymbolScopedError(
+                f"{symbol} 독립 검증 실패: " + " / ".join(problems)
+            )
+        return problems
+    # 보류 경로는 "기록 존재 확인"용 별도 계약입니다 — 저장이 없으므로 판정
+    # 불가(검증 불가)를 실패로 승격하지 않습니다.
     real_problems = [p for p in problems if "검증 불가" not in p]
     if real_problems:
         raise _tb().SymbolScopedError(
@@ -3597,7 +3648,8 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
         if live_persist:
             tb.save_state(symbol, settled.state)
             try:
-                # 4) 내부 근거 → 5) 외부 근거 순서로 승격합니다.
+                # 4) 내부 근거 → 5) 외부 근거 순서로 승격합니다. 외부가 마지막 =
+                #    커밋 시점입니다 (`evidence_file_for_run` 이 외부만 인정).
                 if settled.evidence_path:
                     _mark_evidence_committed(
                         settled.evidence_path, settled.evidence or {}, True
@@ -3608,6 +3660,20 @@ def settle_positions(broker, symbol_config, *, persist=True, now=None):
                     True,
                 )
             except OSError as commit_error:
+                # 부분 커밋을 남기지 않습니다: 내부 상세 근거만 committed=true 로
+                # 남으면 PREVIEW/VERIFY 가 실패한 정산을 확정으로 오인할 수
+                # 있습니다. best-effort 로 되돌리고, 되돌리기까지 실패해도 scope
+                # 표식(`settlement_detail`)이 2차 방어선입니다.
+                if settled.evidence_path:
+                    try:
+                        _mark_evidence_committed(
+                            settled.evidence_path,
+                            settled.evidence or {},
+                            False,
+                            HALT_EVIDENCE_COMMIT_FAILED,
+                        )
+                    except OSError:
+                        pass
                 # state 는 **이미 저장**됐습니다. 되돌리면 실제 거래 상태/워터마크가
                 # 유실돼 더 위험하므로 그대로 둡니다. 다만 근거 승격에 실패했다면
                 # 이 SETTLE 은 확정이 아닙니다 (PREVIEW 는 committed 근거가 없어
