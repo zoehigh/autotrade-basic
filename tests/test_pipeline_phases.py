@@ -5414,3 +5414,152 @@ class TestDeferredFillOwnership:
             _deferred_fill(odno="A2", side="매도", qty="1", amount="50"),
         ]
         assert pipeline._unregistered_deferred_fills(state, rows) == rows
+
+
+# ── 브로커 읽기 타임아웃 / DRY 전구간 / halt 후 복구 ────────────────
+#
+# wall-clock 비의존: 모든 SETTLE 호출에 `now` 를 명시 인자로 넘기고
+# `_FixedDateTime` 같은 전역 시간 모킹은 쓰지 않습니다.
+
+
+class TestBrokerTimeoutDuringSettle:
+    """브로커 읽기 API 가 TimeoutError 를 올릴 때 정산이 확정되지 않아야 합니다.
+
+    정산은 T/순투입/원장을 한 번에 확정하므로, 읽기 실패를 부분 정산으로
+    저장하면 다음 RUN 에서 재처리할 수 없습니다 (잘못된 T 가 고정됨).
+    """
+
+    def test_history_read_timeout_never_saves_partial_settlement(
+        self, io, monkeypatch
+    ):
+        """주문 이력 조회 타임아웃 — 정산 미확정, state 저장 0회.
+
+        현재 구현은 이력 조회 실패를 `halt_reason` 으로 바꾸지 않고 예외를
+        그대로 올려보냅니다(SETTLE 계산에 필요한 데이터가 없으므로 부분 확정
+        자체가 불가). 그래서 두 층을 함께 고정합니다:
+          1) `settle_positions()` — 예외 전파 + 저장 0회 (부분 정산 금지)
+          2) 디스패처(`trading_bot`) — 해당 종목 실패로 집계(성공 아님) + 저장 0회
+        """
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=10, history=[buyer])
+        broker.get_order_history.side_effect = TimeoutError("읽기 시간 초과")
+
+        with pytest.raises(TimeoutError, match="읽기 시간 초과"):
+            pipeline.settle_positions(
+                ReadOnlyBroker(broker),
+                _symbol_config(),
+                now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+            )
+
+        assert io["saved"] == [], "이력 조회 실패 시 state 를 저장하면 안 됩니다"
+        assert broker.place_order.call_count == 0
+
+        # 디스패처 계층: 예외를 삼키지 않고 종목 실패(1)로 집계합니다 (exit 0 금지).
+        monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+        timed_out = _make_broker(balance_qty=10, history=[buyer])
+        timed_out.get_order_history.side_effect = TimeoutError("읽기 시간 초과")
+        assert trading_bot._dispatch_pipeline_phase("SETTLE", timed_out) == 1, (
+            "이력 조회 타임아웃은 종목 실패로 집계돼야 합니다"
+        )
+        assert io["saved"] == [], "타임아웃 종목은 저장하지 않아야 합니다"
+
+    def test_balance_read_timeout_halts_and_does_not_save(self, io):
+        """잔고 조회 타임아웃 — `balance_unavailable` 보류 + 저장 0회."""
+        state, buyer = TestSettle()._processed_state()
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=10, history=[buyer])
+        broker.get_balance.side_effect = TimeoutError("읽기 시간 초과")
+
+        settled = pipeline.settle_positions(
+            ReadOnlyBroker(broker),
+            _symbol_config(),
+            now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+        )
+
+        assert settled.halt_reason == "balance_unavailable"
+        assert io["saved"] == [], "잔고 미확인 SETTLE 은 저장하면 안 됩니다"
+        assert broker.place_order.call_count == 0
+        assert io["notifications"], "보류는 운영자 알림으로 남아야 합니다"
+
+
+def test_dry_full_pipeline_no_side_effects(io, monkeypatch):
+    """DRY 전구간: SETTLE → PREVIEW → APPROVE → EXECUTE 에서 저장/주문 0회.
+
+    DRY 는 미리보기/진단 모드입니다. 실제 주문 경로(EXECUTE)는 DRY 에서
+    **경계 게이트로 거부**되며, 거부되기 전까지 어떤 state 저장도 없어야 합니다.
+    """
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    state, buyer = TestSettle()._processed_state()
+    io["load"]("TQQQ", deepcopy(state))
+    broker = _make_broker(balance_qty=10, history=[buyer])
+
+    # 1) SETTLE (DRY) — halt 없음, 저장 없음
+    settled = pipeline.settle_positions(ReadOnlyBroker(broker), _symbol_config())
+    assert settled.halt_reason is None
+    assert io["saved"] == [], "DRY SETTLE 는 state 를 저장하지 않아야 합니다"
+
+    # 2) PREVIEW — 계획 생성/기록만, 저장·주문 없음
+    plan = pipeline.build_order_plan(settled, ReadOnlyBroker(broker))
+    plan_path = pipeline.write_order_plan(plan)
+    assert Path(plan_path).exists()
+    assert plan.orders, "전구간 검증을 위해 주문이 1건 이상 있어야 합니다"
+    assert io["saved"] == []
+    assert broker.place_order.call_count == 0
+
+    # 3) APPROVE — 승인 파일 기록만, 저장·주문 없음
+    approval_path_str = pipeline.approve_plan_file(plan_path)
+    assert Path(approval_path_str).exists()
+    assert io["saved"] == []
+    assert broker.place_order.call_count == 0
+
+    # 4) EXECUTE — DRY 는 LIVE+EXECUTE 경계에서 거부 (주문 API 도달 전)
+    with pytest.raises(RuntimeError, match="LIVE.*EXECUTE"):
+        pipeline_execute.execute_approved_plan(
+            broker, approval_path_str, now=_fixed_now()
+        )
+
+    assert broker.place_order.call_count == 0, "DRY 에서 주문이 나가면 안 됩니다"
+    assert io["saved"] == [], "DRY 전구간에서 state 저장은 0회여야 합니다"
+    assert pipeline.load_approval(approval_path_str)["consumed"] is False, (
+        "거부된 승인은 소비되면 안 됩니다"
+    )
+
+
+def test_halt_then_recovery_rerun_settles(io):
+    """보류(halt) 후 같은 state 로 재실행하면 정상 정산·저장·PREVIEW 입력이 됩니다."""
+    state, buyer = TestSettle()._processed_state()
+    io["load"]("TQQQ", deepcopy(state))
+
+    # 1차: 잔고 조회 실패(예외) → 보류, 저장 0회
+    # 주의: `get_balance()` 가 None 을 돌려주는 것은 "잔고 0주"로 해석되어
+    # 보류 사유가 되지 않습니다(이력 10주와 불일치하면 T=0 자동보정 후 중단).
+    # 보류(balance_unavailable)는 **예외** 경로입니다.
+    failing = _make_broker(balance_qty=10, history=[buyer])
+    failing.get_balance.side_effect = TimeoutError("읽기 시간 초과")
+    halted = pipeline.settle_positions(
+        ReadOnlyBroker(failing),
+        _symbol_config(),
+        now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    assert halted.halt_reason == "balance_unavailable"
+    assert io["saved"] == [], "보류 실행은 state 를 저장하지 않아야 합니다"
+    assert failing.place_order.call_count == 0
+
+    # 2차: 같은 state + 정상 broker → 보류 해제, 저장 1회
+    recovered = _make_broker(balance_qty=10, history=[buyer])
+    settled = pipeline.settle_positions(
+        ReadOnlyBroker(recovered),
+        _symbol_config(),
+        now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc),
+    )
+    assert settled.halt_reason is None, "보류 사유가 남아 있으면 복구가 아닙니다"
+    assert len(io["saved"]) == 1, "복구 실행은 정확히 1회 저장해야 합니다"
+    assert io["saved"][0]["T"] == pytest.approx(2.0)
+
+    # 후속 단계(PREVIEW)가 같은 state 로 이어서 재계산할 수 있어야 합니다.
+    preview_input = trading_bot._settled_from_state(_symbol_config())
+    assert preview_input.halt_reason is None
+    assert preview_input.T == pytest.approx(2.0)
+    assert preview_input.state["last_settlement_id"] == "run-test"
+    assert preview_input.settlement_run_id == "run-test"
