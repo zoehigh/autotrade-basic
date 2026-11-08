@@ -1,6 +1,8 @@
 name: Backup state caches (encrypted)
 
-# Read-only recovery of six known cache snapshots. Never executes trading.
+# Read-only recovery of known cache snapshots. Never executes trading.
+# 이전 키(40009255811 등 6개)는 캐시 보존기간(7일 미사용)으로 이미 만료돼 제거했습니다.
+# 현재 대상: NHPlug 데모 SOXL 복구 전 스냅샷 (11/6 실행 직후 캐시, 복구 전 백업용)
 on:
   workflow_dispatch:
 
@@ -15,18 +17,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: kis-before
-            key: state-kis-demo-40009255811
-          - label: kis-after
-            key: state-kis-demo-40384302200
-          - label: kiwoom-before
-            key: state-kiwoom-demo-40009933869
-          - label: kiwoom-after
-            key: state-kiwoom-demo-40385059348
-          - label: nhplug-before
-            key: state-nhplug-demo-40010604565
-          - label: nhplug-after
-            key: state-nhplug-demo-40385826091
+          - label: nhplug-soxl-repair-before
+            key: state-nhplug-demo-42287486160
 
     steps:
       - name: Restore the exact snapshot
@@ -56,10 +48,30 @@ jobs:
               --output "backup-${{ matrix.label }}.gpg" .state.json
           test -s "backup-${{ matrix.label }}.gpg"
 
+          # 왕복 검증: 방금 만든 암호문을 다시 복호화해 원본과 바이트 단위로 같은지 확인합니다.
+          # (업로드 후 복호화 불가·손상 백업을 뒤늦게 발견하는 일을 막습니다)
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt --output roundtrip.state.json "backup-${{ matrix.label }}.gpg"
+          cmp .state.json roundtrip.state.json
+          rm -f roundtrip.state.json
+
+          # 원본 SHA-256 을 artifact 안의 파일로만 남깁니다 (공개 로그에는 값을 출력하지 않음).
+          # 복구 전 복호화본이 원본과 같은지 대조하는 기준값입니다.
+          sha256sum .state.json | awk '{print $1}' > "backup-${{ matrix.label }}.state.sha256"
+          sha256sum "backup-${{ matrix.label }}.gpg" | awk '{print $1}' > "backup-${{ matrix.label }}.gpg.sha256"
+
+          # 포함 종목만 로그에 표시 (값은 출력하지 않음). 이후 복구는 SOXL 만 수정하고 나머지는 보존해야 합니다.
+          python3 -c "import json;d=json.load(open('.state.json'));print('포함 종목:', sorted(k for k in d if isinstance(d[k], dict)))"
+          echo "왕복 검증 통과: 복호화본 == 원본"
+
       - name: Upload encrypted snapshot only
         uses: actions/upload-artifact@v4
         with:
           name: backup-${{ matrix.label }}
-          path: backup-${{ matrix.label }}.gpg
+          path: |
+            backup-${{ matrix.label }}.gpg
+            backup-${{ matrix.label }}.state.sha256
+            backup-${{ matrix.label }}.gpg.sha256
           if-no-files-found: error
           retention-days: 7
