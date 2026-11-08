@@ -8,7 +8,7 @@ import os
 import tempfile
 from copy import deepcopy
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from broker.market_utils import resolve_real_kst_from_ord
@@ -337,6 +337,51 @@ def _order_real_kst_date(order):
     return resolved.strftime("%Y%m%d")
 
 
+def _submitted_us_session_date(submitted_at, submitted_session=""):
+    """주문을 제출한 미국(ET) 세션 날짜(YYYYMMDD)를 돌려줍니다.
+
+    주문 등록 시 기록한 `submitted_session`(YYYY-MM-DD)을 우선 쓰고, 없거나 형식이 틀리면
+    제출 시각(KST, YYYYMMDDHHMMSS)에서 계산합니다. 둘 다 없으면 None.
+    """
+    session = str(submitted_session or "").replace("-", "")
+    if len(session) == 8 and session.isdigit():
+        return session
+    text = str(submitted_at or "")
+    if len(text) >= 14 and text[:14].isdigit():
+        try:
+            kst_dt = datetime.strptime(text[:14], "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            return kst_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _order_matches_submitted_date(order, submitted_at, submitted_session=""):
+    """주문이력 행이 메타의 제출일(KST, submitted_at[:8])과 같은 날 주문인지 판정합니다.
+
+    평소에는 `_order_real_kst_date`(ord_dt+ord_tmd 로 복원한 실제 KST 날짜)와 비교합니다.
+    다만 일부 브로커(NHPLUG GSB10030)는 주문이력에 **시각(ord_tmd)이 없고 일자만** 내려줍니다.
+    이 경우 `_order_real_kst_date` 는 ord_dt(미국 영업일)를 그대로 돌려주는데, 봇은 KST 새벽에
+    주문하므로 제출일(KST)은 ord_dt+1 입니다. 단순 비교하면 항상 어긋나 리버스 주문을 "이력 누락"으로
+    오판합니다 (2026-11-06 NHPLUG SOXL 리버스 1일차 실측: T 17.325 가 14.4375 로 오분류).
+    시각이 없는 미국 영업일 행은 **제출 시각에서 계산한 미국 세션 날짜와 정확히 일치**할 때만 인정합니다
+    (ord_dt/ord_dt+1 을 모두 받아주면 연속 세션의 같은 주문번호가 섞일 수 있음).
+    (ord_dt 가 KST 날짜인 브로커(메리츠/TOSS)와 시각이 있는 브로커는 기존 판정 그대로입니다.)
+    """
+    ord_dt = str(order.get("ord_dt", "") or "")
+    has_time = bool(str(order.get("ord_tmd", "") or "").strip())
+    date_only_us_row = (
+        not has_time
+        and not order.get("_ord_dt_is_kst_date")
+        and len(ord_dt) == 8
+        and ord_dt.isdigit()
+    )
+    if date_only_us_row:
+        # 시각이 없으면 ord_dt 를 KST 날짜로 볼 수 없으므로 미국 세션끼리만 비교합니다.
+        return ord_dt == _submitted_us_session_date(submitted_at, submitted_session)
+    return _order_real_kst_date(order) == str(submitted_at)[:8]
+
+
 def _order_us_session_date(order):
     """주문이 속한 미국(ET) 세션 날짜(YYYYMMDD)를 반환합니다.
 
@@ -381,7 +426,7 @@ def _is_reverse_order(state, odno, order=None):
     """주문 메타데이터상 리버스모드 주문인지 확인합니다."""
     meta = state.get("orders_meta", {}).get(str(odno), {})
     if order is not None and meta.get("submitted_at"):
-        if _order_real_kst_date(order) != str(meta["submitted_at"])[:8]:
+        if not _order_matches_submitted_date(order, meta["submitted_at"], meta.get("submitted_session", "")):
             return False
     return bool(meta.get("reverse_action"))
 
@@ -471,7 +516,7 @@ def reconcile_reverse_fills(state, order_history):
         if submitted_at:
             candidates = [
                 order for order in candidates
-                if _order_real_kst_date(order) == submitted_at[:8]
+                if _order_matches_submitted_date(order, submitted_at, meta.get("submitted_session", ""))
             ]
         if not candidates:
             return None

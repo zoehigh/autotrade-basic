@@ -128,7 +128,8 @@ def test_compute_net_invested_skips_reverse_orders():
         _make_buy_order("B1", "20260520", 100, 5000.0),
         {
             "odno": "RSELL",
-            "ord_dt": "20260806",
+            "ord_dt": "20260805",   # 미국 영업일 (KST 8/6 04:16 제출 → ET 8/5), 시각이 있는 실제 이력 형태
+            "ord_tmd": "041650",
             "sll_buy_dvsn_cd_name": "매도",
             "ft_ccld_qty": "32",
             "ft_ccld_amt3": "3968.00",
