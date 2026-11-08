@@ -1,0 +1,254 @@
+name: State 복구 - 리버스 원장 되돌리기 (수동 승인)
+
+# 리버스 매도가 일반 매도로 오분류 정산된 종목의 state 를 재정산 직전으로 되돌립니다 (REPAIR_ACTION=REVERSE_LEDGER_REWIND).
+# 주문번호 원문은 공개 입력(실행 화면에 노출)으로 받지 않습니다 — 봇이 후보를 정확히 1개로 자동 특정(여러 개면 중단).
+# 주문·브로커 호출 없음 (인증정보 미주입). 흐름: preview(저장 없음) → approve(Environment 승인) → apply(복구 + 독립 검증 + 캐시 저장)
+#
+# 안전장치
+#  - 복원 대상 캐시 키가 해당 브로커의 **가장 최신 캐시**여야 함 (오래된 캐시로 최신 state 를 덮어쓰는 사고 방지)
+#  - 복원한 .state.json 의 SHA-256 이 입력값과 같아야 함 (백업과 동일한 상태임을 확인)
+#  - 봇 CAS: 대상 종목 canonical hash·T, 가드 종목 hash (저장 전후 불변)
+#  - 복구 직후 ops/verify_repair_rewind.py 가 JSON 만으로 독립 검증 (가드 종목 불변, 허용 필드만 변경, 기대값 재계산)
+#  - 검증이 통과해야만 새 캐시(state-<broker>-demo-<run_id>)를 저장. 실패하면 아무 캐시도 만들지 않음
+#  - 거래 워크플로와 같은 concurrency 그룹(trade-<broker>-demo) — 거래 실행과 동시에 돌지 않음
+#  - 모의(demo) 전용, main 브랜치에서만 실행
+#
+# 승인 게이트: apply 는 Environment `state-repair` 의 승인을 기다립니다. 저장소 설정에서 해당 Environment 에
+# Required reviewers 를 지정해야 실제 승인 대기가 됩니다 (미설정이면 승인 없이 통과하므로 아래 confirm 입력이 마지막 방어선).
+on:
+  workflow_dispatch:
+    inputs:
+      broker:
+        description: '브로커 (demo 전용)'
+        required: true
+        type: choice
+        options: [nhplug, kis, kiwoom, ls]
+        default: nhplug
+      restore_key:
+        description: '복원할 캐시 키 (예: state-nhplug-demo-42287486160) — 해당 브로커의 최신 캐시여야 함'
+        required: true
+        type: string
+      expect_file_sha256:
+        description: '복원한 .state.json 의 SHA-256 (백업의 원본 SHA-256)'
+        required: true
+        type: string
+      symbol:
+        description: '대상 종목 (예: SOXL)'
+        required: true
+        type: string
+      expect_hash:
+        description: '대상 종목 canonical_state_hash'
+        required: true
+        type: string
+      expect_t:
+        description: '대상 종목 현재 T (예: 14.4375)'
+        required: true
+        type: string
+      guard_symbol:
+        description: '절대 바뀌면 안 되는 종목 (예: TQQQ)'
+        required: true
+        type: string
+      guard_hash:
+        description: '가드 종목 canonical_state_hash'
+        required: true
+        type: string
+      confirm:
+        description: "적용하려면 정확히 'REWIND <종목>' 입력 (예: REWIND SOXL). 비우면 미리보기만"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # 입력은 셸 문자열에 ${{ }} 로 직접 삽입하지 않고 env 로만 전달합니다
+  IN_BROKER: ${{ inputs.broker }}
+  IN_RESTORE_KEY: ${{ inputs.restore_key }}
+  IN_FILE_SHA: ${{ inputs.expect_file_sha256 }}
+  IN_SYMBOL: ${{ inputs.symbol }}
+  IN_HASH: ${{ inputs.expect_hash }}
+  IN_T: ${{ inputs.expect_t }}
+  IN_GUARD_SYMBOL: ${{ inputs.guard_symbol }}
+  IN_GUARD_HASH: ${{ inputs.guard_hash }}
+
+jobs:
+  preview:
+    name: 미리보기 (저장 없음)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.broker }}-demo
+    concurrency:
+      group: trade-${{ inputs.broker }}-demo
+      cancel-in-progress: false
+    outputs:
+      want_apply: ${{ steps.gate.outputs.want_apply }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install && uv sync
+
+      - name: 입력 형식 검증
+        env:
+          IN_CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IN_RESTORE_KEY" =~ ^state-${IN_BROKER}-demo-[0-9]+$ ]] || fail "restore_key 형식이 올바르지 않습니다 (state-<broker>-demo-<숫자>)"
+          [[ "$IN_FILE_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "expect_file_sha256 은 소문자 64자리 hex 여야 합니다"
+          [[ "$IN_HASH" =~ ^[0-9a-f]{64}$ ]] || fail "expect_hash 형식 오류"
+          [[ "$IN_GUARD_HASH" =~ ^[0-9a-f]{64}$ ]] || fail "guard_hash 형식 오류"
+          [[ "$IN_SYMBOL" =~ ^[A-Z]{1,6}$ ]] || fail "symbol 형식 오류"
+          [[ "$IN_GUARD_SYMBOL" =~ ^[A-Z]{1,6}$ ]] || fail "guard_symbol 형식 오류"
+          [[ "$IN_SYMBOL" != "$IN_GUARD_SYMBOL" ]] || fail "가드 종목은 대상 종목과 달라야 합니다"
+          [[ "$IN_T" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "expect_t 형식 오류"
+
+      - name: 복원 대상이 해당 브로커의 최신 캐시인지 확인
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh cache list -R "$GITHUB_REPOSITORY" --key "state-${IN_BROKER}-demo-" --ref refs/heads/main --sort created_at --order desc --limit 1 --json key --jq '.[0].key')"
+          if [[ "$latest" != "$IN_RESTORE_KEY" ]]; then
+            echo "::error::restore_key 가 최신 캐시가 아닙니다 (최신: $latest). 오래된 상태로 덮어쓸 수 있어 중단합니다."
+            exit 1
+          fi
+          echo "최신 캐시 확인: $latest"
+
+      - name: state 캐시 복원 (정확한 키)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state.json
+          key: ${{ inputs.restore_key }}
+          fail-on-cache-miss: true
+
+      - name: 복원본 SHA-256 확인
+        run: |
+          set -euo pipefail
+          echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
+
+      - name: 미리보기 (저장 없음)
+        env:
+          BROKER: ${{ inputs.broker }}
+          BROKER_MODE: demo
+          TRADE_MODE: REPAIR
+          REPAIR_ACTION: REVERSE_LEDGER_REWIND
+          REPAIR_REWIND_SYMBOL: ${{ inputs.symbol }}
+          REPAIR_REWIND_EXPECT_HASH: ${{ inputs.expect_hash }}
+          REPAIR_REWIND_EXPECT_T: ${{ inputs.expect_t }}
+          REPAIR_REWIND_GUARD_SYMBOL: ${{ inputs.guard_symbol }}
+          REPAIR_REWIND_GUARD_HASH: ${{ inputs.guard_hash }}
+          SYMBOLS: ${{ vars.SYMBOLS }}
+          TQQQ_SPLITS: ${{ vars.TQQQ_SPLITS }}
+          TQQQ_SYMBOL_TYPE: ${{ vars.TQQQ_SYMBOL_TYPE }}
+          TQQQ_SEED: ${{ vars.TQQQ_SEED }}
+          SOXL_SPLITS: ${{ vars.SOXL_SPLITS }}
+          SOXL_SYMBOL_TYPE: ${{ vars.SOXL_SYMBOL_TYPE }}
+          SOXL_SEED: ${{ vars.SOXL_SEED }}
+        run: |
+          set -euo pipefail
+          uv run python trading_bot.py
+          # 미리보기는 저장하지 않으므로 파일이 그대로여야 합니다
+          echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
+
+      - name: 적용 여부 결정
+        id: gate
+        env:
+          IN_CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [[ "$IN_CONFIRM" == "REWIND ${IN_SYMBOL}" ]]; then
+            echo "want_apply=true" >> "$GITHUB_OUTPUT"
+            echo "confirm 문구 일치 → 승인 후 적용 단계로 진행합니다."
+          else
+            echo "want_apply=false" >> "$GITHUB_OUTPUT"
+            echo "confirm 문구가 없거나 다릅니다 → 미리보기만 하고 종료합니다."
+          fi
+
+  approve:
+    name: 승인 게이트
+    needs: preview
+    if: needs.preview.outputs.want_apply == 'true'
+    runs-on: ubuntu-latest
+    # Required reviewers 를 지정한 Environment 에서 사람이 미리보기 로그를 확인하고 승인합니다.
+    environment: state-repair
+    steps:
+      - run: echo "승인되었습니다. 미리보기 로그(T·net_invested 변경 값)를 확인한 뒤 승인했는지 확인하세요."
+
+  apply:
+    name: 적용 (복구 + 독립 검증 + 캐시 저장)
+    needs: approve
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.broker }}-demo
+    concurrency:
+      group: trade-${{ inputs.broker }}-demo
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install && uv sync
+
+      - name: 여전히 최신 캐시인지 재확인 (승인 대기 중 거래가 실행됐다면 중단)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh cache list -R "$GITHUB_REPOSITORY" --key "state-${IN_BROKER}-demo-" --ref refs/heads/main --sort created_at --order desc --limit 1 --json key --jq '.[0].key')"
+          if [[ "$latest" != "$IN_RESTORE_KEY" ]]; then
+            echo "::error::승인 대기 중 더 새로운 캐시가 생겼습니다 (최신: $latest). 중단합니다 — 처음부터 다시 실행하세요."
+            exit 1
+          fi
+
+      - name: state 캐시 복원 (정확한 키)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state.json
+          key: ${{ inputs.restore_key }}
+          fail-on-cache-miss: true
+
+      - name: 복원본 SHA-256 확인 및 복구 전 사본 보관
+        run: |
+          set -euo pipefail
+          echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
+          cp .state.json "$RUNNER_TEMP/state.before.json"
+
+      - name: 복구 적용 (REPAIR, 주문 없음)
+        env:
+          BROKER: ${{ inputs.broker }}
+          BROKER_MODE: demo
+          TRADE_MODE: REPAIR
+          REPAIR_ACTION: REVERSE_LEDGER_REWIND
+          REPAIR_REWIND_SYMBOL: ${{ inputs.symbol }}
+          REPAIR_REWIND_EXPECT_HASH: ${{ inputs.expect_hash }}
+          REPAIR_REWIND_EXPECT_T: ${{ inputs.expect_t }}
+          REPAIR_REWIND_GUARD_SYMBOL: ${{ inputs.guard_symbol }}
+          REPAIR_REWIND_GUARD_HASH: ${{ inputs.guard_hash }}
+          REPAIR_REWIND_APPLY: 'true'
+          SYMBOLS: ${{ vars.SYMBOLS }}
+          TQQQ_SPLITS: ${{ vars.TQQQ_SPLITS }}
+          TQQQ_SYMBOL_TYPE: ${{ vars.TQQQ_SYMBOL_TYPE }}
+          TQQQ_SEED: ${{ vars.TQQQ_SEED }}
+          SOXL_SPLITS: ${{ vars.SOXL_SPLITS }}
+          SOXL_SYMBOL_TYPE: ${{ vars.SOXL_SYMBOL_TYPE }}
+          SOXL_SEED: ${{ vars.SOXL_SEED }}
+        run: uv run python trading_bot.py
+
+      - name: 독립 검증 (실패하면 캐시를 저장하지 않음)
+        run: |
+          set -euo pipefail
+          python3 ops/verify_repair_rewind.py "$RUNNER_TEMP/state.before.json" .state.json --symbol "$IN_SYMBOL"
+
+      - name: 새 state 캐시 저장
+        uses: actions/cache/save@v4
+        with:
+          path: .state.json
+          key: state-${{ inputs.broker }}-demo-${{ github.run_id }}
+
+      - name: 저장 결과 안내
+        run: |
+          echo "새 캐시 저장: state-${IN_BROKER}-demo-${GITHUB_RUN_ID}"
+          echo "다음 단계: DRY 1건으로 재정산 결과(T, net_invested, day_count)를 확인하세요."

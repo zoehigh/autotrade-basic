@@ -27,7 +27,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, rewind_misclassified_reverse_sell, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, rewind_misclassified_reverse_sell, find_misclassified_reverse_sell_odnos, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 # 주문번호 매핑 원장은 state 를 거치지 않고 log_mask 에서 직접 가져옵니다
 # (state 와 **같은 모듈 객체**여야 salt·원장이 하나로 유지됩니다 — `src.log_mask` import 금지).
 from log_mask import flush_odno_ledger
@@ -2231,7 +2231,7 @@ def _reverse_ledger_rewind():
 
     사용 (REPAIR_ACTION=REVERSE_LEDGER_REWIND, 주문·브로커 호출 없음):
         REPAIR_REWIND_SYMBOL=SOXL
-        REPAIR_REWIND_ODNO=<오분류된 리버스 매도 주문번호>
+        REPAIR_REWIND_ODNO=<오분류된 리버스 매도 주문번호>   # 생략하면 후보가 정확히 1개일 때 자동 선택(공개 입력에 원문 노출 방지)
         REPAIR_REWIND_EXPECT_HASH=<대상 종목 canonical_state_hash>
         REPAIR_REWIND_EXPECT_T=<현재 T>
         REPAIR_REWIND_GUARD_SYMBOL=TQQQ          # 절대 바뀌면 안 되는 다른 종목
@@ -2250,7 +2250,7 @@ def _reverse_ledger_rewind():
         return raw.strip()
 
     symbol = _required("REPAIR_REWIND_SYMBOL").upper()
-    odno = _required("REPAIR_REWIND_ODNO")
+    odno = os.environ.get("REPAIR_REWIND_ODNO", "").strip()
     expect_hash = _required("REPAIR_REWIND_EXPECT_HASH")
     expect_t = float(_required("REPAIR_REWIND_EXPECT_T"))
     guard_symbol = _required("REPAIR_REWIND_GUARD_SYMBOL").upper()
@@ -2269,6 +2269,11 @@ def _reverse_ledger_rewind():
     if guard_before != guard_hash:
         raise RuntimeError(f"가드 종목 {guard_symbol} hash 불일치: actual={guard_before}, expected={guard_hash}")
 
+    if not odno:
+        candidates = find_misclassified_reverse_sell_odnos(state)
+        if len(candidates) != 1:
+            raise RuntimeError(f"되돌릴 대상 주문을 자동으로 정할 수 없습니다 (후보 {len(candidates)}개) — REPAIR_REWIND_ODNO 를 지정하세요")
+        odno = candidates[0]
     try:
         summary = rewind_misclassified_reverse_sell(state, odno)
     except ValueError as exc:
