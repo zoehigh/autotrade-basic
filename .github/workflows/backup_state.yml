@@ -48,10 +48,30 @@ jobs:
               --output "backup-${{ matrix.label }}.gpg" .state.json
           test -s "backup-${{ matrix.label }}.gpg"
 
+          # 왕복 검증: 방금 만든 암호문을 다시 복호화해 원본과 바이트 단위로 같은지 확인합니다.
+          # (업로드 후 복호화 불가·손상 백업을 뒤늦게 발견하는 일을 막습니다)
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt --output roundtrip.state.json "backup-${{ matrix.label }}.gpg"
+          cmp .state.json roundtrip.state.json
+          rm -f roundtrip.state.json
+
+          # 원본 SHA-256 을 artifact 안의 파일로만 남깁니다 (공개 로그에는 값을 출력하지 않음).
+          # 복구 전 복호화본이 원본과 같은지 대조하는 기준값입니다.
+          sha256sum .state.json | awk '{print $1}' > "backup-${{ matrix.label }}.state.sha256"
+          sha256sum "backup-${{ matrix.label }}.gpg" | awk '{print $1}' > "backup-${{ matrix.label }}.gpg.sha256"
+
+          # 포함 종목만 로그에 표시 (값은 출력하지 않음). 이후 복구는 SOXL 만 수정하고 나머지는 보존해야 합니다.
+          python3 -c "import json;d=json.load(open('.state.json'));print('포함 종목:', sorted(k for k in d if isinstance(d[k], dict)))"
+          echo "왕복 검증 통과: 복호화본 == 원본"
+
       - name: Upload encrypted snapshot only
         uses: actions/upload-artifact@v4
         with:
           name: backup-${{ matrix.label }}
-          path: backup-${{ matrix.label }}.gpg
+          path: |
+            backup-${{ matrix.label }}.gpg
+            backup-${{ matrix.label }}.state.sha256
+            backup-${{ matrix.label }}.gpg.sha256
           if-no-files-found: error
           retention-days: 7
