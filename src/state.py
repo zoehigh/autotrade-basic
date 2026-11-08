@@ -2077,6 +2077,22 @@ def record_settlement_t_adjustment(state, target_t, *, source="", at=None):
     return entry
 
 
+def find_misclassified_reverse_sell_odnos(state):
+    """리버스 매도인데 원장에 일반 `sell` 항목이 있는 주문번호 목록 (되돌리기 후보).
+
+    주문번호 원문을 공개 입력(워크플로 입력은 공개 화면에 보임)으로 받지 않기 위해,
+    후보가 **정확히 1개**일 때 핸들러가 자동으로 대상을 정합니다.
+    """
+    ledger_sell_odnos = {
+        str(e.get("odno", "")) for e in (state.get("settlement_ledger") or {}).get("entries", [])
+        if e.get("kind") == "sell"
+    }
+    return sorted(
+        str(o) for o, m in (state.get("orders_meta") or {}).items()
+        if m.get("reverse_action") == "sell" and str(o) in ledger_sell_odnos
+    )
+
+
 def rewind_misclassified_reverse_sell(state, odno):
     """리버스 매도가 일반 매도(×factor)로 잘못 정산된 상태를 **재정산 직전**으로 되돌립니다.
 

@@ -260,3 +260,31 @@ def test_성공하면_결과가_유한하고_정상값():
     s = _soxl_after_bad_run()
     rewind_misclassified_reverse_sell(s, ODNO)
     assert s["T"] == 19.25 and s["net_invested"] == 5078.21
+
+
+# ── 주문번호 자동 특정 (공개 입력에 원문을 받지 않기 위함) ─────────────
+
+def test_odno_생략시_후보가_1개면_자동_선택해_적용(two_symbols, monkeypatch):
+    _env(monkeypatch, REPAIR_REWIND_APPLY="true")
+    monkeypatch.delenv("REPAIR_REWIND_ODNO")
+    _reverse_ledger_rewind()
+    assert load_state("SOXL")["T"] == 19.25
+
+
+def test_odno_생략시_후보가_0개나_2개면_중단(two_symbols, monkeypatch):
+    s = _soxl_after_bad_run()
+    s["settlement_ledger"]["entries"][-1]["kind"] = "buy"  # 일반 sell 항목 없음 → 후보 0개
+    save_state("SOXL", s)
+    _env(monkeypatch, REPAIR_REWIND_APPLY="true")
+    monkeypatch.delenv("REPAIR_REWIND_ODNO")
+    with pytest.raises(RuntimeError, match="후보 0개"):
+        _reverse_ledger_rewind()
+
+    s = _soxl_after_bad_run()
+    s["orders_meta"]["2618"] = dict(s["orders_meta"][ODNO])
+    s["settlement_ledger"]["entries"].insert(0, {"seq": 0, "kind": "sell", "odno": "2618", "factor": 1.0})
+    save_state("SOXL", s)
+    _env(monkeypatch, REPAIR_REWIND_APPLY="true")
+    monkeypatch.delenv("REPAIR_REWIND_ODNO")
+    with pytest.raises(RuntimeError, match="후보 2개"):
+        _reverse_ledger_rewind()
