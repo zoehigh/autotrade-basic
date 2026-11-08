@@ -2077,6 +2077,88 @@ def record_settlement_t_adjustment(state, target_t, *, source="", at=None):
     return entry
 
 
+def rewind_misclassified_reverse_sell(state, odno):
+    """리버스 매도가 일반 매도(×factor)로 잘못 정산된 상태를 **재정산 직전**으로 되돌립니다.
+
+    사고 사례(NHPlug SOXL, odno 2617): 시각 없는 주문이력 때문에 리버스 1일차 매도가 일반 쿼터매도로
+    분류되어 원장에 `sell` 항목(×0.75)이 들어가고 T 가 19.25 → 14.4375 로 내려갔습니다
+    (정상은 `reverse_sell` 로 ×0.9 → 17.325).
+
+    되돌리는 것 (이 주문 하나에 한정):
+      - 원장의 해당 `sell` 항목 제거 (마지막 항목일 때만), `next_seq` 복귀
+      - `sell_t_effects[odno]` 제거
+      - T = 항목을 뺀 원장 재생값 (반드시 주문의 `reverse_base_t` 와 같아야 함)
+      - `net_invested` += 이미 차감된 `processed_filled_amount` (재정산이 다시 차감)
+      - `orders_meta[odno]` 의 `processed_filled_qty/amount` 를 0 으로 (리버스 경로가 1회 반영)
+    바꾸지 않는 것: 워터마크(last_updated/last_processed_ordno), position_qty, reverse_mode, 다른 주문 메타.
+
+    전제가 하나라도 어긋나면 **아무것도 바꾸지 않고** ValueError 를 냅니다.
+    성공하면 state 를 제자리에서 수정하고 변경 요약(dict)을 반환합니다.
+    """
+    odno = str(odno)
+    meta = (state.get("orders_meta") or {}).get(odno)
+    if not meta:
+        raise ValueError(f"orders_meta 에 주문이 없습니다: {mask_odno(odno)}")
+    reverse_mode = state.get("reverse_mode") or {}
+    if meta.get("reverse_action") != "sell" or meta.get("side") != "SELL":
+        raise ValueError("리버스 매도 주문이 아닙니다")
+    cycle_id = reverse_mode.get("cycle_id", "")
+    if not cycle_id or meta.get("cycle_id") != cycle_id:
+        raise ValueError("현재 리버스 cycle 의 주문이 아닙니다")
+    if meta.get("terminal"):
+        raise ValueError("이미 종결(terminal)된 리버스 주문입니다")
+    if float(meta.get("applied_fill_fraction", 0.0) or 0.0) > 0:
+        raise ValueError("리버스 경로로 이미 반영된 흔적(applied_fill_fraction)이 있습니다")
+    processed_qty = int(meta.get("processed_filled_qty", 0) or 0)
+    processed_amount = float(meta.get("processed_filled_amount", 0.0) or 0.0)
+    if processed_qty <= 0 or processed_amount <= 0:
+        raise ValueError("일반 경로로 반영된 체결 마커(수량·금액)가 없습니다")
+    base_t = float(meta.get("reverse_base_t", 0.0) or 0.0)
+    if base_t <= 0:
+        raise ValueError("reverse_base_t 가 없습니다")
+    if state.get("pending_order_intent") or state.get("pending_order_batch"):
+        raise ValueError("pending 주문 fence 가 남아 있습니다")
+    if state.get("_settlement_hold"):
+        raise ValueError("정산 보류 상태입니다")
+
+    ledger = _ensure_settlement_ledger(state)
+    entries = ledger.get("entries", [])
+    mine = [e for e in entries if str(e.get("odno", "")) == odno]
+    if len(mine) != 1 or mine[0].get("kind") != "sell":
+        raise ValueError("원장에 이 주문의 일반 sell 항목이 정확히 1개 있어야 합니다")
+    entry = mine[0]
+    seq = int(entry.get("seq", 0) or 0)
+    if seq != max(int(e.get("seq", 0) or 0) for e in entries) or int(ledger.get("next_seq", 0)) != seq + 1:
+        raise ValueError("해당 sell 항목이 원장의 마지막 항목이 아닙니다")
+    if odno not in (state.get("sell_t_effects") or {}):
+        raise ValueError("sell_t_effects 에 이 주문이 없습니다")
+
+    t_now = round(float(state.get("T", 0.0)), 4)
+    if abs(_replay_settlement_ledger(state) - t_now) > 1e-4:
+        raise ValueError("현재 T 가 원장 재생값과 다릅니다")
+    trial = deepcopy(state)
+    trial["settlement_ledger"]["entries"] = [e for e in trial["settlement_ledger"]["entries"] if int(e.get("seq", 0) or 0) != seq]
+    rewound_t = _replay_settlement_ledger(trial)
+    if abs(rewound_t - base_t) > 1e-4:
+        raise ValueError(f"항목을 뺀 원장 재생값({rewound_t})이 reverse_base_t({base_t})와 다릅니다")
+
+    before = {"T": t_now, "net_invested": float(state.get("net_invested", 0.0))}
+    ledger["entries"] = [e for e in entries if int(e.get("seq", 0) or 0) != seq]
+    ledger["next_seq"] = seq
+    state["sell_t_effects"].pop(odno, None)
+    state["T"] = rewound_t
+    state["net_invested"] = round(before["net_invested"] + processed_amount, 2)
+    meta["processed_filled_qty"] = 0
+    meta["processed_filled_amount"] = 0.0
+    return {
+        "removed_seq": seq,
+        "T": (before["T"], rewound_t),
+        "net_invested": (before["net_invested"], state["net_invested"]),
+        "marker_qty": (processed_qty, 0),
+        "marker_amount": (processed_amount, 0.0),
+    }
+
+
 def _append_settlement_entry(state, kind, odno, **fields):
     """원장 끝에 새 항목을 추가하고 항목을 반환합니다."""
     ledger = _ensure_settlement_ledger(state)
