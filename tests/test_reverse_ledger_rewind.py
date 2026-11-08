@@ -208,3 +208,55 @@ def test_필수_환경변수가_없으면_중단(two_symbols, monkeypatch):
     monkeypatch.delenv("REPAIR_REWIND_GUARD_HASH")
     with pytest.raises(RuntimeError, match="환경변수가 없습니다"):
         _reverse_ledger_rewind()
+
+
+# ── 리뷰 지적(PR #7): 비유한 숫자 · 거부 시 부작용 ─────────────────
+
+@pytest.mark.parametrize("field,value", [
+    ("processed_filled_amount", float("nan")),
+    ("processed_filled_amount", float("inf")),
+    ("processed_filled_amount", "179.52"),
+    ("processed_filled_qty", 4.5),
+    ("processed_filled_qty", float("nan")),
+    ("processed_filled_qty", True),
+    ("reverse_base_t", float("nan")),
+    ("reverse_base_t", float("inf")),
+    ("applied_fill_fraction", float("nan")),
+])
+def test_비유한_또는_부적절한_메타_값은_거부하고_상태를_바꾸지_않는다(field, value):
+    _assert_untouched_on_refusal(lambda s: s["orders_meta"][ODNO].update({field: value}), "숫자|정수")
+
+
+@pytest.mark.parametrize("key", ["T", "net_invested"])
+def test_상태의_비유한_T_net_invested는_거부(key):
+    _assert_untouched_on_refusal(lambda s: s.update({key: float("nan")}), "유한")
+
+
+def test_원장_항목의_비유한_값은_거부():
+    def poison(s):
+        s["settlement_ledger"]["entries"][0]["delta"] = float("nan")
+    s = _soxl_after_bad_run()
+    poison(s)
+    before = deepcopy(s)
+    with pytest.raises(ValueError):
+        rewind_misclassified_reverse_sell(s, ODNO)
+    # NaN != NaN 이라 == 비교가 불가하므로 repr 로 대조
+    assert repr(s) == repr(before)
+
+
+def test_거부해도_원장_정규화_부작용이_원본에_남지_않는다():
+    """next_seq 와 sell_t_effects 가 없는 상태: 헬퍼가 next_seq 를 채우더라도 거부 시 원본은 그대로."""
+    s = _soxl_after_bad_run()
+    del s["settlement_ledger"]["next_seq"]
+    del s["sell_t_effects"]
+    before = deepcopy(s)
+    with pytest.raises(ValueError):
+        rewind_misclassified_reverse_sell(s, ODNO)
+    assert s == before
+    assert "next_seq" not in s["settlement_ledger"]
+
+
+def test_성공하면_결과가_유한하고_정상값():
+    s = _soxl_after_bad_run()
+    rewind_misclassified_reverse_sell(s, ODNO)
+    assert s["T"] == 19.25 and s["net_invested"] == 5078.21

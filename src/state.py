@@ -2096,6 +2096,10 @@ def rewind_misclassified_reverse_sell(state, odno):
     성공하면 state 를 제자리에서 수정하고 변경 요약(dict)을 반환합니다.
     """
     odno = str(odno)
+    # 모든 검증·수정은 복사본에서 하고, 끝까지 성공했을 때만 원본에 반영합니다
+    # (_ensure_settlement_ledger 등 헬퍼가 원본을 정규화하는 부작용도 거부 시 남기지 않기 위함).
+    original = state
+    state = deepcopy(original)
     meta = (state.get("orders_meta") or {}).get(odno)
     if not meta:
         raise ValueError(f"orders_meta 에 주문이 없습니다: {mask_odno(odno)}")
@@ -2107,15 +2111,27 @@ def rewind_misclassified_reverse_sell(state, odno):
         raise ValueError("현재 리버스 cycle 의 주문이 아닙니다")
     if meta.get("terminal"):
         raise ValueError("이미 종결(terminal)된 리버스 주문입니다")
-    if float(meta.get("applied_fill_fraction", 0.0) or 0.0) > 0:
+    def _finite(value, name):
+        # bool 은 int 의 하위 타입이라 제외하고, NaN/inf 는 비교 검사를 조용히 통과하므로 명시적으로 거부합니다.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} 가 유한한 숫자가 아닙니다")
+        return float(value)
+
+    raw_qty = meta.get("processed_filled_qty", 0)
+    if isinstance(raw_qty, bool) or not isinstance(raw_qty, (int, float)) or not math.isfinite(raw_qty) or raw_qty != int(raw_qty):
+        raise ValueError("processed_filled_qty 가 정수가 아닙니다")
+    processed_qty = int(raw_qty)
+    processed_amount = _finite(meta.get("processed_filled_amount", 0.0), "processed_filled_amount")
+    fraction = _finite(meta.get("applied_fill_fraction", 0.0) or 0.0, "applied_fill_fraction")
+    if fraction > 0:
         raise ValueError("리버스 경로로 이미 반영된 흔적(applied_fill_fraction)이 있습니다")
-    processed_qty = int(meta.get("processed_filled_qty", 0) or 0)
-    processed_amount = float(meta.get("processed_filled_amount", 0.0) or 0.0)
     if processed_qty <= 0 or processed_amount <= 0:
         raise ValueError("일반 경로로 반영된 체결 마커(수량·금액)가 없습니다")
-    base_t = float(meta.get("reverse_base_t", 0.0) or 0.0)
+    base_t = _finite(meta.get("reverse_base_t", 0.0), "reverse_base_t")
     if base_t <= 0:
         raise ValueError("reverse_base_t 가 없습니다")
+    state_t = _finite(state.get("T", 0.0), "T")
+    net_before = _finite(state.get("net_invested", 0.0), "net_invested")
     if state.get("pending_order_intent") or state.get("pending_order_batch"):
         raise ValueError("pending 주문 fence 가 남아 있습니다")
     if state.get("_settlement_hold"):
@@ -2133,16 +2149,17 @@ def rewind_misclassified_reverse_sell(state, odno):
     if odno not in (state.get("sell_t_effects") or {}):
         raise ValueError("sell_t_effects 에 이 주문이 없습니다")
 
-    t_now = round(float(state.get("T", 0.0)), 4)
-    if abs(_replay_settlement_ledger(state) - t_now) > 1e-4:
+    t_now = round(state_t, 4)
+    replay_now = _replay_settlement_ledger(state)
+    if not math.isfinite(replay_now) or abs(replay_now - t_now) > 1e-4:
         raise ValueError("현재 T 가 원장 재생값과 다릅니다")
     trial = deepcopy(state)
     trial["settlement_ledger"]["entries"] = [e for e in trial["settlement_ledger"]["entries"] if int(e.get("seq", 0) or 0) != seq]
     rewound_t = _replay_settlement_ledger(trial)
-    if abs(rewound_t - base_t) > 1e-4:
+    if not math.isfinite(rewound_t) or abs(rewound_t - base_t) > 1e-4:
         raise ValueError(f"항목을 뺀 원장 재생값({rewound_t})이 reverse_base_t({base_t})와 다릅니다")
 
-    before = {"T": t_now, "net_invested": float(state.get("net_invested", 0.0))}
+    before = {"T": t_now, "net_invested": net_before}
     ledger["entries"] = [e for e in entries if int(e.get("seq", 0) or 0) != seq]
     ledger["next_seq"] = seq
     state["sell_t_effects"].pop(odno, None)
@@ -2150,6 +2167,10 @@ def rewind_misclassified_reverse_sell(state, odno):
     state["net_invested"] = round(before["net_invested"] + processed_amount, 2)
     meta["processed_filled_qty"] = 0
     meta["processed_filled_amount"] = 0.0
+    if not math.isfinite(state["net_invested"]):
+        raise ValueError("계산된 net_invested 가 유한하지 않습니다")
+    original.clear()
+    original.update(state)
     return {
         "removed_seq": seq,
         "T": (before["T"], rewound_t),
