@@ -103,6 +103,38 @@ def test_전제_불충족이면_상태를_바꾸지_않고_거부():
     _refuses(second, ok, "후보 2개")
 
 
+@pytest.mark.parametrize("field,value", [
+    ("processed_filled_qty", 0.5),                 # 정수 변환하면 0 이 되는 소수
+    ("processed_filled_qty", None),
+    ("processed_filled_qty", "0"),
+    ("processed_filled_qty", float("nan")),
+    ("processed_filled_qty", False),
+    ("processed_filled_amount", None),
+    ("processed_filled_amount", "0.0"),
+    ("processed_filled_amount", float("nan")),
+    ("processed_filled_amount", float("inf")),
+    ("applied_fill_fraction", None),
+    ("applied_fill_fraction", "0"),
+    ("applied_fill_fraction", float("nan")),
+])
+def test_잘못된_마커_값은_미정산으로_인정하지_않는다(field, value):
+    _refuses(lambda s: s["orders_meta"][ODNO].update({field: value}), (TARGET_UPDATED,), "후보 0개")
+
+
+@pytest.mark.parametrize("missing", ["processed_filled_qty", "processed_filled_amount"])
+def test_마커_누락은_미정산_증거가_아니다(missing):
+    _refuses(lambda s: s["orders_meta"][ODNO].pop(missing), (TARGET_UPDATED,), "후보 0개")
+
+
+def test_반영비율_키가_없으면_0으로_보고_정상_통과():
+    s = _soxl_after_rewind()
+    assert "applied_fill_fraction" not in s["orders_meta"][ODNO]
+    restore_watermark_for_unapplied_reverse_order(s, TARGET_UPDATED)
+    s2 = _soxl_after_rewind()
+    s2["orders_meta"][ODNO]["applied_fill_fraction"] = 0.0  # 명시된 유효한 0 도 허용
+    restore_watermark_for_unapplied_reverse_order(s2, TARGET_UPDATED)
+
+
 def test_오분류_상태_그대로는_거부(monkeypatch):
     """아직 되돌리기 전(마커 4/179.52, 원장에 sell 항목)에는 이 액션을 쓸 수 없습니다."""
     s = _soxl_after_bad_run()

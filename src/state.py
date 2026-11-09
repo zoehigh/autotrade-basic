@@ -2226,18 +2226,27 @@ def restore_watermark_for_unapplied_reverse_order(state, target_last_updated, ta
 
     ledger = _ensure_settlement_ledger(state)
     ledger_odnos = {str(e.get("odno", "")) for e in ledger.get("entries", [])}
+    def _is_valid_zero(value, *, integer):
+        """명시적으로 존재하는 유한한 숫자 0 인지 (bool·문자열·None·NaN·소수 수량은 불인정)."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(value):
+            return False
+        if integer and value != int(value):
+            return False
+        return value == 0
+
     candidates = []
     for o, m in (state.get("orders_meta") or {}).items():
         if m.get("reverse_action") != "sell" or m.get("cycle_id") != cycle_id or m.get("terminal"):
             continue
-        try:
-            unapplied = (
-                int(m.get("processed_filled_qty", 0) or 0) == 0
-                and float(m.get("processed_filled_amount", 0.0) or 0.0) == 0.0
-                and float(m.get("applied_fill_fraction", 0.0) or 0.0) == 0.0
-            )
-        except (TypeError, ValueError):
-            unapplied = False
+        # 미반영의 증거는 '명시된 0' 뿐입니다: 수량·금액 마커는 반드시 존재해야 하고,
+        # 반영 비율(applied_fill_fraction)은 없으면 0 으로 보지만 있으면 유효한 0 이어야 합니다.
+        unapplied = (
+            "processed_filled_qty" in m and _is_valid_zero(m["processed_filled_qty"], integer=True)
+            and "processed_filled_amount" in m and _is_valid_zero(m["processed_filled_amount"], integer=False)
+            and ("applied_fill_fraction" not in m or _is_valid_zero(m["applied_fill_fraction"], integer=False))
+        )
         if unapplied and str(o) not in ledger_odnos:
             candidates.append(str(o))
     if len(candidates) != 1:
