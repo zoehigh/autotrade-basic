@@ -58,3 +58,14 @@ def test_최신_캐시_확인과_sha_확인_존재():
     assert "odno" not in text.split("jobs:")[0].split("inputs:")[1].lower(), "주문번호 원문을 공개 입력으로 받지 않습니다"
     assert text.count("sha256sum -c -") >= 3
     assert "fail-on-cache-miss: true" in text
+
+
+def test_복구_동작_선택과_워터마크_입력():
+    wf = _wf()
+    inputs = wf[True]["workflow_dispatch"]["inputs"]
+    assert inputs["action"]["options"] == ["REVERSE_LEDGER_REWIND", "REVERSE_WATERMARK_RESTORE"]
+    assert "target_last_updated" in inputs
+    assert "target_last_ordno" not in inputs, "주문번호 원문을 공개 입력으로 받지 않습니다 (원장에서 도출)"
+    text = open(_PATH, encoding="utf-8").read()
+    assert text.count("REPAIR_ACTION: ${{ inputs.action }}") == 2  # preview + apply 동일 동작
+    assert "--mode watermark" in text
