@@ -421,7 +421,9 @@ def compare_dynamic_preview(
         reasons.append(REASON_SESSION_UNDETERMINED)
     elif reserved_undetermined:
         note = f"({reservation_note})" if str(reservation_note).strip() else ""
-        fallback_reason = f"fallback:{REASON_RESERVATION_UNDETERMINED}{note}"
+        # E 정책만 예산 미확정으로 fallback. D는 ATR 기반 이론적 단계는 별도로 계산.
+        e_budget_fallback_reason = f"fallback:{REASON_RESERVATION_UNDETERMINED}{note}"
+        fallback_reason = e_budget_fallback_reason
         reasons.append(REASON_RESERVATION_UNDETERMINED)
     elif remaining is None or remaining < 0:
         fallback_reason = f"fallback:{REASON_BUDGET_UNDETERMINED}(remaining_seed)"
@@ -435,7 +437,39 @@ def compare_dynamic_preview(
 
     indicator = _indicator_section(bars, last_close)
 
-    if fallback_reason:
+    # D 정책: ATR 기반 이론적 단계 (예약금과 무관). reserved_undetermined でも 계산.
+    d_decision = None
+    d_threshold1 = DEFAULT_T1 if t1 is None else t1
+    d_threshold2 = DEFAULT_T2 if t2 is None else t2
+    d_hysteresis = DEFAULT_DELTA if delta is None else delta
+    try:
+        d_prices_by_level = {
+            level: _additional_prices(
+                unit, base_qty_int, level, ceiling_value
+            )
+            for level in range(0, MAX_LEVEL_CANDIDATE + 1)
+        }
+        d_decision = decide_levels(
+            "D",
+            atr_ratio=indicator["atr_ratio"],
+            t1=d_threshold1,
+            t2=d_threshold2,
+            prev_level=prev.get("D"),
+            delta=d_hysteresis,
+        )
+    except (ValueError, TypeError, ZeroDivisionError) as exc:
+        d_decision = None
+        reasons.append(f"d-invalid-input({type(exc).__name__})")
+
+    # E 정책: fallback_reason이 reserved_undetermined 전용이면 3단계 fallback,
+    # 다른 사유(오류·세션 미확정 등)로 전체 동적 비활성.
+    e_only_fallback = bool(
+        fallback_reason
+        and fallback_reason.startswith(f"fallback:{REASON_RESERVATION_UNDETERMINED}")
+    )
+
+    if fallback_reason and not e_only_fallback:
+        # ATR·세션·예산(remaining/budget)·가격 능력 부족 등: 동적 전체 비활성
         dynamic = _build_side(
             "A",
             PREVIEW_FIXED_LEVELS,
@@ -445,12 +479,22 @@ def compare_dynamic_preview(
             fallback_reason,
             True,
         )
+        decision = None
+    elif e_only_fallback:
+        # 예약금 미확정: E만 3단계 fallback, D는 ATR 기반 단계 유지
+        dynamic = _build_side(
+            "A",
+            PREVIEW_FIXED_LEVELS,
+            unit,
+            base_qty_int,
+            ceiling_value,
+            e_budget_fallback_reason,
+            True,
+        )
+        decision = None
     else:
-        threshold1 = DEFAULT_T1 if t1 is None else t1
-        threshold2 = DEFAULT_T2 if t2 is None else t2
-        hysteresis = DEFAULT_DELTA if delta is None else delta
+        # 정상 계산: D와 E 모두 계산
         extra_kappa = DEFAULT_KAPPA_ADD if kappa_add is None else kappa_add
-
         try:
             prices_by_level = {
                 level: _additional_prices(
@@ -458,22 +502,14 @@ def compare_dynamic_preview(
                 )
                 for level in range(0, MAX_LEVEL_CANDIDATE + 1)
             }
-            d_decision = decide_levels(
-                "D",
-                atr_ratio=indicator["atr_ratio"],
-                t1=threshold1,
-                t2=threshold2,
-                prev_level=prev.get("D"),
-                delta=hysteresis,
-            )
             decision = decide_levels(
                 policy_name if policy_name in ("A", "B", "C", "D", "E") else "E",
                 atr_ratio=indicator["atr_ratio"],
-                t1=threshold1,
-                t2=threshold2,
+                t1=d_threshold1,
+                t2=d_threshold2,
                 prev_level=prev.get("D"),
                 prev_e=prev.get("E"),
-                delta=hysteresis,
+                delta=d_hysteresis,
                 remaining_seed=remaining,
                 seed=remaining,
                 normal_amount=normal,
@@ -485,7 +521,6 @@ def compare_dynamic_preview(
                 levels=7,
             )
         except (ValueError, TypeError, ZeroDivisionError) as exc:
-            d_decision = None
             decision = None
             fallback_reason = f"fallback:invalid-input({type(exc).__name__})"
             reasons.append("invalid-input")
@@ -510,11 +545,11 @@ def compare_dynamic_preview(
                 unit,
                 base_qty_int,
                 ceiling_value,
-                f"fallback:no-indicator ({decision['reason']})",
+                f"fallback:no-indicator ({decision['reason'] if decision else 'unknown'})",
                 True,
             )
         else:
-            if decision["fallback"]:
+            if decision and decision["fallback"]:
                 reasons.append("dynamic-fallback")
             dynamic = _build_side(
                 policy_name,
@@ -527,7 +562,7 @@ def compare_dynamic_preview(
             )
             # fallback 이 아닌 실제 결정만 세션 prev 로 기록합니다
             # (데이터 결손으로 내려간 값을 다음 세션 히스테리시스에 물려주지 않음).
-            if not decision["fallback"]:
+            if decision and not decision["fallback"]:
                 _store_levels(
                     symbol_text,
                     session,
@@ -594,6 +629,10 @@ def compare_dynamic_preview(
                 if fixed["total"] is None or dynamic["total"] is None
                 else dynamic["total"] - fixed["total"]
             ),
+            # D 정책: ATR 기반 이론적 단계 (예약금 미확정에도 계산 가능)
+            "d_levels": d_decision["levels"] if d_decision else None,
+            "d_reason": d_decision["reason"] if d_decision else "atr-insufficient",
+            "d_fallback": d_decision["fallback"] if d_decision else True,
         },
         "reasons": reasons,
         "prev": dict(prev),
@@ -644,11 +683,22 @@ def format_preview_report(preview):
     lines.append(_side_text(f"동적 {dynamic.get('policy')}", dynamic))
     lines.append(f"  근거: {dynamic.get('reason')}")
 
+    # D 정책: ATR 기반 이론적 단계 (예약금 미확정에도 계산 가능)
+    comparison = preview.get("comparison") or {}
+    d_levels = comparison.get("d_levels")
+    d_reason = comparison.get("d_reason")
+    if d_levels is not None:
+        lines.append(f"  D(ATR 이론): 단계 {d_levels} · {d_reason}")
+    else:
+        lines.append("  D(ATR 이론): 계산 불가 (ATR 부족)")
+
     reserved_state = budget.get("open_reserved_state")
     if reserved_state == "undetermined":
         note = budget.get("reservation_note") or ""
         suffix = f" ({note})" if note else ""
-        lines.append(f"  예약금: 미확정{suffix} → 동적 비활성(고정 3)")
+        lines.append(
+            f"  예약금: 미확정{suffix} → E는 예산 미확정(고정 3), D는 ATR 이론 단계 표시"
+        )
     else:
         lines.append(f"  예약금: ${(budget.get('open_reserved') or 0.0):.2f} (측정값)")
 

@@ -663,3 +663,92 @@ def test_levels_3_regression_matches_direct_call():
     for (level, price), order in zip(direct, virtual):
         assert order["level"] == level
         assert order["price"] == price
+
+
+# ── ATR: 최근 15봉 근사 vs 전체 유효 기간 Wilder 평활 비교 ──────────────
+
+def _wilder_atr_full(bars, period=14):
+    """전체 유효 기간을 사용한 Wilder 14기간 ATR (참조 구현, 테스트 전용).
+
+    모든 봉의 TR 을 계산하고, 처음 period 개 TR 의 단순평균을 초기 ATR 로
+    사용한 뒤 (prev*period-1 + TR)/period 로 재귀 평활합니다.
+    """
+    if not bars or len(bars) < period + 1:
+        return None
+    rows = []
+    for bar in bars:
+        high = bar["h"]; low = bar["l"]; close = bar["c"]
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            return None
+        rows.append((high, low, close))
+    trs = [rows[0][0] - rows[0][1]]
+    for i in range(1, len(rows)):
+        h, l, c = rows[i]
+        pc = rows[i-1][2]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def _make_ohlc_bars(n, base_close=50.0, atr_pct=0.08):
+    """합성 OHLC 봉 n 개 생성 (오래된 순). ATR 비율이 약 atr_pct 가 되도록."""
+    import random
+    random.seed(42)
+    bars = []
+    close = base_close
+    for i in range(n):
+        tr = close * atr_pct * (0.5 + random.random())
+        high = close + tr * 0.6
+        low = close - tr * 0.4
+        open_price = close + (random.random() - 0.5) * tr * 0.2
+        bars.append({"o": open_price, "h": high, "l": low, "c": close})
+        close = close * (1 + (random.random() - 0.5) * 0.02)
+    return bars
+
+
+def test_atr_15_bars_vs_full_period_difference():
+    """최근 15봉 근사 ATR 과 전체 기간 Wilder ATR 의 차이를 측정.
+
+    39봉(실제 메리츠 확정봉 수)과 15봉(최소 개수)으로 ATR 을 계산하고,
+    절대 차이와 상대 차이를 기록합니다. 단계 결정에 영향을 줄 수 있는지
+    t1/t2 임계값 근처에서 D 정책 단계도 비교합니다.
+    """
+    bars_39 = _make_ohlc_bars(39, base_close=52.25, atr_pct=0.085)
+    bars_15 = bars_39[-15:]
+
+    atr_15 = compute_atr14(bars_15)
+    atr_full = _wilder_atr_full(bars_39)
+
+    assert atr_15 is not None
+    assert atr_full is not None
+
+    abs_diff = abs(atr_15 - atr_full)
+    rel_diff = abs_diff / atr_full if atr_full else 0.0
+
+    # 기록용 출력 (테스트 통과/실패와 무관)
+    print(f"\n  ATR(15봉)={atr_15:.4f}, ATR(전체39봉)={atr_full:.4f}")
+    print(f"  절대차이={abs_diff:.4f}, 상대차이={rel_diff:.5f} ({rel_diff*100:.2f}%)")
+
+    # D 정책 단계 결정에 차이가 있는지 확인 (t1=0.04, t2=0.07 후보)
+    close = bars_39[-1]["c"]
+    ratio_15 = atr_ratio(atr_15, close)
+    ratio_full = atr_ratio(atr_full, close)
+
+    level_15 = select_dynamic_d(ratio_15, 0.04, 0.07, prev_level=None, delta=0.02)[0]
+    level_full = select_dynamic_d(ratio_full, 0.04, 0.07, prev_level=None, delta=0.02)[0]
+
+    print(f"  r(15봉)={ratio_15:.5f} → D={level_15}, r(전체)={ratio_full:.5f} → D={level_full}")
+
+    # 두 ATR 값이 너무 다르면(>20%) 단계 결정에 영향을 줄 수 있으므로 경고만 기록
+    # (단정하지 않음 — 후보값 미확정이므로 우열 판정 아님)
+    if rel_diff > 0.20:
+        print(f"  ⚠️ ATR 상대차이 20% 초과 — 단계 결정 영향 가능성 있음 (후보값 재검토 필요)")
+
+
+def test_atr_15_bars_minimum():
+    """확정봉 15개 미만이면 compute_atr14 는 None 반환 (추정 금지)."""
+    bars_14 = _make_ohlc_bars(14, base_close=50.0, atr_pct=0.05)
+    assert compute_atr14(bars_14) is None
+    assert compute_atr14([]) is None

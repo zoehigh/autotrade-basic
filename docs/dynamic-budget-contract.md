@@ -110,15 +110,18 @@ DRY 미리보기 후크(`trading_bot._log_dynamic_loc_preview`)는 `open_reserve
 없기** 때문입니다. 그래서 미리보기는 fail-closed 로 고정 3을 보여주고, 로그에
 `예약금: 미확정 → 동적 비활성(고정 3)` 을 남깁니다.
 
-### 실 DRY 후크의 OHLC 소스 (현재 미배선)
+### 실 DRY 후크의 OHLC 소스 (메리츠 배선 완료)
 
 - 후크는 `broker.get_daily_candles()` **오버라이드 결과만** OHLC 소스로 사용합니다.
+- `src/broker/meritz/adapter.py` 의 `get_daily_candles()` 는 `date/oprc/hprc/lprc/prpr` 을
+  `{"date": "YYYY-MM-DD", "o","h","l","c"}` 로 정규화해 반환하므로, 메리츠 브로커에서는
+  DRY 미리보기가 ATR(14) 계산과 D/E 단계 결정을 수행합니다.
 - `src/broker/base.py` 의 기본 구현은 `get_daily_closes()` 로 `date`+`close` 만 채우므로
   **OHLC(o/h/l/c)가 없습니다**. TOSS 처럼 `date`+`close` 만 주는 소스도 동일합니다.
-- 이 경우 미리보기는 **OHLC 를 합성하지 않고**(합성 금지) `fallback:ohlc-unavailable` 로
-  내려가 **항상 고정 3** 을 보여줍니다 (안전하지만 D/E 비교는 비어 있음).
+- OHLC 키(o/h/l/c)가 없거나 빈 목록이면 미리보기는 **OHLC 를 합성하지 않고**(합성 금지)
+  `fallback:ohlc-unavailable` 로 내려가 **항상 고정 3** 을 보여줍니다 (안전하지만 D/E 비교는 비어 있음).
 - 따라서 **D/E 주문가·수량 비교는 OHLC(o/h/l/c)를 가진 bars 를 넘기는 호출자에서만 동작**합니다
-  (단위 테스트의 fixture, 또는 후속 단계에서 브로커별 OHLC 소스를 배선한 뒤).
+  (메리츠는 배선 완료, 다른 브로커는 후속 단계에서 OHLC 소스를 배선해야 함).
 - 세션 날짜도 봉 `date` 또는 명시 인자로만 확정합니다. 확정 불가면 UTC/로컬 날짜로
   **조용히 대체하지 않고** `session-date-undetermined` fallback 으로 처리합니다.
 
@@ -202,8 +205,9 @@ DRY 미리보기 후크(`trading_bot._log_dynamic_loc_preview`)는 `open_reserve
 ## 8. 활성화 · 안전 규칙
 
 - 기본 **비활성**. `TRADE_MODE=DRY` + `DYNAMIC_LOC_PREVIEW=1|true` 일 때만 후크가 동작합니다.
-- **실 DRY 후크는 현재 OHLC 소스 미배선으로 fallback 3 고정** (`get_daily_candles` 기본 구현이
-  date+close 만 제공) → D/E 비교는 OHLC(o/h/l/c)를 측정해 넘기는 호출자에서만 동작합니다.
+- **실 DRY 후크는 메리츠 OHLC 소스 배선 완료** (`get_daily_candles` 오버라이드가 `date/o/h/l/c` 반환).
+  다른 브로커는 기본 구현이 `date`+`close` 만 제공하므로 `fallback:ohlc-unavailable` 로
+  고정 3 → D/E 비교는 OHLC(o/h/l/c)를 측정해 넘기는 호출자에서만 동작합니다.
 - 미리보기는 **state 를 인자로 받지 않습니다** → T·net_invested·orders_meta 를 바꿀 수 없습니다.
 - LIVE 경로·주문·저장 코드는 이 기능과 무관합니다 (변경 없음).
 - `_PREV_LEVELS` 는 프로세스 메모리에만 존재합니다 (state 스키마 변경 없음, 재시작 시 초기화).

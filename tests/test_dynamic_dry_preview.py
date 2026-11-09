@@ -260,7 +260,42 @@ def test_hook_uses_ohlc_candles_when_broker_provides_them(monkeypatch, capsys):
     assert "세션 20261106" in out
     # 예약금 미확정(fail-closed)은 OHLC 가 있어도 유지됩니다
     assert "fallback:reservation-undetermined" in out
+    # D(ATR 이론) 단계는 별도로 표시, E는 예산 미확정으로 고정 3
+    assert "D(ATR 이론): 단계" in out
+    assert "단계 3" in out  # E 는 예산 미확정으로 고정 3 fallback
     assert broker.order_calls == []
+
+
+def test_compare_dynamic_preview_reserved_none_d_shows_atr_level():
+    """open_reserved=None 일 때 D 는 ATR 기반 이론적 단계, E 는 3단계 fallback."""
+    bars = _bars()
+    preview = compare_dynamic_preview(
+        symbol="TQQQ",
+        bars=bars,
+        last_close=bars[-1]["c"],
+        unit_amount=2000.0,
+        base_qty=24,
+        ceiling=82.5,
+        remaining_seed=20000.0,
+        budget_available=18000.0,
+        open_reserved=None,  # 미확정 → 0 으로 대체 금지
+        normal_amount=1980.0,
+        session_date="20261106",
+        prev_levels=None,
+        policy="E",
+    )
+    # D(ATR 이론) 단계는 별도로 표시
+    comparison = preview["comparison"]
+    assert comparison["d_levels"] is not None
+    assert comparison["d_reason"] is not None
+    assert comparison["d_fallback"] is False  # D 는 ATR 기반으로 계산 가능
+    # E 는 예산 미확정으로 고정 3
+    assert preview["dynamic"]["levels"] == 3
+    assert preview["dynamic"]["fallback"] is True
+    assert "reservation-undetermined" in preview["dynamic"]["reason"]
+    # 예약금은 0 으로 대체되지 않음
+    assert preview["budget"]["open_reserved_state"] == "undetermined"
+    assert preview["budget"]["reserved_applied"] is None
 
 
 def test_hook_survives_ohlc_query_failure(monkeypatch, capsys):
