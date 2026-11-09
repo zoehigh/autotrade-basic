@@ -2196,6 +2196,102 @@ def rewind_misclassified_reverse_sell(state, odno):
     }
 
 
+def restore_watermark_for_unapplied_reverse_order(state, target_last_updated, target_last_ordno=None):
+    """리버스 매도가 **아직 정산되지 않은 상태**에서 워터마크를 이전 값으로 되돌립니다.
+
+    배경: 오분류 정산이 워터마크(last_updated/last_processed_ordno)를 해당 주문 체결 시각까지 올려 두면,
+    원장·마커를 되돌려도 독립 검증기는 그 체결을 "워터마크 이전 = 필수 아님"으로 보고 정상 정산을
+    '과다 반영'으로 판정합니다 (2026-11-09 NHPlug SOXL DRY). 오분류 직전 워터마크로 되돌리면 정산 입력 조건이 같아집니다.
+
+    바꾸는 것: last_updated, last_processed_ordno (이 둘만).
+    전제(하나라도 어긋나면 아무것도 바꾸지 않고 ValueError):
+      - 현재 리버스 cycle 에 '미정산 리버스 매도'가 정확히 1개: 마커 0/0, applied_fill_fraction 0, terminal 아님,
+        원장에 해당 주문 항목 없음 (= 되돌리기 직후 상태)
+      - 목표 last_updated 는 유한한 시각이며 **현재보다 과거**여야 함 (앞으로 감기 금지)
+      - 목표 last_processed_ordno: 주문번호 원문을 공개 입력으로 받지 않기 위해 **생략하면 원장의 마지막 항목 주문번호**를
+        사용합니다 (마지막으로 정산된 주문 = 오분류 직전 워터마크의 주문). 그 주문은 orders_meta 에 있어야 함. fence/정산 보류 없음
+      - 현재 T 가 원장 재생값과 같음
+    성공하면 state 를 제자리에서 수정하고 변경 요약(dict)을 반환합니다.
+    """
+    original = state
+    state = deepcopy(original)
+    reverse_mode = state.get("reverse_mode") or {}
+    cycle_id = reverse_mode.get("cycle_id", "")
+    if not cycle_id:
+        raise ValueError("활성 리버스 cycle 이 없습니다")
+    if state.get("pending_order_intent") or state.get("pending_order_batch"):
+        raise ValueError("pending 주문 fence 가 남아 있습니다")
+    if state.get("_settlement_hold"):
+        raise ValueError("정산 보류 상태입니다")
+
+    ledger = _ensure_settlement_ledger(state)
+    ledger_odnos = {str(e.get("odno", "")) for e in ledger.get("entries", [])}
+    def _is_valid_zero(value, *, integer):
+        """명시적으로 존재하는 유한한 숫자 0 인지 (bool·문자열·None·NaN·소수 수량은 불인정)."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(value):
+            return False
+        if integer and value != int(value):
+            return False
+        return value == 0
+
+    candidates = []
+    for o, m in (state.get("orders_meta") or {}).items():
+        if m.get("reverse_action") != "sell" or m.get("cycle_id") != cycle_id or m.get("terminal"):
+            continue
+        # 미반영의 증거는 '명시된 0' 뿐입니다: 수량·금액 마커는 반드시 존재해야 하고,
+        # 반영 비율(applied_fill_fraction)은 없으면 0 으로 보지만 있으면 유효한 0 이어야 합니다.
+        unapplied = (
+            "processed_filled_qty" in m and _is_valid_zero(m["processed_filled_qty"], integer=True)
+            and "processed_filled_amount" in m and _is_valid_zero(m["processed_filled_amount"], integer=False)
+            and ("applied_fill_fraction" not in m or _is_valid_zero(m["applied_fill_fraction"], integer=False))
+        )
+        if unapplied and str(o) not in ledger_odnos:
+            candidates.append(str(o))
+    if len(candidates) != 1:
+        raise ValueError(f"미정산 리버스 매도가 정확히 1개여야 합니다 (후보 {len(candidates)}개)")
+
+    def _parse_utc(text, name):
+        try:
+            dt = datetime.fromisoformat(str(text))
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} 가 올바른 ISO 시각이 아닙니다")
+        if dt.tzinfo is None:
+            raise ValueError(f"{name} 에 시간대가 없습니다")
+        return dt.astimezone(ZoneInfo("UTC"))
+
+    current_updated = state.get("last_updated", "")
+    if not current_updated:
+        raise ValueError("현재 last_updated 가 비어 있습니다")
+    if _parse_utc(target_last_updated, "목표 last_updated") >= _parse_utc(current_updated, "현재 last_updated"):
+        raise ValueError("목표 워터마크는 현재보다 과거여야 합니다 (앞으로 감기 금지)")
+    target_ordno = str(target_last_ordno or "").strip()
+    if not target_ordno:
+        entries = ledger.get("entries", [])
+        if not entries:
+            raise ValueError("원장이 비어 있어 목표 last_processed_ordno 를 정할 수 없습니다")
+        last_entry = max(entries, key=lambda e: int(e.get("seq", 0) or 0))
+        target_ordno = str(last_entry.get("odno", "")).strip()
+        if not target_ordno or target_ordno not in (state.get("orders_meta") or {}):
+            raise ValueError("원장 마지막 항목의 주문을 orders_meta 에서 찾을 수 없어 목표 last_processed_ordno 를 정할 수 없습니다")
+
+    t_now = float(state.get("T", 0.0))
+    replay = _replay_settlement_ledger(state)
+    if not math.isfinite(t_now) or not math.isfinite(replay) or abs(replay - t_now) > 1e-4:
+        raise ValueError("현재 T 가 원장 재생값과 다릅니다")
+
+    summary = {
+        "last_updated": (current_updated, str(target_last_updated)),
+        "last_processed_ordno": (state.get("last_processed_ordno", ""), target_ordno),
+    }
+    state["last_updated"] = str(target_last_updated)
+    state["last_processed_ordno"] = target_ordno
+    original.clear()
+    original.update(state)
+    return summary
+
+
 def _append_settlement_entry(state, kind, odno, **fields):
     """원장 끝에 새 항목을 추가하고 항목을 반환합니다."""
     ledger = _ensure_settlement_ledger(state)

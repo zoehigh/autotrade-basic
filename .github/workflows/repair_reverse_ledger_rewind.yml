@@ -1,6 +1,7 @@
 name: State 복구 - 리버스 원장 되돌리기 (수동 승인)
 
 # 리버스 매도가 일반 매도로 오분류 정산된 종목의 state 를 재정산 직전으로 되돌립니다 (REPAIR_ACTION=REVERSE_LEDGER_REWIND).
+# 워터마크 복원의 목표 주문번호도 입력받지 않고 복구 전 원장의 마지막 항목에서 도출합니다.
 # 주문번호 원문은 공개 입력(실행 화면에 노출)으로 받지 않습니다 — 봇이 후보를 정확히 1개로 자동 특정(여러 개면 중단).
 # 주문·브로커 호출 없음 (인증정보 미주입). 흐름: preview(저장 없음) → approve(Environment 승인) → apply(복구 + 독립 검증 + 캐시 저장)
 #
@@ -24,6 +25,12 @@ on:
         type: choice
         options: [nhplug, kis, kiwoom, ls]
         default: nhplug
+      action:
+        description: '복구 동작 — REVERSE_LEDGER_REWIND(원장 되돌리기) 또는 REVERSE_WATERMARK_RESTORE(되돌리기 후 워터마크 복원)'
+        required: true
+        type: choice
+        options: [REVERSE_LEDGER_REWIND, REVERSE_WATERMARK_RESTORE]
+        default: REVERSE_LEDGER_REWIND
       restore_key:
         description: '복원할 캐시 키 (예: state-nhplug-demo-42287486160) — 해당 브로커의 최신 캐시여야 함'
         required: true
@@ -52,6 +59,10 @@ on:
         description: '가드 종목 canonical_state_hash'
         required: true
         type: string
+      target_last_updated:
+        description: 'REVERSE_WATERMARK_RESTORE 전용: 복원할 last_updated (ISO, 현재보다 과거, 예: 2026-11-04T19:10:00+00:00)'
+        required: false
+        type: string
       confirm:
         description: "적용하려면 정확히 'REWIND <종목>' 입력 (예: REWIND SOXL). 비우면 미리보기만"
         required: false
@@ -71,6 +82,8 @@ env:
   IN_T: ${{ inputs.expect_t }}
   IN_GUARD_SYMBOL: ${{ inputs.guard_symbol }}
   IN_GUARD_HASH: ${{ inputs.guard_hash }}
+  IN_ACTION: ${{ inputs.action }}
+  IN_TARGET_UPDATED: ${{ inputs.target_last_updated }}
 
 jobs:
   preview:
@@ -104,6 +117,9 @@ jobs:
           [[ "$IN_GUARD_SYMBOL" =~ ^[A-Z]{1,6}$ ]] || fail "guard_symbol 형식 오류"
           [[ "$IN_SYMBOL" != "$IN_GUARD_SYMBOL" ]] || fail "가드 종목은 대상 종목과 달라야 합니다"
           [[ "$IN_T" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "expect_t 형식 오류"
+          if [[ "$IN_ACTION" == "REVERSE_WATERMARK_RESTORE" ]]; then
+            [[ "$IN_TARGET_UPDATED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+\+00:00$ ]] || fail "target_last_updated 는 UTC ISO 형식(…+00:00)이어야 합니다"
+          fi
 
       - name: 복원 대상이 해당 브로커의 최신 캐시인지 확인
         env:
@@ -134,7 +150,8 @@ jobs:
           BROKER: ${{ inputs.broker }}
           BROKER_MODE: demo
           TRADE_MODE: REPAIR
-          REPAIR_ACTION: REVERSE_LEDGER_REWIND
+          REPAIR_ACTION: ${{ inputs.action }}
+          REPAIR_REWIND_TARGET_LAST_UPDATED: ${{ inputs.target_last_updated }}
           REPAIR_REWIND_SYMBOL: ${{ inputs.symbol }}
           REPAIR_REWIND_EXPECT_HASH: ${{ inputs.expect_hash }}
           REPAIR_REWIND_EXPECT_T: ${{ inputs.expect_t }}
@@ -221,7 +238,8 @@ jobs:
           BROKER: ${{ inputs.broker }}
           BROKER_MODE: demo
           TRADE_MODE: REPAIR
-          REPAIR_ACTION: REVERSE_LEDGER_REWIND
+          REPAIR_ACTION: ${{ inputs.action }}
+          REPAIR_REWIND_TARGET_LAST_UPDATED: ${{ inputs.target_last_updated }}
           REPAIR_REWIND_SYMBOL: ${{ inputs.symbol }}
           REPAIR_REWIND_EXPECT_HASH: ${{ inputs.expect_hash }}
           REPAIR_REWIND_EXPECT_T: ${{ inputs.expect_t }}
@@ -240,7 +258,12 @@ jobs:
       - name: 독립 검증 (실패하면 캐시를 저장하지 않음)
         run: |
           set -euo pipefail
-          python3 ops/verify_repair_rewind.py "$RUNNER_TEMP/state.before.json" .state.json --symbol "$IN_SYMBOL"
+          if [[ "$IN_ACTION" == "REVERSE_WATERMARK_RESTORE" ]]; then
+            python3 ops/verify_repair_rewind.py "$RUNNER_TEMP/state.before.json" .state.json --symbol "$IN_SYMBOL" \
+              --mode watermark --target-last-updated "$IN_TARGET_UPDATED"
+          else
+            python3 ops/verify_repair_rewind.py "$RUNNER_TEMP/state.before.json" .state.json --symbol "$IN_SYMBOL"
+          fi
 
       - name: 새 state 캐시 저장
         uses: actions/cache/save@v4

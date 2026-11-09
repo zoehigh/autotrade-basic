@@ -116,25 +116,70 @@ def verify(before, after, symbol, odno=None):
     return problems
 
 
+def verify_watermark(before, after, symbol, target_updated, target_ordno=None):
+    """워터마크 복원 검증: 대상 종목은 last_updated/last_processed_ordno 두 필드만 목표값으로 바뀌고, 나머지는 완전히 동일.
+
+    target_ordno 를 생략하면 복구 전 원장의 마지막 항목 주문번호를 기대값으로 독립 계산합니다.
+    """
+    problems = []
+    if not target_ordno:
+        entries = ((before.get(symbol) or {}).get("settlement_ledger") or {}).get("entries") or []
+        if not entries:
+            return ["복구 전 원장이 비어 있어 기대 last_processed_ordno 를 계산할 수 없습니다"]
+        target_ordno = str(max(entries, key=lambda e: e.get("seq", 0)).get("odno", ""))
+    if set(before) != set(after):
+        problems.append("최상위 종목 집합이 달라졌습니다")
+    for sym in before:
+        if sym != symbol and before.get(sym) != after.get(sym):
+            problems.append(f"대상이 아닌 종목 {sym} 가 변경되었습니다")
+    b, a = before.get(symbol), after.get(symbol)
+    if b is None or a is None:
+        return problems + [f"대상 종목 {symbol} 가 없습니다"]
+    for key in set(b) | set(a):
+        if key in ("last_updated", "last_processed_ordno"):
+            continue
+        if b.get(key) != a.get(key):
+            problems.append(f"허용되지 않은 필드 변경: {key}")
+    if a.get("last_updated") != target_updated:
+        problems.append("last_updated 가 목표값과 다릅니다")
+    if str(a.get("last_processed_ordno")) != str(target_ordno):
+        problems.append("last_processed_ordno 가 목표값과 다릅니다")
+    if b.get("last_updated") == a.get("last_updated") and b.get("last_processed_ordno") == a.get("last_processed_ordno"):
+        problems.append("워터마크가 변경되지 않았습니다")
+    try:
+        from datetime import datetime
+        if datetime.fromisoformat(a["last_updated"]) >= datetime.fromisoformat(b["last_updated"]):
+            problems.append("워터마크가 과거로 이동하지 않았습니다")
+    except (KeyError, TypeError, ValueError):
+        problems.append("last_updated 를 해석할 수 없습니다")
+    return problems
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("before")
     ap.add_argument("after")
     ap.add_argument("--symbol", required=True)
     ap.add_argument("--odno", default="")
+    ap.add_argument("--mode", choices=["ledger-rewind", "watermark"], default="ledger-rewind")
+    ap.add_argument("--target-last-updated", default="")
+    ap.add_argument("--target-last-ordno", default="")
     args = ap.parse_args(argv)
     try:
         before, after = _load(args.before), _load(args.after)
     except (OSError, ValueError) as exc:
         print(f"[검증] 입력 오류: {exc}", file=sys.stderr)
         return 2
-    problems = verify(before, after, args.symbol.upper(), args.odno)
+    if args.mode == "watermark":
+        problems = verify_watermark(before, after, args.symbol.upper(), args.target_last_updated, args.target_last_ordno)
+    else:
+        problems = verify(before, after, args.symbol.upper(), args.odno)
     if problems:
         print("[검증 실패] 복구 결과가 허용 범위를 벗어났습니다 — 캐시를 저장하면 안 됩니다")
         for p in problems:
             print(f"  - {p}")
         return 1
-    print(f"[검증 통과] {args.symbol.upper()} 외 종목 불변, 대상 종목은 허용된 필드만 기대값대로 변경")
+    print(f"[검증 통과] {args.symbol.upper()} 외 종목 불변, 대상 종목은 허용된 필드만 기대값대로 변경 ({args.mode})")
     return 0
 
 
