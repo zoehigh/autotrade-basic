@@ -30,7 +30,7 @@ DRY 모드는 DryBroker 래퍼로 처리 — MeritzBroker 자체는 항상 LIVE�
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -53,6 +53,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     select_recent_history,
+    us_session_closed,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -194,6 +195,11 @@ class MeritzBroker(Broker):
 
         # 취소 API에 필요한 제출 메타(oder_cls_code/수량) — 합성 주문번호 기준
         self._submitted_orders: dict[str, dict] = {}
+
+        # 진단용: 마지막 get_daily_candles() 호출에서 제외한 행 수 (결과 dict 에는 미포함)
+        self._last_candle_dropped_bars = 0
+        # 진단용: 제외 사유 토큰 목록 (제외 1건당 1개, 결과 dict 에는 미포함)
+        self._last_candle_drop_reasons: list[str] = []
 
     @property
     def name(self) -> str:
@@ -546,6 +552,118 @@ class MeritzBroker(Broker):
 
         closes = [finalized[key] for key in sorted(finalized)]
         return closes[-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """
+        해외주식 일봉 OHLC 캔들을 조회합니다 → list[dict] (오래된 순).
+
+        `get_daily_closes()` 와 **같은 API/파라미터**를 사용합니다
+        (GET /market/v1/overseas/candles/days, 최신 40건).
+        응답 필드: date(YYYYMMDD) / oprc(시가) / hprc(고가) / lprc(저가) / prpr(종가).
+
+        확정봉 판정은 `us_session_closed()` 를 씁니다:
+        - XNYS 캘린더 기준 휴장·조기폐장·DST 를 반영해 "그 세션의 장이 끝났는가"를 봅니다.
+        - 마감 전(당일 진행 중) 봉은 제외합니다 (미확정 봉으로 ATR 을 계산하지 않음).
+        - `get_daily_closes()` 의 기존 동작(오늘 ET 날짜 무조건 제외)은 **그대로 둡니다**.
+
+        데이터 품질:
+        - o/h/l/c 가 모두 양수여야 합니다.
+        - h >= max(o, c), l <= min(o, c), h >= l 을 만족해야 합니다.
+        - 위 조건을 어긴 행은 **조용히 건너뜁니다** (사유 문자열을 결과에 넣지 않음).
+        - 제외는 **행 단위**입니다: 한 행이 불량이어도 나머지 봉은 그대로 반환합니다.
+          (날짜가 캘린더 범위 밖이면 `us_session_closed()` 가 예외를 던지는데,
+           이를 잡지 않으면 40봉 조회 전체가 실패합니다.)
+        - 스킵 건수/사유는 진단용으로 `self._last_candle_dropped_bars` /
+          `self._last_candle_drop_reasons` 에만 남깁니다
+          (`get_last_candle_drop_reasons()` 로 복사본 조회).
+
+        Returns:
+            list[dict]: [{"date": "YYYY-MM-DD", "o": float, "h": float, "l": float, "c": float}, ...]
+                        오래된 순, 최대 `days` 개.
+
+        Raises:
+            BrokerError: API 호출 실패 시
+        """
+        params = {
+            "mrkt_div_code": "OV",
+            "mrkt_cls_code": get_quote_exchange_code(exchange),
+            "iscd": symbol.upper(),
+            "dely_rltm_cls_code": "0",
+            "mod_stpr_cls_code": "0",
+        }
+        try:
+            body = self._request("GET", PATH_DAILY_CANDLES, params=params)
+            self._check_rsp_cd(body, _MARKET_SUCCESS_RSP_CDS, "일봉 캔들 조회")
+        except BrokerError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise BrokerError(f"일봉 캔들 조회 실패: {str(e)}")
+
+        rows = self._extract_rows(body)
+        now_utc = datetime.now(timezone.utc)
+        bars: dict[str, dict] = {}
+        drop_reasons: list[str] = []
+
+        for row in rows:
+            if not isinstance(row, dict):
+                drop_reasons.append("non_dict")
+                continue
+            date_str = self._digits(row.get("date"))[:8]
+            if len(date_str) != 8:
+                drop_reasons.append("bad_date_format")
+                continue
+
+            open_price = self._to_float(row.get("oprc"))
+            high = self._to_float(row.get("hprc"))
+            low = self._to_float(row.get("lprc"))
+            close = self._to_float(row.get("prpr"))
+
+            # 가격 유효성 + OHLC 관계 검증 (불량 행은 조용히 스킵)
+            if open_price <= 0 or high <= 0 or low <= 0 or close <= 0:
+                drop_reasons.append("non_positive_price")
+                continue
+            if high < max(open_price, close) or low > min(open_price, close):
+                drop_reasons.append("ohlc_relation_violation")
+                continue
+            if high < low:
+                drop_reasons.append("ohlc_relation_violation")
+                continue
+
+            date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+            # 확정봉만 사용 (휴장·조기폐장·DST 는 us_session_closed 가 판정)
+            # 날짜가 캘린더 범위 밖(예: "00000000")이면 예외가 나는데,
+            # 여기서 잡지 않으면 그 행 하나 때문에 40봉 조회 전체가 실패합니다.
+            try:
+                is_closed = us_session_closed(date_iso, now_utc=now_utc)
+            except Exception:
+                drop_reasons.append("calendar_out_of_bounds")
+                continue
+            if not is_closed:
+                drop_reasons.append("non_finalized")
+                continue
+
+            bars[date_str] = {
+                "date": date_iso,
+                "o": open_price,
+                "h": high,
+                "l": low,
+                "c": close,
+            }
+
+        self._last_candle_dropped_bars = len(drop_reasons)
+        self._last_candle_drop_reasons = drop_reasons
+        ordered = [bars[key] for key in sorted(bars)]
+        return ordered[-days:]
+
+    def get_last_candle_drop_reasons(self) -> list[str]:
+        """
+        마지막 `get_daily_candles()` 호출에서 제외한 행의 사유 토큰 목록(읽기 전용).
+
+        토큰: "non_dict" / "bad_date_format" / "non_positive_price" /
+              "ohlc_relation_violation" / "calendar_out_of_bounds" / "non_finalized".
+        제외 1건당 1개이며, 호출 측이 변형하지 못하도록 복사본을 반환합니다.
+        """
+        return list(getattr(self, "_last_candle_drop_reasons", []) or [])
 
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """

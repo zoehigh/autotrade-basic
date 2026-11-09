@@ -27,6 +27,7 @@ from broker import create_broker
 from broker.base import Broker, OrderResult, OrderNotAcceptedError
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
+from dynamic_preview import compare_dynamic_preview, format_preview_report
 from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 # 주문번호 매핑 원장은 state 를 거치지 않고 log_mask 에서 직접 가져옵니다
 # (state 와 **같은 모듈 객체**여야 salt·원장이 하나로 유지됩니다 — `src.log_mask` import 금지).
@@ -809,6 +810,122 @@ def _order_detail_lines(symbol, order) -> str:
     return "\n".join(lines)
 
 
+DYNAMIC_PREVIEW_ENV = "DYNAMIC_LOC_PREVIEW"
+
+
+def _dynamic_preview_enabled():
+    """
+    동적 단계 미리보기 활성 조건 — **DRY + 명시적 플래그**일 때만 True (기본 비활성).
+
+    플래그 값은 '1' 또는 'true' 만 인정합니다 (그 외/미설정 = off).
+    """
+    return (
+        TRADE_MODE == "DRY"
+        and os.getenv(DYNAMIC_PREVIEW_ENV, "").strip().lower() in ("1", "true")
+    )
+
+
+def _dynamic_preview_inputs(strategy_result):
+    """
+    전략 결과에서 미리보기 입력(정상매수 금액·추가매수 상한)만 뽑습니다.
+
+    state dict 는 넘기지 않습니다 (미리보기가 T·net_invested·orders_meta 를 볼 수 없게 함).
+    """
+    normal_amount = 0.0
+    normal_prices = []
+    for item in strategy_result.get("orders") or []:
+        if item.get("side") != "BUY":
+            continue
+        # "[추가매수]" 표식 주문은 정상매수 합계에서 제외합니다
+        if "[추가매수]" in (item.get("comment") or ""):
+            continue
+        price = float(item.get("price") or 0.0)
+        quantity = float(item.get("quantity") or 0)
+        normal_amount += price * quantity
+        if price > 0:
+            normal_prices.append(price)
+    ceiling = (
+        min(normal_prices) if normal_prices else strategy_result.get("star_buy_price")
+    )
+    return {"normal_amount": normal_amount, "ceiling": ceiling}
+
+
+def _dynamic_ohlc_bars(broker, symbol, exchange, data_errors):
+    """
+    OHLC 확정봉 확보 — `get_daily_candles()` 오버라이드 결과만 사용합니다.
+
+    - 브로커 기본 구현(`base.py`)은 `get_daily_closes()` 로 `date`+`close` 만 채우므로
+      **OHLC(o/h/l/c)가 없습니다** → 합성하지 않고 `ohlc-unavailable` 로 기록합니다.
+      (TOSS 처럼 date+close 만 주는 소스도 동일)
+    - 반환값이 None 이면 미리보기는 동적을 켜지 않습니다(fail-closed → 고정 3).
+    """
+    try:
+        rows = broker.get_daily_candles(symbol, exchange, days=20)
+    except Exception as error:  # 조회 실패는 미리보기 사유로만 남깁니다
+        data_errors.append(f"ohlc-query-failed:{type(error).__name__}")
+        return None
+
+    bars = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            data_errors.append("ohlc-unavailable:daily_candles")
+            return None
+        if any(row.get(key) is None for key in ("o", "h", "l", "c")):
+            data_errors.append("ohlc-unavailable:daily_candles")
+            return None
+        bars.append(
+            {
+                "date": row.get("date"),
+                "o": row["o"],
+                "h": row["h"],
+                "l": row["l"],
+                "c": row["c"],
+            }
+        )
+    if not bars:
+        data_errors.append("ohlc-unavailable:daily_candles")
+        return None
+    return bars
+
+
+def _log_dynamic_loc_preview(broker, symbol, exchange, strategy_result):
+    """
+    DRY 전용 동적 단계 비교 로그 (기본 비활성).
+
+    - 주문 전송·state 저장 없음. 실패해도 DRY 프리뷰를 멈추지 않습니다.
+    - 미체결 예약금은 DRY에서 주문가를 확정할 수 없어 undetermined(None)로 넘깁니다
+      → 동적 정책은 fail-closed 로 고정 3을 보여줍니다 (docs/dynamic-budget-contract.md).
+    - OHLC 소스가 배선되지 않은 브로커(현재 전부)는 ATR 계산 불가 → 고정 3 입니다.
+    """
+    if not _dynamic_preview_enabled():
+        return
+    try:
+        data_errors = []
+        bars = _dynamic_ohlc_bars(broker, symbol, exchange, data_errors)
+
+        inputs = _dynamic_preview_inputs(strategy_result)
+        preview = compare_dynamic_preview(
+            symbol,
+            bars=bars,
+            last_close=strategy_result.get("last_price"),
+            unit_amount=strategy_result.get("unit_amount"),
+            base_qty=strategy_result.get("unit_qty"),
+            ceiling=inputs["ceiling"],
+            remaining_seed=strategy_result.get("remaining_seed"),
+            budget_available=strategy_result.get("orderable_cash"),
+            normal_amount=inputs["normal_amount"],
+            open_reserved=None,
+            reservation_note="dry-preview: open-order price unavailable",
+            data_errors=data_errors,
+        )
+        print(format_preview_report(preview))
+    except Exception as error:
+        print(
+            "[동적 LOC 미리보기] 계산 실패 (DRY 계속): "
+            f"{type(error).__name__}: {error}"
+        )
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -1392,6 +1509,10 @@ def run_one_symbol(broker: Broker, symbol_config):
     rev = state.get("reverse_mode", {})
     if rev.get("day_count", 0) > 0:
         print(f"  [리버스모드] {rev['day_count']}일차 진행 중")
+
+    # DRY 전용 동적 단계 비교 미리보기 (기본 비활성: DYNAMIC_LOC_PREVIEW=1|true)
+    if _dynamic_preview_enabled():
+        _log_dynamic_loc_preview(broker, symbol, exchange, strategy_result)
 
     orders = strategy_result["orders"]
 
