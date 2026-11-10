@@ -178,3 +178,12 @@ def test_reprice_tool_skips_merged_orders():
     meta = _meta(5, 1.0, merged_additional_qty=1, normal_qty=4, original_price=118.10)
     item = rp.plan_order(row["odno"], meta, row, 100.0, {}, et)
     assert item["action"] == rp.ACTION_SKIP and "합산" in item["reason"]
+
+
+def test_partial_fill_equivalence_with_split_orders_is_not_guaranteed():
+    """완전체결만 분리 주문과 동등하다는 점을 고정: 2주 체결 시 합산은 0.4, 정상 2주만 체결된 분리 주문은 0.5."""
+    merged = update_T_from_history("SOXL", _state(MERGED), [_fill("M", 2)])
+    split = update_T_from_history("SOXL", _state(SPLIT), [_fill("N", 2)])
+    assert merged["T"] == 5.4 and split["T"] == 5.5
+    # 순투입은 체결금액 기준이라 같음
+    assert round(merged["net_invested"], 2) == round(split["net_invested"], 2)
