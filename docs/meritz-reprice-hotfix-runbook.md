@@ -14,12 +14,14 @@ git status -sb                                   # main, 변경 없음이어야 
 git rev-parse HEAD                               # 5e97b1180fb73b5749954b226bc1e19a539fcb9b
 git fetch origin hotfix/meritz-buy-loc-reprice
 git merge-base --is-ancestor 5e97b11 <APPROVED_SHA> && echo OK   # 운영 커밋 위에 쌓였는지
-git diff --stat 5e97b11 <APPROVED_SHA>           # 아래 7개 파일 외 변경이 있으면 중단
+git diff --stat 5e97b11 <APPROVED_SHA>           # 아래 8개 파일 외 변경이 있으면 중단
 ```
 
 허용 변경 파일 (이 외 파일이 보이면 배포 중단):
-`docs/meritz-reprice-hotfix-runbook.md`, `ops/meritz_buy_loc_reprice.py`, `src/meritz_reprice.py`,
+`.gitignore`, `docs/meritz-reprice-hotfix-runbook.md`, `ops/meritz_buy_loc_reprice.py`, `src/meritz_reprice.py`,
 `src/run_lock.py`, `src/strategy.py`, `tests/test_meritz_reprice.py`, `trading_bot.py`.
+`.gitignore` 는 `.bot.lock`·`.reprice_journal.json` 을 무시하도록 추가한 것입니다 (없으면 첫 LIVE 실행 뒤
+운영 `git status` 가 더러워져 다음 배포·점검의 "변경 없음" 확인이 깨집니다).
 `ops/run_daily.sh`·크론·`pyproject.toml`·`uv.lock` 은 변경되지 않습니다 (의존성 추가 없음).
 
 ## 1. 배포 (승인 후, 사람이 수행)
@@ -82,8 +84,17 @@ git rev-parse HEAD
 | `불확실 유지(접수 0/거부 0)` | 이력에 정정 행이 아직 없음 | 앱에서 주문 확인 후 잠시 뒤 재실행. 확인 전 재주문 금지 |
 | `정정 거부 확인 ... 보류` | 거부된 정정. 원주문 생존 여부 이력으로 판별 불가 | 앱/HTS 에서 원주문 확인. 원주문 메타는 유지되므로 체결되면 정상 정산됨 |
 | `다른 실행이 락을 쥐고 있습니다` | 봇/런처/다른 도구 실행 중 | 끝난 뒤 재시도. 락 파일 삭제 금지 (flock 은 프로세스 종료 시 자동 해제) |
+| `[중단] ...: 미해결 정정 journal ... 정산·저장을 하지 않습니다` (`exit 1`) | 유지보수 경로(reconcile-only, REPAIR:REINFERENCE, REPAIR:FORCE_T, net_invested repair)가 journal 보류 종목을 대상에 포함 | **여러 종목을 대상으로 하면 하나만 보류돼도 실행 전체가 중단**됩니다 (부분 저장 방지). 보류되지 않은 종목만 따로 지정해 실행하거나, 위 첫 행의 절차로 journal 을 먼저 해소 |
 
 ## 5. 알려진 한계 (이 hotfix 가 해결하지 않는 것)
+
+후속 과제로 기록 (이번 범위에 포함하지 않음):
+- 레거시 `STATE_*_ONLY` 복구 경로(`_repair_state_only`, `_clear_fence_only`, `_set_cycle_start_only`,
+  `_assume_reverse_expiry_only`)에는 journal 보류 게이트가 없음. `_repair_state_only` 는 설정에 따라 T 와 정산 원장도
+  바꾸므로 "정산하지 않아 안전"하다고 가정하지 말 것. 기존 백업·승인 절차를 그대로 지키고, 후속에서 게이트 확장.
+- 어댑터가 거부된 정정 행에도 원주문을 `정정됨`·잔량 0 으로 표시하는 문제 개선.
+- 시세 응답 시각 검증.
+
 
 - 이력만으로는 거부된 정정 뒤 원주문이 살아 있는지 알 수 없음 (어댑터가 `정정됨`·잔량 0 으로 표시). 도구는 보류하고,
   운영 봇은 정정을 하지 않으므로 영향 없음. 어댑터 개선은 별도 PR.
@@ -91,3 +102,31 @@ git rev-parse HEAD
 - 재조회~정정 호출 사이 체결 경쟁은 남음 (정정 거부로 안전하게 끝남).
 - 정정 후 가격이 더 오르면 재실행이 필요함 (LOC 는 종가 기준).
 - 수량 합산·동적 추가매수·전략 공식은 변경하지 않음.
+
+## 6. 보류 조건 — 도구가 정정하지 않거나 사람이 중단해야 하는 경우
+
+| 항목 | 한계 | 도구 동작 | 사람의 판단 기준 |
+|---|---|---|---|
+| 부분체결·체결 있는 주문 | 부분체결 후 정정 수량의 의미를 문서로 확인하지 못함 (이력에도 사례 없음) | 계획에서 SKIP — 정정하지 않음 | 수동 판단. 이 도구로 정정하지 말 것 |
+| 거부된 정정 행이 있는 원주문 | 이력은 원주문을 `정정됨`·잔량 0 으로 보여 주어 생존 여부 판별 불가 | 계획에서 SKIP(보류), 정정 직후 이력이 `거부`면 메타를 옮기지 않고 원주문 메타 유지 | 앱/HTS 에서 원주문 확인. 살아 있으면 체결이 원주문 메타로 정상 정산됨 |
+| 시세 신선도 | 시세 응답에 시각 필드가 없음 (3초 간격 샘플에서 값이 갱신되는 것만 확인) | 정정 직전 재조회 1회만 수행, 신선도 검증 불가 | 실행 전에 앱 시세와 대조해 큰 차이(예: 1% 이상)가 있으면 중단 |
+| 정정 가능 시간 | 문서로 확인하지 못함. 접수된 이력은 17:12~18:32 KST(프리마켓)뿐 | 시간 제한 판정 없음 — 브로커 거부(`REJECTED`/`REJECTED_LATE`)에 의존 | 위 시간대 밖(정규장 등)에서는 첫 시도를 1건으로 제한하고 결과 확인 후 진행 |
+| 재조회~정정 사이 체결 | 조회와 호출 사이 경쟁 | 정정 거부로 안전하게 종료, 메타 불변 | 거부 후 이력 재확인 |
+
+## 7. 최초 적용 후 확인 절차
+
+배포 직후 (이미 1절에 있는 항목 포함):
+1. `git rev-parse HEAD` 가 승인 SHA 와 일치, `git status -sb` 에 변경 없음 (`.gitignore` 반영 확인).
+2. 조회 모드 실행 → 오류 없음, `.state.json` 해시 불변, `.bot.lock`·journal 미생성.
+
+첫 LIVE 실행(18:30) 후:
+1. `.bot.lock` 생성, 로그에 `[중단]` 락 메시지 없음, 18:45 `verify_run` 통과.
+2. 보정된 일반 BUY LOC 의 `orders_meta` 에 `original_price`·`order_price` 기록 (텔레그램의 LOC 가격 보정 알림과 대조).
+3. `git status -sb` 가 여전히 깨끗함.
+
+첫 실제 정정 직후 (정정이 필요한 날에만):
+1. 결과가 `AMENDED` 이고 이력에 정정 행(정정 코드 1)이 접수 상태로 남음, 원주문은 `정정됨`.
+2. `orders_meta` 의 키가 새 주문번호로 이동, `amended_from`·`original_price` 존재, `.reprice_journal.json` 이 비어 있거나 없음.
+3. 앱에서 정정 가격·수량(수량 불변) 확인.
+4. 다음 18:30 정산 후: 체결이 있었다면 T·`net_invested` 가 **한 번만** 반영됐는지, 18:45 `verify_run` 통과 확인.
+5. `REJECTED_LATE`/`UNCERTAIN`/`LINK_FAILED` 가 한 번이라도 나오면 추가 정정을 중단하고 4절 절차로 해소.
