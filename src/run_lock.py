@@ -22,6 +22,21 @@ def bot_lock_path() -> str:
     return os.path.join(_state_dir(), ".bot.lock")
 
 
+def watch_lock_path() -> str:
+    """감시기(ops/meritz_reprice_watch.py) 중복 실행 방지 락."""
+    return os.path.join(_state_dir(), ".watch.lock")
+
+
+def watch_state_path() -> str:
+    """감시기 기록(일일 정정 횟수·알림 중복 방지). 매매 state 와 별개 파일입니다."""
+    return os.path.join(_state_dir(), ".watch_state.json")
+
+
+def watch_halt_path() -> str:
+    """감시기 중단 표식 — 있으면 APPLY 모드는 정정하지 않습니다 (사람이 원인 해소 후 삭제)."""
+    return os.path.join(_state_dir(), ".watch_halt.json")
+
+
 def journal_path() -> str:
     return os.path.join(_state_dir(), ".reprice_journal.json")
 
