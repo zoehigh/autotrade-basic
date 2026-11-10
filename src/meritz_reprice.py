@@ -12,6 +12,7 @@
 import json
 import math
 import os
+import time
 from copy import deepcopy
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -67,7 +68,19 @@ def _skip(odno, reason):
     return {"action": ACTION_SKIP, "odno": odno, "reason": reason}
 
 
-def plan_order(odno, meta, row, last_price, overrides, today_session):
+def find_amend_rows(history, odno):
+    """odno 를 원주문으로 하는 같은 날짜의 정정 행들 (거부 포함)."""
+    plain = _plain_odno(odno)
+    day = str(odno).split(":")[0]
+    return [
+        row for row in (history or [])
+        if row.get("_rctf_code") == "1"
+        and row.get("_plain_orgl_oder_no") == plain
+        and row.get("_oder_date") == day
+    ]
+
+
+def plan_order(odno, meta, row, last_price, overrides, today_session, amend_rows=()):
     """주문 1건의 재조정 계획을 만듭니다 (조회만, 부작용 없음)."""
     if meta.get("side") != "BUY":
         return _skip(odno, "매수 주문 아님")
@@ -78,6 +91,17 @@ def plan_order(odno, meta, row, last_price, overrides, today_session):
     if row is None:
         return _skip(odno, "이력에 주문 행 없음 (상태 불확실)")
 
+    session = _order_us_session_date(row)
+    if session is None or session != today_session:
+        return _skip(odno, "오늘 미국 세션 주문이 아님 (만료 또는 판별 불가)")
+
+    # 거부된 정정 행이 있으면 이력은 원주문을 '정정됨·잔량 0'으로 보여 주지만,
+    # 정정이 거부됐다면 원주문이 살아 있을 수 있습니다. 이력만으로 판별할 수 없으므로 보류합니다.
+    if any(r.get("_is_rejected") for r in amend_rows):
+        return _skip(odno, "거부된 정정 행이 있어 원주문 생존 여부를 판별할 수 없음 — 보류 (앱/HTS 에서 직접 확인)")
+    if amend_rows:
+        return _skip(odno, "이미 정정된 주문 (정정 후 주문번호로 관리)")
+
     original = meta.get("original_price") or overrides.get(odno)
     if not is_valid_price(original):
         return _skip(odno, "원래 전략 매수가를 알 수 없거나 유효하지 않음 (--original 확인)")
@@ -87,10 +111,6 @@ def plan_order(odno, meta, row, last_price, overrides, today_session):
         return _skip(odno, "LOC 주문이 아님")
     if row.get("sll_buy_dvsn_cd_name") != "매수":
         return _skip(odno, "이력상 매수 주문이 아님")
-
-    session = _order_us_session_date(row)
-    if session is None or session != today_session:
-        return _skip(odno, "오늘 미국 세션 주문이 아님 (만료 또는 판별 불가)")
 
     status = str(row.get("prcs_stat_name") or "")
     filled = _to_int(row.get("ft_ccld_qty"))
@@ -136,7 +156,8 @@ def build_plan(state, history, last_price, overrides, today_session):
     plan = []
     for odno, meta in (state.get("orders_meta") or {}).items():
         plan.append(plan_order(str(odno), meta or {}, by_odno.get(str(odno)),
-                               last_price, overrides, today_session))
+                               last_price, overrides, today_session,
+                               amend_rows=find_amend_rows(history, str(odno))))
     known = {item["odno"] for item in plan}
     for odno, row in by_odno.items():
         if odno in known or row.get("prcs_stat_name") != "거부":
@@ -190,51 +211,83 @@ def write_journal(path, entries):
     os.replace(tmp, path)
 
 
+def _amend_row_matches(row, entry):
+    """정정 행이 journal 항목의 정정 건과 같은 주문인지 (거부 여부는 따로 판단)."""
+    return (
+        row.get("_rctf_code") == "1"
+        and row.get("_plain_orgl_oder_no") == _plain_odno(entry["old_odno"])
+        and row.get("_oder_date") == str(entry["old_odno"]).split(":")[0]
+        and not row.get("_is_cancel")
+        and row.get("sll_buy_dvsn_cd_name") == "매수"
+        and row.get("_oder_cls_code") == _LOC_CLS_CODE
+        and row.get("_ordered_qty") == int(entry["qty"])
+        and abs(float(row.get("_order_price") or 0) - float(entry["target_price"])) < 0.005
+    )
+
+
 def resolve_journal(entries, history, state):
     """미해결 journal 을 이력으로 확인해 state 에 연결합니다.
 
-    새 정정 행(정정 코드 1 + 원주문번호 일치)이 정확히 1개일 때만 연결합니다.
-    0개/2개 이상이면 불확실로 남기고, 자동 재주문은 하지 않습니다.
+    - 접수된 정정 행이 정확히 1개 → 새 주문번호로 연결
+    - 접수된 행이 없고 거부된 정정 행만 있음 → 연결하지 않고 항목만 정리
+      (원주문 메타는 그대로 유지: 원주문이 살아 있을 수 있어 체결이 정상 정산되도록)
+    - 그 외(0개, 2개 이상, 접수+거부 혼재) → 불확실로 남김, 자동 재주문 없음
     Returns: (남은 entries, 메시지 목록)
     """
     remaining, messages = [], []
     for entry in entries:
-        old_plain = _plain_odno(entry["old_odno"])
-        old_date = str(entry["old_odno"]).split(":")[0]
-        # 정정 접수의 증거로 인정하는 행: 같은 주문일, 정정 코드, 거부 아님, 매수 LOC,
-        # 같은 수량, 목표가와 같은 가격 — 하나라도 다르면 연결하지 않습니다.
-        matches = [
-            row for row in (history or [])
-            if row.get("_rctf_code") == "1"
-            and row.get("_plain_orgl_oder_no") == old_plain
-            and row.get("_oder_date") == old_date
-            and not row.get("_is_rejected")
-            and not row.get("_is_cancel")
-            and row.get("sll_buy_dvsn_cd_name") == "매수"
-            and row.get("_oder_cls_code") == _LOC_CLS_CODE
-            and row.get("_ordered_qty") == int(entry["qty"])
-            and abs(float(row.get("_order_price") or 0) - float(entry["target_price"])) < 0.005
-        ]
-        if len(matches) == 1:
+        accepted = [r for r in (history or []) if _amend_row_matches(r, entry) and not r.get("_is_rejected")]
+        rejected = [r for r in (history or []) if _amend_row_matches(r, entry) and r.get("_is_rejected")]
+        if len(accepted) == 1 and not rejected:
             relink_amended_order(
-                state, entry["old_odno"], str(matches[0]["odno"]),
+                state, entry["old_odno"], str(accepted[0]["odno"]),
                 entry["qty"], entry["target_price"],
             )
-            messages.append(f"연결 완료: {mask_odno(entry['old_odno'])} → {mask_odno(matches[0]['odno'])}")
+            messages.append(f"연결 완료: {mask_odno(entry['old_odno'])} → {mask_odno(accepted[0]['odno'])}")
+        elif not accepted and rejected:
+            messages.append(
+                f"정정 거부 확인: {mask_odno(entry['old_odno'])} — 연결하지 않음. "
+                f"원주문 생존 여부는 이력으로 판별 불가(보류, 앱/HTS 확인 필요)"
+            )
         else:
             remaining.append(entry)
             messages.append(
-                f"불확실 유지({len(matches)}건 일치): {mask_odno(entry['old_odno'])} — 자동 재주문 안 함"
+                f"불확실 유지(접수 {len(accepted)}건/거부 {len(rejected)}건): "
+                f"{mask_odno(entry['old_odno'])} — 자동 재주문 안 함"
             )
     return remaining, messages
 
 
-def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_fn):
+def verify_new_order(history_fn, new_odno, tries=3, wait=2.0):
+    """정정 직후 이력에서 새 주문의 접수 여부를 확인합니다.
+
+    Returns: "ACCEPTED" | "REJECTED" | "UNKNOWN" (이력 지연·조회 실패·상태 불명)
+    """
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(wait)
+        try:
+            rows = history_fn()
+        except Exception:
+            continue
+        row = next((r for r in rows if str(r.get("odno")) == str(new_odno)), None)
+        if row is None:
+            continue
+        if row.get("_is_rejected"):
+            return "REJECTED"
+        if row.get("prcs_stat_name") in ("미체결", "부분체결", "체결"):
+            return "ACCEPTED"
+    return "UNKNOWN"
+
+
+def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_fn,
+                history_fn, verify_wait=2.0):
     """정정 1건을 실행합니다. 결과 문자열을 반환합니다.
 
     결과:
-      "AMENDED"        정정 접수 + state 연결 완료
-      "REJECTED"       브로커가 명시적으로 미접수 (주문은 그대로 살아 있음)
+      "AMENDED"        정정 접수 확인 + state 연결 완료
+      "REJECTED"       브로커가 API 응답으로 미접수 확정 (주문은 그대로 살아 있음)
+      "REJECTED_LATE"  API 는 접수했으나 이력에 거부로 남음 — 메타 이동 안 함, 원주문 생존 불명(보류)
       "UNCERTAIN"      접수 여부 불확실 — journal 유지, 호출부는 즉시 중단해야 함
       "LINK_FAILED"    정정은 접수됐지만 state 저장 실패 — journal 유지, 즉시 중단
     """
@@ -246,6 +299,7 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
         "at": datetime.now(ZoneInfo("UTC")).isoformat(),
     })
     write_journal(journal_path, entries)  # 호출 전에 먼저 기록
+    others = [e for e in entries if e["old_odno"] != old_odno]
 
     try:
         new_odno = broker.modify_order(
@@ -253,11 +307,23 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
         )
     except OrderNotAcceptedError as error:
         # 브로커가 접수하지 않았음이 확정 — 원 주문은 그대로, journal 항목 제거
-        write_journal(journal_path, [e for e in entries if e["old_odno"] != old_odno])
+        write_journal(journal_path, others)
         print(f"  ✗ 정정 미접수 확정: {mask_odno(old_odno)} — {str(error)[:120]}")
         return "REJECTED"
     except Exception as error:
         print(f"  ⚠️ 정정 접수 여부 불확실: {mask_odno(old_odno)} — {str(error)[:120]}")
+        return "UNCERTAIN"
+
+    # API 응답만으로 연결하지 않습니다 — 실제로 이력에 접수로 남았는지 확인합니다.
+    verdict = verify_new_order(history_fn, new_odno, wait=verify_wait)
+    if verdict == "REJECTED":
+        write_journal(journal_path, others)
+        print(f"  ⚠️ 정정이 이력에 '거부'로 남음: {mask_odno(old_odno)} → {mask_odno(new_odno)}. "
+              f"메타를 옮기지 않았습니다. 원주문 생존 여부를 앱/HTS 에서 확인하세요 (보류)")
+        return "REJECTED_LATE"
+    if verdict == "UNKNOWN":
+        print(f"  ⚠️ 정정 후 이력에서 새 주문을 확인하지 못함: {mask_odno(old_odno)} → "
+              f"{mask_odno(new_odno)}. journal 을 유지하고 중단합니다")
         return "UNCERTAIN"
 
     try:
@@ -268,7 +334,7 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
               f"{mask_odno(new_odno)} — {str(error)[:120]}")
         return "LINK_FAILED"
 
-    write_journal(journal_path, [e for e in entries if e["old_odno"] != old_odno])
+    write_journal(journal_path, others)
     print(f"  ✓ 정정 완료: {mask_odno(old_odno)} → {mask_odno(new_odno)} "
           f"(${item['current_price']:.2f} → ${item['target_price']:.2f})")
     return "AMENDED"

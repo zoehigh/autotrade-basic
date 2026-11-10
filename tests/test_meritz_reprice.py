@@ -113,11 +113,13 @@ class FakeBroker:
         return NEW
 
 
-def _apply(broker, state, tmp_path, saved):
+def _apply(broker, state, tmp_path, saved, history_fn=None):
     item = _plan(state, _row())
     journal = str(tmp_path / "j.json")
     result = rp.apply_amend(broker, "SOXL", "NY", item, state, journal,
-                            lambda s, st: saved.append(deepcopy(st)))
+                            lambda s, st: saved.append(deepcopy(st)),
+                            history_fn or (lambda: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)]),
+                            verify_wait=0)
     return result, journal
 
 
@@ -156,7 +158,9 @@ def test_link_failure_keeps_journal(tmp_path):
 
     def boom(symbol, st):
         raise OSError("disk")
-    assert rp.apply_amend(FakeBroker(), "SOXL", "NY", item, state, journal, boom) == "LINK_FAILED"
+    ok_history = lambda: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    assert rp.apply_amend(FakeBroker(), "SOXL", "NY", item, state, journal, boom,
+                          ok_history, verify_wait=0) == "LINK_FAILED"
     assert len(rp.read_journal(journal)) == 1
 
 
@@ -244,7 +248,7 @@ _ENTRY = {"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69}
 
 
 @pytest.mark.parametrize("change", [
-    {"_oder_date": "20200101"}, {"status": "거부"}, {"_ordered_qty": 3},
+    {"_oder_date": "20200101"}, {"_ordered_qty": 3},
     {"price": 60.0}, {"sll_buy_dvsn_cd_name": "매도"}, {"_oder_cls_code": "01"},
 ])
 def test_journal_resolution_rejects_mismatched_rows(change):
@@ -352,3 +356,59 @@ def test_apply_refused_while_bot_lock_is_held(monkeypatch, tmp_path):
     finally:
         held.close()
     assert broker.calls == []
+
+
+# ── 거부된 정정 행: 원주문 생존 여부를 이력으로 판별할 수 없음 → 보류 ─────────
+
+def _rejected_child_history():
+    child = _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)
+    return [_row(status="정정됨"), child]  # 이력은 원주문을 '정정됨'으로 보여 줌
+
+
+def test_plan_holds_original_when_a_rejected_amend_row_exists():
+    plan = rp.build_plan(_state(), _rejected_child_history(), 65.0, {}, ET_TODAY)
+    item = next(i for i in plan if i["odno"] == OLD)
+    assert item["action"] == rp.ACTION_SKIP and "판별할 수 없음" in item["reason"]
+
+
+def test_plan_does_not_touch_already_amended_order():
+    history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    item = next(i for i in rp.build_plan(_state(), history, 65.0, {}, ET_TODAY) if i["odno"] == OLD)
+    assert item["action"] == rp.ACTION_SKIP and "이미 정정" in item["reason"]
+
+
+def test_late_rejection_keeps_original_meta_and_does_not_relink(tmp_path):
+    state, saved = _state(), []
+    rejected = lambda: [_row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
+    result, journal = _apply(FakeBroker(), state, tmp_path, saved, history_fn=rejected)
+    assert result == "REJECTED_LATE"
+    assert OLD in state["orders_meta"] and NEW not in state["orders_meta"] and not saved
+    assert rp.read_journal(journal) == []
+
+
+@pytest.mark.parametrize("history_fn", [lambda: [], lambda: (_ for _ in ()).throw(OSError("x"))])
+def test_unverified_amend_keeps_journal_and_stops(tmp_path, history_fn):
+    state, saved = _state(), []
+    result, journal = _apply(FakeBroker(), state, tmp_path, saved, history_fn=history_fn)
+    assert result == "UNCERTAIN" and OLD in state["orders_meta"] and not saved
+    assert len(rp.read_journal(journal)) == 1
+
+
+def test_journal_resolution_with_only_rejected_child_does_not_relink():
+    state = _state()
+    left, messages = rp.resolve_journal([dict(_ENTRY)], _rejected_child_history(), state)
+    assert left == [] and OLD in state["orders_meta"] and NEW not in state["orders_meta"]
+    assert any("판별 불가" in m for m in messages)
+
+
+def test_journal_resolution_mixed_accepted_and_rejected_stays_uncertain():
+    history = _rejected_child_history() + [_row(odno="x:9", rctf="1", orgl="100", price=73.69)]
+    left, _ = rp.resolve_journal([dict(_ENTRY)], history, _state())
+    assert left
+
+
+def test_real_shape_rejected_then_accepted_amend_rows():
+    """운영 이력 실측 형태: 거부된 정정 행 뒤에 별개의 정정이 접수된 경우도 보류로 처리."""
+    plan = rp.build_plan(_state(), _rejected_child_history() +
+                         [_row(odno="x:8", rctf="1", orgl="100", price=70.0)], 65.0, {}, ET_TODAY)
+    assert next(i for i in plan if i["odno"] == OLD)["action"] == rp.ACTION_SKIP

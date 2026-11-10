@@ -160,7 +160,12 @@ def main(argv=None, broker=None):
             if not fresh or fresh["action"] != rp.ACTION_AMEND:
                 print(f"  - 재확인에서 정정 불필요/불가: {mask_odno(item['odno'])}")
                 continue
-            result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file, save_state)
+            history_fn = lambda: broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
+            result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file,
+                                    save_state, history_fn)
+            if result == "REJECTED_LATE":
+                print("  → 이 주문은 보류합니다 (원주문 생존 불명). 다른 주문은 계속 검토합니다")
+                continue
             if result in ("UNCERTAIN", "LINK_FAILED"):
                 exit_code = 1
                 print("  → 즉시 중단합니다. 재주문하지 않고 journal 을 유지합니다")
