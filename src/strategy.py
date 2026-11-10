@@ -2,7 +2,7 @@
 import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from config import TRADE_MODE, LS_DEMO_BYPASS_BUGS
+from config import TRADE_MODE, LS_DEMO_BYPASS_BUGS, MERGE_CAPPED_ADDITIONAL
 from broker.base import Broker
 from broker.market_utils import normalize_order_price
 from market_data import get_finnhub_ma5
@@ -61,6 +61,46 @@ def build_additional_loc_prices(unit_amount, base_qty, levels, ceiling):
             previous = price
         index += 1
     return result
+
+def _additional_ladder_with_merge(orders, unit_amount, base_qty, levels, ceiling):
+    """추가매수 계단을 만듭니다. MERGE_CAPPED_ADDITIONAL 이 켜져 있으면 보정된 정상매수에 수량을 합산합니다.
+
+    기본(OFF)은 기존과 같습니다: build_additional_loc_prices(unit_amount, base_qty, levels, ceiling).
+
+    ON 이고 정상매수가 1.19 상한으로 낮춰졌다면 **원래(보정 전) 주문표**를 기준으로 합니다.
+      - 원래 주문표 = 보정 전 정상매수가를 천장으로 한 추가매수 계단 (levels 단계)
+      - 보정가 이상이던 단계는 별도 주문으로 낼 수 없으므로(브로커 +20% 제한) 그 수량을
+        보정가 주문(가장 낮은 정상매수)에 더합니다. LOC 는 종가가 보정가 이하이면 같이 체결되므로
+        원래 주문표와 같은 결과입니다.
+      - 보정가 미만 단계만 추가매수로 남깁니다. 깊은 단계를 더 만들지 않으므로
+        정상매수와 추가매수의 총 수량은 원래 주문표(정상 + levels)와 같습니다 (중복 없음).
+    합산된 주문은 T 계산상 **정상매수** 그대로입니다 (추가 수량은 T 를 올리지 않음):
+      total_qty = 정상 + 합산분, t_target = 정상 값 → 완전체결 시 ΔT = t_target (비례 계산).
+    orders 안의 해당 정상매수 dict 를 직접 수정합니다.
+    """
+    ladder = build_additional_loc_prices(unit_amount, base_qty, levels, ceiling)
+    if not MERGE_CAPPED_ADDITIONAL:
+        return ladder
+    normals = [o for o in orders if o["side"] == "BUY" and _ADDITIONAL_MARK not in o["comment"]]
+    if not normals or not any(o.get("original_price") for o in normals):
+        return ladder  # 상한 보정이 없으면 원래 주문표와 같습니다
+    capped_ceiling = min(o["price"] for o in normals)
+    original_ceiling = min((o.get("original_price") or o["price"]) for o in normals)
+    original_ladder = build_additional_loc_prices(unit_amount, base_qty, levels, original_ceiling)
+    folded = sum(1 for _level, price in original_ladder if price >= capped_ceiling)
+    kept = [price for _level, price in original_ladder if price < capped_ceiling]
+    if folded:
+        target = next(o for o in normals if o["price"] == capped_ceiling)
+        target["normal_qty"] = target["quantity"]
+        target["merged_additional_qty"] = folded
+        target["quantity"] = target["quantity"] + folded
+        target["comment"] += f" [합산 +{folded}주]"
+        print(
+            f"  ℹ️ 추가매수 {folded}단계(보정가 ${capped_ceiling:.2f} 이상)를 정상매수에 합산: "
+            f"{target['normal_qty']}주 → {target['quantity']}주"
+        )
+    return [(index + 1, price) for index, price in enumerate(kept)]
+
 
 def adjust_price_to_tick(price):
     """
@@ -644,8 +684,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
 
         # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (entry_qty + i))
         # 1.19 상한에 걸린 후보는 건너뛰고 진입가보다 낮은 단계부터 배치합니다.
-        for level, add_price in build_additional_loc_prices(
-            unit_amount, entry_qty, additional_loc_levels, entry_price
+        for level, add_price in _additional_ladder_with_merge(
+            orders, unit_amount, entry_qty, additional_loc_levels, entry_price
         ):
             orders.append({
                 "side": "BUY",
@@ -751,8 +791,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 # 1.19 상한에 걸린 후보는 건너뛰고 정상매수보다 낮은 단계부터 배치합니다.
                 if base_qty > 0:
                     ceiling = min(normal_buy_prices) if normal_buy_prices else float("inf")
-                    for level, add_price in build_additional_loc_prices(
-                        unit_amount, base_qty, additional_loc_levels, ceiling
+                    for level, add_price in _additional_ladder_with_merge(
+                        orders, unit_amount, base_qty, additional_loc_levels, ceiling
                     ):
                         orders.append({
                             "side": "BUY",
@@ -796,8 +836,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 # 1.19 상한에 걸린 후보는 건너뛰고 정상매수보다 낮은 단계부터 배치합니다.
                 if qty_at_star > 0:
                     ceiling = min(normal_buy_prices) if normal_buy_prices else float("inf")
-                    for level, add_price in build_additional_loc_prices(
-                        unit_amount, qty_at_star, additional_loc_levels, ceiling
+                    for level, add_price in _additional_ladder_with_merge(
+                        orders, unit_amount, qty_at_star, additional_loc_levels, ceiling
                     ):
                         orders.append({
                             "side": "BUY",
