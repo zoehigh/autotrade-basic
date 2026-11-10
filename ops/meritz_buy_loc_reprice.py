@@ -122,9 +122,13 @@ def main(argv=None, broker=None):
 
         # 미해결 journal 먼저 처리 (재시작/중복 실행 대비)
         journal = [e for e in rp.read_journal(journal_file) if e["symbol"] == symbol]
+        # 복구(state 저장·journal 정리)도 쓰기 작업이므로 종목별 확인 문구가 맞을 때만 수행합니다
+        confirmed = args.apply and args.confirm == f"REPRICE {symbol}"
         if journal:
             print(f"[{symbol}] 미해결 정정 journal {len(journal)}건 — 이력으로 확인합니다")
-            if args.apply:
+            if args.apply and not confirmed:
+                print(f'  확인 문구 불일치 — 복구는 "REPRICE {symbol}" 일 때만 수행합니다 (조회만 합니다)')
+            if confirmed:
                 left, messages = rp.resolve_journal(journal, history, state)
                 for message in messages:
                     print("  " + message)
@@ -137,8 +141,8 @@ def main(argv=None, broker=None):
                 left, messages = rp.resolve_journal(journal, history, deepcopy(state))
                 for message in messages:
                     print("  [조회 모드, 저장 안 함] " + message)
-            if left or (journal and not args.apply):
-                print(f"[{symbol}] 접수 불확실 정정이 남아 있어 중단합니다 (자동 재주문 안 함)")
+            if left or (journal and not confirmed):
+                print(f"[{symbol}] 미해결 journal 이 남아 있어 이 종목은 중단합니다 (자동 재주문 안 함)")
                 exit_code = 1
                 continue
 

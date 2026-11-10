@@ -412,3 +412,67 @@ def test_real_shape_rejected_then_accepted_amend_rows():
     plan = rp.build_plan(_state(), _rejected_child_history() +
                          [_row(odno="x:8", rctf="1", orgl="100", price=70.0)], 65.0, {}, ET_TODAY)
     assert next(i for i in plan if i["odno"] == OLD)["action"] == rp.ACTION_SKIP
+
+
+# ── Codex 재리뷰 반영 ───────────────────────────────────────────────
+
+def _apply_env(monkeypatch):
+    import config
+    monkeypatch.setenv("ALLOW_BROKER_ORDERS", "1")
+    monkeypatch.setattr(config, "BROKER", "meritz")
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+
+
+class _JournalBroker(_ReadOnlyBroker):
+    def get_order_history(self, *a, **k):
+        return [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+
+
+@pytest.mark.parametrize("confirm", [[], ["--confirm", "WRONG"], ["--confirm", "REPRICE TQQQ"]])
+def test_journal_recovery_requires_symbol_confirmation(monkeypatch, tmp_path, confirm):
+    import run_lock
+    import state as st
+    _apply_env(monkeypatch)
+    rp.write_journal(run_lock.journal_path(), [dict(_ENTRY)])
+    journal_before = open(run_lock.journal_path()).read()
+    broker = _JournalBroker()
+    code = _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply"] + confirm, broker)
+    assert code == 1 and broker.calls == []
+    assert OLD in st.load_state("SOXL")["orders_meta"]          # state 불변
+    assert open(run_lock.journal_path()).read() == journal_before  # journal 불변
+
+
+def test_journal_recovery_runs_with_matching_confirmation(monkeypatch, tmp_path):
+    import run_lock
+    import state as st
+    _apply_env(monkeypatch)
+    rp.write_journal(run_lock.journal_path(), [dict(_ENTRY)])
+    _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"], _JournalBroker())
+    metas = st.load_state("SOXL")["orders_meta"]
+    assert NEW in metas and OLD not in metas
+    assert rp.read_journal(run_lock.journal_path()) == []
+
+
+def test_override_original_price_survives_amend_for_later_repricing(tmp_path):
+    state = _state()
+    del state["orders_meta"][OLD]["original_price"]       # 구 주문: 메타에 원래가 없음
+    item = _plan(state, _row(), overrides={OLD: 73.69})
+    assert item["action"] == rp.ACTION_AMEND and item["original_price"] == 73.69
+    saved = []
+    result = rp.apply_amend(FakeBroker(), "SOXL", "NY", item, state, str(tmp_path / "j.json"),
+                            lambda s, st: saved.append(1),
+                            lambda: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)], verify_wait=0)
+    assert result == "AMENDED"
+    assert state["orders_meta"][NEW]["original_price"] == 73.69
+    # 다음 실행: --original 없이도 계획 가능 (현재가 상한 때문에 아직 낮은 경우 재상향)
+    row = _row(odno=NEW, rctf="1", orgl="100", price=66.0)
+    item = rp.build_plan(state, [row], 62.0, {}, ET_TODAY)[0]
+    assert item["action"] == rp.ACTION_AMEND and item["target_price"] == 73.69
+
+
+def test_journal_resolution_also_restores_original_price():
+    state = _state()
+    del state["orders_meta"][OLD]["original_price"]
+    entry = dict(_ENTRY, original_price=73.69)
+    rp.resolve_journal([entry], [_row(odno=NEW, rctf="1", orgl="100", price=73.69)], state)
+    assert state["orders_meta"][NEW]["original_price"] == 73.69

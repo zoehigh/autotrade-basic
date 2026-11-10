@@ -173,7 +173,7 @@ def build_plan(state, history, last_price, overrides, today_session):
     return plan
 
 
-def relink_amended_order(state, old_odno, new_odno, qty, new_price):
+def relink_amended_order(state, old_odno, new_odno, qty, new_price, original_price=None):
     """정정으로 바뀐 주문번호로 orders_meta 키를 옮깁니다 (재실행해도 안전).
 
     체결 반영 표식(processed_*)은 그대로 이어받아 T·순투입이 중복 정산되지 않게 합니다.
@@ -189,6 +189,9 @@ def relink_amended_order(state, old_odno, new_odno, qty, new_price):
     meta["total_qty"] = int(qty)
     meta["order_price"] = float(new_price)
     meta["amended_from"] = old_odno
+    # --original 로 지정한 구 주문도 다음 재조정이 가능하도록 원래 매수가를 새 메타에 남깁니다
+    if original_price and not meta.get("original_price") and is_valid_price(original_price):
+        meta["original_price"] = float(original_price)
     metas[new_odno] = meta
     return True
 
@@ -241,7 +244,7 @@ def resolve_journal(entries, history, state):
         if len(accepted) == 1 and not rejected:
             relink_amended_order(
                 state, entry["old_odno"], str(accepted[0]["odno"]),
-                entry["qty"], entry["target_price"],
+                entry["qty"], entry["target_price"], entry.get("original_price"),
             )
             messages.append(f"연결 완료: {mask_odno(entry['old_odno'])} → {mask_odno(accepted[0]['odno'])}")
         elif not accepted and rejected:
@@ -295,7 +298,7 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
     entries = read_journal(journal_path)
     entries.append({
         "symbol": symbol, "old_odno": old_odno, "qty": item["qty"],
-        "target_price": item["target_price"],
+        "target_price": item["target_price"], "original_price": item.get("original_price"),
         "at": datetime.now(ZoneInfo("UTC")).isoformat(),
     })
     write_journal(journal_path, entries)  # 호출 전에 먼저 기록
@@ -327,7 +330,8 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
         return "UNCERTAIN"
 
     try:
-        relink_amended_order(state, old_odno, str(new_odno), item["qty"], item["target_price"])
+        relink_amended_order(state, old_odno, str(new_odno), item["qty"], item["target_price"],
+                             item.get("original_price"))
         save_fn(symbol, state)
     except Exception as error:
         print(f"  ✗ 정정은 접수됐지만 state 연결 실패: {mask_odno(old_odno)} → "
