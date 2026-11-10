@@ -47,15 +47,23 @@ def bot_is_running() -> bool:
 
 
 def print_plan(symbol, plan):
-    print(f"\n[{symbol}] 정정 계획 ({len(plan)}건)")
+    """계획 출력 — 정정/유지/보류 사유는 개별 출력, 그 밖의 SKIP 은 사유별 건수로 요약합니다."""
+    print(f"\n[{symbol}] 정정 계획 (state 주문 {len(plan)}건)")
+    quiet = {}
     for item in plan:
         tag = mask_odno(item["odno"])
         if item["action"] in (rp.ACTION_AMEND, rp.ACTION_NOOP):
             print(f"  {item['action']:<17} {tag} {item['qty']}주 "
                   f"현재 ${item['current_price']:.2f} → 목표 ${item['target_price']:.2f} "
                   f"(원래 ${item['original_price']:.2f}, 현재가 ${item['last_price']:.2f}) — {item['reason']}")
+        elif item["action"] == rp.ACTION_SKIP and not any(
+            word in item["reason"] for word in ("보류", "정정", "원래 전략 매수가", "부분체결", "상태 불확실")
+        ):
+            quiet[item["reason"]] = quiet.get(item["reason"], 0) + 1
         else:
             print(f"  {item['action']:<17} {tag} — {item['reason']}")
+    for reason, count in sorted(quiet.items(), key=lambda kv: -kv[1]):
+        print(f"  SKIP(요약) {count:>3}건 — {reason}")
 
 
 def main(argv=None, broker=None):
