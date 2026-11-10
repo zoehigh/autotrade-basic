@@ -638,6 +638,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
             "order_type": "LOC",
             "comment": "초기 진입 (1회 매수)",
             "t_target": 1.0,
+            # 1.19 상한으로 낮춘 경우에만 원래 전략 매수가를 남깁니다 (사후 재조정 도구용)
+            "original_price": original_entry_price if entry_capped else None,
         })
 
         # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (entry_qty + i))
@@ -719,6 +721,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                         "order_type": "LOC",
                         "comment": f"전반전 별지점 매수 — 체결 시 T += {t_target_label}",
                         "t_target": t_target_each,
+                        "original_price": star_buy_price if capped else None,
                     })
 
                 if qty_at_avg > 0:
@@ -741,6 +744,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                         "order_type": "LOC",
                         "comment": f"전반전 평단 매수 — 체결 시 T += {t_target_label}",
                         "t_target": t_target_each,
+                        "original_price": avg_buy_price if capped else None,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (base_qty + i))
@@ -785,6 +789,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                         "order_type": "LOC",
                         "comment": "후반전 별지점 매수 (1회 매수) — 체결 시 T += 1",
                         "t_target": 1.0,
+                        "original_price": star_buy_price if capped else None,
                     })
 
                 # 추가매수 LOC: 급락 시 1주씩 추가 매수 (라오어 공식: unit_amount / (qty_at_star + i))

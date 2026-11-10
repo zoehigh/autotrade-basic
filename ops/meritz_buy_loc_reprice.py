@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""메리츠 보정된 일반모드 BUY LOC 사후 재조정 도구 (긴급 hotfix).
+
+기본 동작은 **계획 출력만** 합니다 (조회 전용, 주문·정정·state 저장 없음).
+실제 정정은 아래를 모두 만족할 때만 실행합니다.
+  --apply  --confirm "REPRICE <종목>"  + ALLOW_BROKER_ORDERS=1 + TRADE_MODE=LIVE
+  + BROKER=meritz + trading_bot 프로세스 없음 + 미해결 journal 없음
+
+사용 예
+  uv run python ops/meritz_buy_loc_reprice.py --symbol SOXL
+  uv run python ops/meritz_buy_loc_reprice.py --symbol SOXL --original 20261110:0000123=73.69
+"""
+import argparse
+import fcntl
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+import meritz_reprice as rp  # noqa: E402
+from state import load_state, save_state, mask_odno  # noqa: E402
+
+JOURNAL_PATH = os.path.join(ROOT, ".reprice_journal.json")
+LOCK_PATH = os.path.join(ROOT, ".reprice.lock")
+
+
+def parse_overrides(items):
+    """--original ODNO=PRICE 를 {odno: price} 로 바꿉니다."""
+    result = {}
+    for item in items or []:
+        odno, _, price = item.rpartition("=")
+        if not odno or float(price) <= 0:
+            raise SystemExit(f"--original 형식 오류: {item!r} (예: 20261110:0000123=73.69)")
+        result[odno] = float(price)
+    return result
+
+
+def bot_is_running() -> bool:
+    out = subprocess.run(["pgrep", "-f", "trading_bot.py"], capture_output=True, text=True)
+    return bool(out.stdout.strip())
+
+
+def print_plan(symbol, plan):
+    print(f"\n[{symbol}] 정정 계획 ({len(plan)}건)")
+    for item in plan:
+        tag = mask_odno(item["odno"])
+        if item["action"] in (rp.ACTION_AMEND, rp.ACTION_NOOP):
+            print(f"  {item['action']:<17} {tag} {item['qty']}주 "
+                  f"현재 ${item['current_price']:.2f} → 목표 ${item['target_price']:.2f} "
+                  f"(원래 ${item['original_price']:.2f}, 현재가 ${item['last_price']:.2f}) — {item['reason']}")
+        else:
+            print(f"  {item['action']:<17} {tag} — {item['reason']}")
+
+
+def main(argv=None, broker=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--symbol", action="append", help="대상 종목 (기본: SYMBOLS 설정 전체)")
+    parser.add_argument("--original", action="append", help="원래 매수가 지정 ODNO=PRICE (메타에 없을 때)")
+    parser.add_argument("--apply", action="store_true", help="실제 정정 실행 (기본은 계획만)")
+    parser.add_argument("--confirm", default="", help='실행 확인 문구: "REPRICE <종목>"')
+    args = parser.parse_args(argv)
+
+    import config
+    overrides = parse_overrides(args.original)
+    configs = [c for c in config.SYMBOLS
+               if not args.symbol or c["symbol"] in {s.upper() for s in args.symbol}]
+    if not configs:
+        raise SystemExit("대상 종목이 없습니다")
+
+    if args.apply:
+        problems = []
+        if config.BROKER != "meritz":
+            problems.append("BROKER=meritz 가 아님")
+        if config.TRADE_MODE != "LIVE":
+            problems.append("TRADE_MODE=LIVE 가 아님")
+        if os.getenv("ALLOW_BROKER_ORDERS") != "1":
+            problems.append("ALLOW_BROKER_ORDERS=1 이 아님")
+        if bot_is_running():
+            problems.append("trading_bot 프로세스가 실행 중")
+        if problems:
+            raise SystemExit("정정 실행 거부: " + ", ".join(problems))
+
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit("다른 재조정 도구가 이미 실행 중입니다")
+
+    if broker is None:
+        from broker.meritz.adapter import MeritzBroker
+        broker = MeritzBroker()  # 조회에는 DryBroker 불필요 — 이 도구는 apply 가 없으면 조회만 호출
+
+    today_session = datetime.now(ZoneInfo("America/New_York")).date().strftime("%Y%m%d")
+    exit_code = 0
+    for cfg in configs:
+        symbol, exchange = cfg["symbol"], cfg["exchange"]
+        exchange_code = broker.exchange_code(exchange)
+        state = load_state(symbol)
+        history = broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
+
+        # 미해결 journal 먼저 처리 (재시작/중복 실행 대비)
+        journal = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] == symbol]
+        if journal:
+            print(f"[{symbol}] 미해결 정정 journal {len(journal)}건 — 이력으로 확인합니다")
+            left, messages = rp.resolve_journal(journal, history, state)
+            for message in messages:
+                print("  " + message)
+            if args.apply and len(left) < len(journal):
+                save_state(symbol, state)
+            others = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] != symbol]
+            rp.write_journal(JOURNAL_PATH, others + left)
+            if left:
+                print(f"[{symbol}] 접수 불확실 정정이 남아 있어 중단합니다 (자동 재주문 안 함)")
+                exit_code = 1
+                continue
+
+        last_price = broker.get_stock_price(symbol, exchange_code).last
+        plan = rp.build_plan(state, history, last_price, overrides, today_session)
+        print_plan(symbol, plan)
+
+        targets = [item for item in plan if item["action"] == rp.ACTION_AMEND]
+        if not args.apply:
+            print(f"[{symbol}] 계획만 출력했습니다 (정정 대상 {len(targets)}건, 실행하지 않음)")
+            continue
+        if args.confirm != f"REPRICE {symbol}":
+            print(f'[{symbol}] 확인 문구 불일치 — "REPRICE {symbol}" 필요. 실행하지 않습니다')
+            exit_code = 1
+            continue
+
+        for item in targets:
+            # 정정 직전 재조회·재계획: 그 사이 체결/시세 변동이 있으면 최신 값 기준으로만 실행
+            fresh_history = broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
+            fresh_last = broker.get_stock_price(symbol, exchange_code).last
+            fresh_plan = rp.build_plan(state, fresh_history, fresh_last, overrides, today_session)
+            fresh = next((p for p in fresh_plan if p["odno"] == item["odno"]), None)
+            if not fresh or fresh["action"] != rp.ACTION_AMEND:
+                print(f"  - 재확인에서 정정 불필요/불가: {mask_odno(item['odno'])}")
+                continue
+            result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, JOURNAL_PATH, save_state)
+            if result in ("UNCERTAIN", "LINK_FAILED"):
+                exit_code = 1
+                print("  → 즉시 중단합니다. 재주문하지 않고 journal 을 유지합니다")
+                break
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

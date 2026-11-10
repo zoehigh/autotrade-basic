@@ -1527,6 +1527,11 @@ def run_one_symbol(broker: Broker, symbol_config):
                     "processed_filled_amount": 0.0,
                     "fill_marker_version": FILL_MARKER_VERSION,
                 }
+                # 1.19 상한으로 낮춘 일반 BUY LOC만 원래 전략 매수가를 기록합니다
+                # (메리츠 사후 재조정 도구 ops/meritz_buy_loc_reprice.py 가 사용)
+                if order.get("original_price"):
+                    order_meta["original_price"] = float(order["original_price"])
+                    order_meta["order_price"] = float(order_price)
                 if order.get("reverse_action"):
                     reverse_mode = state.setdefault("reverse_mode", {})
                     cycle_id = reverse_mode.get("cycle_id") or datetime.now(
