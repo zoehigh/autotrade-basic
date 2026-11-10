@@ -32,6 +32,7 @@ from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save
 # (state 와 **같은 모듈 객체**여야 salt·원장이 하나로 유지됩니다 — `src.log_mask` import 금지).
 from log_mask import flush_odno_ledger
 from notifier import notify
+from run_lock import acquire_bot_lock
 
 
 class SymbolScopedError(RuntimeError):
@@ -2927,6 +2928,14 @@ def main():
     SYMBOLS 설정에 있는 종목을 순서대로 처리합니다.
     한 종목이 실패해도 나머지 종목은 계속 처리됩니다.
     """
+    # 같은 체크아웃의 다른 봇/정정 도구와 동시에 실행되지 않도록 본체 락을 잡습니다
+    # (런처 .run.lock 은 시작 구간만 막으므로, 직접 실행도 막으려면 본체가 잡아야 합니다).
+    try:
+        acquire_bot_lock()
+    except RuntimeError as error:
+        print(f"[중단] {error}")
+        sys.exit(1)
+
     # ── 모드 불변식 ──
     # TRADE_MODE는 DRY(프리뷰, 상태 저장 없음) / LIVE(실주문) / REPAIR(유지보수) 중 하나입니다.
     # REPAIR는 액션 소스(REPAIR_ACTION 또는 레거시 STATE_*_ONLY/FORCE_T*)가 정확히

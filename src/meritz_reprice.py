@@ -17,6 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from broker.base import OrderNotAcceptedError
+import run_lock
 from state import mask_odno, _order_us_session_date
 from strategy import cap_buy_loc_price, adjust_price_to_tick
 
@@ -28,11 +29,6 @@ ACTION_REORDER = "REORDER_CANDIDATE"  # 거부된 주문 (참고용 — 이 도�
 
 _LOC_CLS_CODE = "32"
 
-# journal 위치 — 봇(정산 보류 게이트)과 도구가 같은 파일을 봅니다.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-JOURNAL_PATH = os.environ.get("REPRICE_JOURNAL_PATH") or os.path.join(_ROOT, ".reprice_journal.json")
-# 운영 런처(ops/run_daily.sh)와 공유하는 실행 락 — 체크아웃이 다르면 RUN_LOCK_PATH 로 지정
-RUN_LOCK_PATH = os.environ.get("RUN_LOCK_PATH") or os.path.join(_ROOT, ".run.lock")
 
 
 def is_valid_price(value) -> bool:
@@ -47,7 +43,7 @@ def is_valid_price(value) -> bool:
 def unresolved_symbols(path=None) -> set:
     """미해결 정정 journal 이 남아 있는 종목 집합 (봇이 정산 전에 확인)."""
     try:
-        return {str(e.get("symbol", "")).upper() for e in read_journal(path or JOURNAL_PATH)}
+        return {str(e.get("symbol", "")).upper() for e in read_journal(path or run_lock.journal_path())}
     except (OSError, ValueError):
         # journal 을 읽을 수 없으면 안전하게 모든 종목을 보류 대상으로 봅니다
         return {"*"}

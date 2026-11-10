@@ -24,11 +24,10 @@ from datetime import datetime  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
 
 import meritz_reprice as rp  # noqa: E402
+import run_lock  # noqa: E402
+import state as state_module  # noqa: E402
 from state import load_state, save_state, mask_odno  # noqa: E402
 
-JOURNAL_PATH = rp.JOURNAL_PATH
-LOCK_PATH = os.path.join(ROOT, ".reprice.lock")
-RUN_LOCK_PATH = rp.RUN_LOCK_PATH  # 운영 런처(.run.lock)와 같은 락
 
 
 def parse_overrides(items):
@@ -89,15 +88,17 @@ def main(argv=None, broker=None):
 
     # 실제 정정(--apply)은 운영 런처와 같은 .run.lock 을 잡아야만 진행합니다.
     # (pgrep 확인만으로는 확인 직후 시작하는 크론과의 경쟁을 막을 수 없음)
+    # .run.lock = 런처 시작 구간, .bot.lock = 봇 본체 실행 구간 (직접 실행 포함).
+    # 둘 다 .state.json 과 같은 디렉터리의 파일이라 항상 같은 체크아웃을 가리킵니다.
     locks = []
+    journal_file = run_lock.journal_path()
     if args.apply:
-        for path in (RUN_LOCK_PATH, LOCK_PATH):
-            handle = open(path, "w")
+        print(f"[대상 확인] state={os.path.abspath(state_module._STATE_FILE)} journal={journal_file}")
+        for path in (run_lock.run_lock_path(), run_lock.bot_lock_path()):
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise SystemExit(f"다른 실행(봇 또는 정정 도구)이 락을 쥐고 있습니다: {path}")
-            locks.append(handle)
+                locks.append(run_lock.acquire_nonblocking(path))
+            except RuntimeError as error:
+                raise SystemExit(str(error))
 
     if broker is None:
         from broker.meritz.adapter import MeritzBroker
@@ -112,7 +113,7 @@ def main(argv=None, broker=None):
         history = broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
 
         # 미해결 journal 먼저 처리 (재시작/중복 실행 대비)
-        journal = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] == symbol]
+        journal = [e for e in rp.read_journal(journal_file) if e["symbol"] == symbol]
         if journal:
             print(f"[{symbol}] 미해결 정정 journal {len(journal)}건 — 이력으로 확인합니다")
             if args.apply:
@@ -121,8 +122,8 @@ def main(argv=None, broker=None):
                     print("  " + message)
                 if len(left) < len(journal):
                     save_state(symbol, state)  # state 저장 성공 후에만 journal 을 줄입니다
-                others = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] != symbol]
-                rp.write_journal(JOURNAL_PATH, others + left)
+                others = [e for e in rp.read_journal(journal_file) if e["symbol"] != symbol]
+                rp.write_journal(journal_file, others + left)
             else:
                 # 조회 모드: 사본에서만 확인하고 state·journal 은 절대 바꾸지 않습니다
                 left, messages = rp.resolve_journal(journal, history, deepcopy(state))
@@ -159,7 +160,7 @@ def main(argv=None, broker=None):
             if not fresh or fresh["action"] != rp.ACTION_AMEND:
                 print(f"  - 재확인에서 정정 불필요/불가: {mask_odno(item['odno'])}")
                 continue
-            result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, JOURNAL_PATH, save_state)
+            result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file, save_state)
             if result in ("UNCERTAIN", "LINK_FAILED"):
                 exit_code = 1
                 print("  → 즉시 중단합니다. 재주문하지 않고 journal 을 유지합니다")

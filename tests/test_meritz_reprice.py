@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "ops"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import meritz_reprice as rp
 from broker.base import OrderError, OrderNotAcceptedError
@@ -218,8 +219,6 @@ class _ReadOnlyBroker(FakeBroker):
 def _cli(monkeypatch, tmp_path, argv, broker):
     import meritz_buy_loc_reprice as cli
     import state as st
-    monkeypatch.setattr(cli, "JOURNAL_PATH", str(tmp_path / "j.json"))
-    monkeypatch.setattr(cli, "LOCK_PATH", str(tmp_path / "l.lock"))
     monkeypatch.setattr(cli, "bot_is_running", lambda: False)
     st.save_state("SOXL", _state())
     return cli.main(argv, broker=broker)
@@ -264,10 +263,11 @@ def test_query_mode_does_not_touch_journal_or_state(monkeypatch, tmp_path):
     import meritz_buy_loc_reprice as cli
     broker = _ReadOnlyBroker()
     broker.get_order_history = lambda *a, **k: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)]
-    journal = tmp_path / "j.json"
+    import run_lock
+    journal = tmp_path / ".reprice_journal.json"
+    assert run_lock.journal_path() == str(journal)
     rp.write_journal(str(journal), [dict(_ENTRY)])
     before = journal.read_text()
-    monkeypatch.setattr(cli, "JOURNAL_PATH", str(journal))
     _cli(monkeypatch, tmp_path, ["--symbol", "SOXL"], broker)
     assert journal.read_text() == before
     assert OLD in st.load_state("SOXL")["orders_meta"]
@@ -304,8 +304,7 @@ def test_apply_requires_shared_run_lock(monkeypatch, tmp_path):
     import config
     monkeypatch.setattr(config, "BROKER", "meritz")
     monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
-    run_lock = tmp_path / "run.lock"
-    monkeypatch.setattr(cli, "RUN_LOCK_PATH", str(run_lock))
+    run_lock = tmp_path / ".run.lock"
     held = open(run_lock, "w")
     fcntl.flock(held, fcntl.LOCK_EX)  # 런처가 쥐고 있는 상황
     broker = _ReadOnlyBroker()
@@ -313,3 +312,43 @@ def test_apply_requires_shared_run_lock(monkeypatch, tmp_path):
         _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"], broker)
     assert broker.calls == []
     held.close()
+
+
+# ── 2차 리뷰 반영: 봇 본체 락 / 경로 일원화 ─────────────────────────
+
+def test_paths_are_derived_from_state_file_dir(tmp_path):
+    import run_lock
+    for path in (run_lock.run_lock_path(), run_lock.bot_lock_path(), run_lock.journal_path()):
+        assert os.path.dirname(path) == str(tmp_path)
+
+
+def test_bot_main_refuses_to_start_while_lock_is_held(tmp_path, capsys):
+    import fcntl
+    import trading_bot
+    import run_lock
+    held = open(run_lock.bot_lock_path(), "a")
+    fcntl.flock(held, fcntl.LOCK_EX)  # 정정 도구 또는 다른 봇이 실행 중
+    try:
+        with pytest.raises(SystemExit) as exc:
+            trading_bot.main()
+        assert exc.value.code == 1
+    finally:
+        held.close()
+
+
+def test_apply_refused_while_bot_lock_is_held(monkeypatch, tmp_path):
+    import fcntl
+    import config
+    import run_lock
+    monkeypatch.setenv("ALLOW_BROKER_ORDERS", "1")
+    monkeypatch.setattr(config, "BROKER", "meritz")
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    held = open(run_lock.bot_lock_path(), "a")
+    fcntl.flock(held, fcntl.LOCK_EX)  # 직접 실행된 봇
+    broker = _ReadOnlyBroker()
+    try:
+        with pytest.raises(SystemExit):
+            _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"], broker)
+    finally:
+        held.close()
+    assert broker.calls == []
