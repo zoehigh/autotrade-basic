@@ -44,10 +44,10 @@ def is_valid_price(value) -> bool:
 def unresolved_symbols(path=None) -> set:
     """미해결 정정 journal 이 남아 있는 종목 집합 (봇이 정산 전에 확인)."""
     try:
-        # REJECTED_LATE 표식 항목은 사람 확인용 기록일 뿐입니다: 메타를 옮기지 않았으므로 원주문 체결은 그대로
-        # 정산되어 중복 정산 위험이 없습니다 → 봇 정산·주문을 막지 않습니다 (감시기 APPLY 는 별도로 중단 유지).
-        return {str(e.get("symbol", "")).upper() for e in read_journal(path or run_lock.journal_path())
-                if e.get("review_required") != "REJECTED_LATE"}
+        # review_required 표식 항목(REJECTED_LATE 포함)도 **봇을 막습니다**. REJECTED_LATE 는 정산 중복 위험은 없지만,
+        # 어댑터가 거부된 정정 행도 원주문을 '정정됨·잔량 0'으로 표시하므로 원주문이 살아 있어도 봇의 잔여 주문 취소가
+        # 건너뛰어 신규 주문과 중복될 수 있습니다. 사람이 앱에서 원주문을 확인·정리하고 수동 도구로 해소할 때까지 차단합니다.
+        return {str(e.get("symbol", "")).upper() for e in read_journal(path or run_lock.journal_path())}
     except (OSError, ValueError):
         # journal 을 읽을 수 없으면 안전하게 모든 종목을 보류 대상으로 봅니다
         return {"*"}

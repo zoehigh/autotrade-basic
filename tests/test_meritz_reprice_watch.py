@@ -644,8 +644,9 @@ def test_rejected_late_with_unwritable_halt_keeps_journal_marker_and_blocks_othe
     entries = rp.read_journal(run_lock.journal_path())
     assert len(entries) == 1 and entries[0]["review_required"] == "REJECTED_LATE"      # 지속 근거가 남음
     assert OLD in st.load_state("SOXL")["orders_meta"]                                  # 메타는 이동하지 않음
-    # 봇 정산·주문은 막지 않음 (메타 불변 → 중복 정산 위험 없음)
-    assert "SOXL" not in rp.unresolved_symbols()
+    # 봇 정산·주문도 막는다: 어댑터가 원주문을 '정정됨·잔량 0'으로 보여 주므로 살아 있는 원주문이 취소에서 빠져
+    # 신규 주문과 중복될 수 있다 (정산 중복 위험이 없어도 신규 주문 단계의 위험이 남음)
+    assert "SOXL" in rp.unresolved_symbols()
     # 다음 APPLY: 다른 후보를 정정하지 않고 중단 표식을 다시 만든다
     monkeypatch.setattr(mw, "write_halt", real_write_halt)
     world.broker.new_row_rejected = False
@@ -662,10 +663,26 @@ def test_manual_tool_clears_rejected_late_marker(world):
     assert left == [] and any("거부 확인" in m for m in messages)
 
 
-def test_other_review_markers_still_block_the_bot(world):
+@pytest.mark.parametrize("marker", ["UNCERTAIN", "LINK_FAILED", "REJECTED_LATE"])
+def test_every_review_marker_blocks_the_bot_for_that_symbol(world, marker):
     rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69,
-                                                "review_required": "UNCERTAIN"}])
-    assert "SOXL" in rp.unresolved_symbols()
+                                                "review_required": marker}])
+    import trading_bot
+    assert "SOXL" in rp.unresolved_symbols() and trading_bot._pending_amend_journal("SOXL")
+    assert not trading_bot._pending_amend_journal("TQQQ")
+
+
+def test_rejected_late_blocks_bot_new_orders_until_manual_tool_clears_it(world):
+    """원주문이 살아 있어도 이력은 '정정됨·잔량 0'으로 보이므로(봇 취소가 건너뜀) 해소 전까지 신규 주문을 차단."""
+    world.broker.new_row_rejected = True
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    import trading_bot
+    assert trading_bot._pending_amend_journal("SOXL")                       # 봇 차단
+    history = world.broker.get_order_history()
+    left, messages = rp.resolve_journal(rp.read_journal(run_lock.journal_path()), history, st.load_state("SOXL"))
+    assert left == []                                                        # 수동 도구가 정리할 수 있음
+    rp.write_journal(run_lock.journal_path(), left)
+    assert not trading_bot._pending_amend_journal("SOXL")                   # 정리 후 봇 재개
 
 
 def test_normal_success_keeps_recovery_evidence_until_count_is_recorded(world, monkeypatch):
