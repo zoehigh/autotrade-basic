@@ -43,14 +43,48 @@ def _fmt_item(symbol, item):
             f"(원래 ${item['original_price']:.2f}, 현재가 ${item['last_price']:.2f})")
 
 
-def _halt(symbol, result, detail, now_utc, notify_fn):
-    """중단 표식을 만들고 긴급 알림을 보냅니다. 표식 저장이 실패해도 알림과 중단(반환)은 유지합니다."""
-    warning = ""
+def _entry_id(entry):
+    """journal 항목 식별자 — 복구 횟수를 중복 없이 기록하기 위한 키."""
+    return f"{entry.get('old_odno')}|{entry.get('at') or entry.get('target_price')}"
+
+
+def _mark_journal_review(old_odno, reason):
+    """journal 항목에 '사람 확인 필요' 표식을 남깁니다 (halt 파일을 못 써도 자동 복구가 막히도록)."""
+    journal_file = run_lock.journal_path()
+    entries = rp.read_journal(journal_file)
+    changed = False
+    for entry in entries:
+        if entry.get("old_odno") == old_odno and not entry.get("review_required"):
+            entry["review_required"] = reason
+            changed = True
+    if changed:
+        rp.write_journal(journal_file, entries)
+    return changed
+
+
+def _halt(symbol, result, detail, now_utc, notify_fn, review_odno=None):
+    """중단 표식을 만들고 긴급 알림을 보냅니다. 표식 저장이 실패해도 알림과 중단(반환)은 유지합니다.
+
+    review_odno 가 있으면 해당 journal 항목에도 '사람 확인 필요'를 남깁니다. halt 파일 저장이
+    실패해도 이 표식이 남아 있으면 다음 APPLY 가 자동 복구하지 않고 중단을 다시 만듭니다.
+    """
+    problems = []
     try:
         mw.write_halt(run_lock.watch_halt_path(), symbol, result, detail, now_utc)
     except OSError as error:
-        warning = f"\n⚠️ 중단 표식(.watch_halt.json) 저장 실패({str(error)[:60]}) — 직접 만들어 주세요"
+        problems.append(f"중단 표식(.watch_halt.json) 저장 실패({str(error)[:50]})")
         _log(f"중단 표식 저장 실패: {error}")
+    if review_odno:
+        try:
+            _mark_journal_review(review_odno, result)
+        except (OSError, ValueError) as error:
+            problems.append(f"journal 확인 표식 저장 실패({str(error)[:50]})")
+            _log(f"journal 확인 표식 저장 실패: {error}")
+    warning = ""
+    if problems:
+        warning = "\n⚠️ " + " / ".join(problems)
+        if len(problems) == (2 if review_odno else 1):  # 지속 근거가 하나도 남지 않은 경우
+            warning += " — 다음 실행이 막히지 않을 수 있으니 직접 .watch_halt.json 을 만들어 주세요"
     _safe_notify(
         notify_fn,
         f"🛑 메리츠 정정 감시 중단 {symbol}\n결과: {result}\n{detail}\n"
@@ -75,25 +109,39 @@ def _handle_journal(apply, symbol, state, history, now_utc, notify_fn, record):
         return True
     _log(f"{symbol} 미해결 정정 journal {len(entries)}건 — 이력으로 확인")
     if apply:
+        review = [e for e in entries if e.get("review_required")]
+        if review:
+            # 이전 실행이 위험 결과로 끝나면서 남긴 표식 — 사람이 확인하기 전에는 자동 복구하지 않습니다.
+            _log(f"{symbol} 사람 확인이 필요한 journal {len(review)}건 ({review[0].get('review_required')}) — 자동 복구하지 않음")
+            if not mw.read_halt(run_lock.watch_halt_path()):
+                _halt(symbol, "JOURNAL_REVIEW_REQUIRED", f"이전 실행의 위험 결과({review[0].get('review_required')})가 확인되지 않았습니다", now_utc, notify_fn)
+                _register_halt_notified(record, now_utc)
+            return False
+        # (1) 사본으로 해소 결과를 먼저 계산합니다 (state·journal 은 아직 건드리지 않음)
         metas_before = set((state.get("orders_meta") or {}).keys())
-        left, messages = rp.resolve_journal(entries, history, state)
+        preview = deepcopy(state)
+        left, messages = rp.resolve_journal(entries, history, preview)
         for message in messages:
             _log("  " + message)
         resolved = [e for e in entries if e not in left]
-        if resolved:
-            st.save_state(symbol, state)  # state 저장에 성공한 뒤에만 journal 을 줄입니다
-        others = [e for e in rp.read_journal(journal_file) if e["symbol"] != symbol]
-        rp.write_journal(journal_file, others + left)
-        # 복구된 정정도 일일 횟수·마지막 시도 시각에 포함합니다 (기록 저장 전에 종료된 경우를 메움)
+        # (2) 횟수를 **먼저** 기록합니다. 항목 id 로 한 번만 반영하므로 이후 단계에서 종료돼도 재시작이 안전하고,
+        #     기록이 끝나기 전에는 state·journal 근거를 건드리지 않습니다.
+        counted = False
         for entry in resolved:
-            linked = entry["old_odno"] in metas_before and entry["old_odno"] not in (state.get("orders_meta") or {})
-            mw.record_recovered(record, symbol, entry.get("at"), linked, now_utc)
-        if resolved:
+            linked = entry["old_odno"] in metas_before and entry["old_odno"] not in (preview.get("orders_meta") or {})
+            counted |= mw.record_recovered(record, symbol, _entry_id(entry), entry.get("at"), linked, now_utc)
+        if counted:
             try:
                 mw.save_record(run_lock.watch_state_path(), record)
             except OSError as error:
                 _halt(symbol, "RECORD_SAVE_FAILED", f"복구된 정정의 횟수 기록 저장 실패: {str(error)[:80]}", now_utc, notify_fn)
                 return False
+        # (3) 실제 state 반영·저장 → (4) 성공한 뒤에만 journal 을 줄입니다
+        if resolved:
+            rp.resolve_journal(entries, history, state)
+            st.save_state(symbol, state)
+        others = [e for e in rp.read_journal(journal_file) if e["symbol"] != symbol]
+        rp.write_journal(journal_file, others + left)
         if not left:
             return True
         _halt(symbol, "JOURNAL_UNRESOLVED", f"이력으로 해소하지 못한 정정 journal {len(left)}건 — 자동 재주문 안 함", now_utc, notify_fn)
@@ -182,7 +230,7 @@ def _watch_symbol(settings, broker, cfg, record, now_utc, session, notify_fn):
         dangerous = result in ("REJECTED_LATE", "UNCERTAIN", "LINK_FAILED")
         # 위험 결과의 중단 표식을 **먼저** 만듭니다 — 아래 기록 저장이 실패해도 중단은 유지돼야 합니다.
         if dangerous:
-            _halt(symbol, result, _fmt_item(symbol, fresh), now_utc, notify_fn)
+            _halt(symbol, result, _fmt_item(symbol, fresh), now_utc, notify_fn, review_odno=fresh["odno"])
             _register_halt_notified(record, now_utc)
         mw.record_attempt(record, symbol, now_utc, amended=(result == "AMENDED"))
         try:
@@ -243,15 +291,16 @@ def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
         # 손상된 기록은 지우지 않고 옆으로 치웁니다 (이전 정정 횟수를 사람이 확인할 수 있게).
         moved = mw.quarantine_record(run_lock.watch_state_path(), now_utc)
         _log(f"손상된 기록을 보존했습니다: {os.path.basename(moved) if moved else '(이동 실패)'}")
+        # DRY 든 APPLY 든 **중단 표식**을 남깁니다: DRY 가 손상 파일을 치우고 새 기록을 저장해도,
+        # 이후 APPLY 가 '정상적인 새 기록'으로 오해해 한도를 초기화한 채 정정하지 않도록 사람 확인을 요구합니다.
+        if not mw.read_halt(run_lock.watch_halt_path()):
+            _halt("*", "RECORD_CORRUPT", f"감시 기록을 읽을 수 없어 APPLY 를 보류합니다: {warning[:80]}", now_utc, notify_fn)
+            _register_halt_notified(record, now_utc)
+        try:
+            mw.save_record(run_lock.watch_state_path(), record)
+        except OSError:
+            pass
         if apply:
-            # 기존 정정 횟수를 알 수 없으면 일일 한도를 보장할 수 없으므로 APPLY 는 보류합니다.
-            if not mw.read_halt(run_lock.watch_halt_path()):
-                _halt("*", "RECORD_CORRUPT", f"감시 기록을 읽을 수 없어 정정을 보류합니다: {warning[:80]}", now_utc, notify_fn)
-                _register_halt_notified(record, now_utc)
-            try:
-                mw.save_record(run_lock.watch_state_path(), record)
-            except OSError:
-                pass
             return 1
     halt = mw.read_halt(run_lock.watch_halt_path())
     if apply and halt:

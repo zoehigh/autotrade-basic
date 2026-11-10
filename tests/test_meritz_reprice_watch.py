@@ -442,15 +442,17 @@ def test_recovered_journal_counts_toward_daily_amends_and_last_attempt(world):
     assert saved["last_attempt_utc"] == earlier                # 복구된 정정의 실제 시도 시각
 
 
-def test_uncertain_then_recovery_does_not_double_count_amends(world):
+def test_uncertain_records_attempt_but_not_amend_and_requires_human_resolution(world):
     world.broker.error = OrderError("timeout")
-    run(world, env=APPLY_ENV, config=CONFIG_LIVE)               # 시도 1회, amends 는 아직 0
-    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 0
-    os.remove(run_lock.watch_halt_path())                       # 사람이 확인하고 중단 해제
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    info = json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]
+    assert info["attempts"] == 1 and info["amends"] == 0                  # 접수 여부 불명 — 정정으로 세지 않음
+    os.remove(run_lock.watch_halt_path())                                  # halt 만 지워서는 재개되지 않음
     world.broker.error = None
     world.broker.history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
-    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
-    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 1
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and OLD in st.load_state("SOXL")["orders_meta"]       # 자동 복구 없음
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "JOURNAL_REVIEW_REQUIRED"
 
 
 def test_recovery_with_rejected_only_row_is_not_counted_as_amend(world):
@@ -517,7 +519,7 @@ def test_corrupt_record_holds_apply_preserves_file_and_does_not_spam(world):
 def test_corrupt_record_does_not_block_dry(world):
     open(run_lock.watch_state_path(), "w").write("{garbage")
     code, _ = run(world, env=ENV, config=CONFIG_DRY)
-    assert code == 0 and world.broker.calls == [] and not os.path.exists(run_lock.watch_halt_path())
+    assert code == 0 and world.broker.calls == []      # DRY 자체는 계속 동작
     assert any(".corrupt-" in f for f in os.listdir(os.path.dirname(run_lock.watch_state_path())))
 
 
@@ -525,3 +527,103 @@ def test_corrupt_record_does_not_block_dry(world):
 def test_max_per_run_validation(value):
     with pytest.raises(mw.WatchConfigError):
         mw.load_settings({"REPRICE_WATCH_MAX_PER_RUN": value})
+
+
+# ── 3차 리뷰 반영: halt 저장 실패 대비, 복구 중 재종료, DRY 를 거친 손상 기록 ──────
+
+def _recoverable_journal_world(world, at_minutes_ago=45):
+    earlier = (NOW - timedelta(minutes=at_minutes_ago)).isoformat()
+    mw.save_record(run_lock.watch_state_path(), {"session": ET_TODAY, "notified": {},
+                   "symbols": {"SOXL": {"amends": 2, "attempts": 2, "last_attempt_utc": (NOW - timedelta(hours=2)).isoformat()}}})
+    world.broker.history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69,
+                                                "original_price": 73.69, "at": earlier}])
+
+
+def _amends():
+    return json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"]
+
+
+def test_uncertain_with_unwritable_halt_marker_still_blocks_next_apply_via_journal(world, monkeypatch):
+    world.broker.error = OrderError("timeout")
+    real_write_halt = mw.write_halt
+
+    def broken(*a, **k):
+        raise OSError("read-only")
+    monkeypatch.setattr(mw, "write_halt", broken)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and not os.path.exists(run_lock.watch_halt_path())
+    entries = rp.read_journal(run_lock.journal_path())
+    assert len(entries) == 1 and entries[0]["review_required"] == "UNCERTAIN"       # 지속적 근거
+    assert any("저장 실패" in m for _u, m in world.notifier.sent)                     # 표식 저장 실패를 사람에게 알림
+    # 다음 실행(이번엔 halt 쓰기 가능): 이력에 정정이 보여도 자동 복구하지 않고 중단 표식을 다시 만든다
+    monkeypatch.setattr(mw, "write_halt", real_write_halt)
+    world.broker.error = None
+    world.broker.history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and len(world.broker.calls) == 1
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "JOURNAL_REVIEW_REQUIRED"
+    assert OLD in st.load_state("SOXL")["orders_meta"] and len(rp.read_journal(run_lock.journal_path())) == 1
+
+
+def test_review_marked_journal_can_still_be_recovered_by_the_manual_tool(world):
+    """사람이 확인한 뒤에는 수동 도구(--apply --confirm)로 복구할 수 있어야 함 — 표식이 복구를 영구 차단하지 않음."""
+    entry = {"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69, "review_required": "UNCERTAIN"}
+    left, _ = rp.resolve_journal([entry], [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)], _state())
+    assert left == []
+
+
+def test_crash_after_state_save_before_journal_removal_counts_amend_exactly_once(world, monkeypatch):
+    _recoverable_journal_world(world)
+    real_write = rp.write_journal
+
+    def crash(path, entries):
+        raise OSError("killed")
+    monkeypatch.setattr(rp, "write_journal", crash)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)           # 복구 도중 종료 (state 는 이미 저장됨)
+    assert code == 1 and NEW in st.load_state("SOXL")["orders_meta"] and OLD not in st.load_state("SOXL")["orders_meta"]
+    assert len(rp.read_journal(run_lock.journal_path())) == 1          # 근거(journal)는 아직 남아 있음
+    assert _amends() == 3                                              # 횟수는 이미 기록됨
+    monkeypatch.setattr(rp, "write_journal", real_write)
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)                      # 재시작: 구 주문번호가 이미 없어도 안전
+    assert rp.read_journal(run_lock.journal_path()) == [] and _amends() == 3   # 이중 가산 없음
+
+
+def test_crash_after_record_before_state_save_counts_amend_exactly_once(world, monkeypatch):
+    _recoverable_journal_world(world)
+    real_save = st.save_state
+    calls = {"n": 0}
+
+    def crash_once(symbol, state):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("killed")
+        return real_save(symbol, state)
+    monkeypatch.setattr(st, "save_state", crash_once)
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert OLD in st.load_state("SOXL")["orders_meta"] and _amends() == 3   # 횟수만 먼저 기록, state 는 그대로
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert NEW in st.load_state("SOXL")["orders_meta"] and rp.read_journal(run_lock.journal_path()) == []
+    assert _amends() == 3
+
+
+def test_record_save_failure_during_recovery_leaves_state_and_journal_untouched(world, monkeypatch):
+    _recoverable_journal_world(world)
+    _break_record_saves(monkeypatch)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and json.load(open(run_lock.watch_halt_path()))["result"] == "RECORD_SAVE_FAILED"
+    assert OLD in st.load_state("SOXL")["orders_meta"] and len(rp.read_journal(run_lock.journal_path())) == 1
+
+
+def test_dry_run_cannot_launder_a_corrupt_record_for_a_later_apply(world):
+    open(run_lock.watch_state_path(), "w").write("{garbage")
+    code, _ = run(world, env=ENV, config=CONFIG_DRY)                   # DRY 가 먼저 손상 파일을 만남
+    assert code == 0
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "RECORD_CORRUPT"
+    assert any(".corrupt-" in f for f in os.listdir(os.path.dirname(run_lock.watch_state_path())))
+    code, created = run(world, env=APPLY_ENV, config=CONFIG_LIVE)      # 이후 APPLY: 새 기록이 있어도 보류
+    assert code == 1 and created == [] and world.broker.calls == []
+    # 사람이 확인하고 중단 표식을 지우면 재개
+    os.remove(run_lock.watch_halt_path())
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert len(world.broker.calls) == 1

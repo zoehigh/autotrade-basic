@@ -152,12 +152,17 @@ def quarantine_record(path, now_utc):
         return None
 
 
-def record_recovered(record, symbol, at_iso, linked, now_utc):
-    """journal 로 복구한 정정을 일일 횟수·마지막 시도 시각에 반영합니다.
+def record_recovered(record, symbol, entry_id, at_iso, linked, now_utc):
+    """journal 로 복구한 정정을 일일 횟수·마지막 시도 시각에 반영합니다 → 새로 반영했으면 True.
 
-    정정 접수 후 감시 기록을 저장하기 전에 종료된 경우를 메웁니다. 접수된 정정(linked)만 amends 에 더하며,
-    UNCERTAIN 으로 이미 시도 기록이 있어도 amends 는 AMENDED 일 때만 늘었으므로 이중 가산이 없습니다.
+    entry_id(journal 항목 식별자)별로 **한 번만** 반영합니다 — 복구 도중 재시작해도 중복 가산이 없습니다.
+    접수된 정정(linked)만 amends 에 더하며, UNCERTAIN 으로 이미 시도 기록이 있어도 amends 는
+    AMENDED 일 때만 늘었으므로 이중 가산이 없습니다.
     """
+    seen = record.setdefault("recovered_ids", [])
+    if entry_id in seen:
+        return False
+    seen.append(entry_id)
     info = record["symbols"].setdefault(symbol, {"amends": 0, "attempts": 0})
     if linked:
         info["amends"] = int(info.get("amends", 0)) + 1
@@ -170,6 +175,7 @@ def record_recovered(record, symbol, at_iso, linked, now_utc):
     previous = info.get("last_attempt_utc")
     if not previous or attempt_at > datetime.fromisoformat(previous):
         info["last_attempt_utc"] = attempt_at.isoformat()
+    return True
 
 
 def throttle_reason(record, symbol, settings, now_utc):
