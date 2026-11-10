@@ -220,7 +220,8 @@ def _amend_row_matches(row, entry):
         row.get("_rctf_code") == "1"
         and row.get("_plain_orgl_oder_no") == _plain_odno(entry["old_odno"])
         and row.get("_oder_date") == str(entry["old_odno"]).split(":")[0]
-        and not row.get("_is_cancel")
+        # 정정 접수 뒤 그 정정 주문이 취소되면 어댑터가 정정 행 자체를 _is_cancel 로 표시합니다.
+        # 취소 여부와 무관하게 같은 정정 건으로 인식해야 journal 이 풀립니다 (부분체결분 보존).
         and row.get("sll_buy_dvsn_cd_name") == "매수"
         and row.get("_oder_cls_code") == _LOC_CLS_CODE
         and row.get("_ordered_qty") == int(entry["qty"])

@@ -810,6 +810,28 @@ def _order_detail_lines(symbol, order) -> str:
     return "\n".join(lines)
 
 
+def _pending_amend_journal(symbol) -> bool:
+    """메리츠 정정 도구의 미해결 journal 이 이 종목에 남아 있는지 (읽을 수 없으면 True)."""
+    from meritz_reprice import unresolved_symbols
+    held = unresolved_symbols()
+    return symbol.upper() in held or "*" in held
+
+
+def _exit_if_pending_amend_journal(label, symbols):
+    """정산·저장을 하는 유지보수 경로는 미해결 journal 이 있으면 시작 전에 중단합니다 (종료 코드 1).
+
+    정정 접수 후 state 연결 전에 체결된 주문을 여기서 정산하면 미등록 매수로 반영되고,
+    이후 journal 복구가 같은 체결을 한 번 더 반영합니다.
+    """
+    held = [s for s in symbols if _pending_amend_journal(s)]
+    if held:
+        print(
+            f"[중단] {label}: 미해결 정정 journal(.reprice_journal.json)이 있어 {held} 의 "
+            f"정산·저장을 하지 않습니다. ops/meritz_buy_loc_reprice.py 로 복구를 먼저 진행하세요."
+        )
+        sys.exit(1)
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -945,9 +967,7 @@ def run_one_symbol(broker: Broker, symbol_config):
     # 메리츠 정정 도구가 남긴 미해결 journal 이 있으면 정산을 보류합니다.
     # (정정 접수 후 state 연결 전에 체결된 주문을 미등록 주문으로 정산하면,
     #  이후 복구가 같은 체결을 한 번 더 반영합니다)
-    from meritz_reprice import unresolved_symbols
-    _held = unresolved_symbols()
-    if symbol.upper() in _held or "*" in _held:
+    if _pending_amend_journal(symbol):
         raise SymbolScopedError(
             f"{symbol} 미해결 정정 journal(.reprice_journal.json)이 있어 정산·주문을 보류합니다. "
             f"ops/meritz_buy_loc_reprice.py --apply 로 복구를 먼저 진행하세요."
@@ -2321,6 +2341,7 @@ def _reverse_reconcile_only():
         globals()["TRADE_MODE"] = "DRY"
         print("[reconcile-only] 검증 모드 — 브로커 생성 전 DRY로 고정합니다.")
 
+    _exit_if_pending_amend_journal("reconcile-only", [c["symbol"] for c in SYMBOLS])
     broker = create_broker()
     try:
         for symbol_config in SYMBOLS:
@@ -2379,6 +2400,7 @@ def _net_invested_repair_only():
     expect_net_invested = float(_required("STATE_NET_INVESTED_REPAIR_EXPECT_NET_INVESTED"))
     expect_status = _required("STATE_NET_INVESTED_REPAIR_EXPECT_STATUS")
 
+    _exit_if_pending_amend_journal("net_invested repair", [symbol])
     state = load_state(symbol)
     actual_hash = canonical_state_hash(state)
     actual_net_invested = float(state.get("net_invested", 0.0))
@@ -2649,6 +2671,7 @@ def _repair_reinference():
         globals()["TRADE_MODE"] = "DRY"
         print("[REPAIR] REINFERENCE — 브로커 생성 전 DRY 모드로 고정합니다.")
 
+    _exit_if_pending_amend_journal("REPAIR:REINFERENCE", [c["symbol"] for c in SYMBOLS])
     broker = create_broker()
     try:
         planned = {}   # {symbol: 재추정된 state}
@@ -2722,6 +2745,9 @@ def _repair_force_t():
         )
         sys.exit(1)
 
+    _exit_if_pending_amend_journal(
+        "REPAIR:FORCE_T", [c["symbol"] for c in SYMBOLS if c.get("force_t") is not None]
+    )
     broker = create_broker()
     try:
         for symbol_config in SYMBOLS:

@@ -476,3 +476,64 @@ def test_journal_resolution_also_restores_original_price():
     entry = dict(_ENTRY, original_price=73.69)
     rp.resolve_journal([entry], [_row(odno=NEW, rctf="1", orgl="100", price=73.69)], state)
     assert state["orders_meta"][NEW]["original_price"] == 73.69
+
+
+# ── 2차 Codex 재검토 반영 ───────────────────────────────────────────
+
+def _pending_journal():
+    import run_lock
+    rp.write_journal(run_lock.journal_path(), [dict(_ENTRY)])
+
+
+def _no_broker(monkeypatch):
+    import trading_bot
+
+    def boom(*a, **k):
+        raise AssertionError("journal 보류 중에는 브로커를 만들면 안 됩니다")
+    monkeypatch.setattr(trading_bot, "create_broker", boom)
+    return trading_bot
+
+
+def test_pending_journal_helper_is_symbol_scoped_and_fails_closed(tmp_path):
+    import trading_bot
+    import run_lock
+    assert not trading_bot._pending_amend_journal("SOXL")
+    _pending_journal()
+    assert trading_bot._pending_amend_journal("soxl") and not trading_bot._pending_amend_journal("TQQQ")
+    open(run_lock.journal_path(), "w").write("{broken")
+    assert trading_bot._pending_amend_journal("TQQQ")  # 읽을 수 없으면 모든 종목 보류
+
+
+@pytest.mark.parametrize("path", ["reconcile", "reinference", "force_t", "net_invested"])
+def test_maintenance_settlement_paths_stop_before_broker_when_journal_pending(monkeypatch, path):
+    trading_bot = _no_broker(monkeypatch)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [{"symbol": "SOXL", "exchange": "AMS", "force_t": 10}])
+    _pending_journal()
+    if path == "net_invested":
+        for key, value in {"SYMBOL": "SOXL", "TARGET": "1", "EXPECT_HASH": "x",
+                           "EXPECT_NET_INVESTED": "0", "EXPECT_STATUS": "unresolved"}.items():
+            monkeypatch.setenv(f"STATE_NET_INVESTED_REPAIR_{key}", value)
+    fn = {"reconcile": trading_bot._reverse_reconcile_only, "reinference": trading_bot._repair_reinference,
+          "force_t": trading_bot._repair_force_t, "net_invested": trading_bot._net_invested_repair_only}[path]
+    with pytest.raises(SystemExit) as exc:
+        fn()
+    assert exc.value.code == 1
+
+
+def test_maintenance_path_not_blocked_for_other_symbol(monkeypatch):
+    trading_bot = _no_broker(monkeypatch)
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [{"symbol": "TQQQ", "exchange": "NAS"}])
+    _pending_journal()  # SOXL 만 보류
+    # TQQQ 만 대상이면 게이트를 통과해 브로커 생성(여기서는 AssertionError)까지 진행해야 함
+    with pytest.raises(AssertionError):
+        trading_bot._reverse_reconcile_only()
+
+
+def test_cancelled_amendment_row_still_resolves_journal_and_keeps_markers():
+    state = _state(processed_filled_qty=0)
+    cancelled = _row(odno=NEW, status="취소", filled=2, rctf="1", orgl="100", price=73.69)
+    cancelled["_is_cancel"] = True  # 어댑터가 이후 취소를 정정 행에 표시한 형태 (부분체결 2주 포함)
+    left, messages = rp.resolve_journal([dict(_ENTRY)], [_row(status="정정됨"), cancelled], state)
+    assert left == [] and NEW in state["orders_meta"] and OLD not in state["orders_meta"]
+    meta = state["orders_meta"][NEW]
+    assert meta["processed_filled_qty"] == 0 and meta["fill_marker_version"] == 1  # 체결분은 이후 정산이 반영
