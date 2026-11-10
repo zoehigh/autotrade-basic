@@ -25,7 +25,9 @@ set +a
 unset REPRICE_WATCH_MODE TRADE_MODE ALLOW_BROKER_ORDERS
 export REPRICE_WATCH_MODE="${_mode:-DRY}"
 export TRADE_MODE="${_trade:-DRY}"
-[[ -n "$_allow" ]] && export ALLOW_BROKER_ORDERS="$_allow"
+# ALLOW_BROKER_ORDERS 는 unset 만으로는 부족합니다: 파이썬의 load_dotenv() 가 .env 에서 다시 읽어 오므로
+# 값을 명시적으로 내보내 (기본 0) .env 가 덮어쓰지 못하게 합니다. 다른 두 값도 위에서 같은 방식으로 고정합니다.
+export ALLOW_BROKER_ORDERS="${_allow:-0}"
 
 uv run python ops/meritz_reprice_watch.py >> "$LOG" 2>&1
 rc=$?

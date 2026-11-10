@@ -378,3 +378,16 @@ def test_launcher_script_never_lets_dotenv_enable_apply():
     assert "unset REPRICE_WATCH_MODE TRADE_MODE ALLOW_BROKER_ORDERS" in script
     assert 'REPRICE_WATCH_MODE="${_mode:-DRY}"' in script and 'TRADE_MODE="${_trade:-DRY}"' in script
     assert script.index(". ./.env") < script.index("unset REPRICE_WATCH_MODE")
+    # load_dotenv() 가 unset 된 값을 .env 에서 되살리므로 세 값 모두 명시적으로 export 해야 함
+    assert 'export ALLOW_BROKER_ORDERS="${_allow:-0}"' in script
+
+
+def test_dotenv_cannot_resurrect_a_gate_that_launcher_pinned(tmp_path, monkeypatch):
+    """런처가 export 한 값은 python-dotenv(override=False)가 .env 로 바꾸지 못함 — 런처 설계의 전제."""
+    from dotenv import load_dotenv
+    env_file = tmp_path / ".env"
+    env_file.write_text("ALLOW_BROKER_ORDERS=1\nTRADE_MODE=LIVE\nREPRICE_WATCH_MODE=APPLY\n")
+    for key, value in {"ALLOW_BROKER_ORDERS": "0", "TRADE_MODE": "DRY", "REPRICE_WATCH_MODE": "DRY"}.items():
+        monkeypatch.setenv(key, value)
+    load_dotenv(env_file)
+    assert (os.environ["ALLOW_BROKER_ORDERS"], os.environ["TRADE_MODE"], os.environ["REPRICE_WATCH_MODE"]) == ("0", "DRY", "DRY")
