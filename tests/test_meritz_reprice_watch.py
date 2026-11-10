@@ -391,3 +391,137 @@ def test_dotenv_cannot_resurrect_a_gate_that_launcher_pinned(tmp_path, monkeypat
         monkeypatch.setenv(key, value)
     load_dotenv(env_file)
     assert (os.environ["ALLOW_BROKER_ORDERS"], os.environ["TRADE_MODE"], os.environ["REPRICE_WATCH_MODE"]) == ("0", "DRY", "DRY")
+
+
+# ── 2차 리뷰 반영: halt 우선, 복구 횟수 반영, 실행당 시도 제한, 손상 기록 ──────────
+
+def _break_record_saves(monkeypatch):
+    """감시 기록(.watch_state.json) 저장만 실패시킵니다 (halt 표식 등 다른 파일은 정상)."""
+    real = mw.save_record
+    switch = {"broken": True}
+
+    def flaky(path, record):
+        if switch["broken"] and path.endswith(".watch_state.json"):
+            raise OSError("disk full")
+        return real(path, record)
+    monkeypatch.setattr(mw, "save_record", flaky)
+    return switch
+
+
+def test_halt_marker_is_written_even_if_record_save_fails(world, monkeypatch):
+    world.broker.error = OrderError("timeout")           # → UNCERTAIN
+    switch = _break_record_saves(monkeypatch)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and json.load(open(run_lock.watch_halt_path()))["result"] == "UNCERTAIN"
+    switch["broken"] = False
+    # 다음 실행은 사람 확인 없이 journal 을 자동 복구하지 않고 중단 상태를 유지
+    world.broker.error = None
+    code, created = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and created == [] and len(world.broker.calls) == 1
+    assert len(rp.read_journal(run_lock.journal_path())) == 1
+
+
+def test_record_save_failure_after_successful_amend_stops_further_amends(world, monkeypatch):
+    _break_record_saves(monkeypatch)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and len(world.broker.calls) == 1
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "RECORD_SAVE_FAILED"
+    assert NEW in st.load_state("SOXL")["orders_meta"]        # 정정 자체와 메타 연결은 완료된 상태
+
+
+def test_recovered_journal_counts_toward_daily_amends_and_last_attempt(world):
+    earlier = (NOW - timedelta(minutes=45)).isoformat()
+    mw.save_record(run_lock.watch_state_path(), {"session": ET_TODAY, "notified": {},
+                   "symbols": {"SOXL": {"amends": 2, "attempts": 2, "last_attempt_utc": (NOW - timedelta(hours=2)).isoformat()}}})
+    world.broker.history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7,
+                                                "target_price": 73.69, "original_price": 73.69, "at": earlier}])
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    saved = json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]
+    assert code == 0 and saved["amends"] == 3
+    assert saved["last_attempt_utc"] == earlier                # 복구된 정정의 실제 시도 시각
+
+
+def test_uncertain_then_recovery_does_not_double_count_amends(world):
+    world.broker.error = OrderError("timeout")
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)               # 시도 1회, amends 는 아직 0
+    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 0
+    os.remove(run_lock.watch_halt_path())                       # 사람이 확인하고 중단 해제
+    world.broker.error = None
+    world.broker.history = [_row(status="정정됨"), _row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 1
+
+
+def test_recovery_with_rejected_only_row_is_not_counted_as_amend(world):
+    world.broker.history = [_row(status="정정됨"), _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7,
+                                                "target_price": 73.69, "at": NOW.isoformat()}])
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 0
+
+
+class MultiBroker(FakeBroker):
+    """정정 후보가 여러 건인 상황 — 호출마다 새 주문번호를 발급합니다."""
+    OLD2 = OLD.replace("100", "101")
+
+    def __init__(self):
+        super().__init__()
+        self.history = [_row(), _row(odno=self.OLD2, price=60.0)]  # 두 번째는 가격 차이가 더 큼
+
+    def modify_order(self, odno, symbol, exchange, side, qty, price, order_type):
+        self.calls.append((odno, qty, price, order_type))
+        new = NEW if len(self.calls) == 1 else NEW.replace("200", "201")
+        for index, row in enumerate(self.history):
+            if row["odno"] == odno:
+                self.history[index] = _row(odno=odno, status="정정됨", price=row["_order_price"])
+        self.history.append(_row(odno=new, rctf="1", orgl=odno.split(":")[-1].lstrip("0"), price=price))
+        return new
+
+
+def _two_order_world():
+    state = _state()
+    state["orders_meta"][MultiBroker.OLD2] = deepcopy(state["orders_meta"][OLD])
+    state["orders_meta"][MultiBroker.OLD2]["order_price"] = 60.0
+    st.save_state("SOXL", state)
+    return SimpleNamespace(broker=MultiBroker(), notifier=Notifier())
+
+
+def test_only_one_attempt_per_run_by_default_largest_gap_first():
+    world = _two_order_world()
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert [c[0] for c in world.broker.calls] == [MultiBroker.OLD2]     # 가격 차이가 큰 주문 먼저, 1건만
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)                        # 바로 다음 실행은 최소 간격으로 보류
+    assert len(world.broker.calls) == 1
+
+
+def test_max_per_run_can_be_raised_explicitly():
+    world = _two_order_world()
+    run(world, env={**APPLY_ENV, "REPRICE_WATCH_MAX_PER_RUN": "2"}, config=CONFIG_LIVE)
+    assert len(world.broker.calls) == 2
+
+
+def test_corrupt_record_holds_apply_preserves_file_and_does_not_spam(world):
+    open(run_lock.watch_state_path(), "w").write("{garbage")
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and world.broker.calls == []
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "RECORD_CORRUPT"
+    moved = [f for f in os.listdir(os.path.dirname(run_lock.watch_state_path())) if ".watch_state.json.corrupt-" in f]
+    assert len(moved) == 1 and open(os.path.join(os.path.dirname(run_lock.watch_state_path()), moved[0])).read() == "{garbage"
+    first = len(world.notifier.sent)
+    assert first == 1 and world.notifier.sent[0][0] is True
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)                        # 중단 상태 유지, 알림 반복 없음
+    assert len(world.notifier.sent) == first and world.broker.calls == []
+
+
+def test_corrupt_record_does_not_block_dry(world):
+    open(run_lock.watch_state_path(), "w").write("{garbage")
+    code, _ = run(world, env=ENV, config=CONFIG_DRY)
+    assert code == 0 and world.broker.calls == [] and not os.path.exists(run_lock.watch_halt_path())
+    assert any(".corrupt-" in f for f in os.listdir(os.path.dirname(run_lock.watch_state_path())))
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "inf"])
+def test_max_per_run_validation(value):
+    with pytest.raises(mw.WatchConfigError):
+        mw.load_settings({"REPRICE_WATCH_MAX_PER_RUN": value})

@@ -19,6 +19,7 @@
 | `REPRICE_WATCH_CLOSE_BUFFER_MIN` | `30` | 정규장 마감 몇 분 전에 끝낼지 |
 | `REPRICE_WATCH_MIN_STEP` | `0.05` | 이 금액(USD) 미만의 변경은 건너뜀 |
 | `REPRICE_WATCH_MIN_INTERVAL_MIN` | `20` | 같은 종목 정정 시도 사이 최소 간격 |
+| `REPRICE_WATCH_MAX_PER_RUN` | `1` | 한 번의 실행에서 종목당 시도할 정정 수 (후보가 여럿이면 가격 차이가 큰 것부터, 나머지는 다음 실행). 기본 1 이면 모든 시도가 최소 간격만큼 떨어짐 |
 | `REPRICE_WATCH_MAX_AMENDS_PER_DAY` | `3` | 종목별 하루(ET 세션) 정정 한도 |
 | `REPRICE_WATCH_SYMBOLS` | (전체) | 쉼표로 종목 제한 |
 
@@ -30,9 +31,11 @@
 ## 안전장치
 - **중복 실행 방지:** `.watch.lock` + 운영 런처 `.run.lock` + 봇 `.bot.lock` 을 모두 non-blocking 으로 잡고, 하나라도 사용 중이면 조용히 건너뜁니다(0). 정정 도구와도 상호 배제.
 - **정정 직전 재조회·재계획**, 최소 변경폭, 종목별 최소 간격·일일 한도(시도 직후 `.watch_state.json` 에 기록).
-- **journal 복구:** APPLY 는 미해결 journal 을 이력으로 확인해 정확히 일치할 때만 연결(그 외는 중단). DRY 는 복사본으로 확인만 하고 아무것도 쓰지 않으며 긴급 알림.
-- **중단(halt):** `REJECTED_LATE` / `UNCERTAIN` / `LINK_FAILED` / 해소 불가 journal → `.watch_halt.json` 기록 + 긴급 알림 + 이후 APPLY 는 정정하지 않음(재알림 6시간 간격).
+- **journal 복구:** APPLY 는 미해결 journal 을 이력으로 확인해 정확히 일치할 때만 연결(그 외는 중단). 복구된 정정은 일일 횟수와 마지막 시도 시각(journal 의 실제 시도 시각)에 반영하며, 이미 시도로 기록된 UNCERTAIN 건은 횟수를 이중으로 세지 않습니다. DRY 는 복사본으로 확인만 하고 아무것도 쓰지 않으며 긴급 알림.
+- **중단(halt):** `REJECTED_LATE` / `UNCERTAIN` / `LINK_FAILED` / 해소 불가 journal / `RECORD_SAVE_FAILED` / `RECORD_CORRUPT` → `.watch_halt.json` 기록 + 긴급 알림 + 이후 APPLY 는 정정하지 않음(재알림 6시간 간격).
+  **중단 표식은 감시 기록 저장보다 먼저** 만들어, 기록 저장이 실패해도 중단은 유지됩니다.
   자동 재주문은 하지 않습니다. 원인(앱에서 주문 상태 확인, journal 해소)을 확인한 뒤 **사람이** `.watch_halt.json` 을 삭제해야 재개됩니다.
+- **감시 기록 손상:** `.watch_state.json` 을 읽을 수 없으면 기존 정정 횟수를 알 수 없으므로 **APPLY 는 보류**(`RECORD_CORRUPT` 중단)하고, 손상 파일은 지우지 않고 `.watch_state.json.corrupt-<시각>` 으로 보존합니다. DRY 는 새 기록으로 계속합니다. 사람이 이전 횟수를 확인한 뒤 `.watch_halt.json` 을 삭제하면 재개됩니다.
 - **알림 중복 방지:** 같은 계획/오류는 반복 알리지 않습니다(오류 60분, 보류 안내 6시간). 알림 실패는 감시를 죽이지 않습니다.
 - 조회 오류(정정 전)는 중단 표식 없이 긴급 알림 + 종료 코드 1.
 

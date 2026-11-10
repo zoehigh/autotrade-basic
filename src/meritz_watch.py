@@ -59,6 +59,8 @@ def load_settings(env):
         "min_step": _parse_number("REPRICE_WATCH_MIN_STEP", env.get("REPRICE_WATCH_MIN_STEP") or "0.05", float, 0.01),
         "min_interval_min": _parse_number("REPRICE_WATCH_MIN_INTERVAL_MIN", env.get("REPRICE_WATCH_MIN_INTERVAL_MIN") or "20", int, 1),
         "max_amends_per_day": _parse_number("REPRICE_WATCH_MAX_AMENDS_PER_DAY", env.get("REPRICE_WATCH_MAX_AMENDS_PER_DAY") or "3", int, 1),
+        # 한 번의 실행에서 종목당 시도할 최대 정정 수. 기본 1 이면 모든 시도가 최소 간격만큼 떨어집니다.
+        "max_per_run": _parse_number("REPRICE_WATCH_MAX_PER_RUN", env.get("REPRICE_WATCH_MAX_PER_RUN") or "1", int, 1),
         "symbols": symbols,
     }
 
@@ -138,6 +140,36 @@ def save_record(path, record):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+
+
+def quarantine_record(path, now_utc):
+    """손상된 감시 기록을 지우지 않고 옆으로 치웁니다 (사람이 이전 횟수를 확인할 수 있게). 새 경로 또는 None."""
+    target = f"{path}.corrupt-{now_utc:%Y%m%dT%H%M%S}"
+    try:
+        os.replace(path, target)
+        return target
+    except OSError:
+        return None
+
+
+def record_recovered(record, symbol, at_iso, linked, now_utc):
+    """journal 로 복구한 정정을 일일 횟수·마지막 시도 시각에 반영합니다.
+
+    정정 접수 후 감시 기록을 저장하기 전에 종료된 경우를 메웁니다. 접수된 정정(linked)만 amends 에 더하며,
+    UNCERTAIN 으로 이미 시도 기록이 있어도 amends 는 AMENDED 일 때만 늘었으므로 이중 가산이 없습니다.
+    """
+    info = record["symbols"].setdefault(symbol, {"amends": 0, "attempts": 0})
+    if linked:
+        info["amends"] = int(info.get("amends", 0)) + 1
+    try:
+        attempt_at = datetime.fromisoformat(at_iso) if at_iso else now_utc
+    except ValueError:
+        attempt_at = now_utc
+    if attempt_at.tzinfo is None:
+        attempt_at = attempt_at.replace(tzinfo=timezone.utc)
+    previous = info.get("last_attempt_utc")
+    if not previous or attempt_at > datetime.fromisoformat(previous):
+        info["last_attempt_utc"] = attempt_at.isoformat()
 
 
 def throttle_reason(record, symbol, settings, now_utc):
