@@ -187,3 +187,26 @@ def test_partial_fill_equivalence_with_split_orders_is_not_guaranteed():
     assert merged["T"] == 5.4 and split["T"] == 5.5
     # 순투입은 체결금액 기준이라 같음
     assert round(merged["net_invested"], 2) == round(split["net_invested"], 2)
+
+
+# ── "큰수 이상" 경계: 보정가와 같은 가격의 단계는 합산, 바로 아래 단계는 추가매수로 유지 ────────
+
+def _capped_order(price=110.0, original=118.10, qty=4):
+    return [{"side": "BUY", "quantity": qty, "price": price, "original_price": original,
+             "comment": "후반전 별지점 매수", "order_type": "LOC"}]
+
+
+def test_level_exactly_equal_to_cap_price_is_merged(monkeypatch):
+    monkeypatch.setattr(strategy, "MERGE_CAPPED_ADDITIONAL", True)
+    orders = _capped_order()
+    ladder = strategy._additional_ladder_with_merge(orders, 550.0, 4, 3, 110.0)   # 550/5 = 110.00 (== 보정가)
+    assert orders[0]["merged_additional_qty"] == 1 and orders[0]["quantity"] == 5
+    assert [p for _l, p in ladder] == [91.66, 78.57]                              # 같은 가격 단계는 별도 추가매수로 남지 않음
+
+
+def test_level_just_below_cap_price_is_kept_as_additional_not_merged(monkeypatch):
+    monkeypatch.setattr(strategy, "MERGE_CAPPED_ADDITIONAL", True)
+    orders = _capped_order()
+    ladder = strategy._additional_ladder_with_merge(orders, 545.0, 4, 3, 110.0)   # 545/5 = 109.00 (< 보정가)
+    assert "merged_additional_qty" not in orders[0] and orders[0]["quantity"] == 4
+    assert [p for _l, p in ladder][0] == 109.0 and len(ladder) == 3
