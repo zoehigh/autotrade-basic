@@ -383,7 +383,9 @@ def test_late_rejection_keeps_original_meta_and_does_not_relink(tmp_path):
     result, journal = _apply(FakeBroker(), state, tmp_path, saved, history_fn=rejected)
     assert result == "REJECTED_LATE"
     assert OLD in state["orders_meta"] and NEW not in state["orders_meta"] and not saved
-    assert rp.read_journal(journal) == []
+    # 지우지 않고 표식을 남긴다: 원주문 생존 불명 → 봇이 해당 종목을 보류하도록
+    entries = rp.read_journal(journal)
+    assert len(entries) == 1 and entries[0]["review_required"] == "REJECTED_LATE" and entries[0]["old_odno"] == OLD
 
 
 @pytest.mark.parametrize("history_fn", [lambda: [], lambda: (_ for _ in ()).throw(OSError("x"))])
@@ -537,3 +539,102 @@ def test_cancelled_amendment_row_still_resolves_journal_and_keeps_markers():
     assert left == [] and NEW in state["orders_meta"] and OLD not in state["orders_meta"]
     meta = state["orders_meta"][NEW]
     assert meta["processed_filled_qty"] == 0 and meta["fill_marker_version"] == 1  # 체결분은 이후 정산이 반영
+
+
+# ── REJECTED_LATE 보완: 표식 유지 → 봇 보류 → 확인 후에만 정리 (수동 도구 + 실제 run_one_symbol 경로) ──────
+
+def _late_rejected_world(monkeypatch, tmp_path, extra_args=()):
+    """수동 도구로 정정했더니 이력에 '거부'로 남은 상황을 CLI 로 재현합니다."""
+    import run_lock
+    import state as st
+    import config
+    monkeypatch.setenv("ALLOW_BROKER_ORDERS", "1")
+    monkeypatch.setattr(config, "BROKER", "meritz")
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    st.save_state("SOXL", _state())
+
+    class LateRejectBroker(_ReadOnlyBroker):
+        def __init__(self):
+            super().__init__()
+            self.modified = False
+
+        def get_order_history(self, *a, **k):
+            if not self.modified:
+                return [_row()]
+            return [_row(status="정정됨"), _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
+
+        def modify_order(self, odno, symbol, exchange, side, qty, price, order_type):
+            self.calls.append((odno, qty, price, order_type))
+            self.modified = True
+            return NEW
+
+    broker = LateRejectBroker()
+    import meritz_buy_loc_reprice as cli
+    monkeypatch.setattr(cli.time if hasattr(cli, "time") else rp.time, "sleep", lambda s: None)
+    code = _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL", *extra_args], broker)
+    return code, broker, run_lock
+
+
+def test_manual_tool_stops_everything_and_keeps_marker_on_late_rejection(monkeypatch, tmp_path):
+    code, broker, run_lock = _late_rejected_world(monkeypatch, tmp_path)
+    assert code == 1 and len(broker.calls) == 1                                  # 정정 시도는 1회뿐, 즉시 전체 중단
+    entries = rp.read_journal(run_lock.journal_path())
+    assert len(entries) == 1 and entries[0]["review_required"] == "REJECTED_LATE"
+    import trading_bot
+    assert trading_bot._pending_amend_journal("SOXL") and "SOXL" in rp.unresolved_symbols()
+
+
+def test_manual_tool_refuses_to_clear_marker_without_original_checked(monkeypatch, tmp_path):
+    code, broker, run_lock = _late_rejected_world(monkeypatch, tmp_path)
+    before = open(run_lock.journal_path()).read()
+    broker.calls.clear()
+    # 확인 문구는 맞지만 --original-checked 없음 → 정리하지 않는다
+    code = _cli_again(monkeypatch, tmp_path, broker, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"])
+    assert code == 1 and open(run_lock.journal_path()).read() == before and broker.calls == []
+
+
+def test_manual_tool_clears_marker_only_with_original_checked_and_confirm(monkeypatch, tmp_path):
+    code, broker, run_lock = _late_rejected_world(monkeypatch, tmp_path)
+    # --original-checked 만으로는 안 됨 (확인 문구 없음 → 복구는 쓰기 작업)
+    _cli_again(monkeypatch, tmp_path, broker, ["--symbol", "SOXL", "--apply", "--original-checked"])
+    assert len(rp.read_journal(run_lock.journal_path())) == 1
+    # 둘 다 있을 때만 정리 (메타는 원주문 그대로 유지)
+    _cli_again(monkeypatch, tmp_path, broker, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL", "--original-checked"])
+    import state as st
+    assert rp.read_journal(run_lock.journal_path()) == []
+    assert OLD in st.load_state("SOXL")["orders_meta"] and NEW not in st.load_state("SOXL")["orders_meta"]
+    import trading_bot
+    assert not trading_bot._pending_amend_journal("SOXL")
+
+
+def _cli_again(monkeypatch, tmp_path, broker, argv):
+    import meritz_buy_loc_reprice as cli
+    monkeypatch.setattr(cli, "bot_is_running", lambda: False)
+    return cli.main(argv, broker=broker)
+
+
+def test_run_one_symbol_stops_before_settlement_and_orders_when_late_rejection_marker_exists(monkeypatch, tmp_path):
+    """봇의 실제 run_one_symbol 경로: REJECTED_LATE 표식이 있으면 정산·취소 정리·신규 주문 전에 중단."""
+    import run_lock
+    from unittest.mock import MagicMock
+    import trading_bot
+    from test_fence_scope import _make_state, _symbol_config
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69,
+                                                "review_required": "REJECTED_LATE"}])
+    monkeypatch.setattr(trading_bot, "load_state", lambda symbol: _make_state())
+    for name in ("update_T_from_history", "save_state", "무한매수법_V4"):
+        monkeypatch.setattr(trading_bot, name, MagicMock(side_effect=AssertionError(f"{name} 호출 금지")))
+    broker = MagicMock()
+    broker.get_order_history.return_value = []
+    with pytest.raises(trading_bot.SymbolScopedError, match="미해결 정정 journal"):
+        trading_bot.run_one_symbol(broker, _symbol_config("SOXL"))
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+
+
+def test_run_one_symbol_does_not_stop_other_symbols_or_clean_state(monkeypatch, tmp_path):
+    import run_lock
+    import trading_bot
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69,
+                                                "review_required": "REJECTED_LATE"}])
+    assert not trading_bot._pending_amend_journal("TQQQ")

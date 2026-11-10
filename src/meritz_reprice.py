@@ -291,7 +291,11 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
     결과:
       "AMENDED"        정정 접수 확인 + state 연결 완료
       "REJECTED"       브로커가 API 응답으로 미접수 확정 (주문은 그대로 살아 있음)
-      "REJECTED_LATE"  API 는 접수했으나 이력에 거부로 남음 — 메타 이동 안 함, 원주문 생존 불명(보류)
+      "REJECTED_LATE"  API 는 접수했으나 이력에 거부로 남음 — 메타 이동 안 함, 원주문 생존 불명(보류).
+                       journal 항목을 **지우지 않고** review_required="REJECTED_LATE" 표식을 남깁니다 —
+                       어댑터가 거부된 정정 행도 원주문을 '정정됨·잔량 0'으로 보여 주므로, 살아 있는 원주문을
+                       봇의 잔여 주문 취소가 건너뛰어 신규 주문과 중복될 수 있어 해당 종목의 봇 정산·주문을 막습니다.
+                       사람이 원주문 상태를 확인한 뒤 수동 도구(--original-checked)로만 정리합니다.
       "UNCERTAIN"      접수 여부 불확실 — journal 유지, 호출부는 즉시 중단해야 함
       "LINK_FAILED"    정정은 접수됐지만 state 저장 실패 — journal 유지, 즉시 중단
     """
@@ -321,9 +325,12 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
     # API 응답만으로 연결하지 않습니다 — 실제로 이력에 접수로 남았는지 확인합니다.
     verdict = verify_new_order(history_fn, new_odno, wait=verify_wait)
     if verdict == "REJECTED":
-        write_journal(journal_path, others)
+        entries[-1]["review_required"] = "REJECTED_LATE"  # 이번 항목에만 표식 (others 는 그대로)
+        write_journal(journal_path, entries)
         print(f"  ⚠️ 정정이 이력에 '거부'로 남음: {mask_odno(old_odno)} → {mask_odno(new_odno)}. "
-              f"메타를 옮기지 않았습니다. 원주문 생존 여부를 앱/HTS 에서 확인하세요 (보류)")
+              f"메타를 옮기지 않았습니다. 원주문 생존 여부를 판별할 수 없어 journal 에 표식을 남기고 "
+              f"봇의 해당 종목 정산·주문을 보류합니다. 앱/HTS 에서 확인·정리한 뒤 "
+              f"수동 도구 --apply --confirm ... --original-checked 로 해소하세요")
         return "REJECTED_LATE"
     if verdict == "UNKNOWN":
         print(f"  ⚠️ 정정 후 이력에서 새 주문을 확인하지 못함: {mask_odno(old_odno)} → "

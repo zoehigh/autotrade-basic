@@ -72,6 +72,8 @@ def main(argv=None, broker=None):
     parser.add_argument("--original", action="append", help="원래 매수가 지정 ODNO=PRICE (메타에 없을 때)")
     parser.add_argument("--apply", action="store_true", help="실제 정정 실행 (기본은 계획만)")
     parser.add_argument("--confirm", default="", help='실행 확인 문구: "REPRICE <종목>"')
+    parser.add_argument("--original-checked", action="store_true",
+                        help="앱/HTS 에서 원주문 상태(생존 여부)를 확인했음을 명시 — REJECTED_LATE 표식 journal 을 정리할 때만 필요")
     args = parser.parse_args(argv)
 
     import config
@@ -128,6 +130,13 @@ def main(argv=None, broker=None):
             print(f"[{symbol}] 미해결 정정 journal {len(journal)}건 — 이력으로 확인합니다")
             if args.apply and not confirmed:
                 print(f'  확인 문구 불일치 — 복구는 "REPRICE {symbol}" 일 때만 수행합니다 (조회만 합니다)')
+            review = [e for e in journal if e.get("review_required")]
+            if confirmed and review and not args.original_checked:
+                # 원주문 생존 여부를 이력으로 알 수 없는 항목은, 사람이 확인했다고 명시하기 전에는 정리하지 않습니다.
+                print(f"  원주문 확인이 필요한 항목 {len(review)}건({review[0].get('review_required')}) — "
+                      f"앱/HTS 에서 원주문 상태를 확인하고 필요하면 취소한 뒤 --original-checked 를 함께 지정하세요. 정리하지 않습니다")
+                exit_code = 1
+                continue
             if confirmed:
                 left, messages = rp.resolve_journal(journal, history, state)
                 for message in messages:
@@ -175,13 +184,10 @@ def main(argv=None, broker=None):
             history_fn = lambda: broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
             result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file,
                                     save_state, history_fn)
-            if result == "REJECTED_LATE":
-                print("  → 이 주문은 보류합니다 (원주문 생존 불명). 다른 주문은 계속 검토합니다")
-                continue
-            if result in ("UNCERTAIN", "LINK_FAILED"):
-                exit_code = 1
-                print("  → 즉시 중단합니다. 재주문하지 않고 journal 을 유지합니다")
-                break
+            if result in ("REJECTED_LATE", "UNCERTAIN", "LINK_FAILED"):
+                # 원주문 생존 불명/접수 불확실: 다른 주문·종목도 더 정정하지 않고 즉시 전체 중단합니다 (journal 유지).
+                print("  → 즉시 전체 중단합니다. 재주문하지 않고 journal 을 유지합니다 (봇은 해당 종목을 보류)")
+                return 1
     return exit_code
 
 
