@@ -10,6 +10,7 @@
 #   - 부분체결 주문은 정정하지 않습니다 (정정 수량의 의미가 부분체결 시 미검증).
 #   - 접수 여부가 불확실하면 자동 재주문하지 않습니다.
 import json
+import math
 import os
 from copy import deepcopy
 from datetime import datetime
@@ -26,6 +27,30 @@ ACTION_SKIP = "SKIP"                  # 안전 조건 미충족 — 건드리지
 ACTION_REORDER = "REORDER_CANDIDATE"  # 거부된 주문 (참고용 — 이 도구는 재주문하지 않음)
 
 _LOC_CLS_CODE = "32"
+
+# journal 위치 — 봇(정산 보류 게이트)과 도구가 같은 파일을 봅니다.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JOURNAL_PATH = os.environ.get("REPRICE_JOURNAL_PATH") or os.path.join(_ROOT, ".reprice_journal.json")
+# 운영 런처(ops/run_daily.sh)와 공유하는 실행 락 — 체크아웃이 다르면 RUN_LOCK_PATH 로 지정
+RUN_LOCK_PATH = os.environ.get("RUN_LOCK_PATH") or os.path.join(_ROOT, ".run.lock")
+
+
+def is_valid_price(value) -> bool:
+    """유한한 양수 가격인지 확인합니다 (inf/nan 거부)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
+def unresolved_symbols(path=None) -> set:
+    """미해결 정정 journal 이 남아 있는 종목 집합 (봇이 정산 전에 확인)."""
+    try:
+        return {str(e.get("symbol", "")).upper() for e in read_journal(path or JOURNAL_PATH)}
+    except (OSError, ValueError):
+        # journal 을 읽을 수 없으면 안전하게 모든 종목을 보류 대상으로 봅니다
+        return {"*"}
 
 
 def _plain_odno(odno) -> str:
@@ -58,8 +83,8 @@ def plan_order(odno, meta, row, last_price, overrides, today_session):
         return _skip(odno, "이력에 주문 행 없음 (상태 불확실)")
 
     original = meta.get("original_price") or overrides.get(odno)
-    if not original or float(original) <= 0:
-        return _skip(odno, "원래 전략 매수가를 알 수 없음 (--original 로 지정 필요)")
+    if not is_valid_price(original):
+        return _skip(odno, "원래 전략 매수가를 알 수 없거나 유효하지 않음 (--original 확인)")
     original = float(original)
 
     if row.get("_oder_cls_code") != _LOC_CLS_CODE:
@@ -179,9 +204,20 @@ def resolve_journal(entries, history, state):
     remaining, messages = [], []
     for entry in entries:
         old_plain = _plain_odno(entry["old_odno"])
+        old_date = str(entry["old_odno"]).split(":")[0]
+        # 정정 접수의 증거로 인정하는 행: 같은 주문일, 정정 코드, 거부 아님, 매수 LOC,
+        # 같은 수량, 목표가와 같은 가격 — 하나라도 다르면 연결하지 않습니다.
         matches = [
             row for row in (history or [])
-            if row.get("_rctf_code") == "1" and row.get("_plain_orgl_oder_no") == old_plain
+            if row.get("_rctf_code") == "1"
+            and row.get("_plain_orgl_oder_no") == old_plain
+            and row.get("_oder_date") == old_date
+            and not row.get("_is_rejected")
+            and not row.get("_is_cancel")
+            and row.get("sll_buy_dvsn_cd_name") == "매수"
+            and row.get("_oder_cls_code") == _LOC_CLS_CODE
+            and row.get("_ordered_qty") == int(entry["qty"])
+            and abs(float(row.get("_order_price") or 0) - float(entry["target_price"])) < 0.005
         ]
         if len(matches) == 1:
             relink_amended_order(

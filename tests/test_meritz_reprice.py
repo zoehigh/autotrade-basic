@@ -27,6 +27,8 @@ def _row(odno=OLD, status="미체결", filled=0, qty=7, price=70.0, cls="32", rc
         "nccs_qty": str(qty - filled), "prcs_stat_name": status,
         "_order_price": price, "_oder_cls_code": cls, "_rctf_code": rctf,
         "_plain_orgl_oder_no": orgl,
+        "_oder_date": NOW.strftime("%Y%m%d"), "_is_rejected": status == "거부",
+        "_is_cancel": status == "취소", "_ordered_qty": qty,
     }
 
 
@@ -171,7 +173,7 @@ def test_restart_resolves_journal_from_history_once(tmp_path):
 def test_restart_keeps_uncertain_when_history_has_no_or_many_matches():
     entries = [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69}]
     assert rp.resolve_journal(entries, [], _state())[0] == entries
-    two = [_row(odno=NEW, rctf="1", orgl="100"), _row(odno="x:3", rctf="1", orgl="100")]
+    two = [_row(odno=NEW, rctf="1", orgl="100", price=73.69), _row(odno="x:3", rctf="1", orgl="100", price=73.69)]
     assert rp.resolve_journal(entries, two, _state())[0] == entries
 
 
@@ -235,3 +237,79 @@ def test_cli_apply_refused_without_env_gate(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"], broker)
     assert broker.calls == []
+
+
+# ── 리뷰 반영: 복구 검증 강화 / 조회 모드 비파괴 / 정산 보류 / 입력 검증 ───────
+
+_ENTRY = {"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69}
+
+
+@pytest.mark.parametrize("change", [
+    {"_oder_date": "20200101"}, {"status": "거부"}, {"_ordered_qty": 3},
+    {"price": 60.0}, {"sll_buy_dvsn_cd_name": "매도"}, {"_oder_cls_code": "01"},
+])
+def test_journal_resolution_rejects_mismatched_rows(change):
+    row = _row(odno=NEW, rctf="1", orgl="100", price=73.69,
+               status=change.pop("status", "미체결"))
+    if "price" in change:
+        row["_order_price"] = change.pop("price")
+    row.update(change)
+    state = _state()
+    left, _ = rp.resolve_journal([dict(_ENTRY)], [row], state)
+    assert left and OLD in state["orders_meta"]
+
+
+def test_query_mode_does_not_touch_journal_or_state(monkeypatch, tmp_path):
+    import state as st
+    import meritz_buy_loc_reprice as cli
+    broker = _ReadOnlyBroker()
+    broker.get_order_history = lambda *a, **k: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)]
+    journal = tmp_path / "j.json"
+    rp.write_journal(str(journal), [dict(_ENTRY)])
+    before = journal.read_text()
+    monkeypatch.setattr(cli, "JOURNAL_PATH", str(journal))
+    _cli(monkeypatch, tmp_path, ["--symbol", "SOXL"], broker)
+    assert journal.read_text() == before
+    assert OLD in st.load_state("SOXL")["orders_meta"]
+
+
+def test_unresolved_journal_holds_bot_settlement(tmp_path):
+    path = str(tmp_path / "j.json")
+    assert rp.unresolved_symbols(path) == set()
+    rp.write_journal(path, [dict(_ENTRY)])
+    assert "SOXL" in rp.unresolved_symbols(path)
+    (tmp_path / "bad.json").write_text("{broken")
+    assert rp.unresolved_symbols(str(tmp_path / "bad.json")) == {"*"}
+
+
+def test_run_one_symbol_source_checks_journal_before_settlement():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "trading_bot.py"), encoding="utf-8").read()
+    assert src.index("unresolved_symbols()") < src.index("update_T_from_history(symbol, state, order_history")
+
+
+@pytest.mark.parametrize("bad", ["inf", "nan", "-1", "0", "abc"])
+def test_original_price_must_be_finite_positive(bad):
+    import meritz_buy_loc_reprice as cli
+    with pytest.raises(SystemExit):
+        cli.parse_overrides([f"{OLD}={bad}"])
+    state = _state()
+    del state["orders_meta"][OLD]["original_price"]
+    assert _plan(state, _row(), overrides={OLD: float(bad) if bad != "abc" else 0})["action"] == rp.ACTION_SKIP
+
+
+def test_apply_requires_shared_run_lock(monkeypatch, tmp_path):
+    import fcntl
+    import meritz_buy_loc_reprice as cli
+    monkeypatch.setenv("ALLOW_BROKER_ORDERS", "1")
+    import config
+    monkeypatch.setattr(config, "BROKER", "meritz")
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    run_lock = tmp_path / "run.lock"
+    monkeypatch.setattr(cli, "RUN_LOCK_PATH", str(run_lock))
+    held = open(run_lock, "w")
+    fcntl.flock(held, fcntl.LOCK_EX)  # 런처가 쥐고 있는 상황
+    broker = _ReadOnlyBroker()
+    with pytest.raises(SystemExit):
+        _cli(monkeypatch, tmp_path, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"], broker)
+    assert broker.calls == []
+    held.close()

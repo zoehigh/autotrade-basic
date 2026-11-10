@@ -12,6 +12,7 @@
 """
 import argparse
 import fcntl
+from copy import deepcopy
 import os
 import subprocess
 import sys
@@ -25,8 +26,9 @@ from zoneinfo import ZoneInfo  # noqa: E402
 import meritz_reprice as rp  # noqa: E402
 from state import load_state, save_state, mask_odno  # noqa: E402
 
-JOURNAL_PATH = os.path.join(ROOT, ".reprice_journal.json")
+JOURNAL_PATH = rp.JOURNAL_PATH
 LOCK_PATH = os.path.join(ROOT, ".reprice.lock")
+RUN_LOCK_PATH = rp.RUN_LOCK_PATH  # 운영 런처(.run.lock)와 같은 락
 
 
 def parse_overrides(items):
@@ -34,8 +36,8 @@ def parse_overrides(items):
     result = {}
     for item in items or []:
         odno, _, price = item.rpartition("=")
-        if not odno or float(price) <= 0:
-            raise SystemExit(f"--original 형식 오류: {item!r} (예: 20261110:0000123=73.69)")
+        if not odno or not rp.is_valid_price(price):
+            raise SystemExit(f"--original 형식 오류: {item!r} (유한한 양수 가격, 예: 20261110:0000123=73.69)")
         result[odno] = float(price)
     return result
 
@@ -85,11 +87,17 @@ def main(argv=None, broker=None):
         if problems:
             raise SystemExit("정정 실행 거부: " + ", ".join(problems))
 
-    lock = open(LOCK_PATH, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise SystemExit("다른 재조정 도구가 이미 실행 중입니다")
+    # 실제 정정(--apply)은 운영 런처와 같은 .run.lock 을 잡아야만 진행합니다.
+    # (pgrep 확인만으로는 확인 직후 시작하는 크론과의 경쟁을 막을 수 없음)
+    locks = []
+    if args.apply:
+        for path in (RUN_LOCK_PATH, LOCK_PATH):
+            handle = open(path, "w")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise SystemExit(f"다른 실행(봇 또는 정정 도구)이 락을 쥐고 있습니다: {path}")
+            locks.append(handle)
 
     if broker is None:
         from broker.meritz.adapter import MeritzBroker
@@ -107,19 +115,29 @@ def main(argv=None, broker=None):
         journal = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] == symbol]
         if journal:
             print(f"[{symbol}] 미해결 정정 journal {len(journal)}건 — 이력으로 확인합니다")
-            left, messages = rp.resolve_journal(journal, history, state)
-            for message in messages:
-                print("  " + message)
-            if args.apply and len(left) < len(journal):
-                save_state(symbol, state)
-            others = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] != symbol]
-            rp.write_journal(JOURNAL_PATH, others + left)
-            if left:
+            if args.apply:
+                left, messages = rp.resolve_journal(journal, history, state)
+                for message in messages:
+                    print("  " + message)
+                if len(left) < len(journal):
+                    save_state(symbol, state)  # state 저장 성공 후에만 journal 을 줄입니다
+                others = [e for e in rp.read_journal(JOURNAL_PATH) if e["symbol"] != symbol]
+                rp.write_journal(JOURNAL_PATH, others + left)
+            else:
+                # 조회 모드: 사본에서만 확인하고 state·journal 은 절대 바꾸지 않습니다
+                left, messages = rp.resolve_journal(journal, history, deepcopy(state))
+                for message in messages:
+                    print("  [조회 모드, 저장 안 함] " + message)
+            if left or (journal and not args.apply):
                 print(f"[{symbol}] 접수 불확실 정정이 남아 있어 중단합니다 (자동 재주문 안 함)")
                 exit_code = 1
                 continue
 
         last_price = broker.get_stock_price(symbol, exchange_code).last
+        unmatched = [o for o in overrides if o not in (state.get("orders_meta") or {})]
+        if unmatched:
+            print(f"[{symbol}] --original 대상 주문번호가 state 에 없습니다: "
+                  f"{[mask_odno(o) for o in unmatched]}")
         plan = rp.build_plan(state, history, last_price, overrides, today_session)
         print_plan(symbol, plan)
 

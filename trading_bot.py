@@ -941,6 +941,16 @@ def run_one_symbol(broker: Broker, symbol_config):
                 f"{symbol} 상태 파일을 확인할 수 없어 LIVE 주문을 중단합니다: "
                 f"{state_unavailable}"
             )
+    # 메리츠 정정 도구가 남긴 미해결 journal 이 있으면 정산을 보류합니다.
+    # (정정 접수 후 state 연결 전에 체결된 주문을 미등록 주문으로 정산하면,
+    #  이후 복구가 같은 체결을 한 번 더 반영합니다)
+    from meritz_reprice import unresolved_symbols
+    _held = unresolved_symbols()
+    if symbol.upper() in _held or "*" in _held:
+        raise SymbolScopedError(
+            f"{symbol} 미해결 정정 journal(.reprice_journal.json)이 있어 정산·주문을 보류합니다. "
+            f"ops/meritz_buy_loc_reprice.py --apply 로 복구를 먼저 진행하세요."
+        )
     # 정산 전 워터마크 (이번 정산이 처리한 구간의 시작점) — 검증기가 사용합니다.
     watermark_before = str(state.get("last_updated", "") or "")
     T_before = float(state.get("T", 0.0))
