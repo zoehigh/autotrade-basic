@@ -627,3 +627,96 @@ def test_dry_run_cannot_launder_a_corrupt_record_for_a_later_apply(world):
     os.remove(run_lock.watch_halt_path())
     run(world, env=APPLY_ENV, config=CONFIG_LIVE)
     assert len(world.broker.calls) == 1
+
+
+# ── 4차 리뷰 반영: REJECTED_LATE 근거 보존, 정상 성공 직후 종료 시 횟수 보존 ──────
+
+class _Killed(BaseException):
+    """프로세스가 강제 종료된 상황을 흉내냅니다 (Exception 이 아니라 except 로 잡히지 않음)."""
+
+
+def test_rejected_late_with_unwritable_halt_keeps_journal_marker_and_blocks_other_candidates(world, monkeypatch):
+    world.broker.new_row_rejected = True
+    real_write_halt = mw.write_halt
+    monkeypatch.setattr(mw, "write_halt", lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and not os.path.exists(run_lock.watch_halt_path())
+    entries = rp.read_journal(run_lock.journal_path())
+    assert len(entries) == 1 and entries[0]["review_required"] == "REJECTED_LATE"      # 지속 근거가 남음
+    assert OLD in st.load_state("SOXL")["orders_meta"]                                  # 메타는 이동하지 않음
+    # 봇 정산·주문은 막지 않음 (메타 불변 → 중복 정산 위험 없음)
+    assert "SOXL" not in rp.unresolved_symbols()
+    # 다음 APPLY: 다른 후보를 정정하지 않고 중단 표식을 다시 만든다
+    monkeypatch.setattr(mw, "write_halt", real_write_halt)
+    world.broker.new_row_rejected = False
+    calls_before = len(world.broker.calls)
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and len(world.broker.calls) == calls_before
+    assert json.load(open(run_lock.watch_halt_path()))["result"] == "JOURNAL_REVIEW_REQUIRED"
+
+
+def test_manual_tool_clears_rejected_late_marker(world):
+    entry = {"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69, "review_required": "REJECTED_LATE"}
+    history = [_row(status="정정됨"), _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
+    left, messages = rp.resolve_journal([entry], history, _state())
+    assert left == [] and any("거부 확인" in m for m in messages)
+
+
+def test_other_review_markers_still_block_the_bot(world):
+    rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69,
+                                                "review_required": "UNCERTAIN"}])
+    assert "SOXL" in rp.unresolved_symbols()
+
+
+def test_normal_success_keeps_recovery_evidence_until_count_is_recorded(world, monkeypatch):
+    """정정 성공(state 연결 완료) 직후, 감시 기록 저장 전에 프로세스가 죽어도 횟수가 복구된다."""
+    mw.save_record(run_lock.watch_state_path(), {"session": ET_TODAY, "notified": {}, "symbols": {
+        "SOXL": {"amends": 2, "attempts": 2, "last_attempt_utc": (NOW - timedelta(hours=2)).isoformat()}}})
+    real_save = mw.save_record
+
+    def killed(path, record):
+        if path.endswith(".watch_state.json"):
+            raise _Killed()
+        return real_save(path, record)
+    monkeypatch.setattr(mw, "save_record", killed)
+    with pytest.raises(_Killed):
+        run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    monkeypatch.setattr(mw, "save_record", real_save)
+    # 정정과 state 연결은 끝났지만 횟수는 아직 기록 전 — 복구 근거(journal)가 남아 있어야 함
+    assert NEW in st.load_state("SOXL")["orders_meta"] and len(rp.read_journal(run_lock.journal_path())) == 1
+    assert _amends() == 2
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)                       # 재시작: 복구가 횟수를 센다
+    assert _amends() == 3 and rp.read_journal(run_lock.journal_path()) == []
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert _amends() == 3
+
+
+def test_crash_after_count_recorded_before_journal_removal_does_not_double_count(world, monkeypatch):
+    mw.save_record(run_lock.watch_state_path(), {"session": ET_TODAY, "notified": {}, "symbols": {
+        "SOXL": {"amends": 2, "attempts": 2, "last_attempt_utc": (NOW - timedelta(hours=2)).isoformat()}}})
+    real_drop = rp.drop_journal_entry
+    monkeypatch.setattr(rp, "drop_journal_entry", lambda *a, **k: (_ for _ in ()).throw(_Killed()))
+    with pytest.raises(_Killed):
+        run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert _amends() == 3 and len(rp.read_journal(run_lock.journal_path())) == 1   # 기록은 끝, 근거는 남음
+    monkeypatch.setattr(rp, "drop_journal_entry", real_drop)
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)                                  # 재시작: 같은 id 라 다시 세지 않음
+    assert _amends() == 3 and rp.read_journal(run_lock.journal_path()) == []
+
+
+def test_normal_success_path_still_ends_with_clean_journal_and_single_count(world):
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert rp.read_journal(run_lock.journal_path()) == [] and _amends() == 1
+    record = json.load(open(run_lock.watch_state_path()))
+    assert len(record["recovered_ids"]) == 1
+
+
+def test_manual_apply_amend_default_still_cleans_up_immediately(tmp_path):
+    """수동 도구 경로(기본값)는 기존대로 즉시 정리한다 — 감시기만 정리를 미룬다."""
+    from test_meritz_reprice import FakeBroker as ManualBroker
+    state = _state()
+    item = rp.plan_order(OLD, state["orders_meta"][OLD], _row(), 65.0, {}, ET_TODAY)
+    journal = str(tmp_path / "j.json")
+    result = rp.apply_amend(ManualBroker(), "SOXL", "NY", item, state, journal, lambda s, st_: None,
+                            lambda: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)], verify_wait=0)
+    assert result == "AMENDED" and rp.read_journal(journal) == []

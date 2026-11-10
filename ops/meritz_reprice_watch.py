@@ -127,8 +127,13 @@ def _handle_journal(apply, symbol, state, history, now_utc, notify_fn, record):
         # (2) 횟수를 **먼저** 기록합니다. 항목 id 로 한 번만 반영하므로 이후 단계에서 종료돼도 재시작이 안전하고,
         #     기록이 끝나기 전에는 state·journal 근거를 건드리지 않습니다.
         counted = False
+        preview_metas = preview.get("orders_meta") or {}
         for entry in resolved:
-            linked = entry["old_odno"] in metas_before and entry["old_odno"] not in (preview.get("orders_meta") or {})
+            old = entry["old_odno"]
+            # 연결됨 = 구 주문번호 메타가 새 번호로 옮겨졌다. 정정 직후 종료돼 이미 옮겨진 상태로 재시작한 경우에는
+            # 구 키가 처음부터 없으므로 옮겨진 메타의 amended_from 으로 판정한다. (거부만 확인된 항목은 구 키가 그대로 남음)
+            linked = (old in metas_before and old not in preview_metas) or any(
+                (m or {}).get("amended_from") == old for m in preview_metas.values())
             counted |= mw.record_recovered(record, symbol, _entry_id(entry), entry.get("at"), linked, now_utc)
         if counted:
             try:
@@ -225,21 +230,37 @@ def _watch_symbol(settings, broker, cfg, record, now_utc, session, notify_fn):
             _log(f"  재확인에서 정정 불필요/불가: {mask_odno(item['odno'])}")
             continue
         history_fn = lambda: broker.get_order_history(symbol, exchange_code, days=30, verbose=False)
-        result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file, st.save_state, history_fn)
+        # journal 항목은 후속 기록(횟수·중단 표식)이 모두 끝난 뒤 이 함수가 직접 지웁니다 (defer).
+        result = rp.apply_amend(broker, symbol, exchange_code, fresh, state, journal_file, st.save_state,
+                                history_fn, defer_journal_cleanup=True)
         attempted += 1
+        entry = next((e for e in reversed(rp.read_journal(journal_file))
+                      if e.get("symbol") == symbol and e.get("old_odno") == fresh["odno"]), None)
         dangerous = result in ("REJECTED_LATE", "UNCERTAIN", "LINK_FAILED")
         # 위험 결과의 중단 표식을 **먼저** 만듭니다 — 아래 기록 저장이 실패해도 중단은 유지돼야 합니다.
+        # (REJECTED_LATE 도 journal 항목이 남아 있어 '사람 확인 필요' 표식을 지속 근거로 남길 수 있음)
         if dangerous:
             _halt(symbol, result, _fmt_item(symbol, fresh), now_utc, notify_fn, review_odno=fresh["odno"])
             _register_halt_notified(record, now_utc)
-        mw.record_attempt(record, symbol, now_utc, amended=(result == "AMENDED"))
+        mw.record_attempt(record, symbol, now_utc, amended=False)
+        if result == "AMENDED":
+            # 복구 경로와 같은 항목 id 로 한 번만 센다 — 아래 저장 전에 종료돼도 journal 이 남아 있어 복구가 센다.
+            if entry:
+                mw.record_recovered(record, symbol, _entry_id(entry), entry.get("at"), True, now_utc)
+            else:
+                mw.record_attempt(record, symbol, now_utc, amended=True)
         try:
             mw.save_record(run_lock.watch_state_path(), record)  # 시도 직후 기록 (중단돼도 횟수 유지)
         except OSError as error:
             _log(f"감시 기록 저장 실패: {error}")
-            if not dangerous:  # 횟수·간격을 신뢰할 수 없으므로 더 정정하지 않습니다
+            if not dangerous:  # 횟수·간격을 신뢰할 수 없으므로 더 정정하지 않습니다 (journal 은 그대로 남김)
                 _halt(symbol, "RECORD_SAVE_FAILED", f"정정 후 감시 기록 저장 실패: {str(error)[:80]}", now_utc, notify_fn)
             return "halt"
+        if result == "AMENDED":
+            try:
+                rp.drop_journal_entry(journal_file, fresh["odno"])  # 기록이 끝난 뒤에만 복구 근거를 지웁니다
+            except OSError as error:
+                _log(f"journal 항목 제거 실패(다음 실행의 복구가 정리합니다): {error}")
         if dangerous:
             return "halt"
         if result == "AMENDED":

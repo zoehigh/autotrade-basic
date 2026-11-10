@@ -31,12 +31,15 @@
 ## 안전장치
 - **중복 실행 방지:** `.watch.lock` + 운영 런처 `.run.lock` + 봇 `.bot.lock` 을 모두 non-blocking 으로 잡고, 하나라도 사용 중이면 조용히 건너뜁니다(0). 정정 도구와도 상호 배제.
 - **정정 직전 재조회·재계획**, 최소 변경폭, 종목별 최소 간격·일일 한도(시도 직후 `.watch_state.json` 에 기록).
-- **journal 복구:** APPLY 는 미해결 journal 을 이력으로 확인해 정확히 일치할 때만 연결(그 외는 중단). 복구된 정정은 일일 횟수와 마지막 시도 시각(journal 의 실제 시도 시각)에 반영합니다. **횟수 기록 → state 저장 → journal 제거** 순서이고 항목 id 로 한 번만 세므로, 어느 단계에서 종료돼도 재시작 시 이중 가산·누락이 없습니다. DRY 는 복사본으로 확인만 하고 아무것도 쓰지 않으며 긴급 알림.
+- **journal 복구:** APPLY 는 미해결 journal 을 이력으로 확인해 정확히 일치할 때만 연결(그 외는 중단). 복구된 정정은 일일 횟수와 마지막 시도 시각(journal 의 실제 시도 시각)에 반영합니다. **횟수 기록 → state 저장 → journal 제거** 순서이고 항목 id 로 한 번만 세므로, 어느 단계에서 종료돼도 재시작 시 이중 가산·누락이 없습니다.
+  정상 정정 성공 경로도 같습니다: 감시기가 `apply_amend(defer_journal_cleanup=True)` 로 journal 항목을 유지한 채 받아 횟수를 기록·저장한 **뒤에** 직접 지웁니다(수동 도구는 기존대로 즉시 정리). 정정 직후 종료돼 구 주문번호가 이미 사라진 상태에서 재시작해도 이동된 메타의 `amended_from` 으로 정정을 인식해 횟수를 셉니다. DRY 는 복사본으로 확인만 하고 아무것도 쓰지 않으며 긴급 알림.
 - **중단(halt):** `REJECTED_LATE` / `UNCERTAIN` / `LINK_FAILED` / 해소 불가 journal / `RECORD_SAVE_FAILED` / `RECORD_CORRUPT` → `.watch_halt.json` 기록 + 긴급 알림 + 이후 APPLY 는 정정하지 않음(재알림 6시간 간격).
   **중단 표식은 감시 기록 저장보다 먼저** 만들어, 기록 저장이 실패해도 중단은 유지됩니다.
   위험 결과로 남은 journal 항목에는 `review_required` 표식도 함께 남깁니다 — `.watch_halt.json` 저장이 실패해도 다음 APPLY 는
   이 항목을 **자동 복구하지 않고** 중단 표식(`JOURNAL_REVIEW_REQUIRED`)을 다시 만듭니다. 사람이 앱에서 확인한 뒤
   `ops/meritz_buy_loc_reprice.py --apply --confirm "REPRICE <종목>"` 로 journal 을 해소하세요(수동 복구는 감시 횟수에 반영되지 않음).
+  `REJECTED_LATE`(API 는 접수했으나 이력에 거부)도 같은 방식으로 journal 항목을 **지우지 않고** 표식을 남깁니다. 이 항목은 메타가
+  이동하지 않았으므로 **봇 정산·주문은 막지 않고**(중복 정산 위험 없음) 감시기 APPLY 만 중단합니다. 수동 도구가 "정정 거부 확인"으로 정리합니다.
   자동 재주문은 하지 않습니다. 원인(앱에서 주문 상태 확인, journal 해소)을 확인한 뒤 **사람이** `.watch_halt.json` 을 삭제해야 재개됩니다.
 - **감시 기록 손상:** `.watch_state.json` 을 읽을 수 없으면 기존 정정 횟수를 알 수 없으므로 손상 파일을 `.watch_state.json.corrupt-<시각>` 으로 보존하고 **DRY·APPLY 모두 `RECORD_CORRUPT` 중단 표식을 남깁니다**(DRY 가 먼저 만나 새 기록을 저장해도 이후 APPLY 가 한도 초기화 상태로 정정하지 못하게). DRY 자체는 계속 동작하고 APPLY 만 보류합니다. 사람이 이전 횟수를 확인한 뒤 `.watch_halt.json` 을 삭제하면 재개됩니다.
 - **알림 중복 방지:** 같은 계획/오류는 반복 알리지 않습니다(오류 60분, 보류 안내 6시간). 알림 실패는 감시를 죽이지 않습니다.
