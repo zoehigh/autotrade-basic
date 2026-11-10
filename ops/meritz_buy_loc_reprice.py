@@ -138,7 +138,7 @@ def main(argv=None, broker=None):
                 exit_code = 1
                 continue
             if confirmed:
-                left, messages = rp.resolve_journal(journal, history, state)
+                left, messages = rp.resolve_journal(journal, history, state, args.original_checked)
                 for message in messages:
                     print("  " + message)
                 if len(left) < len(journal):
@@ -147,7 +147,7 @@ def main(argv=None, broker=None):
                 rp.write_journal(journal_file, others + left)
             else:
                 # 조회 모드: 사본에서만 확인하고 state·journal 은 절대 바꾸지 않습니다
-                left, messages = rp.resolve_journal(journal, history, deepcopy(state))
+                left, messages = rp.resolve_journal(journal, history, deepcopy(state), args.original_checked)
                 for message in messages:
                     print("  [조회 모드, 저장 안 함] " + message)
             if left or (journal and not confirmed):

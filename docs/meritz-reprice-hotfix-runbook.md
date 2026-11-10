@@ -87,7 +87,7 @@ git rev-parse HEAD
 | `.reprice_journal.json` 존재, 봇이 `정산·주문을 보류합니다` | 정정 접수 후 state 연결 전에 중단됨 | 도구를 `--apply` 없이 실행해 이력 대조 결과 확인 → 일치하면 `--apply --confirm` 로 연결. **journal 을 수동 삭제하지 말 것** |
 | `불확실 유지(접수 0/거부 0)` | 이력에 정정 행이 아직 없음 | 앱에서 주문 확인 후 잠시 뒤 재실행. 확인 전 재주문 금지 |
 | `정정 거부 확인 ... 보류` | 거부된 정정. 원주문 생존 여부 이력으로 판별 불가 | 앱/HTS 에서 원주문 확인. 원주문 메타는 유지되므로 체결되면 정상 정산됨 |
-| `원주문 확인이 필요한 항목 ...` (`review_required`) | `REJECTED_LATE` 뒤 journal 표식. 봇이 해당 종목 보류 중 | ① 앱/HTS 에서 원주문이 살아 있는지 확인, 살아 있으면 직접 취소(또는 의도적으로 유지) ② `--apply --confirm "REPRICE <종목>" --original-checked` 로 정리 — **확인 없이 `--original-checked` 를 붙이지 말 것.** 정리해야 봇이 해당 종목을 재개 |
+| `원주문 확인이 필요한 항목 ...` (`review_required`) | `REJECTED_LATE` 뒤 journal 표식. (표식 없이 남은 journal 이 복구 중 거부 행으로 확인된 경우도 같은 표식이 붙고 정리되지 않음 — 같은 절차)  봇이 해당 종목 보류 중 | ① 앱/HTS 에서 원주문이 살아 있는지 확인, 살아 있으면 직접 취소(또는 의도적으로 유지) ② `--apply --confirm "REPRICE <종목>" --original-checked` 로 정리 — **확인 없이 `--original-checked` 를 붙이지 말 것.** 정리해야 봇이 해당 종목을 재개 |
 | `다른 실행이 락을 쥐고 있습니다` | 봇/런처/다른 도구 실행 중 | 끝난 뒤 재시도. 락 파일 삭제 금지 (flock 은 프로세스 종료 시 자동 해제) |
 | `[중단] ...: 미해결 정정 journal ... 정산·저장을 하지 않습니다` (`exit 1`) | 유지보수 경로(reconcile-only, REPAIR:REINFERENCE, REPAIR:FORCE_T, net_invested repair)가 journal 보류 종목을 대상에 포함 | **여러 종목을 대상으로 하면 하나만 보류돼도 실행 전체가 중단**됩니다 (부분 저장 방지). 보류되지 않은 종목만 따로 지정해 실행하거나, 위 첫 행의 절차로 journal 을 먼저 해소 |
 

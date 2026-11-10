@@ -399,6 +399,11 @@ def test_unverified_amend_keeps_journal_and_stops(tmp_path, history_fn):
 def test_journal_resolution_with_only_rejected_child_does_not_relink():
     state = _state()
     left, messages = rp.resolve_journal([dict(_ENTRY)], _rejected_child_history(), state)
+    # 확인 없이는 정리하지 않고 표식을 붙여 보류 유지
+    assert len(left) == 1 and left[0]["review_required"] == "REJECTED_LATE"
+    assert OLD in state["orders_meta"] and NEW not in state["orders_meta"]
+    # 사람이 원주문을 확인했다고 명시해야 정리
+    left, messages = rp.resolve_journal([dict(_ENTRY)], _rejected_child_history(), state, original_checked=True)
     assert left == [] and OLD in state["orders_meta"] and NEW not in state["orders_meta"]
     assert any("판별 불가" in m for m in messages)
 
@@ -605,6 +610,43 @@ def test_manual_tool_clears_marker_only_with_original_checked_and_confirm(monkey
     assert OLD in st.load_state("SOXL")["orders_meta"] and NEW not in st.load_state("SOXL")["orders_meta"]
     import trading_bot
     assert not trading_bot._pending_amend_journal("SOXL")
+
+
+def _unmarked_journal_world(monkeypatch, tmp_path):
+    """표식 없는 journal(타임아웃·종료로 남음) + 이후 이력에 거부 행 발견 상황."""
+    import run_lock
+    import state as st
+    import config
+    monkeypatch.setenv("ALLOW_BROKER_ORDERS", "1")
+    monkeypatch.setattr(config, "BROKER", "meritz")
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    st.save_state("SOXL", _state())
+    rp.write_journal(run_lock.journal_path(), [dict(_ENTRY)])
+
+    class B(_ReadOnlyBroker):
+        def get_order_history(self, *a, **k):
+            return _rejected_child_history()
+
+    return B(), run_lock
+
+
+def test_unmarked_journal_with_newly_found_rejection_needs_original_checked(monkeypatch, tmp_path):
+    broker, run_lock = _unmarked_journal_world(monkeypatch, tmp_path)
+    code = _cli_again(monkeypatch, tmp_path, broker, ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL"])
+    entries = rp.read_journal(run_lock.journal_path())
+    assert code == 1 and len(entries) == 1 and entries[0]["review_required"] == "REJECTED_LATE"
+    import trading_bot
+    assert trading_bot._pending_amend_journal("SOXL")           # 봇 보류 유지
+    code = _cli_again(monkeypatch, tmp_path, broker,
+                      ["--symbol", "SOXL", "--apply", "--confirm", "REPRICE SOXL", "--original-checked"])
+    assert code == 0 and rp.read_journal(run_lock.journal_path()) == []
+
+
+def test_unmarked_journal_query_mode_never_clears(monkeypatch, tmp_path):
+    broker, run_lock = _unmarked_journal_world(monkeypatch, tmp_path)
+    before = open(run_lock.journal_path()).read()
+    _cli_again(monkeypatch, tmp_path, broker, ["--symbol", "SOXL", "--original-checked"])
+    assert open(run_lock.journal_path()).read() == before
 
 
 def _cli_again(monkeypatch, tmp_path, broker, argv):

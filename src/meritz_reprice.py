@@ -229,12 +229,15 @@ def _amend_row_matches(row, entry):
     )
 
 
-def resolve_journal(entries, history, state):
+def resolve_journal(entries, history, state, original_checked=False):
     """미해결 journal 을 이력으로 확인해 state 에 연결합니다.
 
     - 접수된 정정 행이 정확히 1개 → 새 주문번호로 연결
     - 접수된 행이 없고 거부된 정정 행만 있음 → 연결하지 않고 항목만 정리
       (원주문 메타는 그대로 유지: 원주문이 살아 있을 수 있어 체결이 정상 정산되도록)
+      단, 복구에서 새로 확인된 거부도 원주문 생존 여부는 이력으로 알 수 없으므로
+      original_checked(사람이 원주문 상태를 확인했다는 명시)가 없으면 정리하지 않고
+      review_required 표식을 붙여 보류를 유지합니다.
     - 그 외(0개, 2개 이상, 접수+거부 혼재) → 불확실로 남김, 자동 재주문 없음
     Returns: (남은 entries, 메시지 목록)
     """
@@ -248,6 +251,13 @@ def resolve_journal(entries, history, state):
                 entry["qty"], entry["target_price"], entry.get("original_price"),
             )
             messages.append(f"연결 완료: {mask_odno(entry['old_odno'])} → {mask_odno(accepted[0]['odno'])}")
+        elif not accepted and rejected and not original_checked:
+            entry["review_required"] = "REJECTED_LATE"
+            remaining.append(entry)
+            messages.append(
+                f"정정 거부 확인: {mask_odno(entry['old_odno'])} — 원주문 생존 여부 불명. "
+                f"앱/HTS 확인 후 --original-checked 와 함께 다시 실행하기 전까지 보류 유지"
+            )
         elif not accepted and rejected:
             messages.append(
                 f"정정 거부 확인: {mask_odno(entry['old_odno'])} — 연결하지 않음. "
