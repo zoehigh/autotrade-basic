@@ -44,6 +44,9 @@ def is_valid_price(value) -> bool:
 def unresolved_symbols(path=None) -> set:
     """미해결 정정 journal 이 남아 있는 종목 집합 (봇이 정산 전에 확인)."""
     try:
+        # review_required 표식 항목(REJECTED_LATE 포함)도 **봇을 막습니다**. REJECTED_LATE 는 정산 중복 위험은 없지만,
+        # 어댑터가 거부된 정정 행도 원주문을 '정정됨·잔량 0'으로 표시하므로 원주문이 살아 있어도 봇의 잔여 주문 취소가
+        # 건너뛰어 신규 주문과 중복될 수 있습니다. 사람이 앱에서 원주문을 확인·정리하고 수동 도구로 해소할 때까지 차단합니다.
         return {str(e.get("symbol", "")).upper() for e in read_journal(path or run_lock.journal_path())}
     except (OSError, ValueError):
         # journal 을 읽을 수 없으면 안전하게 모든 종목을 보류 대상으로 봅니다
@@ -294,8 +297,16 @@ def verify_new_order(history_fn, new_odno, tries=3, wait=2.0):
     return "UNKNOWN"
 
 
+def drop_journal_entry(journal_path, old_odno):
+    """old_odno 의 journal 항목을 제거합니다 (호출자가 후속 기록을 마친 뒤 부릅니다)."""
+    entries = read_journal(journal_path)
+    kept = [e for e in entries if e.get("old_odno") != old_odno]
+    if len(kept) != len(entries):
+        write_journal(journal_path, kept)
+
+
 def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_fn,
-                history_fn, verify_wait=2.0):
+                history_fn, verify_wait=2.0, defer_journal_cleanup=False):
     """정정 1건을 실행합니다. 결과 문자열을 반환합니다.
 
     결과:
@@ -308,6 +319,10 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
                        사람이 원주문 상태를 확인한 뒤 수동 도구(--original-checked)로만 정리합니다.
       "UNCERTAIN"      접수 여부 불확실 — journal 유지, 호출부는 즉시 중단해야 함
       "LINK_FAILED"    정정은 접수됐지만 state 저장 실패 — journal 유지, 즉시 중단
+
+    defer_journal_cleanup=True 이면 AMENDED / REJECTED_LATE 에서도 journal 항목을 **지우지 않고** 돌려줍니다.
+    호출자(감시기)가 횟수·중단 표식 같은 후속 기록을 모두 마친 뒤 drop_journal_entry() 로 지웁니다 —
+    그 사이에 종료돼도 복구 근거가 남습니다. (기본 False: 수동 도구는 기존대로 즉시 정리)
     """
     old_odno = item["odno"]
     entries = read_journal(journal_path)
@@ -356,7 +371,8 @@ def apply_amend(broker, symbol, exchange_code, item, state, journal_path, save_f
               f"{mask_odno(new_odno)} — {str(error)[:120]}")
         return "LINK_FAILED"
 
-    write_journal(journal_path, others)
+    if not defer_journal_cleanup:
+        write_journal(journal_path, others)
     print(f"  ✓ 정정 완료: {mask_odno(old_odno)} → {mask_odno(new_odno)} "
           f"(${item['current_price']:.2f} → ${item['target_price']:.2f})")
     return "AMENDED"
