@@ -866,6 +866,12 @@ class MeritzBroker(Broker):
                 if not amend_date or not target_date or target_date != amend_date:
                     continue
                 if target["_plain_oder_no"] == item["_plain_orgl_oder_no"]:
+                    if item.get("_is_rejected"):
+                        # 거부된 정정은 원주문을 대체하지 않습니다 (실데이터: 거부된 정정 행 뒤에도 원주문은
+                        # 자기 행 그대로 존재). 원주문은 자기 상태(미체결·잔량 등)를 유지하고, 생존 여부를
+                        # 이력만으로 확정할 수 없다는 표식만 붙입니다 → 봇이 취소 대상으로 삼아 확인합니다.
+                        target["_amend_rejected"] = True
+                        break
                     target["_is_superseded"] = True
                     target["prcs_stat_name"] = _SUPERSEDED_STATUS_NAME
                     target["nccs_qty"] = "0"
