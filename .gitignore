@@ -31,6 +31,8 @@ wheels/
 .watch_state.json
 .watch_state.json.tmp
 .watch_halt.json
+.watch_halt.json.tmp
+.watch_state.json.corrupt-*
 
 # 정산 근거 파일 (자동 검증용 런타임 산출물)
 settlement-*.json

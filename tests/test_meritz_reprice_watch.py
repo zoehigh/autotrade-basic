@@ -815,3 +815,23 @@ def test_main_wires_production_notify_and_failed_send_is_not_recorded(world, mon
     run(world)
     record = json.load(open(run_lock.watch_state_path()))
     assert not any(k.startswith("plan:") for k in record["notified"])
+
+
+def test_every_file_the_watcher_can_create_is_gitignored(tmp_path):
+    """감시기가 운영 체크아웃에 만들 수 있는 파일이 모두 .gitignore 대상이어야 `git status` 가 깨끗하게 유지된다
+    (배포·점검 절차가 '변경 없음' 을 전제로 함). 손상 기록 격리 파일과 임시 파일 포함."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    names = [".watch.lock", ".watch_state.json", ".watch_state.json.tmp", ".watch_halt.json", ".watch_halt.json.tmp",
+             ".watch_state.json.corrupt-20261111T010203", ".reprice_journal.json", ".bot.lock"]
+    for name in names:
+        result = subprocess.run(["git", "check-ignore", "-q", name], cwd=root)
+        assert result.returncode == 0, f"{name} 가 .gitignore 에 없습니다"
+
+
+def test_quarantine_file_name_matches_gitignore_pattern(tmp_path):
+    """실제 quarantine_record 가 만드는 이름이 .gitignore 패턴(.watch_state.json.corrupt-*)과 같은 형식이다."""
+    path = tmp_path / ".watch_state.json"
+    path.write_text("{broken")
+    target = mw.quarantine_record(str(path), datetime(2026, 11, 11, 1, 2, 3, tzinfo=UTC))
+    assert os.path.basename(target).startswith(".watch_state.json.corrupt-")
