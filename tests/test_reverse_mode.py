@@ -1025,7 +1025,7 @@ def test_reverse_marker_hold_rolls_back_sibling_order():
 # ── 진입 첫날 종료 검사 건너뛰기 (2026-11-11 TQQQ 정지 재현) ─────────────────
 # 운영 실측: T=19.7734(>19), 보유 144주, 평단 $65.5732, 현재가 $59.26 (> 평단×0.85 = $55.74).
 # 종료 검사가 1일차 MOC 매도보다 먼저 돌아 "진입 즉시 종료·주문 0건"이 되고, reverse_mode 가 비워진 채
-# T 가 그대로라 다음 날도 같은 판정이 반복되었습니다. 원본 규칙: 첫날은 무조건 MOC 매도, 종료 판정은 그 이후.
+# T 가 그대로라 다음 날도 같은 판정이 반복되었습니다. 참고 해설 기준(원문 대조 전): 첫날은 무조건 MOC 매도, 종료 판정은 그 이후.
 
 def _tqqq_1111_state():
     return {"T": 19.7734, "reverse_mode": {}, "close_prices": [59.0]}
@@ -1104,3 +1104,206 @@ def test_strategy_entry_day_with_price_above_exit_line_places_moc(monkeypatch):
 
     assert result["reverse_exit"] is False
     assert [o["order_type"] for o in result["orders"]] == ["MOC"]
+
+
+# ── 종료일 같은 날 일반모드 복귀 + 미해결 주문 중복 방지 + 체결 연결 ──────────────
+
+def _strategy_call(state, last_price=59.26, position_qty=130, avg_price=65.5732, cash=2000.0, T=None):
+    from strategy import 무한매수법_V4
+    broker = _make_broker_mock(last_price=last_price, position_qty=position_qty,
+                               avg_price=avg_price, orderable_cash=cash)
+    return 무한매수법_V4(broker, symbol="TQQQ", exchange_code="NAS", splits=20, symbol_type="TQQQ",
+                         seed=9696.18, T=state["T"] if T is None else T, state=state)
+
+
+def test_exit_day_runs_normal_strategy_same_day(monkeypatch):
+    """1일차 매도 체결 후(T=17.7961, 리버스 active, day_count=1): 종료선 위면 같은 날 일반모드 주문을 낸다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = {
+        "T": 17.7961, "close_prices": [59.0], "net_invested": 8000.0, "net_invested_status": "valid",
+        "reverse_mode": {"active": True, "day_count": 1, "cycle_id": "C1"},
+        "orders_meta": {"RS": {"side": "SELL", "reverse_action": "sell", "cycle_id": "C1",
+                               "terminal": True, "processed_filled_qty": 14, "total_qty": 14}},
+    }
+    result = _strategy_call(state)
+
+    assert result["reverse_exit"] is True
+    assert result["orders"], "종료 판정일에도 일반모드 주문이 생성되어야 합니다"
+    assert not any(o.get("reverse_action") for o in result["orders"]), "리버스 주문이 섞이면 안 됩니다"
+    assert any(o["side"] == "BUY" for o in result["orders"])
+    # 일반 경로는 전달받은 state 를 바꾸지 않는다 (reverse_mode 정리는 호출부가 reverse_exit 로 수행)
+    assert state["reverse_mode"] == {"active": True, "day_count": 1, "cycle_id": "C1"}
+
+
+def test_exit_with_unresolved_reverse_order_does_not_place_normal_orders(monkeypatch):
+    """미해결(terminal 아님) 리버스 주문이 남아 있으면 종료만 반환하고 일반 주문은 내지 않는다 (중복 방지)."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = {
+        "T": 17.7961, "close_prices": [59.0], "net_invested": 8000.0, "net_invested_status": "valid",
+        "reverse_mode": {"active": True, "day_count": 1, "cycle_id": "C1"},
+        "orders_meta": {"RS": {"side": "SELL", "reverse_action": "sell", "cycle_id": "C1",
+                               "processed_filled_qty": 5, "total_qty": 14}},   # 부분체결, terminal 아님
+    }
+    result = _strategy_call(state)
+
+    # 미종결 리버스 주문이 있으면 종료 판정도, 일반·리버스 신규 주문도 보류한다 (체결 반영 후 재개)
+    assert result["reverse_exit"] is False
+    assert result["orders"] == []
+    assert state["T"] == 17.7961
+
+
+def test_reconciliation_only_blocks_all_orders(monkeypatch):
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = {
+        "T": 17.7961, "close_prices": [59.0], "net_invested": 8000.0, "net_invested_status": "valid",
+        "reverse_mode": {"active": False, "reconciliation_only": True, "day_count": 1, "cycle_id": "C1"},
+    }
+    result = _strategy_call(state)
+    assert result["orders"] == [] and result["reverse_exit"] is False
+
+
+def test_exit_with_t_still_exhausted_restarts_reverse_day_one(monkeypatch):
+    """종료인데 T 가 여전히 소진 구간이면 리버스 1일차(MOC 매도)로 새로 시작한다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = {
+        "T": 19.5, "close_prices": [59.0], "net_invested": 9500.0, "net_invested_status": "valid",
+        "reverse_mode": {"active": True, "day_count": 1, "cycle_id": "C1"},
+        "orders_meta": {"RS": {"side": "SELL", "reverse_action": "sell", "cycle_id": "C1", "terminal": True}},
+    }
+    result = _strategy_call(state, T=19.5)
+
+    assert result["reverse_exit"] is True
+    assert [o["order_type"] for o in result["orders"]] == ["MOC"]
+    assert result["orders"][0]["reverse_day"] == 1
+
+
+def test_chain_day1_sell_fill_then_day2_normal_orders(monkeypatch):
+    """연결: 1일차 MOC 매도 계획 → 체결 반영(T/day_count) → 다음 거래일 종료선 위 → 일반 주문 생성."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = {"T": 19.7734, "reverse_mode": {}, "close_prices": [59.0],
+             "net_invested": 9518.68, "net_invested_status": "valid", "orders_meta": {}}
+
+    day1 = _strategy_call(state, position_qty=144, cash=177.5)
+    assert day1["reverse_exit"] is False
+    sell = day1["orders"][0]
+    assert sell["order_type"] == "MOC" and sell["quantity"] == 14
+
+    # 주문 등록 (trading_bot 이 하는 일을 최소 재현) + 체결 반영
+    state["reverse_mode"].update({"active": True, "cycle_id": "C1"})
+    state["orders_meta"]["D1"] = {
+        "side": "SELL", "total_qty": 14, "processed_filled_qty": 0, "reverse_action": "sell",
+        "reverse_day": 1, "reverse_base_t": sell["reverse_base_t"],
+        "reverse_t_factor": sell["reverse_t_factor"], "cycle_id": "C1",
+    }
+    history = [{"odno": "D1", "ord_datetime_utc": "2026-11-12T09:30:00+00:00", "ft_ccld_qty": "14",
+                "ft_ccld_unpr3": "59.26", "ft_ccld_amt3": "829.64", "nccs_qty": "0"}]
+    reconcile_reverse_fills(state, history)
+
+    assert state["T"] == round(19.7734 * 0.9, 4)
+    assert state["reverse_mode"]["day_count"] == 1
+    assert state["orders_meta"]["D1"].get("terminal") is True
+
+    state["reverse_mode"].pop("last_planned_session", None)     # 다음 거래일로 간주
+    day2 = _strategy_call(state, position_qty=130, cash=1000.0, T=state["T"])
+
+    assert day2["reverse_exit"] is True
+    assert day2["orders"] and not any(o.get("reverse_action") for o in day2["orders"])
+
+
+def _day1_state(**rev_extra):
+    return {"T": 19.7734, "close_prices": [59.0], "net_invested": 9518.68, "net_invested_status": "valid",
+            "reverse_mode": {"active": True, "day_count": 0, "cycle_id": "C1",
+                             "last_planned_session": "2000-01-01", **rev_extra},
+            "orders_meta": {}}
+
+
+def _day1_meta(**kw):
+    meta = {"side": "SELL", "total_qty": 14, "processed_filled_qty": 0, "reverse_action": "sell",
+            "reverse_day": 1, "reverse_base_t": 19.7734, "reverse_t_factor": 0.9, "cycle_id": "C1"}
+    meta.update(kw)
+    return meta
+
+
+def _hist(filled, remaining, status):
+    return [{"odno": "D1", "ord_datetime_utc": "2026-11-12T09:30:00+00:00", "ft_ccld_qty": str(filled),
+             "ft_ccld_unpr3": "59.26", "ft_ccld_amt3": f"{filled * 59.26:.2f}", "nccs_qty": str(remaining),
+             "prcs_stat_name": status}]
+
+
+def test_rejected_day1_order_retries_day1_not_exit(monkeypatch):
+    """거절: 1일차 주문이 접수되지 않아 meta 가 없고 체결도 없다 → 다음 세션도 1일차 MOC (종료 아님), T 불변."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    result = _strategy_call(state, position_qty=144, cash=177.5)
+
+    assert result["reverse_exit"] is False
+    assert [(o["order_type"], o["quantity"]) for o in result["orders"]] == [("MOC", 14)]
+    assert state["T"] == 19.7734
+
+
+def test_rejected_terminal_zero_fill_keeps_day_and_t(monkeypatch):
+    """거부 상태로 terminal 확정(체결 0): day_count·T 불변, 다음 세션 1일차 MOC 재시도 (중복 아님)."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    state["orders_meta"]["D1"] = _day1_meta()
+    reconcile_reverse_fills(state, _hist(0, 14, "거부"))
+
+    assert state["orders_meta"]["D1"].get("terminal") is True
+    assert state["T"] == 19.7734 and state["reverse_mode"]["day_count"] == 0
+    result = _strategy_call(state, position_qty=144, cash=177.5)
+    assert [(o["order_type"], o["quantity"]) for o in result["orders"]] == [("MOC", 14)]
+
+
+def test_unfilled_open_day1_order_blocks_duplicate_day1(monkeypatch):
+    """미체결: 전일 1일차 MOC 가 아직 미종결 → 새 1일차 MOC 를 내지 않는다 (중복 매도 방지), T·day_count 불변."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    state["orders_meta"]["D1"] = _day1_meta()
+    reconcile_reverse_fills(state, _hist(0, 14, "미체결"))
+
+    assert not state["orders_meta"]["D1"].get("terminal")
+    result = _strategy_call(state, position_qty=144, cash=177.5)
+    assert result["orders"] == [] and result["reverse_exit"] is False
+    assert state["T"] == 19.7734 and state["reverse_mode"]["day_count"] == 0
+
+
+def test_partial_fill_open_blocks_orders_and_t_follows_fill(monkeypatch):
+    """부분체결(미종결): T 는 체결분 비율로만 감소하고, 종결 전까지 신규·종료 판정 없음."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    state["orders_meta"]["D1"] = _day1_meta()
+    reconcile_reverse_fills(state, _hist(7, 7, "부분체결"))
+
+    assert 17.7961 < state["T"] < 19.7734, "T 는 체결 비율만큼만 줄어야 합니다"
+    assert not state["orders_meta"]["D1"].get("terminal")
+    result = _strategy_call(state, position_qty=137, cash=500.0, T=state["T"])
+    assert result["orders"] == [] and result["reverse_exit"] is False
+
+
+def test_partial_fill_then_terminal_advances_day_and_returns_to_normal(monkeypatch):
+    """부분체결 후 종결(취소) → day_count 증가 → 다음 거래일 종료선 위면 일반 주문."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    state["orders_meta"]["D1"] = _day1_meta()
+    reconcile_reverse_fills(state, _hist(7, 7, "부분체결"))
+    reconcile_reverse_fills(state, _hist(7, 7, "취소"))
+
+    assert state["orders_meta"]["D1"].get("terminal") is True
+    assert state["reverse_mode"]["day_count"] == 1
+    t_after = state["T"]
+    result = _strategy_call(state, position_qty=137, cash=1000.0, T=t_after)
+    assert result["reverse_exit"] is True
+    assert result["orders"] and not any(o.get("reverse_action") for o in result["orders"])
+    assert state["T"] == t_after, "전략 호출이 T 를 바꾸면 안 됩니다 (체결 반영만이 T 를 바꿉니다)"
+
+
+def test_same_session_rerun_creates_no_duplicate(monkeypatch):
+    """동일 세션 재실행: 1일차 계획 후 같은 ET 날짜에 다시 실행하면 주문을 만들지 않는다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    from datetime import datetime as _dt
+    today = _dt.now(ZoneInfo("America/New_York")).date().isoformat()
+    state = _day1_state(last_planned_session=today)
+    result = _strategy_call(state, position_qty=144, cash=177.5)
+
+    assert result["orders"] == [] and result["reverse_exit"] is False
+    assert state["T"] == 19.7734
