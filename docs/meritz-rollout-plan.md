@@ -54,7 +54,7 @@ git checkout --detach 6044141 && git rev-parse HEAD  # 6044141...
 ```bash
 .venv/bin/python -I -c "import sys; sys.path[:0]=['src','ops']; import run_lock, meritz_reprice; print('import OK')"
 .venv/bin/python -I ops/meritz_buy_loc_reprice.py --symbol SOXL      # 계획만. 주문·파일 생성 없음
-git status --short; sha256sum .state.json; crontab -l | sha256sum      # 모두 사전 기록과 동일
+git status --short; sha256sum .state.json; crontab -l | md5sum | cut -c1-8     # 모두 사전 기록과 동일
 ```
 합격 기준: import OK, 계획 출력 정상, 상태·크론 해시 불변, `git status` 깨끗.
 
