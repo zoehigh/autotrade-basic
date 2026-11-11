@@ -223,6 +223,39 @@ def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
     return None
 
 
+def _candles_lack_dates(broker, symbol, exchange_code):
+    """브로커가 일봉 날짜를 제공하지 않는지(모든 봉의 date 가 None) 확인합니다. 조회 실패·형식 이상이면 False."""
+    try:
+        candles = broker.get_daily_candles(symbol, exchange_code, days=5)
+    except Exception:
+        return False
+    return (
+        isinstance(candles, list) and len(candles) > 0
+        and all(isinstance(c, dict) and c.get("date") is None for c in candles)
+    )
+
+
+def _resolve_exit_close(broker, symbol, exchange_code, last_price):
+    """리버스 종료 판정에 쓸 (가격, 근거 설명)을 반환합니다. 판정을 보류해야 하면 None.
+
+    - 일봉 날짜를 제공하는 브로커(메리츠): 확정된 직전 정규장 종가만 인정. 못 얻으면 None(보류).
+    - 일봉 날짜를 제공하지 않는 브로커(KIS·KIWOOM·LS·NHPLUG 등 기본 구현): 확정 종가를 검증할 수 없으므로
+      기존 방식(현재가)을 유지하고 경고를 남깁니다 — 그렇지 않으면 이 브로커들은 리버스 1일차 이후 영구 보류됩니다.
+      (이 브로커들의 날짜 포함 일봉 구현은 실응답 검증 후 별도 작업)
+    """
+    confirmed = _confirmed_prev_close(broker, symbol, exchange_code)
+    if confirmed is not None:
+        close_price, close_date = confirmed
+        return close_price, f"확정 종가[{close_date}]"
+    if _candles_lack_dates(broker, symbol, exchange_code):
+        print(
+            f"[경고] {symbol} 이 브로커는 일봉 날짜를 제공하지 않아 확정 종가를 검증할 수 없습니다 "
+            f"→ 기존 방식(현재가 ${last_price:.2f})으로 종료를 판정합니다 (프리마켓 가격 영향 가능)."
+        )
+        return last_price, "현재가(일봉 날짜 미제공 브로커)"
+    return None
+
+
 class _SnapshotBroker:
     """종료일 일반모드 복귀 시 재귀 호출이 시세·잔고를 다시 조회하지 않도록 첫 조회 결과를 고정해 넘기는 래퍼.
 
@@ -260,8 +293,9 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
 
     [원문에 없어 구현이 정한 정책 — 변경 시 별도 검토]
     - 종료 판정 시작 시점: 진입 첫날은 종료 판정을 하지 않고 2일차부터(보수적 해석).
-    - 종료 판정 가격: 확정된 직전 정규장 종가(+ XNYS 직전 마감 세션 날짜 대조). 현재가(프리마켓)로는 종료하지 않고,
-      확정 종가를 얻지 못하면 종료도 계속도 판단하지 않고 그 실행은 주문 없이 보류.
+    - 종료 판정 가격: 일봉 날짜를 제공하는 브로커(메리츠)는 확정된 직전 정규장 종가(+ XNYS 직전 마감 세션 날짜 대조)만 인정,
+      현재가(프리마켓)로는 종료하지 않고 확정 종가를 얻지 못하면 종료도 계속도 판단하지 않고 그 실행은 주문 없이 보류.
+      일봉 날짜를 제공하지 않는 브로커(KIS·KIWOOM·LS·NHPLUG)는 검증 불가이므로 기존 방식(현재가) 유지 + 경고.
     - 미체결·부분체결: terminal 확정 전에는 신규 주문·종료 판정을 모두 보류(중복 매도 방지).
       체결>0 + 종결(취소·만료, 거부 제외)이면 그날을 리버스 1일차 완료로 보는 것은 이 PR 이전부터의 동작(state.py).
     - 종료일 같은 날 일반모드 복귀(원문은 '확인한 다음 날부터'로 읽힐 수 있음 — 이 구현은 종료 판정을 한 그 실행에서 이어서 주문).
@@ -299,24 +333,24 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     threshold = REVERSE_EXIT_THRESHOLD.get(symbol_type, 0.85)
     exit_price = avg_price * threshold
     if not is_first_day:
-        confirmed = _confirmed_prev_close(broker, symbol, exchange_code)
-        if confirmed is None:
+        reference = _resolve_exit_close(broker, symbol, exchange_code, last_price)
+        if reference is None:
             print(
                 f"[리버스모드] {symbol} 확정된 직전 정규장 종가를 확인하지 못해 종료 판정을 보류합니다 "
                 f"→ 이번 실행은 신규 주문을 생성하지 않습니다 (현재가 ${last_price:.2f}는 판정에 쓰지 않음)."
             )
             return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False, "exit_unconfirmed": True}
-        close_price, close_date = confirmed
+        close_price, source = reference
         if close_price > exit_price:
             print(
-                f"[리버스모드] {symbol} 종료 조건 충족 (확정 종가 ${close_price:.2f}[{close_date}] > ${exit_price:.2f}; "
-                f"현재가 ${last_price:.2f}는 판정에 쓰지 않음)"
+                f"[리버스모드] {symbol} 종료 조건 충족 ({source} ${close_price:.2f} > ${exit_price:.2f}; "
+                f"현재가 ${last_price:.2f})"
             )
             return {"orders": [], "new_T": T, "exit": True, "reverse_day": day_count}
         if last_price > exit_price:
             print(
-                f"[리버스모드] {symbol} 현재가 ${last_price:.2f}는 종료선 ${exit_price:.2f} 위지만 확정 종가 "
-                f"${close_price:.2f}[{close_date}]는 이하 → 종료하지 않고 리버스를 유지합니다 (프리마켓 가격 단독 종료 방지)."
+                f"[리버스모드] {symbol} 현재가 ${last_price:.2f}는 종료선 ${exit_price:.2f} 위지만 {source} "
+                f"${close_price:.2f}는 이하 → 종료하지 않고 리버스를 유지합니다 (프리마켓 가격 단독 종료 방지)."
             )
 
     print(f"[리버스모드] {symbol} 진입 {day_count}일차 (T={T})")
