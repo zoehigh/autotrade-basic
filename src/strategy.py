@@ -181,12 +181,28 @@ def _get_reverse_star_point(symbol, last_price, close_prices):
     return last_price
 
 
+def _has_unresolved_reverse_orders(state):
+    """현재 리버스 cycle 에 아직 terminal 확정되지 않은 주문이 있는지 (trading_bot 의 같은 이름 함수와 동일 규칙)."""
+    cycle_id = state.get("reverse_mode", {}).get("cycle_id", "")
+    return any(
+        meta.get("reverse_action")
+        and meta.get("cycle_id") == cycle_id
+        and not meta.get("terminal")
+        for meta in state.get("orders_meta", {}).values()
+    )
+
+
 def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                          position_qty, avg_price, orderable_cash, last_price,
                          state):
     rev = state.get("reverse_mode", {})
     if rev.get("reconciliation_error") or rev.get("reconciliation_only"):
         print(f"[리버스모드] {symbol} 상태 reconciliation 확인 필요 → 신규 주문을 생성하지 않습니다.")
+        return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
+    # 아직 terminal 확정되지 않은 리버스 주문(미체결·부분체결·이력 미확인)이 있으면 새 리버스 주문을 만들지 않습니다.
+    # day_count 는 체결이 반영돼야 증가하므로, 가드가 없으면 전일 1일차 MOC 가 미종결인 상태에서 1일차 MOC 를 또 내 중복 매도합니다.
+    if _has_unresolved_reverse_orders(state):
+        print(f"[리버스모드] {symbol} 미종결 리버스 주문이 있어 신규 주문을 생성하지 않습니다 (체결 반영·이력 확인 후 재개).")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
     session_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     if rev.get("last_planned_session") == session_date:
@@ -199,7 +215,7 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     divisor = _REVERSE_DIVISOR.get(splits, 20)
     sell_factor = _REVERSE_T_SELL_FACTOR.get(splits, 0.95)
 
-    # 진입 첫날은 종료 판정을 하지 않고 무조건 MOC 매도를 먼저 냅니다 (원본 규칙: "첫날 — 무조건 매도").
+    # 진입 첫날은 종료 판정을 하지 않고 무조건 MOC 매도를 먼저 냅니다 (참고 해설 기준: "첫날 — 무조건 매도", 라오어 원문 대조 전).
     # 종료 검사를 먼저 하면 T>분할수-1 인데 종가가 이미 종료선 위인 종목은 진입 즉시 종료되어 매도 없이
     # T 가 그대로 남고, 다음 날도 같은 판정이 반복되어 영구 정지합니다 (2026-11-11 TQQQ 실측).
     # 종료 판정은 2일차부터 합니다.
@@ -489,8 +505,21 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
             )
             new_T = rev_result["new_T"]
             rev_orders = rev_result["orders"]
-            if rev_result.get("exit"):
-                pass
+            if rev_result.get("exit") and not _has_unresolved_reverse_orders(state):
+                # 리버스 종료일: 같은 날 일반모드 전략까지 이어서 실행합니다 (종료 다음 날이 아니라 종료 판정일부터 복귀).
+                # 아직 terminal 확정되지 않은 리버스 주문이 있으면 이어가지 않습니다 (미체결·부분체결 중 중복 주문 방지) —
+                # 그 경우는 아래 기존 경로로 종료만 반환하고, 호출부가 reconciliation_only 로 전환합니다.
+                # 일반 경로는 state 를 읽기만 하므로(net_invested·reverse_mode) reverse_mode 를 비운 얕은 복사본을 씁니다.
+                # T 가 아직 소진 구간이면 리버스 1일차(MOC 매도)로 새로 시작합니다 — "복귀 후 T 가 1회분도 안 남으면 다시 리버스".
+                print(f"[리버스모드] {symbol} 종료 → 같은 날 일반모드로 복귀합니다 (T={new_T})")
+                normal_state = {**state, "reverse_mode": {}}
+                normal_result = 무한매수법_V4(
+                    broker, symbol, exchange_code, splits, symbol_type,
+                    seed=seed, T=new_T, additional_loc_levels=additional_loc_levels,
+                    state=normal_state,
+                )
+                normal_result["reverse_exit"] = True
+                return normal_result
             print(f"[리버스모드] {symbol} 주문 {len(rev_orders)}건 생성")
             return {
                 "symbol": symbol,
