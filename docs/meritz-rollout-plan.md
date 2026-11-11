@@ -9,14 +9,14 @@
 |---|---|---|---|
 | (현재 운영) | #12 구버전 | `342a9f1` | — |
 | **1단계** | #12 보완(`5d8d20e`,`22b007c`) + #15 어댑터 | **`6044141`** | `342a9f1 ⊂ 22b007c ⊂ 6044141` |
-| **2단계** | 1단계 + #14 감시기 | **`0b3dec0`** | `6044141 ⊂ 0b3dec0`, `7465a96 ⊂ 0b3dec0` |
-| **3단계** | 2단계 + #13 합산(기본 OFF) | **`6d3a6c9`** | `0b3dec0 ⊂ 6d3a6c9`, `c2e2bbf ⊂ 6d3a6c9` |
+| **2단계** | 1단계 + #14 감시기 | **`23f7ce7`** | `6044141 ⊂ 23f7ce7`, `c70d3dd ⊂ 23f7ce7` |
+| **3단계** | 2단계 + #13 합산(기본 OFF) | **`72dbcb7`** | `23f7ce7 ⊂ 72dbcb7`, `c2e2bbf ⊂ 72dbcb7` |
 
-⚠️ **PR head 를 그대로 체크아웃하지 마세요.** #14 head(`7465a96`)에는 #15(`6044141`)가 **없고**,
+⚠️ **PR head 를 그대로 체크아웃하지 마세요.** #14 head(`c70d3dd`)에는 #15(`6044141`)가 **없고**,
 #13 head(`c2e2bbf`)에는 #14·#15 가 없습니다. 위 표의 SHA 만 사용합니다 (`integration/meritz-all` 브랜치의 병합 이력).
 모든 단계 공통 확인: `git merge-base --is-ancestor <이전SHA> <적용SHA> && echo OK`.
 
-검증 결과 (mock·격리 테스트): 1단계 `6044141` 1234 passed / 2단계 `0b3dec0` 1310 passed / 3단계 전체 1325 passed + 통합 호환성 4개.
+검증 결과 (mock·격리 테스트): 1단계 `6044141` 1234 passed / 2단계 `23f7ce7` 1312 passed / 3단계 `72dbcb7`(+통합 호환성 4개) 1331 passed.
 플래그 OFF(기본)에서 3단계의 주문표는 `22b007c` 와 3개 시세에서 바이트 단위로 동일합니다.
 
 공통 사전 조건 (매 단계): 18:30 LIVE 실행·18:45 `verify_run` 종료 후 ~ 다음 날 18:25 이전, `pgrep -af "trading_bot|run_daily|reprice"` 비어 있음,
@@ -76,11 +76,11 @@ state 백업을 **맹목적으로 복원하지 않습니다**: 정정으로 주�
 
 ---
 
-## 2. 2단계: #14 감시기 — 코드 배포(`0b3dec0`) 후 **조회 전용 DRY**
+## 2. 2단계: #14 감시기 — 코드 배포(`23f7ce7`) 후 **조회 전용 DRY**
 
 2단계 변경: `.gitignore`, `docs/meritz-reprice-watch.md`, `ops/cron.example`, `ops/meritz_reprice_watch.py`, `ops/run_reprice_watch.sh`,
 `src/meritz_reprice.py`, `src/meritz_watch.py`, `src/run_lock.py`, `tests/test_meritz_reprice_watch.py` (+ 1단계 파일).
-**배포만으로는 아무것도 실행되지 않습니다** (크론 미등록). 배포 절차는 1단계와 같고 SHA 만 `0b3dec0`, 비교 기준은 `6044141`.
+**배포만으로는 아무것도 실행되지 않습니다** (크론 미등록). 배포 절차는 1단계와 같고 SHA 만 `23f7ce7`, 비교 기준은 `6044141`.
 
 **(a) 크론 없이 수동 1회 DRY** (감시 창 안인 시각, 예: 서머타임 19:00~04:30 KST / 동절기 20:00~05:30 KST)
 ```bash
@@ -115,9 +115,8 @@ crontab -l | diff - ~/backup/crontab-<등록 전 백업>.txt && echo "크론 원
 ```
 | 증상 | 조치 |
 |---|---|
-| `.watch_halt.json` 생김 (`RECORD_CORRUPT` 등) | 원인 확인(`.watch_state.json.corrupt-*` 보존됨) 후 사람이 `.watch_halt.json` 삭제. DRY 는 계속 동작 |
+| `.watch_halt.json` 생김 (`RECORD_CORRUPT` 등) | 원인 확인(`.watch_state.json.corrupt-*` 보존됨) 후 사람이 `.watch_halt.json` 삭제. DRY 는 계속 동작. 격리 파일·임시 파일은 `.gitignore` 대상이라 `git status` 는 깨끗하게 유지됨 |
 | `미해결 정정 journal` DRY 알림 | 자동 복구 없음. 런북 4절대로 수동 도구로 이력 확인 |
-| `git status` 에 `.watch_state.json.corrupt-*` 가 보임 | 손상 기록 격리 파일은 `.gitignore` 에 없습니다(알려진 한계 — 후속 수정 후보). 내용을 확인한 뒤 `~/backup/` 으로 옮기면 `git status` 가 다시 깨끗해집니다 |
 | `.watch.lock` 잔존 | 빈 파일이라 무해 (flock 기반) |
 | 알림이 오지 않음 | 로그의 `알림 발송 실패/발송되지 않았습니다` 확인 — 다음 실행에서 재시도됨 |
 
@@ -129,13 +128,13 @@ crontab -l | diff - ~/backup/crontab-<등록 전 백업>.txt && echo "크론 원
 
 ---
 
-## 3. 3단계: #13 합산 (`6d3a6c9`, 기본 OFF)
+## 3. 3단계: #13 합산 (`72dbcb7`, 기본 OFF)
 
 배포만 하면 동작이 바뀌지 않습니다 (`MERGE_CAPPED_ADDITIONAL` 미설정 = OFF; `22b007c` 와 주문표 동일 검증).
 켜기 전: `.env` 에 플래그를 **넣지 않은 채** 배포 → 하루 이상 관찰 → 별도 승인으로 `MERGE_CAPPED_ADDITIONAL=true` + 먼저 DRY 프리뷰로 주문표 확인
 (보정 시 정상매수 수량이 합산되는지, 추가매수 계단과 중복 없는지) → 첫 체결 후 `verify_run` 으로 정산이 한 번만 반영됐는지 확인.
 합산 주문은 가격 정정 도구·감시기가 건드리지 않습니다 (통합 테스트로 고정).
-롤백: 플래그 제거(즉시 OFF) 또는 `0b3dec0` 로 체크아웃.
+롤백: 플래그 제거(즉시 OFF) 또는 `23f7ce7` 로 체크아웃.
 
 ---
 
