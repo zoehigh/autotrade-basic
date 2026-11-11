@@ -1434,11 +1434,21 @@ def run_one_symbol(broker: Broker, symbol_config):
             f"현재가 대비 상한: ${note['to']:.2f}"
         )
 
+    # 리버스 보류(확정 종가 미확보·미종결 리버스 주문)는 '정상적으로 주문이 없는 날'과 구분해 알립니다.
+    hold_reason = strategy_result.get("reverse_hold")
+    if hold_reason:
+        hold_text = _REVERSE_HOLD_MESSAGES.get(hold_reason, hold_reason)
+        print(f"[보류] {symbol}: {hold_text}")
+        if TRADE_MODE == "LIVE":
+            notify(f"⚠️ 리버스 보류 {symbol}\n{hold_text}\n이번 실행은 신규 주문이 없습니다. 확인 후 조치가 필요합니다.", urgent=True)
+
     print(f"\n[Step 3] 생성된 주문 목록 ({len(orders)}개)")
     print("-" * 60)
 
     if len(orders) == 0:
         print("생성된 주문이 없습니다.")
+        if hold_reason:
+            return {"symbol": symbol, "executed": 0, "reserved": 0, "failed": 0, "errors": [], "held": hold_reason}
         return
 
     for i, order in enumerate(orders, 1):
@@ -2160,6 +2170,12 @@ def _recover_order_fence(state, symbol, live_qty):
     print(f"  → [fence 복구] {symbol} 이전 세션({session}) 주문 fence를 이력 정착으로 해제하고 진행합니다.")
     notify(f"[fence 복구] {symbol} 이전 세션({session}) 미확정 주문 fence를 이력 정착으로 해제하고 진행합니다.")
     return True
+
+
+_REVERSE_HOLD_MESSAGES = {
+    "EXIT_UNCONFIRMED": "확정된 직전 정규장 종가를 확인하지 못해 리버스 종료 판정을 보류했습니다 (일봉 조회·날짜 확인 필요).",
+    "UNRESOLVED_REVERSE_ORDERS": "terminal 확정되지 않은 리버스 주문이 있어 신규 주문과 종료 판정을 보류했습니다 (체결 반영·이력 확인 필요).",
+}
 
 
 def _has_unresolved_reverse_orders(state):
@@ -3143,6 +3159,9 @@ def main():
         print(
             f"  합계: 성공 {total_executed}건 / 예약 {total_reserved}건 / 실패 {total_failed}건"
         )
+        for r in run_results:
+            if r.get("held"):
+                print(f"  [보류] {r.get('symbol')}: {r['held']} — 정상 무주문이 아니라 리버스 보류입니다 (알림 발송됨)")
 
         if total_failed > 0:
             summary = "\n".join(

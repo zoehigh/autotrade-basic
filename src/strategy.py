@@ -192,6 +192,11 @@ def _has_unresolved_reverse_orders(state):
     )
 
 
+# 리버스 보류 사유 코드: '정상적으로 주문이 없는 날'과 구분해 상위(호출부·알림·실행 요약)로 전달합니다.
+HOLD_EXIT_UNCONFIRMED = "EXIT_UNCONFIRMED"                      # 확정된 직전 정규장 종가 미확보 → 종료 판정 보류
+HOLD_UNRESOLVED_REVERSE_ORDERS = "UNRESOLVED_REVERSE_ORDERS"    # terminal 미확정 리버스 주문 → 신규 주문·종료 판정 보류
+
+
 def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
     """확정된 직전 정규장 종가를 (종가, 거래일 YYYY-MM-DD) 로 반환합니다. 확보하지 못하면 None.
 
@@ -218,7 +223,10 @@ def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
         if not isinstance(candle, dict) or candle.get("date") != expected:
             continue
         close = candle.get("close")
-        if isinstance(close, (int, float)) and not isinstance(close, bool) and close > 0:
+        if (
+            isinstance(close, (int, float)) and not isinstance(close, bool)
+            and math.isfinite(close) and close > 0
+        ):
             return float(close), expected
     return None
 
@@ -299,21 +307,25 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     - 미체결·부분체결: terminal 확정 전에는 신규 주문·종료 판정을 모두 보류(중복 매도 방지).
       체결>0 + 종결(취소·만료, 거부 제외)이면 그날을 리버스 1일차 완료로 보는 것은 이 PR 이전부터의 동작(state.py).
     - 종료일 같은 날 일반모드 복귀(원문은 '확인한 다음 날부터'로 읽힐 수 있음 — 이 구현은 종료 판정을 한 그 실행에서 이어서 주문).
-    - 쿼터매수 잔금은 broker 주문가능금액만 사용(원문은 매도 회수금 포함 — 의도적 보수 설계, AGENTS.md 참고).
+    - 쿼터매수 잔금 = min(브로커 주문가능금액, 시드 − net_invested). 리버스 매도 체결은 net_invested 를 회수금만큼 줄이므로
+      회수금은 시드 캡 경로로 잔금에 반영됩니다(reverse_mode.cumulative_sell_proceeds 를 따로 더하지는 않음 — 이중 계상 방지).
+      브로커 주문가능금액 자체가 당일 매도대금(미결제분)을 포함하는지는 응답 필드만으로 확인하지 못했습니다(미확인).
     """
     rev = state.get("reverse_mode", {})
     if rev.get("reconciliation_error") or rev.get("reconciliation_only"):
         print(f"[리버스모드] {symbol} 상태 reconciliation 확인 필요 → 신규 주문을 생성하지 않습니다.")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
-    # 아직 terminal 확정되지 않은 리버스 주문(미체결·부분체결·이력 미확인)이 있으면 새 리버스 주문을 만들지 않습니다.
-    # day_count 는 체결이 반영돼야 증가하므로, 가드가 없으면 전일 1일차 MOC 가 미종결인 상태에서 1일차 MOC 를 또 내 중복 매도합니다.
-    if _has_unresolved_reverse_orders(state):
-        print(f"[리버스모드] {symbol} 미종결 리버스 주문이 있어 신규 주문을 생성하지 않습니다 (체결 반영·이력 확인 후 재개).")
-        return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
     session_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     if rev.get("last_planned_session") == session_date:
         print(f"[리버스모드] {symbol} 이미 {session_date} 실행됨 → 중복 주문을 생성하지 않습니다.")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
+    # 같은 세션에 이미 계획·접수했다면 위 가드가 먼저 처리합니다(정상 중복 방지, 보류 알림 대상 아님).
+    # 아직 terminal 확정되지 않은 리버스 주문(미체결·부분체결·이력 미확인)이 있으면 새 리버스 주문을 만들지 않습니다.
+    # day_count 는 체결이 반영돼야 증가하므로, 가드가 없으면 전일 1일차 MOC 가 미종결인 상태에서 1일차 MOC 를 또 내 중복 매도합니다.
+    if _has_unresolved_reverse_orders(state):
+        print(f"[리버스모드] {symbol} 미종결 리버스 주문이 있어 신규 주문을 생성하지 않습니다 (체결 반영·이력 확인 후 재개).")
+        return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False,
+                "hold_reason": HOLD_UNRESOLVED_REVERSE_ORDERS}
     day_count = rev.get("day_count", 0) + 1
     close_prices = state.get("close_prices", [])
     T = float(state.get("T", 0.0))
@@ -339,7 +351,8 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                 f"[리버스모드] {symbol} 확정된 직전 정규장 종가를 확인하지 못해 종료 판정을 보류합니다 "
                 f"→ 이번 실행은 신규 주문을 생성하지 않습니다 (현재가 ${last_price:.2f}는 판정에 쓰지 않음)."
             )
-            return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False, "exit_unconfirmed": True}
+            return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False, "exit_unconfirmed": True,
+                    "hold_reason": HOLD_EXIT_UNCONFIRMED}
         close_price, source = reference
         if close_price > exit_price:
             print(
@@ -661,6 +674,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 "remaining_seed": remaining_seed,
                 "T": new_T,
                 "reverse_exit": bool(rev_result.get("exit")),
+                "reverse_hold": rev_result.get("hold_reason"),
                 "unit_amount": 0.0,
                 "unit_qty": 0,
                 "star_point": None,
