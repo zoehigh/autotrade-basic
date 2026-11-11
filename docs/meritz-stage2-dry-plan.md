@@ -10,7 +10,7 @@
 |---|---|
 | 2단계 적용 SHA (전체) | **`23f7ce76fe15c423b999eaf0b4d8e728c35b14f6`** (= 1단계 `6044141` + #14 `c70d3dd`) |
 | 포함 확인 | `6044141 ⊂ 23f7ce7`, `c70d3dd ⊂ 23f7ce7` |
-| 가져올 원격 ref | `integration/meritz-all` (head `bf948a7f928a64878f55fa2e185477ec4012209c`; 위 SHA 는 그 조상) |
+| 가져올 원격 ref | `integration/meritz-all` (브랜치 head 는 문서 커밋으로 계속 바뀌므로 head 가 아니라 **위 SHA 가 그 조상인지**로 확인) |
 | 허용 변경 파일 (1단계 대비) | `.gitignore`, `docs/meritz-reprice-watch.md`, `ops/cron.example`, `ops/meritz_reprice_watch.py`, `ops/run_reprice_watch.sh`, `src/meritz_reprice.py`, `src/meritz_watch.py`, `src/run_lock.py`, `tests/test_meritz_reprice_watch.py` |
 | 테스트 | 2단계 SHA 전체 1312 passed |
 
