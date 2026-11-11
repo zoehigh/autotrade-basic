@@ -459,8 +459,12 @@ def test_recovery_with_rejected_only_row_is_not_counted_as_amend(world):
     world.broker.history = [_row(status="정정됨"), _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
     rp.write_journal(run_lock.journal_path(), [{"symbol": "SOXL", "old_odno": OLD, "qty": 7,
                                                 "target_price": 73.69, "at": NOW.isoformat()}])
-    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
-    assert json.load(open(run_lock.watch_state_path()))["symbols"]["SOXL"]["amends"] == 0
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    # 거부만 확인돼도 원주문 생존 불명 → 자동 정리·횟수 반영 없이 표식을 남기고 중단 (#12 원칙)
+    assert code == 1 and json.load(open(run_lock.watch_halt_path()))["result"] == "JOURNAL_UNRESOLVED"
+    assert json.load(open(run_lock.watch_state_path()))["symbols"].get("SOXL", {}).get("amends", 0) == 0
+    kept = rp.read_journal(run_lock.journal_path())
+    assert len(kept) == 1 and kept[0]["review_required"] == "REJECTED_LATE"
 
 
 class MultiBroker(FakeBroker):
@@ -659,8 +663,10 @@ def test_rejected_late_with_unwritable_halt_keeps_journal_marker_and_blocks_othe
 def test_manual_tool_clears_rejected_late_marker(world):
     entry = {"symbol": "SOXL", "old_odno": OLD, "qty": 7, "target_price": 73.69, "review_required": "REJECTED_LATE"}
     history = [_row(status="정정됨"), _row(odno=NEW, status="거부", rctf="1", orgl="100", price=73.69)]
-    left, messages = rp.resolve_journal([entry], history, _state())
+    left, messages = rp.resolve_journal([entry], history, _state(), original_checked=True)
     assert left == [] and any("거부 확인" in m for m in messages)
+    held, _ = rp.resolve_journal([dict(entry)], history, _state())            # 확인 없이는 정리하지 않음
+    assert len(held) == 1
 
 
 @pytest.mark.parametrize("marker", ["UNCERTAIN", "LINK_FAILED", "REJECTED_LATE"])
@@ -679,7 +685,8 @@ def test_rejected_late_blocks_bot_new_orders_until_manual_tool_clears_it(world):
     import trading_bot
     assert trading_bot._pending_amend_journal("SOXL")                       # 봇 차단
     history = world.broker.get_order_history()
-    left, messages = rp.resolve_journal(rp.read_journal(run_lock.journal_path()), history, st.load_state("SOXL"))
+    left, messages = rp.resolve_journal(rp.read_journal(run_lock.journal_path()), history, st.load_state("SOXL"),
+                                      original_checked=True)
     assert left == []                                                        # 수동 도구가 정리할 수 있음
     rp.write_journal(run_lock.journal_path(), left)
     assert not trading_bot._pending_amend_journal("SOXL")                   # 정리 후 봇 재개
