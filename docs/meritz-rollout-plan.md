@@ -1,7 +1,14 @@
 # 메리츠 정정 계열 적용 계획 (#12 + #15 → #14 → #13)
 
-현재 운영: `muhan-v4` **detached HEAD `342a9f1`** (PR #12 이전 head). 이 문서는 계획일 뿐이며,
-각 단계는 **사람이 별도로 승인한 뒤** 수행합니다. 이 문서의 어떤 명령도 아직 실행하지 않았습니다.
+## 진행 상태
+
+- ✅ **1단계 배포 완료 (2026-11-11, KST 13:45 전후):** 운영 `muhan-v4` 를 `342a9f1` → **`604414111fc22c0f0d1dd588dc9c04090a8d13a6`** 로 고정.
+  사전 조건(HEAD·clean·프로세스·락·journal)·허용 파일 6개 확인, 저장소 밖 백업(`~/backup/state-20261111-134545.json`) 후 배포,
+  배포 후 HEAD·`git status`(0건)·조회 전용 DRY(TQQQ·SOXL 정정 대상 0건, 주문 없음)·state 해시(`699598893c58`)·크론 md5(`dbf46f3f`) 불변 확인.
+- ⏳ 첫 LIVE(18:30) 로그·`verify_run`(18:45) 확인: **미확인** (점검 결과는 별도 기록).
+- ⬜ 2단계 `23f7ce7…`(감시기, DRY) — 구체 계획: `docs/meritz-stage2-dry-plan.md`. 3단계 `72dbcb7` — 미배포.
+
+이 문서의 2·3단계 명령은 **사람이 별도로 승인한 뒤** 수행합니다. 아직 실행하지 않았습니다.
 
 ## 0. 커밋 지도 — 단계마다 "이전 패치를 모두 포함한" SHA 만 체크아웃
 
@@ -97,7 +104,7 @@ ls -la .watch.lock .watch_state.json .watch_halt.json 2>&1   # 감시 기록 파
 **(b) DRY 크론 등록 (사람이 결정; 이 계획은 등록하지 않음)**
 ```bash
 crontab -l > ~/backup/crontab-$(date +%Y%m%d-%H%M%S).txt          # 등록 전 백업
-( crontab -l; echo '*/10 19-23,0-5 * * 1-6 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh' ) | crontab -
+( crontab -l; echo '*/20 19-23,0-5 * * 1-6 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh' ) | crontab -   # 첫 며칠은 20분 (토큰 발급 횟수 때문; docs/meritz-stage2-dry-plan.md 4절)
 crontab -l | tail -3
 ```
 - 줄에 `REPRICE_WATCH_MODE`·`TRADE_MODE`·`ALLOW_BROKER_ORDERS` 를 **넣지 않으면** DRY 입니다. 기본 설정(`.env` 에 `REPRICE_WATCH_*` 없음)으로 시작:
