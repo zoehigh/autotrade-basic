@@ -785,3 +785,33 @@ def test_halt_alert_is_retried_when_first_delivery_fails(world):
     world.notifier.fail = None
     code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
     assert code == 1 and any(u and "중단" in m for u, m in world.notifier.sent)
+
+
+def test_production_notify_returns_notifier_result(monkeypatch):
+    """main() 이 쓰는 실제 래퍼가 notifier.notify 의 성공/실패를 버리지 않는다 (재시도의 전제)."""
+    import notifier
+    for result in (True, False):
+        monkeypatch.setattr(notifier, "notify", lambda message, urgent=False, telegram_message=None, r=result: r)
+        assert watch.production_notify("m", urgent=True) is result
+
+
+def test_main_wires_production_notify_and_failed_send_is_not_recorded(world, monkeypatch):
+    """main() 경로 전체: 실제 래퍼 → notifier.notify 가 False 면 중복 방지 기록이 남지 않는다."""
+    import notifier
+    import config as real_config
+    captured = {}
+
+    def fake_run_once(env, now, config, factory, notify_fn, calendar):
+        captured["notify_fn"] = notify_fn
+        return 0
+
+    real_run_once = watch.run_once
+    monkeypatch.setattr(watch, "run_once", fake_run_once)
+    watch.main()
+    assert captured["notify_fn"] is watch.production_notify
+    monkeypatch.setattr(watch, "run_once", real_run_once)
+    monkeypatch.setattr(notifier, "notify", lambda message, urgent=False, telegram_message=None: False)
+    world.notifier = watch.production_notify
+    run(world)
+    record = json.load(open(run_lock.watch_state_path()))
+    assert not any(k.startswith("plan:") for k in record["notified"])

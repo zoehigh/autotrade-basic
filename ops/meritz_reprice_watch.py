@@ -383,6 +383,12 @@ def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
     return exit_code
 
 
+def production_notify(message, urgent=False):
+    """실제 알림 발송. 발송 결과(True/False)를 **그대로 돌려줘야** 실패한 알림이 재시도됩니다."""
+    from notifier import notify
+    return notify(message, urgent=urgent)
+
+
 def main():
     import config
     from broker.market_utils import _get_xnys_calendar
@@ -391,11 +397,7 @@ def main():
         from broker.meritz.adapter import MeritzBroker
         return MeritzBroker()
 
-    def notify_fn(message, urgent=False):
-        from notifier import notify
-        notify(message, urgent=urgent)
-
-    return run_once(os.environ, datetime.now(timezone.utc), config, broker_factory, notify_fn, _get_xnys_calendar())
+    return run_once(os.environ, datetime.now(timezone.utc), config, broker_factory, production_notify, _get_xnys_calendar())
 
 
 if __name__ == "__main__":
