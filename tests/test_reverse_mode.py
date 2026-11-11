@@ -1,3 +1,4 @@
+import pytest
 from copy import deepcopy
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -1561,3 +1562,67 @@ def test_reverse_t_formulas_match_source():
     """T 공식(원문): 20분할 매도 ×0.9 / 매수 T+(20−T)×0.25, 40분할 매도 ×0.95 / 매수 T+(40−T)×0.25."""
     from strategy import _REVERSE_T_SELL_FACTOR
     assert _REVERSE_T_SELL_FACTOR[20] == 0.9 and _REVERSE_T_SELL_FACTOR[40] == 0.95
+
+
+# ══ 종가 값 검증(isfinite 등) · 보류 사유 전달 ═══════════════════════════════════════════════════
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), 0, 0.0, -1.0, True, "59.26", None])
+def test_invalid_confirmed_close_values_are_rejected(bad):
+    """inf·NaN·0·음수·bool·문자열·None 종가는 확정 종가로 인정하지 않는다 (미확보 → 보류)."""
+    from strategy import _confirmed_prev_close
+    broker = MagicMock()
+    broker.get_daily_candles.return_value = [{"date": _prev_session(), "close": bad}]
+    assert _confirmed_prev_close(broker, "TQQQ", "NAS") is None
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_inf_nan_close_holds_in_strategy_and_never_exits(monkeypatch, bad):
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    result = _strategy_call(_day2_state(), last_price=59.26, close=bad)
+    assert result["orders"] == [] and result["reverse_exit"] is False
+    assert result["reverse_hold"] == "EXIT_UNCONFIRMED"
+
+
+def test_hold_reason_reaches_strategy_result(monkeypatch):
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    unconfirmed = _strategy_call(_day2_state(), close=None)
+    assert unconfirmed["reverse_hold"] == "EXIT_UNCONFIRMED"
+
+    state = _day1_state()
+    state["orders_meta"]["D1"] = _day1_meta()          # terminal 아님
+    unresolved = _strategy_call(state, position_qty=144, cash=177.5)
+    assert unresolved["reverse_hold"] == "UNRESOLVED_REVERSE_ORDERS"
+
+
+def test_normal_paths_have_no_hold_reason(monkeypatch):
+    """정상 경로(첫날 MOC, 종료+복귀, 동일 세션 재실행)는 보류 사유가 없다 — 정상 무주문과 구분."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    from datetime import datetime as _dt
+    first = _strategy_call(_day1_state(), position_qty=144, cash=177.5)
+    assert first["reverse_hold"] is None and first["orders"]
+    exit_day = _strategy_call(_day2_state(), close=59.26)
+    assert not exit_day.get("reverse_hold")
+    today = _dt.now(ZoneInfo("America/New_York")).date().isoformat()
+    same = _strategy_call(_day1_state(last_planned_session=today), position_qty=144, cash=177.5)
+    assert same["orders"] == [] and same["reverse_hold"] is None
+
+
+def test_reverse_sell_proceeds_reflected_in_remaining_seed_via_net_invested(monkeypatch):
+    """리버스 매도 체결의 회수금은 net_invested 감소 → 시드 캡(잔여 시드) 증가로 잔금에 반영된다.
+    (cumulative_sell_proceeds 를 따로 더하지 않아도 회수금이 사라지지 않음 — 원문의 '매도 회수금 포함'과 같은 방향)"""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    monkeypatch.setattr("strategy._confirmed_prev_close", lambda *a, **k: (50.0, "2026-11-10"))
+    from strategy import 무한매수법_V4
+    state = {"T": 19.7734, "net_invested": 9518.68, "net_invested_status": "valid", "close_prices": [50.0],
+             "reverse_mode": {"active": True, "day_count": 0, "cycle_id": "C1"},
+             "orders_meta": {"D1": _day1_meta()}}
+    reconcile_reverse_fills(state, _hist(14, 0, "체결"))
+    assert state["net_invested"] == round(9518.68 - 14 * 59.26, 2)
+    assert state["reverse_mode"]["cumulative_sell_proceeds"] == 829.64
+
+    broker = _make_broker_mock(last_price=50.0, position_qty=130, avg_price=100.0, orderable_cash=3934.72)
+    result = 무한매수법_V4(broker, symbol="TQQQ", exchange_code="NAS", splits=20, symbol_type="TQQQ",
+                         seed=9696.18, T=state["T"], state=state)
+    assert round(result["remaining_seed"], 2) == round(9696.18 - state["net_invested"], 2)
+    assert result["orderable_cash"] == result["remaining_seed"], "브로커 현금이 충분하면 잔여 시드가 잔금 기준"
+    assert result["remaining_seed"] > 177.5 + 829.0, "회수금만큼 잔여 시드가 증가"

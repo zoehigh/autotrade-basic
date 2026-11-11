@@ -65,11 +65,12 @@ _ORDER_SEQ = {"n": 0}
 @pytest.fixture
 def env(monkeypatch):
     saved = []
-    holder = {}
+    holder = {"notified": []}
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: holder["state"])
     monkeypatch.setattr(trading_bot, "save_state", lambda symbol, state: saved.append(deepcopy(state)))
-    monkeypatch.setattr(trading_bot, "notify", lambda message, urgent=False, **kw: None)
+    monkeypatch.setattr(trading_bot, "notify",
+                        lambda message, urgent=False, **kw: holder["notified"].append((message, urgent)))
     monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
     monkeypatch.setattr(trading_bot, "BROKER_MODE", "demo")   # 실전 pre-market 대기(sleep) 회피
     return holder, saved
@@ -260,3 +261,69 @@ def test_undated_broker_day2_is_not_stalled_in_pipeline(env):
 
     assert broker.place_order.call_count > 0, "날짜 미제공 브로커는 보류가 아니라 기존 방식으로 진행해야 합니다"
     assert saved[-1]["reverse_mode"] == {}
+
+
+# ══ 보류 사유가 상위 결과·알림·실행 요약까지 전달되는지 (정상 무주문과 구분) ══════════════════════════
+
+def test_unconfirmed_close_hold_is_reported_and_notified(env):
+    """확정 종가 미확보 보류: run_one_symbol 결과에 held 사유, 긴급 알림 1회, 정상 무주문과 구분."""
+    holder, saved = env
+    state, odno = _day1(env)
+    holder["notified"].clear()
+    holder["state"] = _next_session(state)
+    broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=None)
+
+    result = trading_bot.run_one_symbol(broker, _config())
+
+    assert result is not None and result["held"] == "EXIT_UNCONFIRMED"
+    assert result["executed"] == 0 and result["failed"] == 0
+    hold_alerts = [(m, u) for m, u in holder["notified"] if "리버스 보류" in m]
+    assert len(hold_alerts) == 1 and hold_alerts[0][1] is True
+    assert "종가" in hold_alerts[0][0] and "신규 주문이 없습니다" in hold_alerts[0][0]
+
+
+def test_unresolved_reverse_order_hold_is_reported_and_notified(env):
+    holder, saved = env
+    state, odno = _day1(env)
+    holder["notified"].clear()
+    holder["state"] = _next_session(state)
+    broker = _broker(_day2_history(odno, 0, "미체결", 144), qty=144, close=59.26)
+
+    result = trading_bot.run_one_symbol(broker, _config())
+
+    assert result is not None and result["held"] == "UNRESOLVED_REVERSE_ORDERS"
+    assert any("리버스 보류" in m and "terminal" in m for m, _ in holder["notified"])
+    assert broker.place_order.call_count == 0
+
+
+def test_normal_no_order_day_is_not_reported_as_hold(env):
+    """동일 세션 재실행(이미 계획됨)은 정상 무주문: held 없음, 보류 알림 없음."""
+    holder, saved = env
+    state, odno = _day1(env)
+    holder["notified"].clear()
+    holder["state"] = deepcopy(state)          # 같은 세션 그대로 재실행
+    result = trading_bot.run_one_symbol(_broker(_buy_history(144), qty=144, close=None), _config())
+
+    assert not result
+    assert not any("리버스 보류" in m for m, _ in holder["notified"])
+
+
+def test_main_summary_lists_hold_separately(env, monkeypatch, capsys):
+    """main() 실행 요약: 보류는 성공 집계와 별도 [보류] 줄로 표시되고 보류 사유가 남는다 (단순 성공으로만 보고하지 않음)."""
+    holder, saved = env
+    monkeypatch.setattr(trading_bot, "run_one_symbol",
+                        lambda broker, cfg: {"symbol": cfg["symbol"], "executed": 0, "reserved": 0, "failed": 0,
+                                             "errors": [], "held": "EXIT_UNCONFIRMED"})
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [_config()])
+    monkeypatch.setattr(trading_bot, "create_broker", lambda: MagicMock())
+    monkeypatch.setattr(trading_bot, "load_state", lambda symbol: {})
+    monkeypatch.setattr(trading_bot.time, "sleep", lambda s: None)
+    exited = []
+    monkeypatch.setattr(trading_bot.sys, "exit", lambda code=0: exited.append(code))
+
+    trading_bot.main()
+
+    out = capsys.readouterr().out
+    assert "[보류] TQQQ: EXIT_UNCONFIRMED" in out
+    assert "합계: 성공 0건 / 예약 0건 / 실패 0건" in out
+    assert 1 not in exited, "보류는 실행 실패(종료코드 1)가 아니라 알림으로 구분됩니다"
