@@ -9,6 +9,7 @@
 
 종료 코드: 0 정상/건너뜀, 1 오류·중단·보류(알림 발송), 2 설정 오류.
 """
+import hashlib
 import os
 import sys
 from copy import deepcopy
@@ -19,6 +20,7 @@ sys.path[:0] = [os.path.join(ROOT, "src"), os.path.join(ROOT, "ops")]
 
 import meritz_reprice as rp  # noqa: E402
 import meritz_watch as mw  # noqa: E402
+from meritz_readonly import ReadOnlyBroker, ReadOnlyViolation  # noqa: E402
 import run_lock  # noqa: E402
 import state as st  # noqa: E402
 from state import mask_odno  # noqa: E402
@@ -323,6 +325,17 @@ def run_once(env, now_utc, config, broker_factory, notify_fn, calendar):
             handle.close()
 
 
+def _state_fingerprint():
+    """매매 state 파일의 해시 (없으면 'absent')."""
+    try:
+        with open(st._STATE_FILE, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as error:
+        return f"unreadable:{type(error).__name__}"
+
+
 def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
     record, warning = mw.load_record(run_lock.watch_state_path(), session)
     apply = settings["mode"] == mw.MODE_APPLY
@@ -356,9 +369,21 @@ def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
         _log("대상 종목이 없습니다")
         return 2
 
+    # state 불변 확인은 **이 실행이 락(.watch/.run/.bot)을 잡은 동안**의 전후로만 비교합니다.
+    # 정상 LIVE 봇이 별도로 state 를 갱신한 것(락이 풀려 있던 시간)은 DRY 의 변경으로 오인하지 않습니다.
+    state_before = _state_fingerprint() if not apply else None
     broker = broker_factory()
+    guard_error = None
+    if not apply:
+        # DRY 는 읽기 전용 브로커로만 동작합니다 — 주문·정정·취소는 실제 호출 전에 차단됩니다.
+        try:
+            broker = ReadOnlyBroker(broker)
+        except ReadOnlyViolation as error:
+            guard_error = error  # 차단을 설치하지 못했으면 조회도 하지 않고 중단 (fail-closed)
     exit_code = 0
     try:
+        if guard_error:
+            raise guard_error
         for cfg in symbols:
             outcome = _watch_symbol(settings, broker, cfg, record, now_utc, session, notify_fn)
             if outcome == "halt":
@@ -366,6 +391,13 @@ def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
                 break
             if outcome == "error":
                 exit_code = 1
+    except ReadOnlyViolation as error:
+        # DRY 에서 주문 변경 시도가 있었다는 것은 코드 결함입니다 — 요청은 나가지 않았지만 사람이 확인해야 합니다.
+        _log(f"읽기 전용 위반: {error}")
+        if not mw.read_halt(run_lock.watch_halt_path()):
+            delivered = _halt("*", "READONLY_VIOLATION", str(error), now_utc, notify_fn)
+            _register_halt_notified(record, now_utc, delivered)
+        exit_code = 1
     except Exception as error:  # 조회 실패 등 — 정정은 하지 않은 상태에서의 오류
         text = f"{type(error).__name__}: {str(error)[:120]}"
         _log(f"오류: {text}")
@@ -373,6 +405,17 @@ def _run_locked(settings, now_utc, session, config, broker_factory, notify_fn):
                      f"⚠️ 메리츠 정정 감시 오류 ({settings['mode']}): {text}", urgent=True, repeat_after_min=60)
         exit_code = 1
     finally:
+        if state_before is not None:
+            state_after = _state_fingerprint()
+            if state_after != state_before:
+                # 락을 잡은 동안 매매 state 가 바뀌었다 = DRY 가 (또는 락을 무시한 무언가가) 썼다. 사람이 확인해야 합니다.
+                _log(f"매매 state 가 DRY 실행 중 변경되었습니다 ({state_before[:12]} → {state_after[:12]})")
+                if not mw.read_halt(run_lock.watch_halt_path()):
+                    delivered = _halt("*", "STATE_CHANGED_IN_DRY", f"state {state_before[:12]} → {state_after[:12]}", now_utc, notify_fn)
+                    _register_halt_notified(record, now_utc, delivered)
+                exit_code = 1
+            else:
+                _log(f"state 불변 확인 (락 보유 중 전후 동일, {state_after[:12]})")
         try:
             mw.save_record(run_lock.watch_state_path(), record)
         except OSError as error:

@@ -18,11 +18,11 @@
 45 18 * * 1-5 /home/ubuntu/investment/muhan-v4/ops/verify_run.sh
 
 # ── (선택·미등록) 가격 정정 감시기 ─────────────────────────────────────────────
-# 기본 DRY 로 먼저 돌려 알림/로그를 확인한 뒤 사람이 등록 여부를 결정하세요. 자세한 내용: docs/meritz-reprice-watch.md
+# 기본 DRY 로 먼저 돌려 알림/로그를 확인한 뒤 사람이 등록 여부를 결정하세요. 실행마다 토큰을 새로 발급하므로 20분 주기로 시작합니다. 자세한 내용: docs/meritz-reprice-watch.md
 # 감시 창(ET 06:00~15:30, 조기마감 반영)은 코드가 판단하므로 KST 고정 시각으로 자주 호출해도 됩니다.
 # 서머타임 19:00~04:30 KST / 동절기 20:00~05:30 KST 를 모두 덮고, 창 밖·휴장일은 즉시 종료합니다.
 #
-#   */10 19-23,0-5 * * 1-6 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh
+#   */20 19-23,0-5 * * 1-6 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh
 #
 # 실제 정정(APPLY)은 같은 줄에 세 값을 모두 명시해야만 켜집니다 (.env 로는 켜지지 않음):
-#   */10 19-23,0-5 * * 1-6 REPRICE_WATCH_MODE=APPLY TRADE_MODE=LIVE ALLOW_BROKER_ORDERS=1 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh
+#   */20 19-23,0-5 * * 1-6 REPRICE_WATCH_MODE=APPLY TRADE_MODE=LIVE ALLOW_BROKER_ORDERS=1 /home/ubuntu/investment/muhan-v4/ops/run_reprice_watch.sh
