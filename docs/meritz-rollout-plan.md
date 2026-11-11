@@ -38,8 +38,8 @@ git fetch origin hotfix/meritz-buy-loc-reprice fix/meritz-adapter-rejected-amend
 git merge-base --is-ancestor 342a9f1 6044141 && echo OK
 git diff --stat 342a9f1 6044141                      # 위 6개 파일뿐인지
 pgrep -af "trading_bot|run_daily"; ls .bot.lock .reprice_journal.json .watch_halt.json 2>&1 | head
-flock -n .run.lock true && echo "락 비어 있음"
-crontab -l | sha256sum                               # 기록 (변경 없음 확인용, 기대값 dbf46f3f...)
+flock -n .run.lock true && echo "락 비어 있음"   # 주의: flock 은 파일이 없으면 만듭니다(.bot.lock 은 .gitignore 대상, 빈 파일이라 무해)
+crontab -l | md5sum | cut -c1-8                      # 기록 (변경 없음 확인용, 기대값 dbf46f3f — md5 기준)
 sha256sum .state.json                                # 기록 (기대값 699598893c58...)
 ```
 
