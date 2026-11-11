@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from config import TRADE_MODE, LS_DEMO_BYPASS_BUGS
 from broker.base import Broker
-from broker.market_utils import normalize_order_price
+from broker.market_utils import normalize_order_price, us_session_last_closed_date
 from market_data import get_finnhub_ma5
 
 # BUY LOC 가격 상한 — 브로커가 현재가 대비 +20% 초과 주문을 거부하므로 미리 낮춥니다.
@@ -192,9 +192,81 @@ def _has_unresolved_reverse_orders(state):
     )
 
 
+def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
+    """확정된 직전 정규장 종가를 (종가, 거래일 YYYY-MM-DD) 로 반환합니다. 확보하지 못하면 None.
+
+    리버스 종료 판정은 '종가' 기준이므로 프리마켓·실시간 시세(last_price)를 쓰지 않습니다.
+    확정 종가의 조건: XNYS 캘린더상 이미 마감된 가장 최근 세션(조기마감·휴장 반영)의 일봉이
+    브로커 일봉에 같은 날짜로 존재하고 종가가 양수일 것. 브로커가 날짜를 주지 않거나(date=None)
+    최신 일봉이 그 세션보다 오래됐거나 조회가 실패하면 '미확보'입니다.
+    """
+    if broker is None or not hasattr(broker, "get_daily_candles"):
+        return None
+    if now_utc is None:
+        now_utc = datetime.now(ZoneInfo("UTC"))   # 전략의 시계를 그대로 사용 (섀도 원장 등 세션 시뮬레이션과 일치)
+    expected = us_session_last_closed_date(now_utc)
+    if not expected:
+        return None
+    try:
+        candles = broker.get_daily_candles(symbol, exchange_code, days=5)
+    except Exception as error:  # 조회 실패는 '미확보'로 처리 (종료 판정을 하지 않음)
+        print(f"[경고] {symbol} 일봉 조회 실패 — 확정 종가 미확보: {error}")
+        return None
+    if not isinstance(candles, list):
+        return None
+    for candle in reversed(candles):
+        if not isinstance(candle, dict) or candle.get("date") != expected:
+            continue
+        close = candle.get("close")
+        if isinstance(close, (int, float)) and not isinstance(close, bool) and close > 0:
+            return float(close), expected
+    return None
+
+
+class _SnapshotBroker:
+    """종료일 일반모드 복귀 시 재귀 호출이 시세·잔고를 다시 조회하지 않도록 첫 조회 결과를 고정해 넘기는 래퍼.
+
+    첫 판정(종료 판단)과 복귀 주문 계산이 서로 다른 시점의 시세·잔고·주문가능금액을 쓰면 판단과 주문이 어긋날 수 있습니다.
+    """
+
+    def __init__(self, broker, quotation, price_detail, balance, purchase_amount):
+        self._broker = broker
+        self._snap = {
+            "get_stock_quotation": quotation,
+            "get_stock_price": price_detail,
+            "get_balance": balance,
+            "get_purchase_amount": purchase_amount,
+        }
+
+    def __getattr__(self, name):
+        if name in self._snap:
+            value = self._snap[name]
+            return lambda *args, **kwargs: value
+        return getattr(self._broker, name)
+
+
 def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                          position_qty, avg_price, orderable_cash, last_price,
                          state):
+    """리버스모드 1회 실행의 주문을 계산합니다 (상태는 읽기만 합니다 — T·day_count 는 체결 반영으로만 바뀝니다).
+
+    [원문(라오어 V4 두 문서)에서 확인된 규칙]
+    - 진입: 20분할 T>19 / 40분할 T>39. 첫날은 매수 없이 MOC 매도만(보유량 1/10, 40분할 1/20, 내림).
+    - 둘째 날부터: 직전 보유량을 같은 비율로 나눠 별지점(직전 5거래일 종가 평균)에 LOC 매도 + 총 잔금 1/4 로 별지점 아래 쿼터매수.
+    - 리버스 중 소진 판단은 T 가 아니라 '잔금 1/4 로 1주 매수 가능 여부'(불가하면 매수 없이 MOC 매도만).
+    - T: 20분할 매도 ×0.9 / 쿼터매수 T+(20−T)×0.25, 40분할 ×0.95 / T+(40−T)×0.25. 일반모드 복귀 시 그대로 승계.
+    - 종료: 종가가 평단 대비 TQQQ −15%, SOXL −20% 위로 회복했음을 확인하면 일반모드 복귀(하루 만에 종료될 수도 있음).
+      복귀 후 매수금은 잔금÷(분할수−T), T 가 소진이면 다시 리버스.
+
+    [원문에 없어 구현이 정한 정책 — 변경 시 별도 검토]
+    - 종료 판정 시작 시점: 진입 첫날은 종료 판정을 하지 않고 2일차부터(보수적 해석).
+    - 종료 판정 가격: 확정된 직전 정규장 종가(+ XNYS 직전 마감 세션 날짜 대조). 현재가(프리마켓)로는 종료하지 않고,
+      확정 종가를 얻지 못하면 종료도 계속도 판단하지 않고 그 실행은 주문 없이 보류.
+    - 미체결·부분체결: terminal 확정 전에는 신규 주문·종료 판정을 모두 보류(중복 매도 방지).
+      체결>0 + 종결(취소·만료, 거부 제외)이면 그날을 리버스 1일차 완료로 보는 것은 이 PR 이전부터의 동작(state.py).
+    - 종료일 같은 날 일반모드 복귀(원문은 '확인한 다음 날부터'로 읽힐 수 있음 — 이 구현은 종료 판정을 한 그 실행에서 이어서 주문).
+    - 쿼터매수 잔금은 broker 주문가능금액만 사용(원문은 매도 회수금 포함 — 의도적 보수 설계, AGENTS.md 참고).
+    """
     rev = state.get("reverse_mode", {})
     if rev.get("reconciliation_error") or rev.get("reconciliation_only"):
         print(f"[리버스모드] {symbol} 상태 reconciliation 확인 필요 → 신규 주문을 생성하지 않습니다.")
@@ -215,17 +287,37 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     divisor = _REVERSE_DIVISOR.get(splits, 20)
     sell_factor = _REVERSE_T_SELL_FACTOR.get(splits, 0.95)
 
-    # 진입 첫날은 종료 판정을 하지 않고 무조건 MOC 매도를 먼저 냅니다 (참고 해설 기준: "첫날 — 무조건 매도", 라오어 원문 대조 전).
+    # 진입 첫날은 종료 판정을 하지 않고 무조건 MOC 매도를 먼저 냅니다 ("첫날 — 무조건 매도").
     # 종료 검사를 먼저 하면 T>분할수-1 인데 종가가 이미 종료선 위인 종목은 진입 즉시 종료되어 매도 없이
     # T 가 그대로 남고, 다음 날도 같은 판정이 반복되어 영구 정지합니다 (2026-11-11 TQQQ 실측).
     # 종료 판정은 2일차부터 합니다.
+    #
+    # 종료 판정 가격은 '확정된 직전 정규장 종가'입니다 (프리마켓·실시간 last_price 로 종료하지 않음).
+    # 확정 종가를 확보하지 못하면(일봉 조회 실패·날짜 불일치·날짜 미제공) 종료도 계속도 판단하지 않고
+    # 이번 실행은 신규 주문 없이 보류합니다 (오종료로 일반 매수가 나가거나 리버스 매도가 어긋나는 것보다 하루 보류가 안전).
     is_first_day = (day_count == 1)
     threshold = REVERSE_EXIT_THRESHOLD.get(symbol_type, 0.85)
     exit_price = avg_price * threshold
-    if not is_first_day and last_price > exit_price:
-        print(f"[리버스모드] {symbol} 종료 조건 충족 (종가 ${last_price:.2f} > ${exit_price:.2f})")
-        new_T = T
-        return {"orders": [], "new_T": new_T, "exit": True, "reverse_day": day_count}
+    if not is_first_day:
+        confirmed = _confirmed_prev_close(broker, symbol, exchange_code)
+        if confirmed is None:
+            print(
+                f"[리버스모드] {symbol} 확정된 직전 정규장 종가를 확인하지 못해 종료 판정을 보류합니다 "
+                f"→ 이번 실행은 신규 주문을 생성하지 않습니다 (현재가 ${last_price:.2f}는 판정에 쓰지 않음)."
+            )
+            return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False, "exit_unconfirmed": True}
+        close_price, close_date = confirmed
+        if close_price > exit_price:
+            print(
+                f"[리버스모드] {symbol} 종료 조건 충족 (확정 종가 ${close_price:.2f}[{close_date}] > ${exit_price:.2f}; "
+                f"현재가 ${last_price:.2f}는 판정에 쓰지 않음)"
+            )
+            return {"orders": [], "new_T": T, "exit": True, "reverse_day": day_count}
+        if last_price > exit_price:
+            print(
+                f"[리버스모드] {symbol} 현재가 ${last_price:.2f}는 종료선 ${exit_price:.2f} 위지만 확정 종가 "
+                f"${close_price:.2f}[{close_date}]는 이하 → 종료하지 않고 리버스를 유지합니다 (프리마켓 가격 단독 종료 방지)."
+            )
 
     print(f"[리버스모드] {symbol} 진입 {day_count}일차 (T={T})")
     orders = []
@@ -488,7 +580,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
 
     # ========================================
     # 4. 소진 상태 확인 (T > splits - 1)
-    #    원본 규칙: 20분할 T>19, 40분할 T>39 — 마지막 1회 매수도 불가능한 상태
+    #    원문 규칙: 20분할 T>19, 40분할 T>39 — 마지막 1회 매수도 불가능한 상태
     # ========================================
 
     reverse_state = (state or {}).get("reverse_mode", {})
@@ -514,7 +606,8 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 print(f"[리버스모드] {symbol} 종료 → 같은 날 일반모드로 복귀합니다 (T={new_T})")
                 normal_state = {**state, "reverse_mode": {}}
                 normal_result = 무한매수법_V4(
-                    broker, symbol, exchange_code, splits, symbol_type,
+                    _SnapshotBroker(broker, quotation, price_detail, balance, psamount),
+                    symbol, exchange_code, splits, symbol_type,
                     seed=seed, T=new_T, additional_loc_levels=additional_loc_levels,
                     state=normal_state,
                 )

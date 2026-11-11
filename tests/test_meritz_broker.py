@@ -399,6 +399,23 @@ def test_daily_closes_returned_oldest_first(make_broker):
     assert broker.get_daily_closes("TQQQ", "NAS", days=3) == [71.0, 72.0, 73.0]
 
 
+def test_daily_candles_include_session_date_and_exclude_today(make_broker):
+    """날짜 포함 일봉: 'YYYY-MM-DD' 세션 날짜 + 종가, 오래된 순, 당일(ET) 미확정 봉 제외. get_daily_closes 와 같은 종가열."""
+    rows = [
+        {"date": et_days_ago(0), "prpr": "99.9"},   # 당일(ET) → 제외
+        {"date": et_days_ago(1), "prpr": "73.0"},
+        {"date": et_days_ago(2), "prpr": "72.0"},
+        {"date": et_days_ago(3), "prpr": "71.0"},
+    ]
+    broker, _session = make_broker([ok(data=rows), ok(data=rows)])
+    candles = broker.get_daily_candles("TQQQ", "NAS", days=3)
+
+    assert [c["close"] for c in candles] == [71.0, 72.0, 73.0]
+    assert all(len(c["date"]) == 10 and c["date"][4] == "-" and c["date"][7] == "-" for c in candles)
+    assert [c["date"] for c in candles] == sorted(c["date"] for c in candles)
+    assert [c["close"] for c in candles] == broker.get_daily_closes("TQQQ", "NAS", days=3)
+
+
 def test_daily_closes_params_official(make_broker):
     """일봉 query는 공식 5종 (mod_stpr_cls_code 포함, from/to/days 없음)."""
     broker, session = make_broker([ok(data=[])])

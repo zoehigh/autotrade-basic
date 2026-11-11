@@ -506,9 +506,9 @@ class MeritzBroker(Broker):
         open_price = self._to_float(data.get("oprc"))
         return open_price, last
 
-    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+    def _fetch_finalized_daily(self, symbol: str, exchange: str) -> dict[str, float]:
         """
-        해외주식 일봉 종가를 조회합니다 → list[float] (오래된 순).
+        해외주식 일봉(확정 봉만)을 {YYYYMMDD: 종가} 로 조회합니다.
 
         GET /market/v1/overseas/candles/days
         - 공식 필수 query 5종만 전송 (from/to 생략 → 최신 40건 반환)
@@ -533,7 +533,6 @@ class MeritzBroker(Broker):
         rows = self._extract_rows(body)
         today_et = datetime.now(ET_TZ).strftime("%Y%m%d")
 
-        # 당일 미확정 봉 제외 (date >= 오늘 ET) 후 날짜순 정렬 → 최신 days개
         finalized: dict[str, float] = {}
         for row in rows:
             if not isinstance(row, dict):
@@ -543,9 +542,26 @@ class MeritzBroker(Broker):
             if not date_str or date_str >= today_et or close <= 0:
                 continue
             finalized[date_str] = close
+        return finalized
 
+    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+        """해외주식 일봉 종가 → list[float] (오래된 순, 당일(ET) 미확정 봉 제외)."""
+        finalized = self._fetch_finalized_daily(symbol, exchange)
         closes = [finalized[key] for key in sorted(finalized)]
         return closes[-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """해외주식 일봉 → [{"date": "YYYY-MM-DD", "close": float}] (오래된 순, 당일(ET) 미확정 봉 제외).
+
+        date 는 응답 행의 date 필드(미국 세션 날짜로 가정)입니다. 리버스 종료 판정이 이 날짜를
+        XNYS 직전 마감 세션과 대조해 확정 종가인지 검증합니다.
+        """
+        finalized = self._fetch_finalized_daily(symbol, exchange)
+        keys = sorted(finalized)[-days:]
+        return [
+            {"date": f"{key[:4]}-{key[4:6]}-{key[6:8]}", "close": finalized[key]}
+            for key in keys
+        ]
 
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """
