@@ -199,15 +199,19 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     divisor = _REVERSE_DIVISOR.get(splits, 20)
     sell_factor = _REVERSE_T_SELL_FACTOR.get(splits, 0.95)
 
+    # 진입 첫날은 종료 판정을 하지 않고 무조건 MOC 매도를 먼저 냅니다 (원본 규칙: "첫날 — 무조건 매도").
+    # 종료 검사를 먼저 하면 T>분할수-1 인데 종가가 이미 종료선 위인 종목은 진입 즉시 종료되어 매도 없이
+    # T 가 그대로 남고, 다음 날도 같은 판정이 반복되어 영구 정지합니다 (2026-11-11 TQQQ 실측).
+    # 종료 판정은 2일차부터 합니다.
+    is_first_day = (day_count == 1)
     threshold = REVERSE_EXIT_THRESHOLD.get(symbol_type, 0.85)
     exit_price = avg_price * threshold
-    if last_price > exit_price:
+    if not is_first_day and last_price > exit_price:
         print(f"[리버스모드] {symbol} 종료 조건 충족 (종가 ${last_price:.2f} > ${exit_price:.2f})")
         new_T = T
         return {"orders": [], "new_T": new_T, "exit": True, "reverse_day": day_count}
 
     print(f"[리버스모드] {symbol} 진입 {day_count}일차 (T={T})")
-    is_first_day = (day_count == 1)
     orders = []
 
     if is_first_day:

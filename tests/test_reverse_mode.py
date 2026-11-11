@@ -1020,3 +1020,87 @@ def test_reverse_marker_hold_rolls_back_sibling_order():
     assert state.get("_reverse_settlement_deltas", []) == []
     assert state["last_updated"] == "2026-07-31T20:00:00+00:00"
     assert state["last_processed_ordno"] == "OLD10"
+
+
+# ── 진입 첫날 종료 검사 건너뛰기 (2026-11-11 TQQQ 정지 재현) ─────────────────
+# 운영 실측: T=19.7734(>19), 보유 144주, 평단 $65.5732, 현재가 $59.26 (> 평단×0.85 = $55.74).
+# 종료 검사가 1일차 MOC 매도보다 먼저 돌아 "진입 즉시 종료·주문 0건"이 되고, reverse_mode 가 비워진 채
+# T 가 그대로라 다음 날도 같은 판정이 반복되었습니다. 원본 규칙: 첫날은 무조건 MOC 매도, 종료 판정은 그 이후.
+
+def _tqqq_1111_state():
+    return {"T": 19.7734, "reverse_mode": {}, "close_prices": [59.0]}
+
+
+def _run_reverse(state, last_price=59.26, position_qty=144, avg_price=65.5732, symbol_type="TQQQ"):
+    return execute_reverse_mode(
+        broker=None, symbol=symbol_type, exchange_code="NAS", splits=20, symbol_type=symbol_type,
+        position_qty=position_qty, avg_price=avg_price, orderable_cash=177.5,
+        last_price=last_price, state=state,
+    )
+
+
+def test_first_day_sells_moc_even_when_price_above_exit_line(monkeypatch):
+    """재현: 진입 첫날 현재가가 종료선 위여도 1일차 MOC 매도를 내야 하고, 종료하지 않는다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    result = _run_reverse(_tqqq_1111_state())
+
+    assert result["exit"] is False
+    assert len(result["orders"]) == 1
+    order = result["orders"][0]
+    assert order["side"] == "SELL" and order["order_type"] == "MOC"
+    assert order["quantity"] == 14          # 144 // 10 (20분할 1/10, 내림)
+    assert result["reverse_day"] == 1
+    assert result["new_T"] == round(19.7734 * 0.9, 4)
+
+
+def test_first_day_never_buys(monkeypatch):
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    result = _run_reverse(_tqqq_1111_state())
+    assert all(o["side"] == "SELL" for o in result["orders"])
+
+
+def test_second_day_still_exits_when_price_above_exit_line(monkeypatch):
+    """2일차 이후에는 기존대로 종료 판정 (종료선 위 → 종료, 주문 없음)."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _tqqq_1111_state()
+    state["reverse_mode"] = {"active": True, "day_count": 1}
+    result = _run_reverse(state)
+
+    assert result["exit"] is True
+    assert result["orders"] == []
+    assert result["reverse_day"] == 2
+
+
+def test_second_day_continues_when_price_below_exit_line(monkeypatch):
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _tqqq_1111_state()
+    state["reverse_mode"] = {"active": True, "day_count": 1}
+    result = _run_reverse(state, last_price=50.0)
+
+    assert result["exit"] is False
+    assert result["orders"], "종료선 아래면 리버스가 계속되어야 합니다"
+
+
+def test_first_day_soxl_threshold_also_skipped(monkeypatch):
+    """SOXL(−20%)도 첫날은 종료 검사를 하지 않는다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    result = _run_reverse(
+        {"T": 19.5, "reverse_mode": {}, "close_prices": [90.0]},
+        last_price=95.0, position_qty=100, avg_price=100.0, symbol_type="SOXL",
+    )
+    assert result["exit"] is False and result["orders"][0]["order_type"] == "MOC"
+
+
+def test_strategy_entry_day_with_price_above_exit_line_places_moc(monkeypatch):
+    """무한매수법_V4 전체 경로: T>19 진입 첫날 종료선 위여도 MOC 매도가 생성되고 reverse_exit 가 아니다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    from strategy import 무한매수법_V4
+
+    state = {"T": 19.7734, "reverse_mode": {}, "close_prices": [59.0], "net_invested": 9518.68,
+             "net_invested_status": "valid"}
+    broker = _make_broker_mock(last_price=59.26, position_qty=144, avg_price=65.5732, orderable_cash=177.5)
+    result = 무한매수법_V4(broker, symbol="TQQQ", exchange_code="NAS", splits=20, symbol_type="TQQQ",
+                         seed=9696.18, T=19.7734, state=state)
+
+    assert result["reverse_exit"] is False
+    assert [o["order_type"] for o in result["orders"]] == ["MOC"]
