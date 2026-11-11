@@ -91,6 +91,10 @@ def plan_order(odno, meta, row, last_price, overrides, today_session, amend_rows
         return _skip(odno, "리버스 주문은 대상 아님")
     if meta.get("is_additional"):
         return _skip(odno, "추가매수 주문은 대상 아님")
+    if meta.get("merged_additional_qty"):
+        # 합산 주문의 한도를 원래 매수가까지 올리면 합산된 추가매수 수량이 원래 주문표보다
+        # 높은 종가에서도 체결되어 의도한 노출을 넘습니다.
+        return _skip(odno, "추가매수 수량을 합산한 주문은 가격 정정 대상 아님")
     if row is None:
         return _skip(odno, "이력에 주문 행 없음 (상태 불확실)")
 
