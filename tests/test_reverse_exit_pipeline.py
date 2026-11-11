@@ -247,3 +247,16 @@ def test_unconfirmed_close_on_day2_places_nothing_and_keeps_state(env):
     assert final["reverse_mode"]["active"] is True and final["reverse_mode"].get("cycle_id")
     assert final["T"] == round(19.7734 * 0.9, 4)
     assert not final.get("pending_order_batch") and not final.get("pending_order_intent")
+
+
+def test_undated_broker_day2_is_not_stalled_in_pipeline(env):
+    """일봉 날짜를 제공하지 않는 브로커(KIS 등)로도 2일차 이후 리버스가 정지하지 않는다 (기존 방식으로 판정, Codex P1)."""
+    holder, saved = env
+    state, odno = _day1(env)
+    holder["state"] = _next_session(state)
+    broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=59.26, candle_date=None)
+
+    trading_bot.run_one_symbol(broker, _config())
+
+    assert broker.place_order.call_count > 0, "날짜 미제공 브로커는 보류가 아니라 기존 방식으로 진행해야 합니다"
+    assert saved[-1]["reverse_mode"] == {}

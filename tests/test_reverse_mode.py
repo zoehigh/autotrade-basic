@@ -1353,11 +1353,45 @@ def test_confirmed_close_stale_date_holds(monkeypatch):
     assert result["orders"] == [] and result["reverse_exit"] is False
 
 
-def test_confirmed_close_without_date_holds(monkeypatch):
-    """브로커가 일봉 날짜를 주지 않으면(date=None) 미확보 → 보류."""
+def test_undated_broker_keeps_legacy_last_price_judgement_with_warning(monkeypatch, capsys):
+    """일봉 날짜를 제공하지 않는 브로커(KIS·KIWOOM·LS·NHPLUG 기본 구현, date=None)는 확정 종가를 검증할 수 없으므로
+    기존 방식(현재가)을 유지한다 — 보류하면 이 브로커들은 리버스 1일차 이후 영구 정지한다 (Codex P1)."""
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
-    result = _strategy_call(_day2_state(), close=59.26, candle_date=None)
-    assert result["orders"] == [] and result["reverse_exit"] is False
+    above = _strategy_call(_day2_state(), last_price=59.26, close=59.26, candle_date=None)
+    assert above["reverse_exit"] is True and above["orders"]
+    assert "일봉 날짜를 제공하지 않아" in capsys.readouterr().out
+
+    below = _strategy_call(_day2_state(), last_price=50.0, close=50.0, candle_date=None)
+    assert below["reverse_exit"] is False
+    assert below["orders"] and all(o.get("reverse_action") for o in below["orders"])
+
+
+def test_base_broker_default_candles_are_undated_and_not_blocked(monkeypatch):
+    """기본 구현(get_daily_closes 기반, date=None)의 실제 클래스 동작: 영구 보류가 아니라 기존 방식으로 판정한다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    from broker.base import Broker
+    from strategy import _resolve_exit_close
+
+    class _Legacy(Broker):          # 추상 메서드는 필요한 것만 흉내 (기본 get_daily_candles 를 그대로 사용)
+        def __init__(self):
+            pass
+        def get_daily_closes(self, symbol, exchange, days=5):
+            return [57.0, 58.0]
+
+    _Legacy.__abstractmethods__ = frozenset()
+    result = _resolve_exit_close(_Legacy(), "TQQQ", "NAS", last_price=59.26)
+    assert result is not None and result[0] == 59.26
+
+
+def test_dated_broker_without_matching_session_still_holds(monkeypatch):
+    """날짜를 제공하는 브로커(메리츠·토스)인데 직전 마감 세션 봉이 없으면 보류 (날짜 없는 브로커와 구분)."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    from strategy import _resolve_exit_close
+    broker = MagicMock()
+    broker.get_daily_candles.return_value = [{"date": "2020-01-02", "close": 50.0}]
+    assert _resolve_exit_close(broker, "TQQQ", "NAS", last_price=59.26) is None
+    broker.get_daily_candles.return_value = []
+    assert _resolve_exit_close(broker, "TQQQ", "NAS", last_price=59.26) is None
 
 
 def test_premarket_above_line_but_confirmed_close_below_keeps_reverse(monkeypatch):
