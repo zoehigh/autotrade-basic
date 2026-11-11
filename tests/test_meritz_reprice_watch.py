@@ -193,6 +193,20 @@ class Notifier:
         self.sent.append((urgent, message))
 
 
+class FlakyNotifier(Notifier):
+    """발송 실패를 흉내냅니다 — 예외(fail='raise') 또는 실제 notifier 처럼 False 반환(fail='false')."""
+    def __init__(self, fail):
+        super().__init__()
+        self.fail = fail
+
+    def __call__(self, message, urgent=False):
+        if self.fail == "raise":
+            raise OSError("telegram down")
+        if self.fail == "false":
+            return False
+        return super().__call__(message, urgent=urgent)
+
+
 ENV = {"REPRICE_WATCH_START_ET": "00:00", "REPRICE_WATCH_END_ET": "23:59", "REPRICE_WATCH_CLOSE_BUFFER_MIN": "0"}
 APPLY_ENV = {**ENV, "REPRICE_WATCH_MODE": "APPLY", "ALLOW_BROKER_ORDERS": "1"}
 CONFIG_LIVE = SimpleNamespace(BROKER="meritz", TRADE_MODE="LIVE", SYMBOLS=[{"symbol": "SOXL", "exchange": "AMS"}])
@@ -744,3 +758,30 @@ def test_manual_apply_amend_default_still_cleans_up_immediately(tmp_path):
     result = rp.apply_amend(ManualBroker(), "SOXL", "NY", item, state, journal, lambda s, st_: None,
                             lambda: [_row(odno=NEW, rctf="1", orgl="100", price=73.69)], verify_wait=0)
     assert result == "AMENDED" and rp.read_journal(journal) == []
+
+
+@pytest.mark.parametrize("fail", ["raise", "false"])
+def test_dry_plan_alert_is_retried_after_delivery_failure(world, fail):
+    """발송에 실패한 알림은 중복 방지 기록에 남지 않아, 복구된 뒤 다음 실행에서 다시 보낸다."""
+    world.notifier = FlakyNotifier(fail)
+    run(world)
+    record = json.load(open(run_lock.watch_state_path()))
+    assert not any(k.startswith("plan:") for k in record["notified"])
+    world.notifier.fail = None
+    run(world)
+    assert len(world.notifier.sent) == 1 and "DRY" in world.notifier.sent[0][1]
+    run(world)
+    assert len(world.notifier.sent) == 1                                     # 성공 뒤에는 다시 중복 방지
+
+
+def test_halt_alert_is_retried_when_first_delivery_fails(world):
+    """halt 알림이 실패하면 halt_reminder 를 등록하지 않아, 다음 실행의 중단 상태 알림이 다시 시도된다."""
+    world.broker.error = OrderError("timeout")
+    world.notifier = FlakyNotifier("false")
+    run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert os.path.exists(run_lock.watch_halt_path())
+    record = json.load(open(run_lock.watch_state_path()))
+    assert "halt_reminder" not in record["notified"]
+    world.notifier.fail = None
+    code, _ = run(world, env=APPLY_ENV, config=CONFIG_LIVE)
+    assert code == 1 and any(u and "중단" in m for u, m in world.notifier.sent)

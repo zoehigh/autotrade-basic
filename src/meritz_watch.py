@@ -205,15 +205,27 @@ def digest(*parts) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()[:16]
 
 
-def should_notify(record, key, value, now_utc, repeat_after_min=None):
-    """같은 내용을 반복 알리지 않습니다. 새 내용이거나(repeat 설정 시) 오래됐으면 True 이고 기록도 갱신합니다."""
+def notify_due(record, key, value, now_utc, repeat_after_min=None):
+    """지금 이 알림을 보내야 하는지만 판단합니다 (기록은 바꾸지 않음)."""
     previous = record["notified"].get(key)
     if previous and previous.get("value") == value:
         if repeat_after_min is None:
             return False
         if now_utc - datetime.fromisoformat(previous["at"]) < timedelta(minutes=repeat_after_min):
             return False
+    return True
+
+
+def mark_notified(record, key, value, now_utc):
+    """발송에 **성공한 뒤** 호출합니다 — 실패한 알림은 기록하지 않아 다음 실행에서 재시도됩니다."""
     record["notified"][key] = {"value": value, "at": now_utc.isoformat()}
+
+
+def should_notify(record, key, value, now_utc, repeat_after_min=None):
+    """판단 + 즉시 기록 (발송 성공 여부와 무관한 호출부용). 발송 결과를 아는 곳은 notify_due/mark_notified 를 쓰세요."""
+    if not notify_due(record, key, value, now_utc, repeat_after_min):
+        return False
+    mark_notified(record, key, value, now_utc)
     return True
 
 
