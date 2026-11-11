@@ -279,6 +279,12 @@ COMMISSION_RATE = float(os.getenv("COMMISSION_RATE") or "0.0025")
 _reinvest_raw = (os.getenv("REINVEST") or "true").strip().lower()
 REINVEST = _reinvest_raw == "true"
 
+# 상한 보정된 정상매수 + 원래 주문표의 보정가 이상 추가매수 수량 합산 (기본 OFF)
+# true 로 설정하면 현재가 ×1.19 상한으로 낮춘 정상매수 주문에, 원래(보정 전) 주문표에서
+# 보정가 이상이던 추가매수 단계의 수량을 더해 한 주문으로 제출합니다.
+# .env 예: MERGE_CAPPED_ADDITIONAL=true
+MERGE_CAPPED_ADDITIONAL = os.getenv("MERGE_CAPPED_ADDITIONAL", "").strip().lower() == "true"
+
 # T값 강제 재추정 플래그
 # true로 설정 시 state.json의 last_updated를 초기화하여 전체 주문 이력에서 T를 재추정합니다.
 # GitHub Actions에서 state 캐시가 깨졌거나 state 없이 시작한 경우 사용합니다.

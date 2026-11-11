@@ -1563,6 +1563,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                 if order.get("original_price"):
                     order_meta["original_price"] = float(order["original_price"])
                     order_meta["order_price"] = float(order_price)
+                # 보정된 정상매수에 추가매수 수량을 합산한 주문 (T 는 정상매수 기준, total_qty 는 합산 수량)
+                if order.get("merged_additional_qty"):
+                    order_meta["merged_additional_qty"] = int(order["merged_additional_qty"])
+                    order_meta["normal_qty"] = int(order["normal_qty"])
                 if order.get("reverse_action"):
                     reverse_mode = state.setdefault("reverse_mode", {})
                     cycle_id = reverse_mode.get("cycle_id") or datetime.now(
