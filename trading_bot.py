@@ -56,7 +56,7 @@ from pipeline_execute import execute_approved_plan
 from settlement_report import build_symbol_report, send_settlement_report
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
-from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
+from state import FILL_MARKER_VERSION, log_salt_hex, mask_odno, load_state, save_state, save_states, update_T_from_history, compute_position_from_history, register_order_meta_in_state, canonical_state_hash, reset_settlement_ledger, record_settlement_t_adjustment, rewind_misclassified_reverse_sell, find_misclassified_reverse_sell_odnos, restore_watermark_for_unapplied_reverse_order, _order_real_kst_date, _order_us_session_date, _fill_amount, _has_unconfirmed_amount_fills
 # 주문번호 매핑 원장은 state 를 거치지 않고 log_mask 에서 직접 가져옵니다
 # (state 와 **같은 모듈 객체**여야 salt·원장이 하나로 유지됩니다 — `src.log_mask` import 금지).
 from log_mask import flush_odno_ledger
@@ -1512,6 +1512,135 @@ def _repair_state_only():
     print(f"[상태 복구] {symbol} T/체결 watermark를 유지하고 리버스 상태만 초기화했습니다.")
 
 
+def _reverse_ledger_rewind():
+    """리버스 매도가 일반 매도로 오분류된 정산을 재정산 직전으로 되돌립니다 (REPAIR 전용, CAS).
+
+    사용 (REPAIR_ACTION=REVERSE_LEDGER_REWIND, 주문·브로커 호출 없음):
+        REPAIR_REWIND_SYMBOL=SOXL
+        REPAIR_REWIND_ODNO=<오분류된 리버스 매도 주문번호>   # 생략하면 후보가 정확히 1개일 때 자동 선택(공개 입력에 원문 노출 방지)
+        REPAIR_REWIND_EXPECT_HASH=<대상 종목 canonical_state_hash>
+        REPAIR_REWIND_EXPECT_T=<현재 T>
+        REPAIR_REWIND_GUARD_SYMBOL=TQQQ          # 절대 바뀌면 안 되는 다른 종목
+        REPAIR_REWIND_GUARD_HASH=<그 종목 canonical_state_hash>
+        REPAIR_REWIND_APPLY=true                 # 없으면 미리보기만 (저장 없음)
+
+    - 대상 종목의 hash/T 가 기대값과 같을 때만, 그리고 가드 종목 hash 가 기대값과 같을 때만 진행합니다.
+    - 저장은 대상 종목 1개뿐이며, 저장 뒤 가드 종목 hash 가 그대로인지 다시 확인합니다.
+    - 되돌리는 범위와 전제는 `state.rewind_misclassified_reverse_sell` 참고.
+    - 실행 직후 환경변수를 삭제하세요 (1회성).
+    """
+    def _required(name):
+        raw = os.environ.get(name)
+        if not raw or not raw.strip():
+            raise RuntimeError(f"리버스 원장 되돌리기 환경변수가 없습니다: {name}")
+        return raw.strip()
+
+    symbol = _required("REPAIR_REWIND_SYMBOL").upper()
+    odno = os.environ.get("REPAIR_REWIND_ODNO", "").strip()
+    expect_hash = _required("REPAIR_REWIND_EXPECT_HASH")
+    expect_t = float(_required("REPAIR_REWIND_EXPECT_T"))
+    guard_symbol = _required("REPAIR_REWIND_GUARD_SYMBOL").upper()
+    guard_hash = _required("REPAIR_REWIND_GUARD_HASH")
+    apply_change = os.environ.get("REPAIR_REWIND_APPLY", "").strip().lower() == "true"
+    if guard_symbol == symbol:
+        raise RuntimeError("가드 종목은 대상 종목과 달라야 합니다")
+
+    state = load_state(symbol)
+    actual_hash = canonical_state_hash(state)
+    if actual_hash != expect_hash:
+        raise RuntimeError(f"원장 되돌리기 hash 불일치: actual={actual_hash}, expected={expect_hash}")
+    if abs(float(state.get("T", 0.0)) - expect_t) > 1e-4:
+        raise RuntimeError(f"원장 되돌리기 T 불일치: actual={state.get('T')}, expected={expect_t}")
+    guard_before = canonical_state_hash(load_state(guard_symbol))
+    if guard_before != guard_hash:
+        raise RuntimeError(f"가드 종목 {guard_symbol} hash 불일치: actual={guard_before}, expected={guard_hash}")
+
+    if not odno:
+        candidates = find_misclassified_reverse_sell_odnos(state)
+        if len(candidates) != 1:
+            raise RuntimeError(f"되돌릴 대상 주문을 자동으로 정할 수 없습니다 (후보 {len(candidates)}개) — REPAIR_REWIND_ODNO 를 지정하세요")
+        odno = candidates[0]
+    try:
+        summary = rewind_misclassified_reverse_sell(state, odno)
+    except ValueError as exc:
+        raise RuntimeError(f"원장 되돌리기 전제 불충족: {exc}") from exc
+
+    print(f"[원장 되돌리기] {symbol} 주문 {mask_odno(odno)} — 원장 seq {summary['removed_seq']} 제거")
+    print(f"  T: {summary['T'][0]} → {summary['T'][1]}")
+    print(f"  net_invested: {summary['net_invested'][0]:.2f} → {summary['net_invested'][1]:.2f}")
+    print(f"  체결 마커: 수량 {summary['marker_qty'][0]}→0, 금액 {summary['marker_amount'][0]:.2f}→0.00")
+    print("  유지: 워터마크, position_qty, reverse_mode, 다른 주문 메타, 가드 종목")
+    if not apply_change:
+        print("[원장 되돌리기] 미리보기입니다 — 저장하지 않았습니다 (적용하려면 REPAIR_REWIND_APPLY=true).")
+        return
+
+    save_state(symbol, state)
+    guard_after = canonical_state_hash(load_state(guard_symbol))
+    if guard_after != guard_hash:
+        raise RuntimeError(f"가드 종목 {guard_symbol} 가 저장 후 변경되었습니다: {guard_after}")
+    print(f"[원장 되돌리기] {symbol} 저장 완료. {guard_symbol} 불변 확인. 다음 RUN 정산이 리버스 매도로 1회 반영합니다.")
+
+
+def _reverse_watermark_restore():
+    """미정산 리버스 매도가 남은 종목의 워터마크를 이전 값으로 되돌립니다 (REPAIR 전용, CAS).
+
+    REVERSE_LEDGER_REWIND 직후 후속 조치: 오분류 정산이 올려 둔 워터마크 때문에 독립 검증기가 정상 정산을
+    '과다 반영'으로 판정하므로, 오분류 직전 워터마크(Evidence 의 watermark_before / last_processed_ordno_before)로 되돌립니다.
+
+    사용 (REPAIR_ACTION=REVERSE_WATERMARK_RESTORE, 주문·브로커 호출 없음):
+        REPAIR_REWIND_SYMBOL / EXPECT_HASH / EXPECT_T / GUARD_SYMBOL / GUARD_HASH   (REVERSE_LEDGER_REWIND 와 동일)
+        REPAIR_REWIND_TARGET_LAST_UPDATED=<ISO 시각, 현재보다 과거>
+        REPAIR_REWIND_TARGET_LAST_ORDNO=<선택: 생략하면 원장의 마지막 항목 주문번호 — 공개 입력에 원문을 받지 않기 위함>
+        REPAIR_REWIND_APPLY=true                  # 없으면 미리보기만
+    - 바꾸는 것은 last_updated, last_processed_ordno 두 필드뿐이며 저장 전후 가드 종목 hash 불변을 확인합니다.
+    """
+    def _required(name):
+        raw = os.environ.get(name)
+        if not raw or not raw.strip():
+            raise RuntimeError(f"워터마크 복원 환경변수가 없습니다: {name}")
+        return raw.strip()
+
+    symbol = _required("REPAIR_REWIND_SYMBOL").upper()
+    expect_hash = _required("REPAIR_REWIND_EXPECT_HASH")
+    expect_t = float(_required("REPAIR_REWIND_EXPECT_T"))
+    guard_symbol = _required("REPAIR_REWIND_GUARD_SYMBOL").upper()
+    guard_hash = _required("REPAIR_REWIND_GUARD_HASH")
+    target_updated = _required("REPAIR_REWIND_TARGET_LAST_UPDATED")
+    target_ordno = os.environ.get("REPAIR_REWIND_TARGET_LAST_ORDNO", "").strip()
+    apply_change = os.environ.get("REPAIR_REWIND_APPLY", "").strip().lower() == "true"
+    if guard_symbol == symbol:
+        raise RuntimeError("가드 종목은 대상 종목과 달라야 합니다")
+
+    state = load_state(symbol)
+    actual_hash = canonical_state_hash(state)
+    if actual_hash != expect_hash:
+        raise RuntimeError(f"워터마크 복원 hash 불일치: actual={actual_hash}, expected={expect_hash}")
+    if abs(float(state.get("T", 0.0)) - expect_t) > 1e-4:
+        raise RuntimeError(f"워터마크 복원 T 불일치: actual={state.get('T')}, expected={expect_t}")
+    guard_before = canonical_state_hash(load_state(guard_symbol))
+    if guard_before != guard_hash:
+        raise RuntimeError(f"가드 종목 {guard_symbol} hash 불일치: actual={guard_before}, expected={guard_hash}")
+
+    try:
+        summary = restore_watermark_for_unapplied_reverse_order(state, target_updated, target_ordno or None)
+    except ValueError as exc:
+        raise RuntimeError(f"워터마크 복원 전제 불충족: {exc}") from exc
+
+    print(f"[워터마크 복원] {symbol}")
+    print(f"  last_updated: {summary['last_updated'][0]} → {summary['last_updated'][1]}")
+    print(f"  last_processed_ordno: {mask_odno(summary['last_processed_ordno'][0])} → {mask_odno(summary['last_processed_ordno'][1])}")
+    print("  유지: T, net_invested, 원장, 마커, reverse_mode, 가드 종목")
+    if not apply_change:
+        print("[워터마크 복원] 미리보기입니다 — 저장하지 않았습니다 (적용하려면 REPAIR_REWIND_APPLY=true).")
+        return
+
+    save_state(symbol, state)
+    guard_after = canonical_state_hash(load_state(guard_symbol))
+    if guard_after != guard_hash:
+        raise RuntimeError(f"가드 종목 {guard_symbol} 가 저장 후 변경되었습니다: {guard_after}")
+    print(f"[워터마크 복원] {symbol} 저장 완료. {guard_symbol} 불변 확인.")
+
+
 def _reverse_audit_only():
     """브로커 주문이력과 state orders_meta를 대조해 리버스 주문 상태만 출력합니다.
 
@@ -1896,7 +2025,8 @@ _REPAIR_LEGACY_MAP = {
 # REPAIR 모드에서 허용되는 액션 목록
 _REPAIR_ACTIONS = {"DIAGNOSTIC", "REVERSE_AUDIT", "REVERSE_RECONCILE", "REVERSE_RESET",
                    "REVERSE_T_FIX", "FENCE_CLEAR", "NET_INVESTED_REPAIR",
-                   "CYCLE_START_SET", "ASSUME_EXPIRY", "REINFERENCE", "FORCE_T"}
+                   "CYCLE_START_SET", "ASSUME_EXPIRY", "REINFERENCE", "FORCE_T",
+                   "REVERSE_LEDGER_REWIND", "REVERSE_WATERMARK_RESTORE"}
 
 
 def _repair_reinference():
@@ -2158,6 +2288,10 @@ def _dispatch_repair():
             _repair_reinference()
         elif action == "FORCE_T":
             _repair_force_t()
+        elif action == "REVERSE_LEDGER_REWIND":
+            _reverse_ledger_rewind()
+        elif action == "REVERSE_WATERMARK_RESTORE":
+            _reverse_watermark_restore()
         elif action in _REPAIR_LEGACY_MAP:
             globals()[_REPAIR_LEGACY_MAP[action]]()
         else:

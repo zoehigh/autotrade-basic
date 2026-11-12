@@ -539,6 +539,8 @@ def test_reverse_unconfirmed_amount_holds_without_marker_change():
     before = deepcopy(state)
     orders = [_amount_row("R1", side="매도", qty=5, amount=None,
                           ts="2026-10-21T08:16:50+00:00")]
+    # 실제 이력 형태: ord_dt=미국 영업일, ord_tmd=KST 시각 (제출 KST 10/21 08:16 → ET 10/20)
+    orders[0]["ord_dt"], orders[0]["ord_tmd"] = "20261020", "081650"
     reconcile_reverse_fills(state, orders)
     assert state.get("_settlement_hold") is True
     assert state.get("_pending_amount_odnos") == ["R1"]
