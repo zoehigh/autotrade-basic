@@ -5600,3 +5600,182 @@ def test_halt_then_recovery_rerun_settles(io):
     assert preview_input.T == pytest.approx(2.0)
     assert preview_input.state["last_settlement_id"] == "run-test"
     assert preview_input.settlement_run_id == "run-test"
+
+
+# ── 리버스 reconciliation × 시각 없는 주문이력(NHPLUG) ─────────────
+#
+# e29f9c5 회귀 범위: NHPLUG GSB10030 은 주문이력에 **시각(ord_tmd) 없이 일자만** 내려주고,
+# 그 일자는 미국(ET) 영업일입니다. 봇은 KST 새벽(ET 전일 오후)에 주문하므로
+# 제출일(KST) = ord_dt + 1 이고, 단순 날짜 비교(`ord_dt == submitted_at[:8]`)는 항상
+# 어긋나 리버스 매도를 "리버스 주문 이력 누락"으로 오판했습니다. 그러면
+# `_is_reverse_order` 가 False 가 되어 리버스 매도가 일반 쿼터매도(×0.75)로 정산됩니다
+# (2026-11-06 NHPLUG SOXL 실측: T 17.325 → 14.4375, verify-settlement 가 검출).
+#
+# 기존 단위 테스트(tests/test_reverse_order_date_no_time.py)는 state 헬퍼만 고정합니다.
+# 여기서는 SETTLE 파이프라인(`pipeline.settle_positions` → `update_T_from_history`
+# → `reconcile_reverse_fills`)까지 연결해 T·순투입·마커·원장이 기대값이 되는지 고정합니다.
+#
+# wall-clock 비의존: 정산 기준 시각은 `now=` 인자로만 고정하고 전역 시간 모킹은 쓰지 않습니다.
+
+
+class TestReverseReconciliationDateOnlyHistory:
+    """NHPLUG식 시각 없는(일자만) 리버스 이력이 SETTLE 리버스 정산에 반영됩니다."""
+
+    # 2026-10-24(토) 12:00 UTC → 정산 대상 세션 2026-10-23(금), 실행 세션 2026-10-26(월).
+    NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+
+    # KST 10/24 05:22 = ET 10/23 16:22 → 미국 세션 20261023.
+    SUBMITTED_AT = "20261024052250"
+    SUBMITTED_SESSION = "2026-10-23"
+
+    def _position_history(self):
+        """보유 44주를 만든 매수 이력 (정산 세션 이전, 워터마크 이전)."""
+        return [
+            self._buy_row("2401", 24, "20260902", 50.0),
+            self._buy_row("2402", 20, "20260916", 50.0),
+        ]
+
+    def _buy_row(self, odno, qty, ord_dt, price):
+        return {
+            "odno": odno,
+            "ord_dt": ord_dt,          # 미국(ET) 영업일
+            "ord_tmd": "041500",       # KST 시각
+            "ord_datetime_utc": f"{ord_dt[:4]}-{ord_dt[4:6]}-{ord_dt[6:]}T19:15:00+00:00",
+            "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": str(qty),
+            "ft_ccld_amt3": str(qty * price),
+            "ft_ccld_unpr3": str(price),
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+
+    def _reverse_state(self, **overrides):
+        """리버스 1일차 매도(T 19.25 → ×0.9)를 기다리는 상태."""
+        state = _base_state(
+            T=19.25,
+            net_invested=5000.0,
+            position_qty=44,
+            cycle_start_date="2026-09-01",
+            last_updated="2026-10-22T12:00:00+00:00",
+            last_processed_ordno="2500",
+            reverse_mode={
+                "active": True,
+                "day_count": 0,
+                "cycle_id": "C1",
+                "cycle_start_date": "2026-09-01",
+            },
+            orders_meta={
+                "2617": {
+                    "side": "SELL",
+                    "total_qty": 4,
+                    "t_target": 0.0,
+                    "processed_filled_qty": 0,
+                    "processed_filled_amount": 0.0,
+                    "fill_marker_version": 1,
+                    "reverse_action": "sell",
+                    "reverse_day": 1,
+                    "reverse_base_t": 19.25,
+                    "reverse_t_factor": 0.9,
+                    "cycle_id": "C1",
+                    "submitted_at": self.SUBMITTED_AT,
+                    "submitted_session": self.SUBMITTED_SESSION,
+                }
+            },
+        )
+        state.update(overrides)
+        return state
+
+    def _date_only_sell_row(self, **overrides):
+        """NHPLUG GSB10030 실측 형태 — ord_tmd 없음, ord_dt 는 미국 영업일."""
+        row = {
+            "odno": "2617",
+            "ord_dt": "20261023",           # 미국(ET) 영업일
+            "ord_tmd": "",                  # 시각 없음 (어댑터가 04:10 KST 가정으로 UTC 생성)
+            "ord_datetime_utc": "2026-10-23T19:10:00+00:00",
+            "sll_buy_dvsn_cd_name": "매도",
+            "ft_ccld_qty": "4",
+            "ft_ccld_amt3": "179.52",
+            "ft_ccld_unpr3": "44.88",
+            "nccs_qty": "0",
+            "prcs_stat_name": "체결",
+        }
+        row.update(overrides)
+        return row
+
+    def _settle(self, io, state, rows, *, balance_qty=40):
+        io["load"]("TQQQ", deepcopy(state))
+        broker = _make_broker(balance_qty=balance_qty, history=list(rows))
+        return pipeline.settle_positions(
+            ReadOnlyBroker(broker), _symbol_config(), now=self.NOW
+        )
+
+    def _reverse_ledger_entries(self, state):
+        return [
+            entry
+            for entry in (state.get("settlement_ledger", {}).get("entries") or [])
+            if entry.get("kind") == "reverse_sell"
+        ]
+
+    def test_date_only_history_settles_reverse_sell_with_09_factor(self, io):
+        """일자만 있는 이력도 ×0.9 로 반영되고 '리버스 이력 누락' 오판이 없습니다."""
+        rows = self._position_history() + [self._date_only_sell_row()]
+        settled = self._settle(io, self._reverse_state(), rows)
+
+        assert settled.halt_reason is None, f"정산 보류 사유: {settled.halt_reason}"
+        assert len(io["saved"]) == 1, "정상 정산은 state 를 정확히 1회 저장해야 합니다"
+        saved = io["saved"][0]
+
+        # 19.25 × 0.9 = 17.325 (일반 쿼터매도 ×0.75 였다면 14.4375)
+        assert saved["T"] == pytest.approx(17.325)
+        assert saved["reverse_mode"]["day_count"] == 1
+        assert "reconciliation_error" not in saved["reverse_mode"]
+        assert saved["reverse_mode"].get("reconciliation_only") is not True
+
+        meta = saved["orders_meta"]["2617"]
+        assert meta["processed_filled_qty"] == 4
+        assert meta["processed_filled_amount"] == pytest.approx(179.52)
+
+        # 매도 체결대금만큼 순투입이 줄고, 원장에는 리버스 매도 항목이 남습니다.
+        assert saved["net_invested"] == pytest.approx(5000.0 - 179.52)
+        entries = self._reverse_ledger_entries(saved)
+        assert len(entries) == 1
+        assert entries[0]["odno"] == "2617"
+        assert entries[0]["factor"] == pytest.approx(0.9)
+        assert entries[0]["base_t"] == pytest.approx(19.25)
+        assert entries[0]["delta"] == pytest.approx(-1.925)
+
+    def test_legacy_meta_without_submitted_session_still_matches(self, io):
+        """`submitted_session` 이 없는 기존 메타도 제출 시각으로 세션을 계산해 인정합니다."""
+        state = self._reverse_state()
+        state["orders_meta"]["2617"].pop("submitted_session")
+        rows = self._position_history() + [self._date_only_sell_row()]
+        settled = self._settle(io, state, rows)
+
+        assert settled.halt_reason is None, f"정산 보류 사유: {settled.halt_reason}"
+        saved = io["saved"][0]
+        assert saved["T"] == pytest.approx(17.325)
+        assert saved["orders_meta"]["2617"]["processed_filled_qty"] == 4
+
+    def test_다른_세션의_일자만_있는_행은_리버스_체결로_반영하지_않는다(self, io):
+        """세션 날짜가 어긋난 행은 ord_dt±1 을 모두 받아주지 않습니다 (Codex P2).
+
+        제출 KST 날짜를 그대로 ord_dt 로 적어 둔 행(20261024)입니다. 단순 날짜 비교라면
+        매칭되지만, 미국 세션 기준으로는 다음 세션이므로 이 주문의 체결이 아닙니다.
+        받아주면 연속 세션의 같은 주문번호가 섞여 T 가 다른 배율로 고정됩니다.
+        """
+        wrong_session_row = self._date_only_sell_row(
+            ord_dt="20261024",  # 제출 KST 날짜 = 이 주문의 미국 세션(20261023)과 다름
+            ord_datetime_utc="2026-10-24T19:10:00+00:00",
+        )
+        rows = self._position_history() + [wrong_session_row]
+        settled = self._settle(io, self._reverse_state(), rows)
+
+        state = settled.state
+        assert state["orders_meta"]["2617"]["processed_filled_qty"] == 0, (
+            "다른 세션 행을 리버스 체결로 반영하면 연속 세션의 같은 주문번호가 섞입니다"
+        )
+        assert self._reverse_ledger_entries(state) == []
+        assert state["reverse_mode"]["day_count"] == 0
+        assert state["T"] != pytest.approx(17.325), (
+            "매칭되지 않은 행으로 리버스 배율(×0.9)을 적용하면 안 됩니다"
+        )

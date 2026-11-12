@@ -49,7 +49,7 @@ def test_tqqq_order_history():
         print(f"❌ 실패: {str(e)}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"TQQQ 주문체결내역 조회 실패: {e}")
 
 
 if __name__ == "__main__":

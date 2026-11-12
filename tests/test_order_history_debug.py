@@ -87,7 +87,7 @@ def test_all_order_history_debug():
         if response_data.get("rt_cd") != "0":
             msg = response_data.get("msg1", "알 수 없는 에러")
             print(f"❌ API 호출 실패: {msg}")
-            return False
+            pytest.fail(f"주문체결내역 전체 조회 API 실패 (rt_cd={response_data.get('rt_cd')}): {msg}")
         
         output = response_data.get("output", [])
         
@@ -140,7 +140,7 @@ def test_all_order_history_debug():
         print(f"❌ 실패: {str(e)}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"주문체결내역 전체 조회(디버깅) 실패: {e}")
 
 
 if __name__ == "__main__":

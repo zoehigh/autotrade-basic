@@ -127,7 +127,7 @@ def test_overseas_symbol_order_history():
         print(f"❌ 테스트 실패: {str(e)}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"주문체결내역 조회 실패 ({TEST_SYMBOL}/{TEST_EXCHANGE}): {e}")
 
 
 if __name__ == "__main__":

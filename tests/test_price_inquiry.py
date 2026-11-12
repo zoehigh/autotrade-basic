@@ -62,7 +62,7 @@ def test_tqqq_price_inquiry():
         print("4. 한국투자증권 API 상태 확인")
         print("5. EGW00133 오류는 자동으로 1분 대기 후 재시도됩니다")
         
-        return False
+        pytest.fail(f"TQQQ 현재가 조회 실패: {e}")
 
 
 if __name__ == "__main__":
