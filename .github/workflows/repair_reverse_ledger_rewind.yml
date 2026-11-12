@@ -3,20 +3,34 @@ name: State 복구 - 리버스 원장 되돌리기 (수동 승인)
 # 리버스 매도가 일반 매도로 오분류 정산된 종목의 state 를 재정산 직전으로 되돌립니다 (REPAIR_ACTION=REVERSE_LEDGER_REWIND).
 # 워터마크 복원의 목표 주문번호도 입력받지 않고 복구 전 원장의 마지막 항목에서 도출합니다.
 # 주문번호 원문은 공개 입력(실행 화면에 노출)으로 받지 않습니다 — 봇이 후보를 정확히 1개로 자동 특정(여러 개면 중단).
-# 주문·브로커 호출 없음 (인증정보 미주입). 흐름: preview(저장 없음) → approve(Environment 승인) → apply(복구 + 독립 검증 + 캐시 저장)
+# 주문·브로커 호출 없음 (브로커 인증정보 미주입, TRADE_MODE=REPAIR). 캐시의 state 만 바꾸고, 다음 거래 실행이 그 결과를 읽습니다.
+#
+# ── 실행 절차 (두 번 실행합니다) ──────────────────────────────────────────────
+#  `confirm` 은 실행을 **시작할 때** 입력하는 값이라, 같은 실행 안에서 미리보기를 보고 나서 정할 수 없습니다
+#  (Environment `state-repair` 에 Required reviewers 가 없으면 approve 단계는 대기 없이 통과합니다).
+#   1) `confirm` 을 비우고 실행 → 미리보기만 하고 저장하지 않음. 실행 요약(Summary)에 현재값·목표값이 나란히 표시됩니다.
+#   2) 미리보기 출력과, 근거 실행 Evidence 의 `watermark_before` 등을 대조합니다 (실행자가 직접 대조 — 독립된 승인자가 있는 것이 아닙니다).
+#   3) 같은 입력에 `confirm`="REWIND <종목>" 을 넣어 다시 실행 → 최신 캐시·hash 재검증 → 암호화 백업 → 적용.
+#  1)~3) 사이에 거래 실행이 끼어 새 캐시가 생기면 3) 의 최신 캐시 검사에서 중단됩니다 (새 restore_key·SHA·hash 로 처음부터).
+#  따라서 두 번의 실행은 **다음 거래 슬롯 전에** 끝내고, 거래 슬롯(대기 중 실행은 새 실행에 밀려 취소될 수 있음) 시간대는 피하세요.
 #
 # 안전장치
 #  - 복원 대상 캐시 키가 해당 브로커의 **가장 최신 캐시**여야 함 (오래된 캐시로 최신 state 를 덮어쓰는 사고 방지)
 #  - 복원한 .state.json 의 SHA-256 이 입력값과 같아야 함 (백업과 동일한 상태임을 확인)
+#  - 복구 전 state 를 **암호화 백업(gpg, 왕복 검증)** 해 artifact 로 보관 — 이 백업 잡이 성공해야만 apply 가 시작됩니다.
+#    백업 passphrase(secrets.STATE_BACKUP_PASSPHRASE)는 **백업 잡에만** 주입합니다. 봇을 실행하는 잡(preview/apply)에는 시크릿이 없습니다.
+#    평문 state 는 공개 artifact 로 올리지 않습니다 (공개 저장소 — artifact 는 누구나 받을 수 있음).
 #  - 봇 CAS: 대상 종목 canonical hash·T, 가드 종목 hash (저장 전후 불변)
 #  - 복구 직후 ops/verify_repair_rewind.py 가 JSON 만으로 독립 검증 (가드 종목 불변, 허용 필드만 변경, 기대값 재계산)
 #  - 검증이 통과해야만 새 캐시(state-<broker>-demo-<run_id>)를 저장. 실패하면 아무 캐시도 만들지 않음
+#  - `actions/cache/save` 는 캐시 서비스 장애·예약 충돌에도 경고만 남기고 성공할 수 있으므로, 저장 뒤 **새 키가 실제로 존재하는지** 한 번 더 확인합니다
+#  - 실행 요약(Summary)에 복구 적용·독립 검증·캐시 저장·새 캐시 존재 확인 결과를 **따로** 남깁니다 (실패해도 남김, 주문번호 원문 없음)
 #  - 거래 워크플로와 같은 concurrency 그룹(trade-<broker>-demo) — 거래 실행과 동시에 돌지 않음
 #  - 모의(demo) 전용, main 브랜치에서만 실행
 #
 # 승인 게이트 (선택 사항): Environment `state-repair` 에 Required reviewers 를 지정하면 apply 직전에 사람의 승인을 기다립니다.
-# **지정하지 않아도 정상 동작**합니다 — 미설정이면 approve 단계는 대기 없이 통과하고, 이때는 아래 confirm 입력("REWIND <종목>"),
-# 미리보기 확인, CAS·독립 검증이 방어선입니다. 이 설정은 이 수동 복구 워크플로에만 영향을 주며 정기 거래 실행과는 무관합니다.
+# **지정하지 않아도 정상 동작**합니다 — 미설정이면 approve 단계는 대기 없이 통과하고, 이때는 위 절차의 실행자 대조,
+# confirm 입력, CAS·독립 검증, 암호화 백업이 방어선입니다. 이 설정은 이 수동 복구 워크플로에만 영향을 주며 정기 거래 실행과는 무관합니다.
 # 협업자가 늘어 작업자≠승인자를 분리하거나 실계좌로 확장할 때 지정하세요 ("Prevent self-review" 는 단독 운영이면 끄세요).
 on:
   workflow_dispatch:
@@ -62,11 +76,15 @@ on:
         required: true
         type: string
       target_last_updated:
-        description: 'REVERSE_WATERMARK_RESTORE 전용: 복원할 last_updated (ISO, 현재보다 과거, 예: 2026-11-04T19:10:00+00:00)'
+        description: 'REVERSE_WATERMARK_RESTORE 전용: 복원할 last_updated (ISO, 현재보다 과거, 예: 2026-11-04T19:10:00+00:00). 근거 실행 Evidence 의 watermark_before 와 직접 대조한 값을 넣으세요'
+        required: false
+        type: string
+      evidence_run_id:
+        description: 'REVERSE_WATERMARK_RESTORE 필수(숫자): 목표값의 근거로 삼은 Evidence 가 있는 실행 번호 (값이 맞다는 증명은 아니고 근거를 추적하기 위한 기록). 되돌리기 동작은 선택'
         required: false
         type: string
       confirm:
-        description: "적용하려면 정확히 'REWIND <종목>' 입력 (예: REWIND SOXL). 비우면 미리보기만"
+        description: "적용하려면 정확히 'REWIND <종목>' 입력 (예: REWIND SOXL). 비우면 미리보기만 — 먼저 비우고 실행해 출력을 대조한 뒤, 같은 입력에 confirm 을 넣어 다시 실행"
         required: false
         type: string
 
@@ -86,6 +104,7 @@ env:
   IN_GUARD_HASH: ${{ inputs.guard_hash }}
   IN_ACTION: ${{ inputs.action }}
   IN_TARGET_UPDATED: ${{ inputs.target_last_updated }}
+  IN_EVIDENCE_RUN: ${{ inputs.evidence_run_id }}
 
 jobs:
   preview:
@@ -121,6 +140,10 @@ jobs:
           [[ "$IN_T" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "expect_t 형식 오류"
           if [[ "$IN_ACTION" == "REVERSE_WATERMARK_RESTORE" ]]; then
             [[ "$IN_TARGET_UPDATED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+\+00:00$ ]] || fail "target_last_updated 는 UTC ISO 형식(…+00:00)이어야 합니다"
+            # 근거 추적용 기록입니다 (값의 정확성을 증명하지는 않음). 워터마크 복원에서는 필수입니다.
+            [[ "$IN_EVIDENCE_RUN" =~ ^[0-9]{1,20}$ ]] || fail "evidence_run_id(목표값의 근거 Evidence 가 있는 실행 번호, 숫자)가 필요합니다"
+          elif [[ -n "$IN_EVIDENCE_RUN" ]]; then
+            [[ "$IN_EVIDENCE_RUN" =~ ^[0-9]{1,20}$ ]] || fail "evidence_run_id 는 숫자여야 합니다"
           fi
 
       - name: 복원 대상이 해당 브로커의 최신 캐시인지 확인
@@ -148,6 +171,7 @@ jobs:
           echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
 
       - name: 미리보기 (저장 없음)
+        id: dryrun
         env:
           BROKER: ${{ inputs.broker }}
           BROKER_MODE: demo
@@ -170,6 +194,7 @@ jobs:
           set -euo pipefail
           uv run python trading_bot.py
           # 미리보기는 저장하지 않으므로 파일이 그대로여야 합니다
+          # (미리보기 실행이 실수로 state 를 쓰는 회귀를 잡는 방어선 — 이 잡에는 캐시 저장 단계가 없습니다)
           echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
 
       - name: 적용 여부 결정
@@ -185,6 +210,58 @@ jobs:
             echo "confirm 문구가 없거나 다릅니다 → 미리보기만 하고 종료합니다."
           fi
 
+      - name: 미리보기 요약 (현재값·목표값 나란히)
+        if: always()
+        env:
+          DRYRUN_OUTCOME: ${{ steps.dryrun.outcome }}
+          WANT_APPLY: ${{ steps.gate.outputs.want_apply }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          env = os.environ
+          symbol = env.get("IN_SYMBOL", "")
+          try:
+              with open(".state.json", encoding="utf-8") as f:
+                  current = (json.load(f).get(symbol) or {})
+          except (OSError, ValueError):
+              current = {}
+          action = env.get("IN_ACTION", "")
+          lines = [
+              "## 복구 미리보기 (저장 없음)",
+              "",
+              f"- 브로커/종목: `{env.get('IN_BROKER', '')}` / `{symbol}`",
+              f"- 복구 동작: `{action}`",
+              f"- 복원 캐시: `{env.get('IN_RESTORE_KEY', '')}`",
+              f"- 미리보기 실행 결과: `{env.get('DRYRUN_OUTCOME', '') or '미실행'}` (skipped 는 앞 단계 실패로 건너뜀)",
+              "",
+              "| 항목 | 현재(복원본) | 목표/기대 |",
+              "|---|---|---|",
+              f"| T | {current.get('T', '(없음)')} | 입력 expect_t = {env.get('IN_T', '')} (되돌리기는 reverse_base_t 로 복귀) |",
+              f"| net_invested | {current.get('net_invested', '(없음)')} | (되돌리기는 반영 금액만큼 증가) |",
+              f"| last_updated | {current.get('last_updated', '(없음)')} | "
+              + (f"{env.get('IN_TARGET_UPDATED', '')}" if action == "REVERSE_WATERMARK_RESTORE" else "변경 없음")
+              + " |",
+              "",
+          ]
+          if action == "REVERSE_WATERMARK_RESTORE":
+              lines += [
+                  f"- 근거 Evidence 실행 번호(evidence_run_id): `{env.get('IN_EVIDENCE_RUN', '')}`",
+                  "- **목표 last_updated 가 그 Evidence 의 `watermark_before` 와 같은지 직접 대조하세요.** 이 워크플로는 값의 정확성을 확인하지 못합니다.",
+                  "",
+              ]
+          if env.get("WANT_APPLY") == "true":
+              lines.append("- 이 실행에는 confirm 이 들어 있어 승인 게이트 → 백업 → 적용 단계로 이어집니다.")
+          else:
+              lines += [
+                  "- 이 실행은 미리보기만 하고 끝납니다. 출력을 대조한 뒤 **같은 입력에 confirm=`REWIND <종목>`** 을 넣어 다시 실행하세요.",
+                  "- 두 번째 실행은 다음 거래 슬롯 전에 끝내세요 (그 사이 새 캐시가 생기면 최신 캐시 검사에서 중단됩니다).",
+              ]
+          with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
+
   approve:
     name: 승인 게이트
     needs: preview
@@ -195,9 +272,94 @@ jobs:
     steps:
       - run: echo "승인 게이트를 통과했습니다. Required reviewers 미설정 시에는 별도 승인 대기 없이 진행됩니다."
 
+  backup:
+    name: 복구 전 암호화 백업 (성공해야 적용 시작)
+    needs: approve
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # 이 잡은 캐시를 읽기만 합니다(저장 없음). 봇 코드를 실행하지 않으므로 STATE_BACKUP_PASSPHRASE 는 이 잡에만 주입합니다.
+    # 거래 concurrency 그룹에는 넣지 않습니다 — 사이에 거래가 끼면 apply 의 최신 캐시 재확인에서 중단됩니다.
+    steps:
+      - name: state 캐시 복원 (정확한 키)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state.json
+          key: ${{ inputs.restore_key }}
+          fail-on-cache-miss: true
+
+      - name: 복원본 SHA-256 확인 후 암호화·왕복 검증 (state 값은 출력하지 않음)
+        id: encrypt
+        shell: bash
+        env:
+          PASSPHRASE: ${{ secrets.STATE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # apply 가 수정할 파일과 바이트 단위로 같은 것을 백업합니다 (같은 SHA-256 입력으로 고정)
+          echo "$IN_FILE_SHA  .state.json" | sha256sum -c -
+          test -s .state.json
+          python3 -m json.tool .state.json > /dev/null
+          if [[ -z "$PASSPHRASE" ]]; then
+            echo "::error::STATE_BACKUP_PASSPHRASE 가 비어 있거나 사용할 수 없어 백업할 수 없습니다 — 복구를 진행하지 않습니다"
+            exit 1
+          fi
+          # "Re-run all jobs" 는 run_id 가 같고 run_attempt 만 올라갑니다. artifact 는 덮어쓸 수 없으므로 이름에 시도 번호를 넣습니다.
+          name="repair-backup-${IN_BROKER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --symmetric \
+              --cipher-algo AES256 --s2k-digest-algo SHA256 \
+              --output "${name}.gpg" .state.json
+          test -s "${name}.gpg"
+
+          # 왕복 검증: 방금 만든 암호문을 다시 복호화해 원본과 바이트 단위로 같은지 확인합니다.
+          printf '%s' "$PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --decrypt --output roundtrip.state.json "${name}.gpg"
+          cmp .state.json roundtrip.state.json
+          rm -f roundtrip.state.json
+
+          # 원본·암호문 SHA-256 은 artifact 안의 파일로 남깁니다 (복호화본이 원본과 같은지 대조하는 기준값).
+          sha256sum .state.json | awk '{print $1}' > "${name}.state.sha256"
+          sha256sum "${name}.gpg" | awk '{print $1}' > "${name}.gpg.sha256"
+          echo "왕복 검증 통과: 복호화본 == 원본 (평문은 업로드하지 않습니다)"
+
+      - name: 암호화 백업만 업로드 (보관 30일)
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-backup-${{ inputs.broker }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            repair-backup-${{ inputs.broker }}-${{ github.run_id }}-${{ github.run_attempt }}.gpg
+            repair-backup-${{ inputs.broker }}-${{ github.run_id }}-${{ github.run_attempt }}.state.sha256
+            repair-backup-${{ inputs.broker }}-${{ github.run_id }}-${{ github.run_attempt }}.gpg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 백업 결과 요약
+        if: always()
+        env:
+          ENCRYPT_OUTCOME: ${{ steps.encrypt.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          {
+            echo "## 복구 전 암호화 백업"
+            echo
+            echo "| 단계 | 결과 |"
+            echo "|---|---|"
+            echo "| 암호화·왕복 검증 | ${ENCRYPT_OUTCOME:-미실행} |"
+            echo "| artifact 업로드(보관 30일) | ${UPLOAD_OUTCOME:-미실행} |"
+            echo
+            if [[ "${ENCRYPT_OUTCOME:-}" == "success" && "${UPLOAD_OUTCOME:-}" == "success" ]]; then
+              echo "- 백업 성공 → 적용 단계가 진행됩니다. artifact: \`repair-backup-${IN_BROKER}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\` (gpg 암호화본, 복호화는 STATE_BACKUP_PASSPHRASE)"
+            else
+              echo "- **백업 실패 → 복구는 진행되지 않습니다.** 캐시는 바뀌지 않았습니다."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   apply:
     name: 적용 (복구 + 독립 검증 + 캐시 저장)
-    needs: approve
+    needs: [approve, backup]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: ${{ inputs.broker }}-demo
@@ -236,6 +398,7 @@ jobs:
           cp .state.json "$RUNNER_TEMP/state.before.json"
 
       - name: 복구 적용 (REPAIR, 주문 없음)
+        id: repair
         env:
           BROKER: ${{ inputs.broker }}
           BROKER_MODE: demo
@@ -258,6 +421,7 @@ jobs:
         run: uv run python trading_bot.py
 
       - name: 독립 검증 (실패하면 캐시를 저장하지 않음)
+        id: verify
         run: |
           set -euo pipefail
           if [[ "$IN_ACTION" == "REVERSE_WATERMARK_RESTORE" ]]; then
@@ -268,12 +432,131 @@ jobs:
           fi
 
       - name: 새 state 캐시 저장
+        id: save
         uses: actions/cache/save@v4
         with:
           path: .state.json
           key: state-${{ inputs.broker }}-demo-${{ github.run_id }}
 
+      # actions/cache/save 는 캐시 서비스 장애·예약 충돌 때도 경고만 남기고 성공으로 끝날 수 있습니다.
+      # 그래서 step outcome 만으로 "저장 성공"이라고 하지 않고, 새 키가 실제로 존재하는지 확인합니다.
+      - name: 새 캐시가 실제로 만들어졌는지 확인
+        id: confirm_saved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          key="state-${IN_BROKER}-demo-${GITHUB_RUN_ID}"
+          tries="${CONFIRM_TRIES:-6}"
+          wait_s="${CONFIRM_SLEEP:-5}"
+          for ((i = 1; i <= tries; i++)); do
+            # 출력을 먼저 변수에 담습니다 (grep -q 가 일찍 끝나 gh 가 SIGPIPE 로 실패 처리되는 것을 피함)
+            found="$(gh cache list -R "$GITHUB_REPOSITORY" --key "$key" --ref refs/heads/main --limit 5 --json key --jq '.[].key' || true)"
+            if grep -Fxq "$key" <<< "$found"; then
+              echo "새 캐시 확인: $key"
+              exit 0
+            fi
+            sleep "$wait_s"
+          done
+          echo "::error::새 캐시($key)를 찾지 못했습니다. actions/cache/save 는 실패해도 경고만 남기고 성공할 수 있어, 복구 결과가 운영 캐시에 반영되지 않았을 수 있습니다. 거래를 재개하기 전에 캐시 목록을 확인하세요."
+          exit 1
+
       - name: 저장 결과 안내
         run: |
-          echo "새 캐시 저장: state-${IN_BROKER}-demo-${GITHUB_RUN_ID}"
+          echo "새 캐시 저장 확인: state-${IN_BROKER}-demo-${GITHUB_RUN_ID}"
           echo "다음 단계: DRY 1건으로 재정산 결과(T, net_invested, day_count)를 확인하세요."
+
+      - name: 감사 요약 (실패해도 기록)
+        if: always()
+        env:
+          REPAIR_OUTCOME: ${{ steps.repair.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          SAVE_OUTCOME: ${{ steps.save.outcome }}
+          CONFIRM_OUTCOME: ${{ steps.confirm_saved.outcome }}
+          BACKUP_RESULT: ${{ needs.backup.result }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          env = os.environ
+
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except (OSError, ValueError):
+                  return None
+
+
+          def sha(path):
+              try:
+                  with open(path, "rb") as f:
+                      return hashlib.sha256(f.read()).hexdigest()
+              except OSError:
+                  return "(없음)"
+
+
+          symbol = env.get("IN_SYMBOL", "")
+          before_path = os.path.join(env.get("RUNNER_TEMP", "."), "state.before.json")
+          before = (load(before_path) or {}).get(symbol) or {}
+          after = (load(".state.json") or {}).get(symbol) or {}
+
+
+          def change(key):
+              return f"{before.get(key, '(없음)')} → {after.get(key, '(없음)')}"
+
+
+          repair = env.get("REPAIR_OUTCOME") or "미실행"
+          verify = env.get("VERIFY_OUTCOME") or "미실행"
+          save = env.get("SAVE_OUTCOME") or "미실행"
+          confirm = env.get("CONFIRM_OUTCOME") or "미실행"
+          run_id = env.get("GITHUB_RUN_ID", "")
+          if save == "success" and confirm == "success":
+              verdict = f"✅ 독립 검증 통과 + 새 캐시 저장 확인: `state-{env.get('IN_BROKER', '')}-demo-{run_id}`"
+          elif save == "success":
+              verdict = ("⚠️ 독립 검증은 통과했고 저장 단계는 끝났지만 **새 캐시가 존재하는지 확인하지 못했습니다**. "
+                         "복구가 운영 캐시에 반영되지 않았을 수 있으니 캐시 목록을 확인하세요.")
+          elif verify == "success":
+              verdict = "⚠️ 독립 검증은 통과했지만 **캐시 저장에 실패**했습니다. 운영 캐시는 복구 전 그대로입니다."
+          else:
+              verdict = "❌ 복구 또는 독립 검증이 통과하지 못했습니다. 캐시는 저장되지 않았고 운영 캐시는 복구 전 그대로입니다."
+          watermark_changed = "예" if before.get("last_processed_ordno") != after.get("last_processed_ordno") else "아니오"
+          lines = [
+              "## 복구 감사 기록",
+              "",
+              verdict,
+              "",
+              "| 단계 | 결과 |",
+              "|---|---|",
+              f"| 암호화 백업 잡 | {env.get('BACKUP_RESULT') or '미실행'} |",
+              f"| 복구 적용 | {repair} |",
+              f"| 독립 검증 | {verify} |",
+              f"| 캐시 저장 단계 | {save} |",
+              f"| 새 캐시 존재 확인 | {confirm} |",
+              "",
+              "| 기록 | 값 |",
+              "|---|---|",
+              f"| 워크플로 커밋 | `{env.get('WORKFLOW_SHA', '')}` |",
+              f"| 실행 번호 | `{run_id}` |",
+              f"| 브로커 / 종목 / 동작 | `{env.get('IN_BROKER', '')}` / `{symbol}` / `{env.get('IN_ACTION', '')}` |",
+              f"| 복원한 캐시 | `{env.get('IN_RESTORE_KEY', '')}` |",
+              f"| 복원본 파일 SHA-256 (입력값) | `{env.get('IN_FILE_SHA', '')}` |",
+              f"| 복구 후 파일 SHA-256 (러너 안) | `{sha('.state.json')}` |",
+              f"| 대상 종목 canonical hash (입력 CAS) | `{env.get('IN_HASH', '')}` |",
+              f"| 가드 종목 / hash (입력 CAS) | `{env.get('IN_GUARD_SYMBOL', '')}` / `{env.get('IN_GUARD_HASH', '')}` |",
+              f"| T | {change('T')} |",
+              f"| net_invested | {change('net_invested')} |",
+              f"| last_updated(워터마크) | {change('last_updated')} |",
+              f"| last_processed_ordno 변경 여부 (원문 미기록) | {watermark_changed} |",
+              f"| 근거 Evidence 실행 번호 | `{env.get('IN_EVIDENCE_RUN', '') or '(미입력)'}` |",
+              "",
+              "- 복구 후 값은 러너 안의 파일 기준이며, **새 캐시 존재 확인까지 성공했을 때만** 운영 캐시에 반영된 것입니다.",
+              f"- 복구 전 상태의 암호화 백업: artifact `repair-backup-{env.get('IN_BROKER', '')}-{run_id}-{env.get('GITHUB_RUN_ATTEMPT', '1')}` (보관 30일, 복호화는 STATE_BACKUP_PASSPHRASE).",
+          ]
+          with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
