@@ -55,7 +55,7 @@ def test_main_브랜치_demo_전용():
 def test_시크릿은_백업_잡의_암호화_단계에만_있다():
     """봇을 실행하는 잡(preview/apply)에는 시크릿이 없고, 백업 passphrase 는 백업 잡에만 주입됩니다."""
     jobs = _wf()["jobs"]
-    for name in ("preview", "approve", "apply"):
+    for name in ("preview", "approve", "hashes", "apply", "summary"):
         assert "secrets." not in json.dumps(jobs[name], ensure_ascii=False), f"{name} 잡에 시크릿 금지"
     backup = json.dumps(jobs["backup"], ensure_ascii=False)
     assert re.findall(r"secrets\.[A-Za-z0-9_]+", backup) == ["secrets.STATE_BACKUP_PASSPHRASE"]
@@ -243,8 +243,11 @@ def _gpg_env(tmp_path):
     return {"GNUPGHOME": str(home)}
 
 
-def _backup_env(tmp_path, sha, passphrase="test-pass"):
-    return {**_gpg_env(tmp_path), "IN_FILE_SHA": sha, "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "2", "PASSPHRASE": passphrase}
+def _backup_env(tmp_path, sha, passphrase="test-pass", mode=""):
+    out = tmp_path / "gh_output.txt"
+    out.write_text("")
+    return {**_gpg_env(tmp_path), "IN_FILE_SHA": sha, "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "4242",
+            "GITHUB_RUN_ATTEMPT": "2", "PASSPHRASE": passphrase, "MODE": mode, "GITHUB_OUTPUT": str(out)}
 
 
 @needs_gpg
@@ -410,7 +413,7 @@ _VALID_INPUT = {
     "IN_BROKER": "nhplug", "IN_RESTORE_KEY": "state-nhplug-demo-123", "IN_FILE_SHA": "a" * 64,
     "IN_HASH": "b" * 64, "IN_GUARD_HASH": "c" * 64, "IN_SYMBOL": "SOXL", "IN_GUARD_SYMBOL": "TQQQ",
     "IN_T": "14.4375", "IN_ACTION": "REVERSE_LEDGER_REWIND", "IN_TARGET_UPDATED": "", "IN_EVIDENCE_RUN": "",
-    "IN_CONFIRM": "",
+    "MODE": "preview",
 }
 
 
@@ -453,7 +456,8 @@ def _fake_gpg(tmp_path):
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
 def test_동적_백업은_전제조건_실패시_gpg_호출_전에_중단한다(tmp_path):
     script = _step("backup", "encrypt")["run"]
-    env = {**_fake_gpg(tmp_path), "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "9", "GITHUB_RUN_ATTEMPT": "1"}
+    env = {**_fake_gpg(tmp_path), "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "9", "GITHUB_RUN_ATTEMPT": "1",
+           "GITHUB_OUTPUT": str(tmp_path / "gh_output.txt"), "MODE": "apply"}
     good_sha = _write_state(tmp_path / ".state.json")
 
     cases = [
@@ -517,7 +521,7 @@ def test_동적_새_캐시_확인_정확한_키가_있을_때만_성공(tmp_path
 def _gate(tmp_path, confirm, symbol="SOXL"):
     out = tmp_path / "gate_out.txt"
     out.write_text("")
-    script = "set -e\n" + _step("preview", "gate")["run"]  # GitHub 의 기본 셸(bash -e)과 같은 조건
+    script = "set -e\n" + _step("preview", "mode")["run"]  # GitHub 의 기본 셸(bash -e)과 같은 조건
     r = _sh(script, tmp_path, {"IN_CONFIRM": confirm, "IN_SYMBOL": symbol, "GITHUB_OUTPUT": str(out)})
     assert r.returncode == 0, r.stderr
     return dict(line.split("=", 1) for line in out.read_text().splitlines())
@@ -530,9 +534,16 @@ def test_동적_게이트_confirm_문구별_실행_범위(tmp_path):
     assert _gate(tmp_path, "REWIND SOXL") == {"mode": "apply", "want_apply": "true", "want_backup": "true"}
     # 정확히 일치하지 않으면 미리보기만: 대소문자·공백·다른 종목·접두어/접미어
     for bad in ("backup SOXL", "Rewind SOXL", "BACKUP  SOXL", "BACKUP SOXL ", " REWIND SOXL", "REWIND TQQQ",
-                "BACKUP TQQQ", "REWIND", "BACKUP", "REWIND SOXL; echo", "REWIND SOXLX"):
+                "BACKUP TQQQ", "REWIND", "REWIND SOXL; echo", "REWIND SOXLX", "backup", "BACKUP ", " BACKUP"):
         assert _gate(tmp_path, bad)["mode"] == "preview", bad
     assert _gate(tmp_path, "BACKUP TQQQ", symbol="TQQQ")["mode"] == "backup"
+    # BACKUP 은 종목 없이도 인정 (종목 입력이 있어도 'BACKUP' 단독은 인정)
+    assert _gate(tmp_path, "BACKUP", symbol="")["mode"] == "backup"
+    assert _gate(tmp_path, "BACKUP")["mode"] == "backup"
+    # 종목이 비어 있으면 REWIND 는 성립하지 않음 (적용은 종목이 있어야 함)
+    assert _gate(tmp_path, "REWIND ", symbol="")["mode"] == "preview"
+    assert _gate(tmp_path, "REWIND", symbol="")["mode"] == "preview"
+    assert _gate(tmp_path, "BACKUP SOXL", symbol="")["mode"] == "preview"
 
 
 def _eval_expr(text, ctx):
@@ -580,12 +591,12 @@ _MODES = {
 }
 
 
-def _simulate(mode, *, ref="refs/heads/main", preview="success", approve="success", backup="success", apply_="success"):
+def _simulate(mode, *, ref="refs/heads/main", preview="success", approve="success", backup="success", hashes="success", apply_="success"):
     """잡을 의존 순서대로 평가해 각 잡의 결과(success/skipped/그 잡이 낸 결과)를 돌려줍니다."""
     jobs = _wf()["jobs"]
-    outcome = {"preview": preview, "approve": approve, "backup": backup, "apply": apply_, "summary": "success"}
+    outcome = {"preview": preview, "approve": approve, "backup": backup, "hashes": hashes, "apply": apply_, "summary": "success"}
     results, outputs = {}, {}
-    for name in ("preview", "approve", "backup", "apply", "summary"):
+    for name in ("preview", "approve", "backup", "hashes", "apply", "summary"):
         ran = _runs(jobs[name], results, outputs, ref)
         results[name] = outcome[name] if ran else "skipped"
         if name == "preview" and results[name] == "success":
@@ -595,12 +606,14 @@ def _simulate(mode, *, ref="refs/heads/main", preview="success", approve="succes
 
 def test_잡_실행_조건_미리보기만이면_backup_apply_모두_생략():
     r = _simulate("preview")
-    assert r == {"preview": "success", "approve": "skipped", "backup": "skipped", "apply": "skipped", "summary": "success"}
+    assert r == {"preview": "success", "approve": "skipped", "backup": "skipped", "hashes": "skipped",
+                 "apply": "skipped", "summary": "success"}
 
 
 def test_잡_실행_조건_BACKUP_모드는_approve_없이_backup_까지만():
     r = _simulate("backup")
     assert r["approve"] == "skipped" and r["backup"] == "success"
+    assert r["hashes"] == "success", "BACKUP 에서는 복원 state 지문 계산 잡도 돕니다"
     assert r["apply"] == "skipped", "백업 전용 실행에서 apply(복구 적용)가 돌면 안 됩니다"
     # 백업이 실패해도 apply 는 돌지 않고 요약은 남습니다
     r = _simulate("backup", backup="failure")
@@ -608,7 +621,7 @@ def test_잡_실행_조건_BACKUP_모드는_approve_없이_backup_까지만():
 
 
 def test_잡_실행_조건_REWIND_모드는_승인과_백업이_모두_성공해야_apply():
-    assert _simulate("apply") == {"preview": "success", "approve": "success", "backup": "success",
+    assert _simulate("apply") == {"preview": "success", "approve": "success", "backup": "success", "hashes": "skipped",
                                   "apply": "success", "summary": "success"}
     # 승인 실패·반려: 백업도 하지 않고 apply 도 돌지 않음
     r = _simulate("apply", approve="failure")
@@ -624,18 +637,19 @@ def test_잡_실행_조건_미리보기_실패나_main_아님이면_이후_잡_�
     r = _simulate("apply", preview="failure")
     assert (r["approve"], r["backup"], r["apply"]) == ("skipped", "skipped", "skipped") and r["summary"] == "success"
     r = _simulate("apply", ref="refs/heads/feature")
-    assert r == {"preview": "skipped", "approve": "skipped", "backup": "skipped", "apply": "skipped", "summary": "success"}
+    assert r == {"preview": "skipped", "approve": "skipped", "backup": "skipped", "hashes": "skipped",
+                 "apply": "skipped", "summary": "success"}
 
 
 def test_최종_요약_잡_구성():
     job = _wf()["jobs"]["summary"]
-    assert set(job["needs"]) == {"preview", "approve", "backup", "apply"}
+    assert set(job["needs"]) == {"preview", "approve", "backup", "hashes", "apply"}
     assert "!cancelled()" in job["if"] or "always()" in job["if"]
     assert "secrets." not in json.dumps(job)
     env = job["steps"][0]["env"]
     for key, expected in {"MODE": "needs.preview.outputs.mode", "PREVIEW_RESULT": "needs.preview.result",
                           "APPROVE_RESULT": "needs.approve.result", "BACKUP_RESULT": "needs.backup.result",
-                          "APPLY_RESULT": "needs.apply.result"}.items():
+                          "HASHES_RESULT": "needs.hashes.result", "APPLY_RESULT": "needs.apply.result"}.items():
         assert expected in env[key]
 
 
@@ -644,7 +658,8 @@ def _final_summary(tmp_path, mode, **results):
     summary.unlink(missing_ok=True)
     env = {"MODE": mode, "GITHUB_STEP_SUMMARY": str(summary), "WORKFLOW_SHA": "abc", "GITHUB_RUN_ID": "9",
            "IN_BROKER": "nhplug", "IN_SYMBOL": "SOXL", "IN_ACTION": "REVERSE_LEDGER_REWIND",
-           "PREVIEW_RESULT": "success", "APPROVE_RESULT": "success", "BACKUP_RESULT": "success", "APPLY_RESULT": "success"}
+           "PREVIEW_RESULT": "success", "APPROVE_RESULT": "success", "BACKUP_RESULT": "success",
+           "HASHES_RESULT": "success", "APPLY_RESULT": "success"}
     env.update({k.upper() + "_RESULT": v for k, v in results.items()})
     r = _sh(_wf()["jobs"]["summary"]["steps"][0]["run"], tmp_path, env)
     assert r.returncode == 0, r.stderr
@@ -656,6 +671,10 @@ def test_동적_최종_요약_모든_경로의_판정(tmp_path):
 
     ok = _final_summary(tmp_path, "backup", approve="skipped", apply="skipped")
     assert "백업 전용 실행이 완료" in ok and "state 는 바뀌지 않았습니다" in ok and "저장 경로는 이 실행의 확인 대상이 아닙니다" in ok
+    assert "| 복원 state 지문 계산 | success |" in ok
+    # 백업은 됐지만 지문 계산이 실패하면 ✅ 로 보고하지 않고 REWIND 입력값을 못 얻었음을 알림
+    nohash = _final_summary(tmp_path, "backup", approve="skipped", apply="skipped", hashes="failure")
+    assert "지문 계산이 성공하지 못했습니다" in nohash and "✅" not in nohash and "입력값(SHA·hash·T)은 얻지 못했습니다" in nohash
     bad = _final_summary(tmp_path, "backup", approve="skipped", backup="failure", apply="skipped")
     assert "백업이 성공하지 못했습니다" in bad and "복구는 적용되지 않았고" in bad
 
@@ -672,12 +691,12 @@ def test_동적_최종_요약_모든_경로의_판정(tmp_path):
 
 
 def test_동적_미리보기_요약_BACKUP_모드_안내(tmp_path):
-    out = _preview_summary(tmp_path, action="REVERSE_LEDGER_REWIND", mode="backup")
-    assert "백업만" in out and "state 도 바꾸지 않습니다" in out
-    assert "승인 게이트 → 백업 → 적용" not in out
+    out = _preview_summary(tmp_path, action="REVERSE_LEDGER_REWIND", mode="backup", outcome="skipped")
+    assert "BACKUP 모드" in out and "복구 미리보기는 **실행하지 않았습니다**" in out and "state 를 바꾸지 않습니다" in out
+    assert "승인 게이트 → 백업 → 적용" not in out and "| T |" not in out, "BACKUP 은 종목 표를 만들지 않습니다"
     # 비운 미리보기는 백업 경로가 확인되지 않는다는 점과 BACKUP 모드를 안내합니다
     pv = _preview_summary(tmp_path, action="REVERSE_LEDGER_REWIND", mode="preview")
-    assert "백업 경로는 확인되지 않습니다" in pv and "BACKUP <종목>" in pv
+    assert "백업 경로는 확인되지 않습니다" in pv and "confirm=`BACKUP`" in pv
 
 
 def test_절차_문서화_세_가지_실행_범위():
@@ -685,7 +704,7 @@ def test_절차_문서화_세_가지_실행_범위():
     desc = inputs["confirm"]["description"]
     assert "BACKUP <종목>" in desc and "REWIND <종목>" in desc and "state 변경 없음" in desc
     text = _text()
-    assert "처음 병합한 뒤에는 실제 복구 전에" in text and "BACKUP" in text.split("jobs:")[0]
+    assert "실제 복구 전에" in text and "BACKUP" in text.split("jobs:")[0]
     assert "preview → backup" in text and "preview → approve → backup → apply" in text
 
 
@@ -796,3 +815,301 @@ def test_동적_감사_요약은_해시_계산_실패가_판정을_바꾸지_않
     # 반대로 해시가 정상이어도 검증 실패 판정은 그대로
     failed = _apply_summary(tmp_path, "success", "failure", "skipped", "skipped", audit=_AUDIT)
     assert "통과하지 못해" in failed and "✅" not in failed
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKUP 모드: 복구 대상이 없는 정상 state 에서도 최소 입력으로 끝까지 돌아야 합니다
+# (봇의 복구 미리보기는 복구 대상이 없으면 실패하므로 BACKUP 에서는 건너뜁니다)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ROOT = os.path.join(os.path.dirname(__file__), "..")
+_SEEDS = {"TQQQ_SEED": "10000", "SOXL_SEED": "5000"}
+
+
+def test_필수_입력은_broker_action_restore_key_뿐():
+    """BACKUP 에서 쓰이지 않는 값은 required 가 아닙니다 (REWIND·미리보기의 필수 검증은 스크립트가 모드별로 수행)."""
+    inputs = _wf()[True]["workflow_dispatch"]["inputs"]
+    assert sorted(k for k, v in inputs.items() if v["required"]) == ["action", "broker", "restore_key"]
+    for key in ("expect_file_sha256", "symbol", "expect_hash", "expect_t", "guard_symbol", "guard_hash"):
+        assert "BACKUP" in inputs[key]["description"], key
+
+
+def test_모드_결정이_첫_단계이고_봇_미리보기는_BACKUP_에서_건너뛴다():
+    steps = _wf()["jobs"]["preview"]["steps"]
+    assert steps[0].get("id") == "mode", "모드는 입력 검증·봇 미리보기보다 먼저 정해야 합니다"
+    assert _wf()["jobs"]["preview"]["outputs"]["mode"] == "${{ steps.mode.outputs.mode }}"
+    assert _step("preview", "dryrun") is not None
+    dry = _step("preview", "dryrun")
+    ctx = lambda m: {"steps.mode.outputs.mode": m}  # noqa: E731
+    assert _eval_expr(dry["if"], ctx("backup")) is False, "BACKUP 은 봇의 복구 미리보기를 실행하지 않습니다"
+    assert _eval_expr(dry["if"], ctx("preview")) is True
+    assert _eval_expr(dry["if"], ctx("apply")) is True
+    assert _step_named("preview", "입력 형식 검증")["env"]["MODE"] == "${{ steps.mode.outputs.mode }}"
+
+
+def _validate_mode(tmp_path, mode, **over):
+    script = _step_named("preview", "입력 형식 검증")["run"]
+    empty = {k: "" for k in ("IN_FILE_SHA", "IN_HASH", "IN_GUARD_HASH", "IN_SYMBOL", "IN_GUARD_SYMBOL", "IN_T",
+                              "IN_TARGET_UPDATED", "IN_EVIDENCE_RUN")}
+    env = {**empty, "IN_BROKER": "nhplug", "IN_RESTORE_KEY": "state-nhplug-demo-123",
+           "IN_ACTION": "REVERSE_LEDGER_REWIND", "MODE": mode, **over}
+    r = _sh(script, tmp_path, env)
+    return r.returncode, r.stdout + r.stderr
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
+def test_동적_BACKUP_입력검증은_broker_와_restore_key_만_요구한다(tmp_path):
+    assert _validate_mode(tmp_path, "backup")[0] == 0
+    # 선택 입력은 주어졌다면 형식이 맞아야 합니다
+    assert _validate_mode(tmp_path, "backup", IN_FILE_SHA="a" * 64)[0] == 0
+    rc, out = _validate_mode(tmp_path, "backup", IN_FILE_SHA="xyz")
+    assert rc != 0 and "생략하려면 비워 두세요" in out
+    assert _validate_mode(tmp_path, "backup", IN_FILE_SHA="A" * 64)[0] != 0, "대문자 hex 불인정"
+    assert _validate_mode(tmp_path, "backup", IN_EVIDENCE_RUN="abc")[0] != 0
+    assert _validate_mode(tmp_path, "backup", IN_EVIDENCE_RUN="42287486160")[0] == 0
+    # restore_key 는 BACKUP 에서도 필수·형식 검증
+    assert _validate_mode(tmp_path, "backup", IN_RESTORE_KEY="")[0] != 0
+    assert _validate_mode(tmp_path, "backup", IN_RESTORE_KEY="state-kis-demo-123")[0] != 0, "다른 브로커의 캐시 키"
+    # BACKUP 에서 복구용 값은 무시됩니다 (잘못된 형식이어도 통과 — 쓰이지 않는 입력)
+    assert _validate_mode(tmp_path, "backup", IN_HASH="not-a-hash", IN_T="x")[0] == 0
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
+def test_동적_미리보기_REWIND_는_기존처럼_모든_입력이_필수(tmp_path):
+    full = {"IN_FILE_SHA": "a" * 64, "IN_HASH": "b" * 64, "IN_GUARD_HASH": "c" * 64, "IN_SYMBOL": "SOXL",
+            "IN_GUARD_SYMBOL": "TQQQ", "IN_T": "14.4375"}
+    for mode in ("preview", "apply"):
+        assert _validate_mode(tmp_path, mode, **full)[0] == 0, mode
+        for key in full:  # 하나라도 비면 실패 (BACKUP 에서만 생략 가능)
+            rc, _ = _validate_mode(tmp_path, mode, **{**full, key: ""})
+            assert rc != 0, f"{mode}: {key} 가 비어도 통과하면 안 됩니다"
+        assert _validate_mode(tmp_path, mode, **{**full, "IN_GUARD_SYMBOL": "SOXL"})[0] != 0  # 가드=대상 불가
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
+def test_동적_preview_SHA_확인은_입력이_있으면_반드시_대조하고_없으면_표시한다(tmp_path):
+    script = _step_named("preview", "복원본 SHA-256 확인")["run"]
+    sha = _write_state(tmp_path / ".state.json")
+    ok = _sh(script, tmp_path, {"IN_FILE_SHA": sha})
+    assert ok.returncode == 0
+    assert _sh(script, tmp_path, {"IN_FILE_SHA": "0" * 64}).returncode != 0, "입력했다면 불일치는 실패"
+    skipped = _sh(script, tmp_path, {"IN_FILE_SHA": ""})
+    assert skipped.returncode == 0 and "사전 지문 대조 없이" in skipped.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
+def test_동적_백업_SHA_생략은_BACKUP_모드에서만_허용(tmp_path):
+    script = _step("backup", "encrypt")["run"]
+    state_sha = _write_state(tmp_path / ".state.json")
+    base = {**_fake_gpg(tmp_path), "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "9", "GITHUB_RUN_ATTEMPT": "1",
+            "PASSPHRASE": "x"}
+
+    def run(sha, mode):
+        out = tmp_path / "gh_output.txt"
+        out.write_text("")
+        (tmp_path / "GPG_CALLED").unlink(missing_ok=True)
+        r = _sh(script, tmp_path, {**base, "IN_FILE_SHA": sha, "MODE": mode, "GITHUB_OUTPUT": str(out)})
+        return r, out.read_text(), (tmp_path / "GPG_CALLED").exists()
+
+    r, out, gpg_called = run("", "apply")  # REWIND 에서 SHA 없이는 백업 자체를 만들지 않음
+    assert r.returncode != 0 and not gpg_called and "사전 지문 대조 없이는" in r.stdout + r.stderr
+    r, out, gpg_called = run("", "preview")
+    assert r.returncode != 0 and not gpg_called
+    r, out, gpg_called = run("0" * 64, "backup")  # 입력했다면 BACKUP 이어도 불일치는 실패
+    assert r.returncode != 0 and not gpg_called and "pre_check" not in out
+    r, out, gpg_called = run("", "backup")  # 생략: 통과하고 '사전 대조 생략'으로 기록 (가짜 gpg 라 이후 단계는 실패해도 무방)
+    assert "pre_check=skipped" in out and "사전 지문 대조 없이 백업" in r.stdout
+    r, out, gpg_called = run(state_sha, "backup")
+    assert "pre_check=matched" in out
+
+
+@needs_gpg
+def test_동적_BACKUP_SHA_생략_실제_암호화까지_완료(tmp_path):
+    state_sha = _write_state(tmp_path / ".state.json")
+    r = _sh(_step("backup", "encrypt")["run"], tmp_path, _backup_env(tmp_path, "", mode="backup"))
+    assert r.returncode == 0, r.stderr
+    assert "pre_check=skipped" in (tmp_path / "gh_output.txt").read_text()
+    gpg = tmp_path / "repair-backup-nhplug-4242-2.gpg"
+    assert gpg.exists() and (tmp_path / "repair-backup-nhplug-4242-2.state.sha256").read_text().strip() == state_sha
+
+
+def _backup_summary_with(tmp_path, pre_check, mode):
+    step = _step_named("backup", "백업 결과 요약")
+    summary = tmp_path / "summary.md"
+    summary.unlink(missing_ok=True)
+    r = _sh(step["run"], tmp_path, {"ENCRYPT_OUTCOME": "success", "UPLOAD_OUTCOME": "success", "PRE_CHECK": pre_check,
+                                    "MODE": mode, "IN_BROKER": "nhplug", "GITHUB_RUN_ID": "4242",
+                                    "GITHUB_RUN_ATTEMPT": "2", "GITHUB_STEP_SUMMARY": str(summary)})
+    assert r.returncode == 0, r.stderr
+    return summary.read_text()
+
+
+def test_동적_백업_요약은_사전_대조_여부를_구분한다(tmp_path):
+    skipped = _backup_summary_with(tmp_path, "skipped", "backup")
+    assert "사전 지문 대조 없이 백업" in skipped and "BACKUP 모드 — 복구는 적용되지 않았고 state 는 바뀌지 않았습니다" in skipped
+    assert "적용 단계가 진행됩니다" not in skipped
+    matched = _backup_summary_with(tmp_path, "matched", "apply")
+    assert "입력값과 일치" in matched and "적용 단계가 진행됩니다" in matched and "사전 지문 대조 없이" not in matched
+
+
+def test_지문_계산_잡은_시크릿이_없고_읽기_전용():
+    job = _wf()["jobs"]["hashes"]
+    blob = json.dumps(job, ensure_ascii=False)
+    assert "secrets." not in blob, "저장소 코드를 실행하므로 시크릿이 있는 잡과 분리합니다"
+    assert "environment" not in job, "환경(시크릿·변수) 없이 동작합니다"
+    assert "actions/cache/save" not in blob and "upload-artifact" not in blob and "trading_bot.py" not in blob
+    assert job["needs"] == "preview"
+    assert "needs.preview.outputs.mode == 'backup'" in job["if"]
+    uses = [s.get("uses", "") for s in job["steps"]]
+    assert any(u.startswith("actions/cache/restore") for u in uses)
+    restore = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/cache/restore"))
+    assert restore["with"]["fail-on-cache-miss"] is True and restore["with"]["key"] == "${{ inputs.restore_key }}"
+    run = next(s["run"] for s in job["steps"] if "ops/repair_state_fingerprint.py" in s.get("run", ""))
+    assert '--expect-sha "$IN_FILE_SHA"' in run and "GITHUB_STEP_SUMMARY" in run
+    # 백업 잡은 여전히 저장소 코드를 실행하지 않습니다 (시크릿 격리)
+    backup = json.dumps(_wf()["jobs"]["backup"], ensure_ascii=False)
+    assert "ops/repair_state_fingerprint.py" not in backup and "uv " not in backup
+
+
+# ── 지문 계산 스크립트 ─────────────────────────────────────────────────────────────
+
+def _fp(tmp_path, data, *extra):
+    state_file = tmp_path / ".state.json"
+    state_file.write_text(json.dumps(data))
+    summary = tmp_path / "fp_summary.md"
+    summary.unlink(missing_ok=True)
+    script = os.path.join(_ROOT, "ops", "repair_state_fingerprint.py")
+    r = subprocess.run([sys.executable, script, "--state", str(state_file), "--summary", str(summary), *extra],
+                       capture_output=True, text=True, timeout=60, env={**os.environ, **_SEEDS})
+    return r, (summary.read_text() if summary.exists() else "")
+
+
+def _canonical_via_state(tmp_path, symbol):
+    """저장소의 canonical_state_hash(load_state(...)) 로 직접 계산 — 복구 입력(CAS)과 같은 정의여야 합니다."""
+    code = ("import sys,json; sys.path.insert(0,'src'); import state; state._STATE_FILE=sys.argv[1];"
+            "print(state.canonical_state_hash(state.load_state(sys.argv[2])))")
+    r = subprocess.run([sys.executable, "-c", code, str(tmp_path / ".state.json"), symbol], cwd=_ROOT,
+                       capture_output=True, text=True, timeout=60, env={**os.environ, **_SEEDS})
+    return r.stdout.strip().splitlines()[-1]
+
+
+def test_지문_계산_모든_종목의_hash_T_파일SHA를_출력한다(tmp_path):
+    data = {"SOXL": {**_REC, "T": 14.25}, "TQQQ": {**_REC, "T": 18.0}, "note": "종목 아님"}
+    r, md = _fp(tmp_path, data)
+    assert r.returncode == 0, r.stderr
+    raw_sha = hashlib.sha256((tmp_path / ".state.json").read_bytes()).hexdigest()
+    assert raw_sha in md and "사전 지문 대조 없이" in md
+    for sym, t in (("SOXL", "14.25"), ("TQQQ", "18.0")):
+        assert _canonical_via_state(tmp_path, sym) in md, f"{sym}: CAS 와 같은 canonical hash 여야 합니다"
+        assert f"| `{sym}` |" in md and t in md
+    assert "`note`" not in md, "dict 가 아닌 최상위 항목은 종목이 아닙니다"
+    # 읽기 전용: 파일은 그대로
+    assert hashlib.sha256((tmp_path / ".state.json").read_bytes()).hexdigest() == raw_sha
+
+
+def test_지문_계산_입력_SHA_대조(tmp_path):
+    data = {"SOXL": dict(_REC), "TQQQ": dict(_REC)}
+    (tmp_path / ".state.json").write_text(json.dumps(data))
+    sha = hashlib.sha256((tmp_path / ".state.json").read_bytes()).hexdigest()
+    r, md = _fp(tmp_path, data, "--expect-sha", sha)
+    assert r.returncode == 0 and "입력 SHA-256 과 **일치**" in md and "사전 지문 대조 없이" not in md
+    r, md = _fp(tmp_path, data, "--expect-sha", "0" * 64)
+    assert r.returncode == 1 and "다릅니다" in md, "불일치는 실패하되 값은 모두 출력합니다"
+    assert sha in md
+
+
+def test_지문_계산_읽을_수_없으면_실패한다(tmp_path):
+    (tmp_path / ".state.json").write_text("{broken")
+    script = os.path.join(_ROOT, "ops", "repair_state_fingerprint.py")
+    r = subprocess.run([sys.executable, script, "--state", str(tmp_path / ".state.json")], capture_output=True,
+                       text=True, timeout=60, env={**os.environ, **_SEEDS})
+    assert r.returncode == 1 and "계산 실패" in r.stderr
+    r, _ = _fp(tmp_path, {"only": "strings"})
+    assert r.returncode == 1  # 종목 상태가 없으면 실패
+
+
+# ── 통합: 정상 state 에서 최소 입력으로 BACKUP 이 끝까지 돌고, 복구·state 변경·캐시 저장이 없다 ─────────
+
+def test_정상_state_에서는_봇의_복구_미리보기가_실패한다_그래서_BACKUP_은_건너뛴다(tmp_path):
+    """복구 대상이 없는 정상 state 로 미리보기 함수를 호출하면 두 동작 모두 실패합니다 (BACKUP 이 미리보기에 종속되면 안 되는 이유)."""
+    code = r'''
+import json, os, sys, tempfile
+sys.path.insert(0, "src"); sys.path.insert(0, ".")
+import state, trading_bot
+rec = lambda t: {"T": t, "last_updated": "2026-11-10T19:20:00+00:00", "effective_seed": 100.0, "net_invested": 50.0,
+                 "net_invested_status": "valid", "last_processed_ordno": "", "orders_meta": {}, "settlement_ledger": {}}
+path = os.path.join(tempfile.mkdtemp(), "state.json")
+json.dump({"SOXL": rec(14.25), "TQQQ": rec(18.0)}, open(path, "w"))
+state._STATE_FILE = path
+h = lambda s: state.canonical_state_hash(state.load_state(s))
+os.environ.update({"REPAIR_REWIND_SYMBOL": "SOXL", "REPAIR_REWIND_EXPECT_HASH": h("SOXL"), "REPAIR_REWIND_EXPECT_T": "14.25",
+                   "REPAIR_REWIND_GUARD_SYMBOL": "TQQQ", "REPAIR_REWIND_GUARD_HASH": h("TQQQ"),
+                   "REPAIR_REWIND_TARGET_LAST_UPDATED": "2026-11-09T19:10:00+00:00"})
+os.environ.pop("REPAIR_REWIND_APPLY", None)
+for fn in (trading_bot._reverse_ledger_rewind, trading_bot._reverse_watermark_restore):
+    try:
+        fn(); print("RESULT", fn.__name__, "통과")
+    except RuntimeError as e:
+        print("RESULT", fn.__name__, "실패", str(e)[:60])
+print("UNCHANGED", json.load(open(path))["SOXL"]["T"] == 14.25)
+'''
+    r = subprocess.run([sys.executable, "-c", code], cwd=_ROOT, capture_output=True, text=True, timeout=120,
+                       env={**os.environ, **_SEEDS})
+    lines = [ln for ln in r.stdout.splitlines() if ln.startswith(("RESULT", "UNCHANGED"))]
+    assert lines[0].startswith("RESULT _reverse_ledger_rewind 실패") and "후보 0개" in lines[0], r.stdout + r.stderr
+    assert lines[1].startswith("RESULT _reverse_watermark_restore 실패"), lines
+    assert lines[2] == "UNCHANGED True"
+
+
+def _ran_steps(job_name, ctx):
+    """BACKUP 모드에서 실행될 단계(단계 수준 if 가 거짓인 것은 제외)."""
+    out = []
+    for step in _wf()["jobs"][job_name]["steps"]:
+        cond = step.get("if")
+        if cond is not None and not _eval_expr(str(cond), ctx):
+            continue
+        out.append(step)
+    return out
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash 없음")
+def test_통합_정상_state_최소_입력_BACKUP_전체_흐름(tmp_path):
+    """모드 결정 → 입력 검증(broker·restore_key 만) → SHA 확인(생략) → 봇 미리보기 건너뜀 → 지문 계산 → 백업(생략 표시).
+    그 어디서도 복구 함수 호출·state 변경·캐시 저장이 없어야 합니다."""
+    state_file = tmp_path / ".state.json"
+    before_sha = _write_state(state_file)
+    ctx = {"steps.mode.outputs.mode": "backup"}
+
+    # 1) 모드 결정: 종목도 SHA 도 없이 confirm=BACKUP
+    out = tmp_path / "mode_out.txt"
+    out.write_text("")
+    r = _sh("set -e\n" + _step("preview", "mode")["run"], tmp_path, {"IN_CONFIRM": "BACKUP", "IN_SYMBOL": "", "GITHUB_OUTPUT": str(out)})
+    assert r.returncode == 0 and "mode=backup" in out.read_text()
+    # 2) 입력 검증: 최소 입력
+    rc, _ = _validate_mode(tmp_path, "backup")
+    assert rc == 0
+    # 3) SHA 확인: 생략
+    r = _sh(_step_named("preview", "복원본 SHA-256 확인")["run"], tmp_path, {"IN_FILE_SHA": ""})
+    assert r.returncode == 0 and "사전 지문 대조 없이" in r.stdout
+    # 4) 봇 미리보기는 건너뜀 (실행됐다면 정상 state 에서 실패했을 단계)
+    ran = [s.get("id") for s in _ran_steps("preview", ctx)]
+    assert "dryrun" not in ran and "mode" in ran
+    # 5) 지문 계산 (시크릿 없는 잡의 스크립트)
+    r, md = _fp(tmp_path, json.loads(state_file.read_text()))
+    assert r.returncode == 0 and before_sha in md
+    # 6) 암호화 백업 (SHA 생략) — gpg 를 쓸 수 있으면 실제로, 아니면 이 단계는 위 스텁 테스트가 보장
+    if _gpg_usable():
+        r = _sh(_step("backup", "encrypt")["run"], tmp_path, _backup_env(tmp_path, "", mode="backup"))
+        assert r.returncode == 0, r.stderr
+        assert "pre_check=skipped" in (tmp_path / "gh_output.txt").read_text()
+
+    # 복구·저장 없음: state 파일은 그대로, BACKUP 에서 실행되는 잡들에는 캐시 저장·봇 실행 단계가 없음
+    assert hashlib.sha256(state_file.read_bytes()).hexdigest() == before_sha
+    sim = _simulate("backup")
+    ran_jobs = [name for name, res in sim.items() if res != "skipped"]
+    assert set(ran_jobs) == {"preview", "backup", "hashes", "summary"}, sim
+    for name in ran_jobs:
+        for step in _ran_steps(name, ctx):
+            assert not str(step.get("uses", "")).startswith("actions/cache/save"), f"{name}: 캐시 저장 금지"
+            assert "trading_bot.py" not in step.get("run", ""), f"{name}/{step.get('name')}: 봇 실행 금지"
+            assert "REPAIR_REWIND_APPLY" not in json.dumps(step, ensure_ascii=False), f"{name}: 복구 적용 금지"
