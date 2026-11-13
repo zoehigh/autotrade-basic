@@ -143,6 +143,17 @@ def test_같은_세션의_주문은_아직_만료가_아니므로_건드리지_�
     lambda m: m.update(processed_filled_qty=1),
     lambda m: m.update(processed_filled_amount=10.0),
     lambda m: m.update(submitted_session=""),
+    lambda m: m.update(processed_filled_qty=0.5),       # 소수 수량은 0 으로 잘리면 안 됨
+    lambda m: m.update(processed_filled_qty="0"),       # 문자열 0 불인정
+    lambda m: m.update(processed_filled_amount="0.0"),
+    lambda m: m.update(processed_filled_qty=None),
+    lambda m: m.update(processed_filled_amount=""),
+    lambda m: m.update(processed_filled_qty=True),
+    lambda m: m.update(processed_filled_qty=float("nan")),
+    lambda m: m.update(applied_fill_fraction=0.25),     # 반영 흔적
+    lambda m: m.update(applied_fill_fraction="x"),
+    lambda m: m.pop("processed_filled_qty"),            # 마커 누락
+    lambda m: m.pop("processed_filled_amount"),
 ])
 def test_반영_흔적이나_세션_정보_이상이면_보류(mutate):
     st = _state()
@@ -161,3 +172,27 @@ def test_늦게_체결_행이_생기면_델타로_반영된다():
     s = _run(s, history=late)
     assert s["orders_meta"]["2002"]["processed_filled_qty"] == 4
     assert s["net_invested"] > 9000.0 - 1  # 매수 금액 반영
+
+
+@pytest.mark.parametrize("broker,mode", [("kis", "demo"), ("kis", "real"), ("kiwoom", "demo"), ("nhplug", "demo"), ("ls", "demo")])
+def test_이미_종결된_주문은_이력에_없어도_브로커_모드_무관하게_보류하지_않는다(broker, mode):
+    """공통 동작: 종결된 주문의 이력 누락은 무시 (KIS 데모 한정 아님)."""
+    st = _state()
+    st["orders_meta"]["2002"]["terminal"] = True
+    s = _run(st, broker=broker, mode=mode)
+    assert "reconciliation_only" not in s["reverse_mode"]
+    assert s["orders_meta"]["2002"]["terminal"] is True
+    assert not s["orders_meta"]["2002"].get("terminal_assumed")
+
+
+@pytest.mark.parametrize("broker,mode", [("kis", "real"), ("kiwoom", "demo")])
+def test_이벤트_없는_실행에서_모두_종결이면_보류_해제는_공통이지만_미종결이면_유지(broker, mode):
+    st = _state()
+    st["reverse_mode"].update(reconciliation_only=True, reconciliation_error="reverse_order_history_missing")
+    # 미종결 주문이 남아 있으면 해제하지 않음
+    s = _run(deepcopy(st), history=[_sell_row(odno="9", ord_dt="20261101")], broker=broker, mode=mode)
+    assert s["reverse_mode"].get("reconciliation_only") is True
+    # 전부 종결이면 해제
+    st["orders_meta"]["2002"]["terminal"] = True
+    s = _run(st, history=[_sell_row(odno="9", ord_dt="20261101")], broker=broker, mode=mode)
+    assert "reconciliation_only" not in s["reverse_mode"]

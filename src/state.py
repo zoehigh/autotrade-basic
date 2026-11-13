@@ -493,6 +493,17 @@ def _auto_assume_reverse_expiry(meta, order):
 _FILLED_ONLY_HISTORY_BROKERS = {"kis"}
 
 
+def _is_explicit_zero(value, *, integer):
+    """명시적으로 존재하는 유한한 숫자 0 인지 (bool·문자열·None·NaN·소수 수량은 불인정)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    if integer and value != int(value):
+        return False
+    return value == 0
+
+
 def _assume_missing_reverse_order_zero_fill(meta, order_history):
     """체결만 주는 이력에서 **이전 세션 리버스 주문이 행 없이 빠진 경우** 0체결 만료로 가정해 종결합니다.
 
@@ -516,12 +527,13 @@ def _assume_missing_reverse_order_zero_fill(meta, order_history):
         return False
     if meta.get("terminal"):
         return False
-    try:
-        if int(meta.get("processed_filled_qty", 0) or 0) != 0:
-            return False
-        if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
-            return False
-    except (TypeError, ValueError):
+    # 미반영의 증거는 '명시된 유한한 숫자 0' 뿐입니다 (누락·None·빈 문자열·"0"·소수 수량·bool 은 불명확 → 보류 유지).
+    if not ("processed_filled_qty" in meta and _is_explicit_zero(meta["processed_filled_qty"], integer=True)):
+        return False
+    if not ("processed_filled_amount" in meta and _is_explicit_zero(meta["processed_filled_amount"], integer=False)):
+        return False
+    # 반영 흔적(applied_fill_fraction > 0)이 있으면 종결하지 않습니다. 필드가 없으면 0 으로 봅니다.
+    if "applied_fill_fraction" in meta and not _is_explicit_zero(meta["applied_fill_fraction"], integer=False):
         return False
     session = str(meta.get("submitted_session", "") or "").replace("-", "")
     if len(session) != 8 or not session.isdigit() or not order_history:
