@@ -488,6 +488,75 @@ def _auto_assume_reverse_expiry(meta, order):
     return True
 
 
+# 주문이력이 **체결된 주문만** 돌려주는 브로커 (미체결·만료 주문은 이력에 행 자체가 없음).
+# KIS: 조회 조건 CCLD_NCCS_DVSN="01"(체결) 이라 체결되지 않은 주문은 나타나지 않습니다.
+_FILLED_ONLY_HISTORY_BROKERS = {"kis"}
+
+
+def _assume_missing_reverse_order_zero_fill(meta, order_history):
+    """체결만 주는 이력에서 **이전 세션 리버스 주문이 행 없이 빠진 경우** 0체결 만료로 가정해 종결합니다.
+
+    사고(2026-11-12 KIS SOXL 데모): 리버스 2일차 쿼터매수(LIMIT 변환)가 세션 종료까지 체결되지 않아 이력에 행이 없었고,
+    정산이 "리버스 주문 이력 누락"으로 보류해 신규 주문이 멈췄습니다. 체결만 주는 이력에서는 '행 없음' = '미체결·만료'
+    이므로 이력 누락이 아닙니다 (체결됐다면 부분체결이라도 행이 있습니다).
+
+    적용 조건 (하나라도 어긋나면 False — 기존대로 보류):
+      - BROKER 가 체결 전용 이력 브로커(KIS)이고 BROKER_MODE=demo (실전은 확인 전까지 보수적으로 보류 유지)
+      - 아직 종결·반영된 적이 없는 주문: terminal 아님, processed_filled_qty/amount = 0
+      - 이력 조회가 실제로 내용을 돌려줌(비어 있지 않음)
+      - 이력에 해당 주문 세션 날짜 이전(같은 날 포함)과 이후(같은 날 포함)의 행이 모두 있음 (조회 구간이 그 세션을 덮는다는 증거)
+    성공하면 meta 를 terminal/terminal_assumed 로 표시합니다. 늦은 체결은 이후 이력에 행이 생기면
+    odno 단위 processed_filled_qty 델타로 그대로 반영됩니다(상태 소실 없음).
+    """
+    try:
+        from config import BROKER, BROKER_MODE
+    except Exception:
+        return False
+    if str(BROKER).lower() not in _FILLED_ONLY_HISTORY_BROKERS or BROKER_MODE != "demo":
+        return False
+    if meta.get("terminal"):
+        return False
+    try:
+        if int(meta.get("processed_filled_qty", 0) or 0) != 0:
+            return False
+        if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    session = str(meta.get("submitted_session", "") or "").replace("-", "")
+    if len(session) != 8 or not session.isdigit() or not order_history:
+        return False
+    dates = [str(row.get("ord_dt", "") or "") for row in order_history]
+    dates = [d for d in dates if len(d) == 8 and d.isdigit()]
+    # 조회 구간이 그 세션을 덮는다는 증거: 세션 날짜 **이전(같은 날 포함)** 행과 **이후(같은 날 포함)** 행이 모두 있어야 합니다.
+    # 이후 행만 있으면 조회 시작일(예: 30일 한도)보다 오래된 주문일 수 있어 만료로 가정하지 않습니다.
+    if not (any(d <= session for d in dates) and any(d >= session for d in dates)):
+        return False
+    meta["terminal"] = True
+    meta["terminal_assumed"] = True
+    meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
+    meta["terminal_assumption_reason"] = "missing_from_filled_only_history_after_session"
+    return True
+
+
+def _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, active_cycle_id):
+    """현재 cycle 의 모든 리버스 주문이 종결됐으면 reconciliation 보류 표식을 해제합니다.
+
+    체결 이벤트가 없는 실행(이력에 리버스 행이 하나도 없음)에서도 호출되어, 마지막 미종결 주문을 종결 처리한 뒤
+    보류 표식이 영구히 남지 않게 합니다.
+    """
+    cycle_meta = [
+        meta for meta in orders_meta.values()
+        if meta.get("reverse_action") and meta.get("cycle_id") == active_cycle_id
+    ]
+    if reverse_mode.get("reconciliation_only") and cycle_meta and all(meta.get("terminal") for meta in cycle_meta):
+        if reverse_mode.get("active"):
+            reverse_mode.pop("reconciliation_only", None)
+            reverse_mode.pop("reconciliation_error", None)
+        else:
+            state["reverse_mode"] = {}
+
+
 def reconcile_reverse_fills(state, order_history):
     """리버스모드 주문의 실제 누적 체결만 상태에 반영합니다.
 
@@ -532,12 +601,21 @@ def reconcile_reverse_fills(state, order_history):
             continue
         order = _order_for_meta(odno, meta)
         if not order:
+            if meta.get("terminal"):
+                # 이미 종결(확정·만료 가정 포함)된 주문이 이력에서 빠진 것은 이력 누락이 아닙니다 — 재보류하지 않습니다.
+                continue
             submitted_at = str(meta.get("submitted_at", ""))
             today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
             if meta.get("submitted_session", "") < today_session:
-                reverse_mode["reconciliation_error"] = "reverse_order_history_missing"
-                reverse_mode["reconciliation_only"] = True
-                print(f"[경고] 리버스 주문 이력 누락: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
+                if _assume_missing_reverse_order_zero_fill(meta, order_history):
+                    print(
+                        f"[정보] 체결 전용 이력에 없는 이전 세션 리버스 주문을 0체결 만료로 가정합니다: "
+                        f"odno={mask_odno(odno)} → 자동 종결 처리"
+                    )
+                else:
+                    reverse_mode["reconciliation_error"] = "reverse_order_history_missing"
+                    reverse_mode["reconciliation_only"] = True
+                    print(f"[경고] 리버스 주문 이력 누락: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
             continue
         submitted_at = str(meta.get("submitted_at", ""))
         today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
@@ -599,6 +677,7 @@ def reconcile_reverse_fills(state, order_history):
         return
 
     if not events:
+        _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, active_cycle_id)
         return
 
     # 전역 T를 과거 이력으로 재생하지 않고, 마지막 저장 이후 새로 확인된
@@ -861,16 +940,7 @@ def reconcile_reverse_fills(state, order_history):
     state["T"] = round(float(state.get("T", 0.0)), 4)
     state["net_invested"] = round(max(0.0, net_invested), 2)
     reverse_mode["cumulative_sell_proceeds"] = round(confirmed_sell_proceeds, 2)
-    cycle_meta = [
-        meta for meta in orders_meta.values()
-        if meta.get("reverse_action") and meta.get("cycle_id") == active_cycle_id
-    ]
-    if reverse_mode.get("reconciliation_only") and cycle_meta and all(meta.get("terminal") for meta in cycle_meta):
-        if reverse_mode.get("active"):
-            reverse_mode.pop("reconciliation_only", None)
-            reverse_mode.pop("reconciliation_error", None)
-        else:
-            state["reverse_mode"] = {}
+    _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, active_cycle_id)
     if pending_amount_odnos:
         state.clear()
         state.update(hold_snapshot)
