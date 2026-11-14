@@ -53,6 +53,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     select_recent_history,
+    us_session_last_closed_date,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -513,7 +514,8 @@ class MeritzBroker(Broker):
         GET /market/v1/overseas/candles/days
         - 공식 필수 query 5종만 전송 (from/to 생략 → 최신 40건 반환)
         - 종가는 prpr 필드 사용
-        - 당일(ET) 미확정 봉 제외: date가 오늘(ET) 이후인 행은 제외
+        - 미확정 봉 제외: **마감된 마지막 미국 세션(XNYS 달력, 조기 마감 포함) 이후** 날짜의 행은 제외합니다.
+          장 중이면 오늘 봉은 제외, 정규장 마감 뒤(자정 ET 전)면 오늘 봉도 확정 봉으로 포함합니다.
         """
         params = {
             "mrkt_div_code": "OV",
@@ -532,6 +534,8 @@ class MeritzBroker(Broker):
 
         rows = self._extract_rows(body)
         today_et = datetime.now(ET_TZ).strftime("%Y%m%d")
+        last_closed = us_session_last_closed_date()           # "YYYY-MM-DD" 또는 None (달력 오류·마감 세션 없음)
+        cutoff = last_closed.replace("-", "") if last_closed else None
 
         finalized: dict[str, float] = {}
         for row in rows:
@@ -539,19 +543,22 @@ class MeritzBroker(Broker):
                 continue
             date_str = self._digits(row.get("date"))[:8]
             close = self._to_float(row.get("prpr"))
-            if not date_str or date_str >= today_et or close <= 0:
+            if not date_str or close <= 0:
+                continue
+            # 마감된 세션까지만 확정 봉으로 인정. 달력을 못 구하면 기존 보수 규칙(오늘 이후 제외)으로 되돌립니다.
+            if (date_str > cutoff) if cutoff else (date_str >= today_et):
                 continue
             finalized[date_str] = close
         return finalized
 
     def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """해외주식 일봉 종가 → list[float] (오래된 순, 당일(ET) 미확정 봉 제외)."""
+        """해외주식 일봉 종가 → list[float] (오래된 순, 마감 전 미확정 봉 제외)."""
         finalized = self._fetch_finalized_daily(symbol, exchange)
         closes = [finalized[key] for key in sorted(finalized)]
         return closes[-days:]
 
     def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
-        """해외주식 일봉 → [{"date": "YYYY-MM-DD", "close": float}] (오래된 순, 당일(ET) 미확정 봉 제외).
+        """해외주식 일봉 → [{"date": "YYYY-MM-DD", "close": float}] (오래된 순, 마감 전 미확정 봉 제외).
 
         date 는 응답 행의 date 필드(미국 세션 날짜로 가정)입니다. 리버스 종료 판정이 이 날짜를
         XNYS 직전 마감 세션과 대조해 확정 종가인지 검증합니다.
