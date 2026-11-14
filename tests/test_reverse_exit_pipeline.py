@@ -5,7 +5,7 @@
 import os
 import sys
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,21 @@ for _p in (_repo_root, _src_path):
 import trading_bot
 from broker.base import Balance, OrderResult, PurchaseAmount, StockPrice, StockQuotation
 from broker.market_utils import us_session_last_closed_date
+
+
+# 실제 시계에 의존하면 주말·장 마감 이후에 체결 시각이 제출 시각보다 앞서 분류가 달라집니다.
+# 운영 18:30 KST 실행과 같은 평일 시각으로 고정합니다 (2026-11-12 목요일 09:30Z = ET 04:30, 직전 마감 세션 11-11).
+_FROZEN_NOW_UTC = datetime(2026, 11, 12, 9, 30, 30, tzinfo=ZoneInfo("UTC"))
+
+
+_CLOCK = {"offset_seconds": 0}   # 다음 실행으로 넘어갈 때 조금 앞으로 보냅니다 (cycle_id 가 시각 기반이라 달라야 함)
+
+
+class _FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        now = _FROZEN_NOW_UTC + timedelta(seconds=_CLOCK["offset_seconds"])
+        return now if tz is None else now.astimezone(tz)
 
 
 def _et_today():
@@ -55,8 +70,9 @@ def _row(odno, side, qty, filled, price, utc, ord_dt, status):
     return {"odno": odno, "sll_buy_dvsn_cd_name": side, "ft_ord_qty": str(qty), "ft_ccld_qty": str(filled),
             "ft_ccld_unpr3": f"{price:.2f}", "ft_ccld_amt3": f"{filled * price:.2f}",
             "nccs_qty": str(qty - filled if status in ("미체결", "부분체결") else 0),
-            "prcs_stat_name": status, "ord_dt": ord_dt, "ord_tmd": "041500", "ord_datetime_utc": utc,
-            "ord_datetime_kst": utc, "tr_mket_name": "NASD", "ovrs_excg_cd": "NASD"}
+            "prcs_stat_name": status, "ord_dt": ord_dt, "ord_tmd": "183012", "ord_datetime_utc": utc,
+            "ord_datetime_kst": utc, "tr_mket_name": "NASD", "ovrs_excg_cd": "NASD",
+            "_ord_dt_is_kst_date": True}   # 메리츠 컨벤션: ord_dt 는 KST 날짜 (운영 어댑터가 설정하는 값)
 
 
 _ORDER_SEQ = {"n": 0}
@@ -66,7 +82,12 @@ _ORDER_SEQ = {"n": 0}
 def env(monkeypatch):
     saved = []
     holder = {"notified": []}
+    _CLOCK["offset_seconds"] = 0
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    import strategy, state as state_module
+    from broker import market_utils
+    for module in (sys.modules[__name__], strategy, state_module, trading_bot, market_utils):
+        monkeypatch.setattr(module, "datetime", _FrozenDatetime)
     monkeypatch.setattr(trading_bot, "load_state", lambda symbol: holder["state"])
     monkeypatch.setattr(trading_bot, "save_state", lambda symbol, state: saved.append(deepcopy(state)))
     monkeypatch.setattr(trading_bot, "notify",
@@ -124,6 +145,7 @@ def _day1(env):
 def _next_session(state):
     """다음 거래일로 간주: 동일 세션 중복 가드(last_planned_session)를 어제로 돌린다."""
     state = deepcopy(state)
+    _CLOCK["offset_seconds"] += 60          # 같은 날(ET) 안에서 1분 뒤 — cycle_id 구분용
     state["reverse_mode"]["last_planned_session"] = "2000-01-03"
     return state
 
