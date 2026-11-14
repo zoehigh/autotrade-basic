@@ -349,8 +349,8 @@ def test_unresolved_prior_day_order_blocks_orders_via_reconciliation(env):
     assert final["orders_meta"][odno].get("terminal") is not True
 
 
-@pytest.mark.xfail(strict=True, reason="알려진 공백: reconcile 이 막은 보류(reconciliation_only)는 hold_reason 없이 조용히 끝나 [보류] 알림이 나가지 않음")
 def test_unresolved_prior_day_order_hold_is_reported_and_notified(env):
+    """reconcile 이 막은 보류도 정상 무주문이 아니라 hold_reason(RECONCILIATION_PENDING) + 긴급 알림으로 보고됩니다."""
     holder, saved = env
     state, odno = _day1(env)
     holder["notified"].clear()
@@ -359,8 +359,9 @@ def test_unresolved_prior_day_order_hold_is_reported_and_notified(env):
 
     result = trading_bot.run_one_symbol(broker, _config())
 
-    assert result is not None and result.get("held")
-    assert any("리버스 보류" in m for m, _ in holder["notified"])
+    assert result is not None and result["held"] == "RECONCILIATION_PENDING"
+    assert any("리버스 보류" in m and "reconcile" in m and urgent for m, urgent in holder["notified"])
+    assert broker.place_order.call_count == 0
 
 
 def test_normal_no_order_day_is_not_reported_as_hold(env):

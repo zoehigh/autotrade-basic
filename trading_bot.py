@@ -2138,6 +2138,7 @@ def _recover_order_fence(state, symbol, live_qty):
 
 _REVERSE_HOLD_MESSAGES = {
     "EXIT_UNCONFIRMED": "확정된 직전 정규장 종가를 확인하지 못해 리버스 종료 판정을 보류했습니다 (일봉 조회·날짜 확인 필요).",
+    "RECONCILIATION_PENDING": "리버스 체결 반영·주문이력 확인(reconcile)이 끝나지 않아 신규 주문을 보류했습니다 (전일 리버스 주문 미종결·이력 누락 등 — 체결·이력 확인 필요).",
     "UNRESOLVED_REVERSE_ORDERS": "terminal 확정되지 않은 리버스 주문이 있어 신규 주문과 종료 판정을 보류했습니다 (체결 반영·이력 확인 필요).",
 }
 

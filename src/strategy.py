@@ -194,6 +194,7 @@ def _has_unresolved_reverse_orders(state):
 
 # 리버스 보류 사유 코드: '정상적으로 주문이 없는 날'과 구분해 상위(호출부·알림·실행 요약)로 전달합니다.
 HOLD_EXIT_UNCONFIRMED = "EXIT_UNCONFIRMED"                      # 확정된 직전 정규장 종가 미확보 → 종료 판정 보류
+HOLD_RECONCILIATION_PENDING = "RECONCILIATION_PENDING"          # 체결 반영·이력 확인(reconcile)이 끝나지 않아 신규 주문 보류
 HOLD_UNRESOLVED_REVERSE_ORDERS = "UNRESOLVED_REVERSE_ORDERS"    # terminal 미확정 리버스 주문 → 신규 주문·종료 판정 보류
 
 
@@ -314,7 +315,9 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     rev = state.get("reverse_mode", {})
     if rev.get("reconciliation_error") or rev.get("reconciliation_only"):
         print(f"[리버스모드] {symbol} 상태 reconciliation 확인 필요 → 신규 주문을 생성하지 않습니다.")
-        return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
+        # 정상 무주문이 아니라 보류이므로 사유를 상위로 전달합니다 (알림·실행 요약 대상).
+        return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False,
+                "hold_reason": HOLD_RECONCILIATION_PENDING}
     session_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     if rev.get("last_planned_session") == session_date:
         print(f"[리버스모드] {symbol} 이미 {session_date} 실행됨 → 중복 주문을 생성하지 않습니다.")

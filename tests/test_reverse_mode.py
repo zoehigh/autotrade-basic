@@ -1594,6 +1594,18 @@ def test_hold_reason_reaches_strategy_result(monkeypatch):
     assert unresolved["reverse_hold"] == "UNRESOLVED_REVERSE_ORDERS"
 
 
+@pytest.mark.parametrize("flag", [{"reconciliation_only": True}, {"reconciliation_error": "reverse_order_history_missing"}])
+def test_reconciliation_pending_is_reported_as_hold_not_silent(monkeypatch, flag):
+    """reconcile 이 막은 상태는 정상 무주문이 아니라 RECONCILIATION_PENDING 보류로 상위(reverse_hold)까지 전달된다."""
+    monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+    state = _day1_state()
+    state["reverse_mode"].update(flag)
+    direct = _run_reverse(state, position_qty=144)
+    assert direct["orders"] == [] and direct["hold_reason"] == "RECONCILIATION_PENDING"
+    via_strategy = _strategy_call(state, position_qty=144, cash=177.5)
+    assert via_strategy["orders"] == [] and via_strategy["reverse_hold"] == "RECONCILIATION_PENDING"
+
+
 def test_normal_paths_have_no_hold_reason(monkeypatch):
     """정상 경로(첫날 MOC, 종료+복귀, 동일 세션 재실행)는 보류 사유가 없다 — 정상 무주문과 구분."""
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
