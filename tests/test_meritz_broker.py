@@ -382,21 +382,85 @@ def test_balance_symbol_mismatch_returns_none(make_broker):
     assert broker.get_balance("TQQQ", "NAS") is None
 
 
-def test_daily_closes_returned_oldest_first(make_broker):
-    """일봉은 prpr 종가를 오래된 순으로, 당일(ET) 미확정 봉은 제외합니다."""
-    broker, _session = make_broker(
-        [
-            ok(
-                data=[
-                    {"date": et_days_ago(0), "prpr": "99.9"},   # 당일(ET) → 제외
-                    {"date": et_days_ago(1), "prpr": "73.0"},
-                    {"date": et_days_ago(2), "prpr": "72.0"},
-                    {"date": et_days_ago(3), "prpr": "71.0"},
-                ]
-            ),
-        ]
-    )
+def _freeze_utc(monkeypatch, iso):
+    """어댑터·시장 유틸의 현재 시각을 고정합니다 (실제 시계·주말·장 마감 여부에 의존하지 않도록)."""
+    from datetime import datetime as _dt, timezone as _tz
+    fixed = _dt.fromisoformat(iso).replace(tzinfo=_tz.utc)
+
+    class _Frozen(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed if tz is None else fixed.astimezone(tz)
+
+    import broker.market_utils as market_utils
+    import broker.meritz.adapter as meritz_adapter
+    monkeypatch.setattr(market_utils, "datetime", _Frozen)
+    monkeypatch.setattr(meritz_adapter, "datetime", _Frozen)
+
+
+_DAILY_ROWS = [
+    {"date": "20261112", "prpr": "99.9"},   # 11-12(목) 봉
+    {"date": "20261111", "prpr": "73.0"},
+    {"date": "20261110", "prpr": "72.0"},
+    {"date": "20261109", "prpr": "71.0"},
+]
+
+
+def test_daily_closes_returned_oldest_first_during_session(monkeypatch, make_broker):
+    """장 중(ET 10:00): 오늘(11-12) 봉은 미확정이라 제외, 오래된 순."""
+    _freeze_utc(monkeypatch, "2026-11-12T15:00:00")
+    broker, _session = make_broker([ok(data=_DAILY_ROWS)])
     assert broker.get_daily_closes("TQQQ", "NAS", days=3) == [71.0, 72.0, 73.0]
+
+
+def test_daily_candles_include_session_date_and_exclude_open_session(monkeypatch, make_broker):
+    """날짜 포함 일봉: 'YYYY-MM-DD' 세션 날짜 + 종가, 오래된 순. 장 중 오늘 봉 제외. get_daily_closes 와 같은 종가열."""
+    _freeze_utc(monkeypatch, "2026-11-12T15:00:00")
+    broker, _session = make_broker([ok(data=_DAILY_ROWS), ok(data=_DAILY_ROWS)])
+    candles = broker.get_daily_candles("TQQQ", "NAS", days=3)
+
+    assert [c["close"] for c in candles] == [71.0, 72.0, 73.0]
+    assert [c["date"] for c in candles] == ["2026-11-09", "2026-11-10", "2026-11-11"]
+    assert [c["close"] for c in candles] == broker.get_daily_closes("TQQQ", "NAS", days=3)
+
+
+@pytest.mark.parametrize("now_utc, expected_last", [
+    ("2026-11-12T09:30:30", "2026-11-11"),   # ET 04:30 장 전(운영 18:30 KST): 직전 세션까지
+    ("2026-11-12T21:30:00", "2026-11-12"),   # ET 16:30 정규장 마감 직후: 오늘 봉 포함
+    ("2026-11-13T04:00:00", "2026-11-12"),   # ET 23:00 자정 전: 오늘 봉 포함
+    ("2026-11-13T09:30:30", "2026-11-12"),   # 다음 날 장 전: 직전 세션 (오늘 11-13 봉은 아직 없음/제외)
+])
+def test_daily_candles_cutoff_follows_session_close(monkeypatch, make_broker, now_utc, expected_last):
+    """마감된 마지막 세션까지만 확정 봉으로 인정 — 장 마감 후 자정 전에도 오늘 종가를 버리지 않는다 (확정 종가 날짜 대조와 일치)."""
+    from broker.market_utils import us_session_last_closed_date
+    _freeze_utc(monkeypatch, now_utc)
+    rows = [{"date": "20261113", "prpr": "88.8"}] + _DAILY_ROWS      # 11-13 행은 항상 미확정 취급
+    broker, _session = make_broker([ok(data=rows)])
+    candles = broker.get_daily_candles("TQQQ", "NAS", days=5)
+
+    assert candles[-1]["date"] == expected_last
+    assert candles[-1]["date"] == us_session_last_closed_date(), "어댑터 마지막 일봉 날짜 = 달력상 직전 마감 세션"
+    assert all(c["date"] <= expected_last for c in candles)
+
+
+def test_daily_candles_early_close_day_includes_today_after_early_close(monkeypatch, make_broker):
+    """조기 마감일(2026-11-27 금, 13:00 ET 마감): 마감 전(12:00 ET)은 오늘 제외, 마감 후(14:00 ET)는 오늘 포함."""
+    rows = [{"date": "20261127", "prpr": "60.5"}, {"date": "20261125", "prpr": "60.0"}, {"date": "20261124", "prpr": "59.0"}]
+    _freeze_utc(monkeypatch, "2026-11-27T17:00:00")           # ET 12:00 — 아직 장 중
+    broker, _s = make_broker([ok(data=rows)])
+    assert [c["date"] for c in broker.get_daily_candles("TQQQ", "NAS", days=5)][-1] == "2026-11-25"
+    _freeze_utc(monkeypatch, "2026-11-27T19:00:00")           # ET 14:00 — 조기 마감 후
+    broker, _s = make_broker([ok(data=rows)])
+    assert [c["date"] for c in broker.get_daily_candles("TQQQ", "NAS", days=5)][-1] == "2026-11-27"
+
+
+def test_daily_candles_falls_back_to_exclude_today_when_calendar_unavailable(monkeypatch, make_broker):
+    """달력 조회가 실패(None)하면 기존 보수 규칙: 오늘(ET) 이후 행은 제외."""
+    import broker.meritz.adapter as meritz_adapter
+    _freeze_utc(monkeypatch, "2026-11-12T21:30:00")
+    monkeypatch.setattr(meritz_adapter, "us_session_last_closed_date", lambda *a, **k: None)
+    broker, _session = make_broker([ok(data=_DAILY_ROWS)])
+    assert [c["date"] for c in broker.get_daily_candles("TQQQ", "NAS", days=5)][-1] == "2026-11-11"
 
 
 def test_daily_closes_params_official(make_broker):
