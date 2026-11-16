@@ -497,6 +497,56 @@ class TestKISBrokerContract(BrokerContractTest):
         broker = self._create_broker()
         assert broker.exchange_code("AMS") == "AMEX"
 
+    # ── 일자별종가 (HHDFS76240000) — BYMD 누락 회귀 ────────────────────
+    # 2026-11-16 KIS 데모 DRY: "ERROR INPUT FIELD NOT FOUND [BYMD]" 로 조회가 항상 실패했고,
+    # 리버스 종료 판정 보류(신규 주문 0건)로 이어졌습니다.
+
+    def test_daily_closes_request_has_required_params(self):
+        """일자별종가 요청에 필수 입력 BYMD·MODP 가 들어가야 합니다 (누락 시 API 가 거부)."""
+        self._set_mock_response({"rt_cd": "0", "output1": {}, "output2": [{"xymd": "20261113", "clos": "52.70"}]})
+        broker = self._create_broker()
+        broker.get_daily_closes("SOXL", "AMS", days=5)
+        params = self._mock_session.request.call_args.kwargs["params"]
+        assert "BYMD" in params and "MODP" in params
+        assert params["BYMD"] == "" and params["MODP"] == "0"
+        assert params["EXCD"] == "AMS" and params["SYMB"] == "SOXL" and params["GUBN"] == "0"   # 시세 API 는 3글자 거래소 코드
+
+    def test_daily_closes_reads_output2_oldest_first(self):
+        """실제 응답 형태(output2, 최신순)를 읽어 오래된 순 종가를 반환합니다."""
+        self._set_mock_response({
+            "rt_cd": "0", "output1": {"rsym": "DAMXSOXL"},
+            "output2": [{"xymd": "20261113", "clos": "55.00"}, {"xymd": "20261112", "clos": "54.00"},
+                        {"xymd": "20261111", "clos": "53.00"}],
+        })
+        broker = self._create_broker()
+        assert broker.get_daily_closes("SOXL", "AMS", days=2) == [54.0, 55.0]
+
+    def test_daily_closes_legacy_output_still_read(self):
+        """예전 형태(output)도 계속 읽습니다 (output2 가 없을 때만)."""
+        self._set_mock_response({"rt_cd": "0", "output": [{"clos": "52.00"}, {"clos": "51.00"}]})
+        broker = self._create_broker()
+        assert broker.get_daily_closes("SOXL", "AMS", days=5) == [51.0, 52.0]
+
+    def test_daily_closes_skips_invalid_rows(self):
+        self._set_mock_response({"rt_cd": "0", "output2": [{"clos": "0"}, {"clos": "x"}, {}, {"clos": "50.00"}]})
+        broker = self._create_broker()
+        assert broker.get_daily_closes("SOXL", "AMS", days=5) == [50.0]
+
+    def test_daily_closes_api_error_raises(self):
+        """API 오류(rt_cd != 0)는 조용히 빈 목록이 아니라 BrokerError 입니다."""
+        self._set_mock_response({"rt_cd": "1", "msg1": "ERROR INPUT FIELD NOT FOUND [BYMD]"})
+        broker = self._create_broker()
+        with pytest.raises(BrokerError):
+            broker.get_daily_closes("SOXL", "AMS", days=5)
+
+    def test_daily_candles_have_no_dates(self):
+        """KIS 일봉은 날짜 없이(date=None) 돌려줍니다 — 리버스 종료 판정(PR #16)이 'KIS 는 날짜 미제공 브로커'로
+        보고 기존 방식으로 판정하는 전제입니다. 일봉이 비어 있으면(=조회 실패와 구분 불가) 그 전제가 깨집니다."""
+        self._set_mock_response({"rt_cd": "0", "output2": [{"xymd": "20261113", "clos": "55.00"}, {"clos": "54.00"}]})
+        broker = self._create_broker()
+        candles = broker.get_daily_candles("SOXL", "AMS", days=5)
+        assert len(candles) == 2 and all(c.get("date") is None for c in candles)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # KiwoomBroker 계약 테스트
