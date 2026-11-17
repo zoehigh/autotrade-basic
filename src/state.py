@@ -406,7 +406,7 @@ def _is_terminal_reverse_order(order):
 
 
 def _auto_assume_reverse_expiry(meta, order):
-    """데모 환경에서 이전 세션의 zero-fill 리버스 주문을 만료로 가정해 자동 종결합니다.
+    """데모·메리츠 실전에서 이전 세션의 zero-fill 리버스 주문을 만료로 가정해 자동 종결합니다.
 
     데모(특히 키움 모의)는 일중 주문(LOC/LOO/MOC→LIMIT 자동 변환)이 마감 후
     만료돼도 상태를 "미체결"로 남겨 _is_terminal_reverse_order()가 영구 False가
@@ -414,15 +414,21 @@ def _auto_assume_reverse_expiry(meta, order):
     차단과 만나면 리버스모드가 무기한 동결됩니다.
 
     이를 막기 위해, 이전 미국 세션에서 체결 기회가 지나고 체결량/체결금액이
-    0인 주문(BROKER_MODE=demo 한정)은 terminal_assumed=True로 자동 종결 처리합니다.
+    0인 주문(BROKER_MODE=demo 또는 BROKER=meritz+real 한정)은 terminal_assumed=True로 자동 종결 처리합니다.
+    부분체결 주문은 대상이 아니며 기존대로 보류합니다(day_count·T 반영 경로가 달라 수동 확인이 필요).
     늦은 체결은 reconcile의 odno 단위 processed_filled_qty 델타가 다음 RUN에
     그대로 반영하므로 상태가 소실되지 않습니다. 매수/매도 모두 대상입니다.
     """
     try:
-        from config import BROKER_MODE
+        from config import BROKER, BROKER_MODE
     except Exception:
-        BROKER_MODE = ""
-    if BROKER_MODE != "demo":
+        BROKER = BROKER_MODE = ""
+    is_demo = BROKER_MODE == "demo"
+    # 메리츠 실전: 이전 미국 세션의 LOC/MOC 일중 주문은 세션 종료로 만료됩니다
+    # (기간 이력은 만료 주문도 '미체결'+잔량=주문수량으로 보여 주며, 만료 여부는 취소 시도 시
+    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — AGENTS.md). 호출부가 이전 세션임을 보장합니다.
+    is_meritz_real = BROKER == "meritz" and BROKER_MODE == "real"
+    if not (is_demo or is_meritz_real):
         return False
     if meta.get("terminal"):
         return False
@@ -439,7 +445,10 @@ def _auto_assume_reverse_expiry(meta, order):
     meta["terminal"] = True
     meta["terminal_assumed"] = True
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
-    meta["terminal_assumption_reason"] = "auto_expired_demo_day_order_after_session"
+    meta["terminal_assumption_reason"] = (
+        "auto_expired_meritz_day_order_after_session" if is_meritz_real
+        else "auto_expired_demo_day_order_after_session"
+    )
     return True
 
 
@@ -507,7 +516,7 @@ def reconcile_reverse_fills(state, order_history):
             elif _auto_assume_reverse_expiry(meta, order):
                 print(
                     f"[경고] 이전 세션 미체결 리버스 주문을 만료로 가정합니다: "
-                    f"odno={mask_odno(odno)} → 자동 종결 처리 (데모 일중 주문)"
+                    f"odno={mask_odno(odno)} → 자동 종결 처리 (이전 세션 일중 주문, 체결 0)"
                 )
             else:
                 reverse_mode["reconciliation_error"] = "reverse_order_not_terminal"
