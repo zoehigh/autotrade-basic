@@ -509,8 +509,7 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     return {"orders": orders, "new_T": new_T, "exit": False, "reverse_day": day_count}
 
 
-def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3, state=None,
-                 reverse_additional_loc_levels=8):
+def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=8, state=None):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -534,8 +533,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         symbol_type (str): 종목 타입 ("TQQQ" 또는 "SOXL") — 별지점 공식 결정용
         seed (float): 이 종목에 투입할 최대 금액 (달러). 필수.
         T (float): 현재까지의 누적 매수 횟수 (state.py에서 로드)
-        additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 3)
-        reverse_additional_loc_levels (int): 리버스모드 쿼터매수 아래 추가매수 단계 수 (기본값 8, 일반모드와 별개)
+        additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 8, 일반모드·리버스모드 공통)
 
     Returns:
         dict: 전략 결과
@@ -685,7 +683,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
             rev_result = execute_reverse_mode(
                 broker, symbol, exchange_code, splits, symbol_type,
                 position_qty, avg_price, orderable_cash, last_price,
-                state, additional_loc_levels=reverse_additional_loc_levels,
+                state, additional_loc_levels=additional_loc_levels,
             )
             new_T = rev_result["new_T"]
             rev_orders = rev_result["orders"]

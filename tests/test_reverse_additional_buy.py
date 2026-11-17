@@ -130,14 +130,15 @@ def test_default_reverse_levels_is_eight(monkeypatch):
     assert len(extra) == 8
 
 
-def test_config_reverse_levels_default_and_override(monkeypatch):
-    import importlib, config
+def test_config_additional_levels_is_shared_and_defaults_to_eight(monkeypatch):
+    """일반모드와 리버스모드가 같은 {SYMBOL}_ADDITIONAL_LOC_LEVELS 를 쓰고 기본값은 8."""
+    import config
     monkeypatch.setenv("TQQQ_SEED", "1000"); monkeypatch.setenv("SOXL_SEED", "1000")
-    monkeypatch.delenv("SOXL_REVERSE_ADDITIONAL_LOC_LEVELS", raising=False)
-    monkeypatch.delenv("REVERSE_ADDITIONAL_LOC_LEVELS", raising=False)
+    monkeypatch.delenv("SOXL_ADDITIONAL_LOC_LEVELS", raising=False)
+    monkeypatch.delenv("ADDITIONAL_LOC_LEVELS", raising=False)
     cfg = {c["symbol"]: c for c in config._parse_symbols()}
-    assert cfg["SOXL"]["reverse_additional_loc_levels"] == 8
-    assert cfg["SOXL"]["additional_loc_levels"] == 3   # 일반모드 기본값 불변
-    monkeypatch.setenv("SOXL_REVERSE_ADDITIONAL_LOC_LEVELS", "0")
+    assert cfg["SOXL"]["additional_loc_levels"] == 8
+    assert "reverse_additional_loc_levels" not in cfg["SOXL"]
+    monkeypatch.setenv("SOXL_ADDITIONAL_LOC_LEVELS", "0")
     cfg = {c["symbol"]: c for c in config._parse_symbols()}
-    assert cfg["SOXL"]["reverse_additional_loc_levels"] == 0
+    assert cfg["SOXL"]["additional_loc_levels"] == 0
