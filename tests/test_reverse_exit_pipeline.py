@@ -396,3 +396,100 @@ def test_main_summary_lists_hold_separately(env, monkeypatch, capsys):
     assert "[보류] TQQQ: EXIT_UNCONFIRMED" in out
     assert "합계: 성공 0건 / 예약 0건 / 실패 0건" in out
     assert 1 not in exited, "보류는 실행 실패(종료코드 1)가 아니라 알림으로 구분됩니다"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 리버스 2일차 쿼터매수 + 1주씩 계단식 추가매수 — 파이프라인·독립 검증기 end-to-end
+# ═══════════════════════════════════════════════════════════════════
+_DAY3_NOW_UTC = datetime(2026, 11, 16, 9, 30, 30, tzinfo=ZoneInfo("UTC"))   # 월요일 ET 04:30 (직전 세션 11-13)
+
+
+def _day2_orders(env, monkeypatch, tmp_path):
+    """1일차 → 2일차(쿼터매수 + 추가매수 8단계 접수)까지 실제 파이프라인으로 실행합니다. (day2_state, [(odno, side, qty, price)])"""
+    monkeypatch.chdir(tmp_path)                        # 정산 근거(settlement-*.json) 파일을 임시 폴더에 쓴다
+    monkeypatch.setattr("config.BROKER", "meritz")     # 운영과 같게: 이전 세션 미체결 주문은 만료로 가정(PR #21)
+    holder, saved = env
+    day1_state, day1_odno = _day1(env)
+    holder["state"] = _next_session(day1_state)
+    history = _day2_history(day1_odno, 14, "체결", 130)
+    broker = _broker(history, last=50.0, qty=130, avg=65.5732, cash=3000.0, close=50.0)
+    placed = []
+
+    def _place(symbol, exch, side, qty_, price, order_type):
+        odno = f"20261113:{len(placed) + 1:08d}"
+        placed.append((odno, side, int(qty_), float(price)))
+        return OrderResult(order_id=odno, order_time="20261113183020", is_reservation=False)
+
+    broker.place_order.side_effect = _place
+    trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+    return deepcopy(saved[-1]), placed, history
+
+
+def test_reverse_day2_places_quarter_buy_and_eight_step_ladder(env, monkeypatch, tmp_path):
+    state, placed, _ = _day2_orders(env, monkeypatch, tmp_path)
+    sells = [p for p in placed if p[1] == "SELL"]
+    buys = [p for p in placed if p[1] == "BUY"]
+    assert [(s[2]) for s in sells] == [13]                          # 보유 130 → 1/10
+    quarter_qty, quarter_price = buys[0][2], buys[0][3]
+    assert quarter_qty > 0 and 0 < quarter_price <= 59.5             # 쿼터매수 @별지점-0.01 (잔금은 시드 캡 반영, 현재가×1.19 상한 이하)
+    ladder = buys[1:]
+    assert len(ladder) == 8 and all(b[2] == 1 for b in ladder)
+    prices = [b[3] for b in ladder]
+    assert prices == sorted(prices, reverse=True) and prices[0] < quarter_price
+    amount = prices[0] * (quarter_qty + 1)                           # 쿼터매수금액 ÷ (쿼터매수 수량 + i) 공식
+    for i, price in enumerate(prices, start=1):
+        assert abs(price * (quarter_qty + i) - amount) < (quarter_qty + i) * 0.011
+    metas = state["orders_meta"]
+    add_metas = [m for m in metas.values() if m.get("reverse_day") == 2 and m.get("is_additional")]
+    assert len(add_metas) == 8
+    assert all(m["reverse_action"] == "buy" and m["reverse_t_target"] == 0.0 for m in add_metas)
+
+
+def test_reverse_day3_additional_fill_keeps_t_adds_net_invested_and_passes_verifier(env, monkeypatch, tmp_path):
+    import json, glob
+    sys.path.append(os.path.join(_repo_root, "ops"))
+    import verify_run
+    holder, saved = env
+    day2_state, placed, history2 = _day2_orders(env, monkeypatch, tmp_path)
+    et = ZoneInfo("America/New_York")
+    assert _CLOCK["now"].astimezone(et).date() < _DAY3_NOW_UTC.astimezone(et).date()
+
+    def _rows(with_ladder_fill):
+        rows = list(history2)
+        close = datetime(2026, 11, 13, 21, 0, tzinfo=ZoneInfo("UTC")).isoformat()
+        for i, (odno, side, qty, price) in enumerate(placed):
+            filled = 0
+            if i == 0:
+                filled = 13                                  # 리버스 매도 13주 체결
+            elif i == 1:
+                filled = qty                                 # 쿼터매수 전량 체결
+            elif i == 4 and with_ladder_fill:
+                filled = 1                                   # 추가매수 3단계 1주만 체결
+            status = "체결" if filled else "미체결"
+            rows.append(_row(odno, "매도" if side == "SELL" else "매수", qty, filled, price, close, "20261113", status))
+        return rows
+
+    results = {}
+    for name, with_fill in (("with", True), ("without", False)):
+        for f in glob.glob(str(tmp_path / "settlement-TQQQ-*.json")):
+            os.remove(f)
+        _CLOCK["now"] = _DAY3_NOW_UTC
+        holder["state"] = deepcopy(day2_state)
+        balance = 144 - 14 - 13 + placed[1][2] + (1 if with_fill else 0)   # 이력과 같은 순보유수량
+        broker = _broker(_rows(with_fill), last=50.0, qty=balance, avg=65.5732, cash=3000.0, close=50.0)
+        trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+        final = deepcopy(saved[-1])
+        evid = sorted(glob.glob(str(tmp_path / "settlement-TQQQ-*.json")))
+        results[name] = (final, evid)
+
+    with_state, with_evid = results["with"]
+    without_state, _ = results["without"]
+    ladder_price = placed[4][3]
+    assert with_state["T"] == pytest.approx(without_state["T"]), "추가매수 체결은 T 를 올리지 않는다"
+    assert with_state["net_invested"] - without_state["net_invested"] == pytest.approx(ladder_price, abs=0.011)
+    assert with_evid, "정산 근거 파일이 기록돼야 합니다"
+    # 정산 근거의 broker 라벨은 trading_bot 이 import 시점의 config.BROKER(테스트 환경 기본값)로 기록하므로 근거 값과 같게 넘긴다
+    # (검증하려는 것은 라벨이 아니라 추가매수 체결의 T·순투입금 독립 재계산).
+    label = json.loads(open(with_evid[-1], encoding="utf-8").read()).get("broker")
+    ok, problems = verify_run.verify_evidence_file(with_evid[-1], label, "LIVE")
+    assert ok is True, problems
