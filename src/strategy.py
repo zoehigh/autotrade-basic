@@ -286,15 +286,51 @@ class _SnapshotBroker:
         return getattr(self._broker, name)
 
 
+def _build_reverse_additional_buys(quarter_amount, quarter_qty, quarter_price, total_cash,
+                                   levels, day_count, base_t):
+    """리버스 쿼터매수 아래에 1주씩 계단식 추가매수 LOC 를 만듭니다.
+
+    - 가격: 쿼터매수금액 ÷ (쿼터매수 수량 + i) — 일반모드 추가매수와 같은 공식·함수 재사용
+    - 쿼터매수 가격(보정 후) 이상이거나 앞 단계 이하인 가격은 건너뜁니다
+    - 쿼터매수 + 추가매수 합계가 주문가능금액(시드 캡 반영)을 넘지 않게 단계를 멈춥니다
+    - T 는 올리지 않습니다(reverse_t_target=0): 체결은 net_invested 에만 반영됩니다
+    """
+    if levels <= 0 or quarter_qty <= 0 or quarter_amount <= 0:
+        return []
+    committed = quarter_qty * quarter_price
+    extra = []
+    for level, price in build_additional_loc_prices(
+        quarter_amount, quarter_qty, levels, quarter_price
+    ):
+        if committed + price > total_cash + 1e-9:
+            break
+        committed += price
+        extra.append({
+            "side": "BUY",
+            "quantity": 1,
+            "price": price,
+            "order_type": "LOC",
+            "comment": f"리버스모드 {day_count}일차 추가매수 {level}단계 (쿼터매수 아래) {_ADDITIONAL_MARK}",
+            "t_target": 0.0,
+            "reverse_action": "buy",
+            "reverse_day": day_count,
+            "reverse_base_t": base_t,
+            "reverse_t_target": 0.0,
+        })
+    return extra
+
+
 def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                          position_qty, avg_price, orderable_cash, last_price,
-                         state):
+                         state, additional_loc_levels=8):
     """리버스모드 1회 실행의 주문을 계산합니다 (상태는 읽기만 합니다 — T·day_count 는 체결 반영으로만 바뀝니다).
 
     [원문(라오어 V4 두 문서)에서 확인된 규칙]
     - 진입: 20분할 T>19 / 40분할 T>39. 첫날은 매수 없이 MOC 매도만(보유량 1/10, 40분할 1/20, 내림).
     - 둘째 날부터: 직전 보유량을 같은 비율로 나눠 별지점(직전 5거래일 종가 평균)에 LOC 매도 + 총 잔금 1/4 로 별지점 아래 쿼터매수.
     - 리버스 중 소진 판단은 T 가 아니라 '잔금 1/4 로 1주 매수 가능 여부'(불가하면 매수 없이 MOC 매도만).
+    - 둘째 날부터 쿼터매수 아래에 1주씩 계단식 추가매수 LOC 를 함께 건다(원문 주문표, 사용자 제공 PDF 기준 — 이 저장소에는 PDF 사본이 없음).
+      가격은 일반모드와 같은 공식 쿼터매수금액÷(쿼터매수 수량+i). 추가매수 체결은 T 를 올리지 않고(reverse_t_target=0) net_invested 만 반영합니다.
     - T: 20분할 매도 ×0.9 / 쿼터매수 T+(20−T)×0.25, 40분할 ×0.95 / T+(40−T)×0.25. 일반모드 복귀 시 그대로 승계.
     - 종료: 종가가 평단 대비 TQQQ −15%, SOXL −20% 위로 회복했음을 확인하면 일반모드 복귀(하루 만에 종료될 수도 있음).
       복귀 후 매수금은 잔금÷(분할수−T), T 가 소진이면 다시 리버스.
@@ -438,6 +474,10 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
             })
             new_T_buy = round(new_T_sell + (splits - new_T_sell) * 0.25, 4)
             new_T = new_T_buy
+            orders.extend(_build_reverse_additional_buys(
+                buy_amount, buy_qty, buy_price, total_cash, additional_loc_levels,
+                day_count, T,
+            ))
             print(f"  → LOC 매도 {sell_qty}주 @${adjusted_star}, LOC 매수 {buy_qty}주 @${buy_price}")
             print(f"  → T: {T} → (매도{new_T_sell}) → (매수{new_T_buy}) → T={new_T}")
         else:
@@ -466,7 +506,8 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     return {"orders": orders, "new_T": new_T, "exit": False, "reverse_day": day_count}
 
 
-def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3, state=None):
+def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=3, state=None,
+                 reverse_additional_loc_levels=8):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -491,6 +532,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
         seed (float): 이 종목에 투입할 최대 금액 (달러). 필수.
         T (float): 현재까지의 누적 매수 횟수 (state.py에서 로드)
         additional_loc_levels (int): 급락 대비 추가 LOC 주문 단계 수 (기본값 3)
+        reverse_additional_loc_levels (int): 리버스모드 쿼터매수 아래 추가매수 단계 수 (기본값 8, 일반모드와 별개)
 
     Returns:
         dict: 전략 결과
@@ -640,7 +682,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
             rev_result = execute_reverse_mode(
                 broker, symbol, exchange_code, splits, symbol_type,
                 position_qty, avg_price, orderable_cash, last_price,
-                state,
+                state, additional_loc_levels=reverse_additional_loc_levels,
             )
             new_T = rev_result["new_T"]
             rev_orders = rev_result["orders"]

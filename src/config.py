@@ -135,6 +135,7 @@ HTTP_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 #   SOXL_SYMBOL_TYPE=SOXL
 #   SOXL_SEED=5000
 #   SOXL_ADDITIONAL_LOC_LEVELS=3
+#   SOXL_REVERSE_ADDITIONAL_LOC_LEVELS=8  → 리버스모드 쿼터매수 아래 추가매수 단계 수 (기본 8, 0=끔)
 def _parse_symbols():
 	"""
 	환경변수에서 종목 목록을 읽어 종목별 설정 dict 리스트로 반환합니다.
@@ -241,6 +242,14 @@ def _parse_symbols():
 				os.getenv(f"{sym}_ADDITIONAL_LOC_LEVELS")
 				or os.getenv("ADDITIONAL_LOC_LEVELS")
 				or "3"
+			),
+			# 리버스모드 쿼터매수 아래 추가매수 계단 수 (원문 주문표 8단계)
+			# 종목별({SYMBOL}_REVERSE_ADDITIONAL_LOC_LEVELS) → 글로벌(REVERSE_ADDITIONAL_LOC_LEVELS) → 기본값 8
+			# 0 이면 리버스 추가매수를 걸지 않습니다. 일반모드 단계 수(additional_loc_levels)와 별개입니다.
+			"reverse_additional_loc_levels": int(
+				os.getenv(f"{sym}_REVERSE_ADDITIONAL_LOC_LEVELS")
+				or os.getenv("REVERSE_ADDITIONAL_LOC_LEVELS")
+				or "8"
 			),
 			# T값 강제 설정 (환경변수, 1회성 보정)
 			# {SYMBOL}_FORCE_T: 설정 시 state.json의 T를 이 값으로 덮어씁니다
