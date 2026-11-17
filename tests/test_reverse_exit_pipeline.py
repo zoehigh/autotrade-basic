@@ -411,16 +411,20 @@ def test_reverse_day3_additional_fill_keeps_t_adds_net_invested_and_passes_verif
         trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
         final = deepcopy(saved[-1])
         evid = sorted(glob.glob(str(tmp_path / "settlement-TQQQ-*.json")))
-        results[name] = (final, evid)
+        assert evid, "정산 근거 파일이 기록돼야 합니다"
+        # 두 시나리오는 같은 고정 시각·파일명을 쓰므로, 근거 파일은 그 시나리오 실행 직후 독립 검증한다
+        # (다음 시나리오 시작 시 삭제되거나 덮어써져 다른 시나리오 파일을 읽는 일을 막는다).
+        if with_fill:
+            # 정산 근거의 broker 라벨은 trading_bot 이 import 시점의 config.BROKER(테스트 환경 기본값)로 기록하므로 근거 값과 같게 넘긴다
+            # (검증하려는 것은 라벨이 아니라 추가매수 체결의 T·순투입금 독립 재계산).
+            with open(evid[-1], encoding="utf-8") as fh:
+                label = json.loads(fh.read()).get("broker")
+            ok, problems = verify_run.verify_evidence_file(evid[-1], label, "LIVE")
+            assert ok is True, problems
+        results[name] = final
 
-    with_state, with_evid = results["with"]
-    without_state, _ = results["without"]
+    with_state = results["with"]
+    without_state = results["without"]
     ladder_price = placed[4][3]
     assert with_state["T"] == pytest.approx(without_state["T"]), "추가매수 체결은 T 를 올리지 않는다"
     assert with_state["net_invested"] - without_state["net_invested"] == pytest.approx(ladder_price, abs=0.011)
-    assert with_evid, "정산 근거 파일이 기록돼야 합니다"
-    # 정산 근거의 broker 라벨은 trading_bot 이 import 시점의 config.BROKER(테스트 환경 기본값)로 기록하므로 근거 값과 같게 넘긴다
-    # (검증하려는 것은 라벨이 아니라 추가매수 체결의 T·순투입금 독립 재계산).
-    label = json.loads(open(with_evid[-1], encoding="utf-8").read()).get("broker")
-    ok, problems = verify_run.verify_evidence_file(with_evid[-1], label, "LIVE")
-    assert ok is True, problems
