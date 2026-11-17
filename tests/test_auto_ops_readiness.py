@@ -184,7 +184,7 @@ def test_reverse_buy_applies_price_cap(monkeypatch):
         last_price=50.0, state=state,
     )
 
-    buys = [o for o in result["orders"] if o["side"] == "BUY"]
+    buys = [o for o in result["orders"] if o["side"] == "BUY" and "[추가매수]" not in o["comment"]]
     assert len(buys) == 1
     # 별지점 $100 - 0.01 = $99.99 → 상한 50 × 1.19 = $59.50
     assert buys[0]["price"] == 59.5
@@ -208,7 +208,7 @@ def test_reverse_buy_without_cap_keeps_star_price(monkeypatch):
         last_price=45.0, state=state,
     )
 
-    buys = [o for o in result["orders"] if o["side"] == "BUY"]
+    buys = [o for o in result["orders"] if o["side"] == "BUY" and "[추가매수]" not in o["comment"]]
     assert len(buys) == 1
     # 별지점 50 - 0.01 = 49.99, 상한 45 × 1.19 = 53.55 → 캡 없음
     assert buys[0]["price"] == 49.99

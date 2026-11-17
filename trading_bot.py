@@ -827,6 +827,7 @@ def run_one_symbol(broker: Broker, symbol_config):
     symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
     additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
+    reverse_additional_loc_levels = symbol_config.get("reverse_additional_loc_levels", 8)
 
     # DRY(저장 금지)·LIVE(복구와 주문 결합)에서 FORCE_T 는 어떤 조회·변경보다 먼저 막습니다.
     _force_t_block = _force_t_mode_block_message(TRADE_MODE, [symbol_config])
@@ -1361,6 +1362,7 @@ def run_one_symbol(broker: Broker, symbol_config):
         seed=seed,
         T=T,
         additional_loc_levels=additional_loc_levels,
+        reverse_additional_loc_levels=reverse_additional_loc_levels,
         state=strategy_state,
     )
 

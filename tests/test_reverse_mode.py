@@ -905,9 +905,10 @@ def test_reverse_non_exhaustion_loc_sell_and_loc_buy(monkeypatch):
         state=state,
     )
 
-    assert len(result["orders"]) == 2, "비소진 시 매도+매수 2건이 있어야 합니다"
-    sell_order = next(o for o in result["orders"] if o["side"] == "SELL")
-    buy_order = next(o for o in result["orders"] if o["side"] == "BUY")
+    core = [o for o in result["orders"] if "[추가매수]" not in o["comment"]]
+    assert len(core) == 2, "비소진 시 매도+쿼터매수 2건이 있어야 합니다 (추가매수 계단은 별도)"
+    sell_order = next(o for o in core if o["side"] == "SELL")
+    buy_order = next(o for o in core if o["side"] == "BUY")
     assert sell_order["order_type"] == "LOC", "비소진 시 LOC 매도여야 합니다"
     assert buy_order["order_type"] == "LOC", "비소진 시 LOC 매수여야 합니다"
     assert "쿼터매수" in buy_order["comment"]
@@ -1529,7 +1530,8 @@ def test_reverse_continues_loc_sell_and_quarter_buy_even_when_t_above_19(monkeyp
     result = execute_reverse_mode(None, "SOXL", "AMS", 20, "SOXL", state=state, **kw)
 
     assert result["exit"] is False
-    kinds = sorted((o["side"], o["order_type"]) for o in result["orders"])
+    core = [o for o in result["orders"] if "[추가매수]" not in o["comment"]]
+    kinds = sorted((o["side"], o["order_type"]) for o in core)
     assert kinds == [("BUY", "LOC"), ("SELL", "LOC")], "T>19 여도 쿼터매수 가능하면 LOC 매도+LOC 매수 유지"
     assert not any(o["order_type"] == "MOC" for o in result["orders"])
 
