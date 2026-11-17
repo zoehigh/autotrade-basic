@@ -459,6 +459,10 @@ def _auto_assume_reverse_expiry(meta, order):
         # (KIS 의 _assume_missing_reverse_order_zero_fill 과 같은 엄격한 마커 규칙).
         if "ft_ccld_qty" not in order or not _is_explicit_zero_text(order.get("ft_ccld_qty")):
             return False
+        # 체결수량 0 인데 체결금액이 0 이 아니거나 읽을 수 없는 비정상 응답도 0체결로 보지 않습니다
+        # (실측: 메리츠 미체결 행은 ft_ccld_amt3='0.0' 으로 내려옵니다).
+        if "ft_ccld_amt3" not in order or not _is_explicit_zero_text(order.get("ft_ccld_amt3")):
+            return False
         for key in ("processed_filled_qty", "processed_filled_amount"):
             if key not in meta or not _is_explicit_zero_number(meta.get(key)):
                 return False
