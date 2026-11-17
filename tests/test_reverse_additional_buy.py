@@ -11,6 +11,13 @@ from state import reconcile_reverse_fills
 _MARK = "[추가매수]"
 
 
+@pytest.fixture(autouse=True)
+def _demo_mode(monkeypatch):
+    """기본은 데모(자동 만료 가정이 있어 추가매수 허용). 실전 분기는 각 테스트에서 지정."""
+    monkeypatch.setattr("config.BROKER_MODE", "demo")
+    monkeypatch.setattr("config.BROKER", "kis")
+
+
 def _patch_star(monkeypatch, star=50.0):
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
     monkeypatch.setattr("strategy._confirmed_prev_close", lambda *a, **k: (star, "2026-11-10"))
@@ -142,3 +149,22 @@ def test_config_additional_levels_is_shared_and_defaults_to_eight(monkeypatch):
     monkeypatch.setenv("SOXL_ADDITIONAL_LOC_LEVELS", "0")
     cfg = {c["symbol"]: c for c in config._parse_symbols()}
     assert cfg["SOXL"]["additional_loc_levels"] == 0
+
+
+@pytest.mark.parametrize("broker,mode,expected", [
+    ("meritz", "real", 8), ("kis", "demo", 8), ("kiwoom", "demo", 8), ("nhplug", "demo", 8),
+    ("kis", "real", 0), ("ls", "real", 0), ("kiwoom", "real", 0), ("toss", "real", 0), ("nhplug", "real", 0),
+])
+def test_ladder_only_where_unfilled_orders_can_be_closed(monkeypatch, broker, mode, expected):
+    """만료 확인 경로가 있는 환경(데모 전체·메리츠 실전)에서만 추가매수를 건다 (Codex P2: KIS 실전은 미체결이 이력에서 빠져 보류됨)."""
+    _patch_star(monkeypatch)
+    monkeypatch.setattr("config.BROKER", broker)
+    monkeypatch.setattr("config.BROKER_MODE", mode)
+    result = execute_reverse_mode(
+        None, "SOXL", "AMS", 20, "SOXL", position_qty=100, avg_price=100.0,
+        orderable_cash=10_000.0, last_price=50.0, state=_day2_state(),
+    )
+    extra = [o for o in result["orders"] if _MARK in o["comment"]]
+    assert len(extra) == expected
+    core = [o for o in result["orders"] if _MARK not in o["comment"]]
+    assert sorted(o["side"] for o in core) == ["BUY", "SELL"]      # 쿼터매수·매도는 어느 환경에서도 그대로
