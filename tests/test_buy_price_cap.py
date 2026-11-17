@@ -120,6 +120,7 @@ def _soxl_late_half_orders(monkeypatch, last_price=93.71):
     return 무한매수법_V4(
         broker, symbol="SOXL", exchange_code="AMS", splits=20, symbol_type="SOXL",
         seed=9627.46, T=12.6562, state=state,
+        additional_loc_levels=3,  # 이 테스트는 3단계 계단·상한 동작을 고정합니다 (기본값은 8)
     )
 
 
@@ -179,6 +180,7 @@ def test_orders_without_cap_are_unchanged(monkeypatch):
     result = 무한매수법_V4(
         broker, symbol="TQQQ", exchange_code="NAS", splits=20, symbol_type="TQQQ",
         seed=9696.18, T=12.375, state=state,
+        additional_loc_levels=3,  # 이 테스트는 3단계 기준 주문을 고정합니다 (기본값은 8)
     )
 
     buys = [o for o in result["orders"] if o["side"] == "BUY"]
