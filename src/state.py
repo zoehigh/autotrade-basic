@@ -405,6 +405,27 @@ def _is_terminal_reverse_order(order):
         return False
 
 
+def _is_explicit_zero_number(value):
+    """state 마커용: bool 이 아닌 유한한 숫자 0 만 True (None·문자열·NaN·0 이 아닌 값은 False)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value == 0
+    )
+
+
+def _is_explicit_zero_text(value):
+    """브로커 이력용: '0'·0·'0.0' 처럼 명시적으로 파싱되는 유한한 0 만 True (빈 문자열·None·bool·이상값은 False)."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        return False
+    return math.isfinite(number) and number == 0
+
+
 def _auto_assume_reverse_expiry(meta, order):
     """데모·메리츠 실전에서 이전 세션의 zero-fill 리버스 주문을 만료로 가정해 자동 종결합니다.
 
@@ -432,16 +453,28 @@ def _auto_assume_reverse_expiry(meta, order):
         return False
     if meta.get("terminal"):
         return False
-    try:
-        history_filled = int(float(order.get("ft_ccld_qty", "0") or 0))
-    except (TypeError, ValueError):
-        history_filled = 0
-    if history_filled != 0:
-        return False
-    if int(meta.get("processed_filled_qty", 0) or 0) != 0:
-        return False
-    if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
-        return False
+    if is_meritz_real:
+        # 실전은 '명시적으로 0체결이 확인된 경우에만' 만료로 봅니다. 누락·None·문자열·NaN·소수 등
+        # 불명확한 값을 0 으로 해석하면 체결된 주문을 미체결로 오판해 T·순투입금 반영이 어긋납니다
+        # (KIS 의 _assume_missing_reverse_order_zero_fill 과 같은 엄격한 마커 규칙).
+        if "ft_ccld_qty" not in order or not _is_explicit_zero_text(order.get("ft_ccld_qty")):
+            return False
+        for key in ("processed_filled_qty", "processed_filled_amount"):
+            if key not in meta or not _is_explicit_zero_number(meta.get(key)):
+                return False
+        if "applied_fill_fraction" in meta and not _is_explicit_zero_number(meta.get("applied_fill_fraction")):
+            return False
+    else:
+        try:
+            history_filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            history_filled = 0
+        if history_filled != 0:
+            return False
+        if int(meta.get("processed_filled_qty", 0) or 0) != 0:
+            return False
+        if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
+            return False
     meta["terminal"] = True
     meta["terminal_assumed"] = True
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
