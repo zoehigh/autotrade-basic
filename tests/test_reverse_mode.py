@@ -1745,6 +1745,42 @@ def test_meritz_real_unclear_history_fill_qty_is_not_treated_as_zero(monkeypatch
     assert not meta.get("terminal") and not meta.get("terminal_assumed")
 
 
+@pytest.mark.parametrize("bad_amount", ["10.5", "", None, "abc", "nan", "inf", True, "-0.01"])
+def test_meritz_real_zero_qty_with_nonzero_or_unclear_amount_is_not_expired(monkeypatch, bad_amount):
+    """체결수량 0 이어도 체결금액이 0 이 아니거나 불명확하면 만료 가정하지 않는다 (비정상 응답)."""
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    row["ft_ccld_amt3"] = bad_amount
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+    assert not meta.get("terminal") and not meta.get("terminal_assumed")
+
+
+def test_meritz_real_missing_history_amount_field_is_not_expired(monkeypatch):
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    del row["ft_ccld_amt3"]
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+
+
+@pytest.mark.parametrize("zero_amount", ["0", "0.0", "0.00", 0, 0.0])
+def test_meritz_real_real_world_zero_amount_formats_are_expired(monkeypatch, zero_amount):
+    """운영 실측 형태('0.0') 포함, 명시적 0 금액은 만료 가정 가능."""
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    row["ft_ccld_amt3"] = zero_amount
+
+    assert _auto_assume_reverse_expiry(meta, row) is True
+    assert meta["terminal_assumed"] is True
+
+
 def test_meritz_real_missing_history_fill_qty_field_is_not_treated_as_zero(monkeypatch):
     from state import _auto_assume_reverse_expiry
     _meritz_real(monkeypatch)
