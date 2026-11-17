@@ -580,7 +580,8 @@ def test_auto_expire_prev_session_zero_fill_sell_demo(monkeypatch):
 
 
 def test_auto_expire_not_in_real_mode(monkeypatch):
-    """실전: 같은 zero-fill 주문이라도 자동 만료하지 않고 차단 유지."""
+    """실전(메리츠 외): 같은 zero-fill 주문이라도 자동 만료하지 않고 차단 유지."""
+    monkeypatch.setattr("config.BROKER", "kis")
     monkeypatch.setattr("config.BROKER_MODE", "real")
     state = {
         "T": 12.0,
@@ -1638,3 +1639,220 @@ def test_reverse_sell_proceeds_reflected_in_remaining_seed_via_net_invested(monk
     assert round(result["remaining_seed"], 2) == round(9696.18 - state["net_invested"], 2)
     assert result["orderable_cash"] == result["remaining_seed"], "브로커 현금이 충분하면 잔여 시드가 잔금 기준"
     assert result["remaining_seed"] > 177.5 + 829.0, "회수금만큼 잔여 시드가 증가"
+
+
+# ── 메리츠 실전: 이전 세션 zero-fill 리버스 주문 만료 가정 (2026-11-17 SOXL 11-16 LOC 매도 10주 미체결 실측) ──
+def _meritz_state(side, session, qty=10):
+    sell = side == "SELL"
+    meta = {
+        "side": side, "total_qty": qty, "processed_filled_qty": 0, "processed_filled_amount": 0.0,
+        "fill_marker_version": 1, "reverse_action": "sell" if sell else "buy", "reverse_day": 2,
+        "cycle_id": "CM", "submitted_at": session.replace("-", "") + "183026", "submitted_session": session,
+        "_ord_dt_is_kst_date": True,
+    }
+    if sell:
+        meta.update({"reverse_base_t": 17.9384, "reverse_t_factor": 0.9})
+    else:
+        meta["reverse_t_target"] = 1.0
+    return {"T": 17.9384, "reverse_mode": {"active": True, "cycle_id": "CM", "day_count": 1},
+            "orders_meta": {"RM1": meta}}
+
+
+def _meritz_row(side, session, filled="0", remain="10", status="미체결"):
+    return [{
+        "odno": "RM1", "ord_dt": session.replace("-", ""), "ord_tmd": "183026", "_ord_dt_is_kst_date": True,
+        "ord_datetime_utc": session + "T09:30:26+00:00",
+        "sll_buy_dvsn_cd_name": "매도" if side == "SELL" else "매수",
+        "ft_ccld_qty": filled, "ft_ccld_amt3": "0", "nccs_qty": remain, "prcs_stat_name": status,
+    }]
+
+
+@pytest.mark.parametrize("side", ["SELL", "BUY"])
+def test_meritz_real_prev_session_zero_fill_is_assumed_expired(monkeypatch, side):
+    monkeypatch.setattr("config.BROKER", "meritz")
+    monkeypatch.setattr("config.BROKER_MODE", "real")
+    state = _meritz_state(side, "2026-08-10")
+
+    reconcile_reverse_fills(state, _meritz_row(side, "2026-08-10"))
+
+    meta = state["orders_meta"]["RM1"]
+    assert meta["terminal"] is True and meta["terminal_assumed"] is True
+    assert meta["terminal_assumption_reason"] == "auto_expired_meritz_day_order_after_session"
+    assert state["reverse_mode"].get("reconciliation_error") is None
+    assert state["reverse_mode"].get("reconciliation_only") is None
+    assert state["T"] == 17.9384
+    from strategy import _has_unresolved_reverse_orders
+    assert _has_unresolved_reverse_orders(state) is False
+
+
+def test_meritz_real_today_session_is_not_assumed_expired(monkeypatch):
+    monkeypatch.setattr("config.BROKER", "meritz")
+    monkeypatch.setattr("config.BROKER_MODE", "real")
+    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    state = _meritz_state("SELL", today)
+
+    reconcile_reverse_fills(state, _meritz_row("SELL", today))
+
+    assert state["orders_meta"]["RM1"].get("terminal") is not True
+    assert state["reverse_mode"].get("reconciliation_only") is None
+
+
+def test_meritz_real_partial_fill_is_still_held(monkeypatch):
+    """부분체결은 기존대로 보류 (day_count·T 반영 경로가 달라 수동 확인 대상)."""
+    monkeypatch.setattr("config.BROKER", "meritz")
+    monkeypatch.setattr("config.BROKER_MODE", "real")
+    state = _meritz_state("SELL", "2026-08-10")
+
+    rows = _meritz_row("SELL", "2026-08-10", filled="4", remain="6", status="부분체결")
+    rows[0]["ft_ccld_amt3"] = "232.28"
+    reconcile_reverse_fills(state, rows)
+
+    assert state["orders_meta"]["RM1"].get("terminal_assumed") is not True
+    assert state["reverse_mode"]["reconciliation_error"] == "reverse_order_not_terminal"
+
+
+def test_meritz_late_fill_after_assumed_expiry_is_still_reflected(monkeypatch):
+    monkeypatch.setattr("config.BROKER", "meritz")
+    monkeypatch.setattr("config.BROKER_MODE", "real")
+    state = _meritz_state("BUY", "2026-08-10")
+    state["orders_meta"]["RM1"]["reverse_t_target"] = 0.0
+    state["net_invested"] = 1000.0
+
+    reconcile_reverse_fills(state, _meritz_row("BUY", "2026-08-10"))      # 만료 가정
+    late = _meritz_row("BUY", "2026-08-10", filled="2", remain="0", status="체결")
+    late[0]["ft_ccld_amt3"] = "100.00"
+    reconcile_reverse_fills(state, late)                                   # 늦은 체결
+
+    assert state["net_invested"] == pytest.approx(1100.0)
+
+
+# ── 메리츠 실전: 명시적 0체결·마커가 확인된 경우에만 만료 가정 (불명확한 값은 보류) ──
+def _meritz_real(monkeypatch):
+    monkeypatch.setattr("config.BROKER", "meritz")
+    monkeypatch.setattr("config.BROKER_MODE", "real")
+
+
+@pytest.mark.parametrize("bad_filled", ["", None, "abc", "nan", "inf", "0.5", True, "-1"])
+def test_meritz_real_unclear_history_fill_qty_is_not_treated_as_zero(monkeypatch, bad_filled):
+    """불명확한 이력 체결수량은 0체결이 아니다 (함수 직접 호출 — 이후 reconcile 은 손상 값에서 예외로 중단되는 fail-closed)."""
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    row["ft_ccld_qty"] = bad_filled
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+    assert not meta.get("terminal") and not meta.get("terminal_assumed")
+
+
+@pytest.mark.parametrize("bad_amount", ["10.5", "", None, "abc", "nan", "inf", True, "-0.01"])
+def test_meritz_real_zero_qty_with_nonzero_or_unclear_amount_is_not_expired(monkeypatch, bad_amount):
+    """체결수량 0 이어도 체결금액이 0 이 아니거나 불명확하면 만료 가정하지 않는다 (비정상 응답)."""
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    row["ft_ccld_amt3"] = bad_amount
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+    assert not meta.get("terminal") and not meta.get("terminal_assumed")
+
+
+def test_meritz_real_missing_history_amount_field_is_not_expired(monkeypatch):
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    del row["ft_ccld_amt3"]
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+
+
+@pytest.mark.parametrize("zero_amount", ["0", "0.0", "0.00", 0, 0.0])
+def test_meritz_real_real_world_zero_amount_formats_are_expired(monkeypatch, zero_amount):
+    """운영 실측 형태('0.0') 포함, 명시적 0 금액은 만료 가정 가능."""
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    row["ft_ccld_amt3"] = zero_amount
+
+    assert _auto_assume_reverse_expiry(meta, row) is True
+    assert meta["terminal_assumed"] is True
+
+
+def test_meritz_real_missing_history_fill_qty_field_is_not_treated_as_zero(monkeypatch):
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    row = _meritz_row("SELL", "2026-08-10")[0]
+    del row["ft_ccld_qty"]
+
+    assert _auto_assume_reverse_expiry(meta, row) is False
+    assert not meta.get("terminal_assumed")
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("processed_filled_qty", None), ("processed_filled_qty", "0"), ("processed_filled_qty", 0.5),
+    ("processed_filled_qty", float("nan")), ("processed_filled_qty", True), ("processed_filled_qty", "MISSING"),
+    ("processed_filled_amount", None), ("processed_filled_amount", "0.0"), ("processed_filled_amount", float("nan")),
+    ("processed_filled_amount", "MISSING"),
+    ("applied_fill_fraction", None), ("applied_fill_fraction", "0"), ("applied_fill_fraction", 0.3),
+])
+def test_meritz_real_unclear_state_markers_are_not_treated_as_zero(monkeypatch, key, bad):
+    from state import _auto_assume_reverse_expiry
+    _meritz_real(monkeypatch)
+    meta = _meritz_state("SELL", "2026-08-10")["orders_meta"]["RM1"]
+    if bad == "MISSING":
+        meta.pop(key, None)
+    else:
+        meta[key] = bad
+
+    assert _auto_assume_reverse_expiry(meta, _meritz_row("SELL", "2026-08-10")[0]) is False
+    assert not meta.get("terminal") and not meta.get("terminal_assumed")
+
+
+def test_meritz_real_explicit_zero_markers_and_absent_fraction_are_assumed_expired(monkeypatch):
+    """실제 운영 state 형태: processed_filled_qty=0(int), processed_filled_amount=0.0(float), applied_fill_fraction 키 없음."""
+    _meritz_real(monkeypatch)
+    state = _meritz_state("SELL", "2026-08-10")
+    assert "applied_fill_fraction" not in state["orders_meta"]["RM1"]
+
+    reconcile_reverse_fills(state, _meritz_row("SELL", "2026-08-10"))
+
+    assert state["orders_meta"]["RM1"]["terminal_assumed"] is True
+
+
+def test_meritz_real_late_quarter_buy_fill_updates_t_once_and_is_not_double_applied(monkeypatch):
+    """쿼터매수(T 목표 > 0)가 만료 가정 뒤 늦게 부분→전량 체결돼도 T·순투입금이 정확히 1회씩만 반영되고 재실행에도 중복되지 않는다."""
+    _meritz_real(monkeypatch)
+    state = _meritz_state("BUY", "2026-08-10")
+    meta = state["orders_meta"]["RM1"]
+    meta["reverse_t_target"] = 1.0
+    state["net_invested"] = 1000.0
+
+    reconcile_reverse_fills(state, _meritz_row("BUY", "2026-08-10"))            # 만료 가정(체결 0)
+    assert meta["terminal_assumed"] is True and state["T"] == 17.9384
+
+    def _late(filled, amount):
+        rows = _meritz_row("BUY", "2026-08-10", filled=str(filled), remain=str(10 - filled),
+                           status="체결" if filled == 10 else "부분체결")
+        rows[0]["ft_ccld_amt3"] = f"{amount:.2f}"
+        return rows
+
+    reconcile_reverse_fills(state, _late(4, 40.0))                               # 늦은 부분체결 4/10
+    assert state["T"] == pytest.approx(17.9384 + 0.4, abs=1e-3)
+    assert state["net_invested"] == pytest.approx(1040.0)
+
+    reconcile_reverse_fills(state, _late(4, 40.0))                               # 같은 이력 재실행 → 중복 반영 없음
+    assert state["T"] == pytest.approx(17.9384 + 0.4, abs=1e-3)
+    assert state["net_invested"] == pytest.approx(1040.0)
+
+    reconcile_reverse_fills(state, _late(10, 100.0))                             # 나머지 체결 10/10 → 델타 0.6, 60달러
+    assert state["T"] == pytest.approx(17.9384 + 1.0, abs=1e-3)
+    assert state["net_invested"] == pytest.approx(1100.0)
+
+    reconcile_reverse_fills(state, _late(10, 100.0))                             # 재실행 → 변화 없음
+    assert state["T"] == pytest.approx(17.9384 + 1.0, abs=1e-3)
+    assert state["net_invested"] == pytest.approx(1100.0)
+    assert meta["processed_filled_qty"] == 10 and meta["applied_fill_fraction"] == 1.0
