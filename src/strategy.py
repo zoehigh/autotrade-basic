@@ -286,6 +286,19 @@ class _SnapshotBroker:
         return getattr(self._broker, name)
 
 
+def _reverse_ladder_supported():
+    """리버스 추가매수 계단을 걸어도 되는 환경인지 판단합니다.
+
+    추가매수는 대부분 체결되지 않으므로, 다음 세션에 미체결 주문을 '종결'로 처리하는 경로가 있어야
+    "전일 리버스 주문 미종결 → 신규 주문 보류"에 걸리지 않습니다.
+    - 데모(BROKER_MODE=demo): 이전 세션 zero-fill 자동 만료 가정(KIS 는 체결 전용 이력 가정 포함)
+    - 메리츠 실전: 이전 세션 zero-fill 만료 가정(PR #21)
+    그 밖의 실전(KIS·LS·KIWOOM·TOSS·NHPLUG real)은 만료 확인 경로가 없어 걸지 않습니다(Codex P2).
+    """
+    import config
+    return config.BROKER_MODE == "demo" or (config.BROKER == "meritz" and config.BROKER_MODE == "real")
+
+
 def _build_reverse_additional_buys(quarter_amount, quarter_qty, quarter_price, total_cash,
                                    levels, day_count, base_t):
     """리버스 쿼터매수 아래에 1주씩 계단식 추가매수 LOC 를 만듭니다.
@@ -474,10 +487,13 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
             })
             new_T_buy = round(new_T_sell + (splits - new_T_sell) * 0.25, 4)
             new_T = new_T_buy
-            orders.extend(_build_reverse_additional_buys(
-                buy_amount, buy_qty, buy_price, total_cash, additional_loc_levels,
-                day_count, T,
-            ))
+            if _reverse_ladder_supported():
+                orders.extend(_build_reverse_additional_buys(
+                    buy_amount, buy_qty, buy_price, total_cash, additional_loc_levels,
+                    day_count, T,
+                ))
+            elif additional_loc_levels > 0:
+                print(f"  ※ 리버스 추가매수는 이 브로커·모드에서 미체결 주문 만료 확인 경로가 없어 걸지 않습니다")
             print(f"  → LOC 매도 {sell_qty}주 @${adjusted_star}, LOC 매수 {buy_qty}주 @${buy_price}")
             print(f"  → T: {T} → (매도{new_T_sell}) → (매수{new_T_buy}) → T={new_T}")
         else:
