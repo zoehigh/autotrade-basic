@@ -837,11 +837,17 @@ def _required_settlement_fills(evidence):
             if item.get("expected_delta") is None:
                 # 쿼터매수 T 효과(reverse_t_rule=2)는 '직전 T' 기준: 이 주문 항목을 뺀 원장을 독립 재생해
                 # 기대 효과를 구하고, 원장 항목이 아예 없거나(누락) 값이 다르면 실패시킵니다.
+                # '직전'은 이 주문보다 먼저 정산된 항목만입니다(같은 묶음에서 뒤에 반영된 사건은 제외).
+                earlier_seqs = set()
+                for ev_order in orders:
+                    if str(ev_order.get("odno")) == odno:
+                        break
+                    if ev_order.get("ledger_seq") is not None:
+                        earlier_seqs.add(str(ev_order.get("ledger_seq")))
                 prior_ledger = {
                     "start_T": _as_float((evidence.get("ledger_before") or {}).get("start_T", evidence.get("T_before"))),
-                    "entries": [
-                        e for e in (list((evidence.get("ledger_before") or {}).get("entries") or []) + new_entries)
-                        if not (e.get("kind") == kind and str(e.get("odno")) == odno)
+                    "entries": list((evidence.get("ledger_before") or {}).get("entries") or []) + [
+                        e for e in new_entries if str(e.get("seq")) in earlier_seqs
                     ],
                 }
                 prior_t = _replay_ledger(prior_ledger)
