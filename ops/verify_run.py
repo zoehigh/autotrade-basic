@@ -1067,8 +1067,11 @@ def _independent_expected_ordered(evidence):
                 splits_v = _as_int(meta.get("reverse_splits", order.get("reverse_splits")))
                 prior_t = _replay_ledger({
                     "start_T": round(start_t, 4),
+                    # 리버스 정산은 일반 정산(늦은 매도 재분류 등)보다 먼저 일어나므로, 이번 실행 전에 이미 있던
+                    # 항목은 정산 전(before) 값으로 재생합니다 (같은 실행의 뒤 개정이 직전 T 에 섞이지 않게).
                     "entries": [
-                        expected_entries[k] for k in sorted(expected_entries, key=lambda value: int(value))
+                        before_entries.get(k) or expected_entries[k]
+                        for k in sorted(expected_entries, key=lambda value: int(value))
                         if int(k) < int(seq)
                     ],
                 })
