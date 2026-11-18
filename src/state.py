@@ -750,11 +750,15 @@ def reconcile_reverse_fills(state, order_history):
                     t_basis = float(state.get("T", 0.0))
                     if splits_for_rule <= 0 or not math.isfinite(t_basis):
                         raise ValueError("invalid")
+                    if t_basis > splits_for_rule + 1e-9:
+                        # T 가 분할수를 넘은 상태는 정상 경로로 만들어지지 않습니다. 매수 효과가 음수가 되어
+                        # 오류를 덮을 수 있으므로 자르지 않고 원인 확인을 위해 정산을 보류합니다.
+                        raise ValueError("t_above_splits")
                 except (TypeError, ValueError):
                     _mark_settlement_hold(
                         state,
-                        f"리버스 매수 {mask_odno(odno)} 의 분할수(reverse_splits)·기준 T 가 유효하지 않아 "
-                        f"T 효과를 확정할 수 없습니다",
+                        f"리버스 매수 {mask_odno(odno)} 의 분할수(reverse_splits)·기준 T 가 유효하지 않거나 "
+                        f"T 가 분할수를 초과해 T 효과를 확정할 수 없습니다 — 원인 확인 필요",
                     )
                     continue
                 settled_target = round((splits_for_rule - t_basis) * 0.25, 4)
