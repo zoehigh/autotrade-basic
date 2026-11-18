@@ -483,7 +483,11 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                 "reverse_action": "buy",
                 "reverse_day": day_count,
                 "reverse_base_t": T,
+                # 계획 시점 추정값(매도 전량 체결 가정). 실제 반영은 정산에서 첫 체결 때
+                # '그 시점의 T' 기준으로 확정합니다 (reverse_t_rule=2, 원문: 매수 T = 직전 T + (N-직전 T)×0.25).
                 "reverse_t_target": round((splits - new_T_sell) * 0.25, 4),
+                "reverse_t_rule": 2,
+                "reverse_splits": splits,
             })
             new_T_buy = round(new_T_sell + (splits - new_T_sell) * 0.25, 4)
             new_T = new_T_buy
