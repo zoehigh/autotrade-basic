@@ -14,6 +14,8 @@ from state import reconcile_reverse_fills
 
 _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(_repo_root, "ops"))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 SPLITS = 20
 
@@ -258,3 +260,39 @@ def test_verifier_accepts_buy_followed_by_later_sell_in_same_batch():
     state["_settlement_deltas"] = state.pop("_reverse_settlement_deltas", [])
     evidence = build_settlement_evidence("SOXL", state, history, mode="LIVE", before=before, balance_qty=110)
     assert verify_run._verify_evidence_ordered(evidence) == []
+
+
+def test_expected_ledger_prior_t_ignores_same_run_sell_reclassification():
+    """같은 실행에서 이전 일반 매도가 재분류(0.75→0.25)돼도 쿼터매수의 직전 T 는 정산 전 값(18)이다.
+
+    리버스 정산이 먼저 일어나므로 목표는 +0.5 (재분류 후 값 6 을 섞으면 +3.5 로 잘못 기대한다).
+    """
+    import verify_run
+    evidence = _evidence_for(0, 10)
+    buy_order = next(o for o in evidence["orders"] if o["odno"] == "RBUY")
+    buy_order["ledger_seq"] = 2
+    sell_before = {"seq": 1, "kind": "sell", "odno": "OLD_SELL", "factor": 0.75, "basis": 100, "cumulative_qty": 10}
+    sell_after = dict(sell_before, factor=0.25)
+    buy_entry = {"seq": 2, "kind": "reverse_buy", "odno": "RBUY", "delta": 0.5}
+    evidence["T_before"] = 18.0
+    evidence["ledger_before"] = {"start_T": 24.0, "entries": [sell_before]}
+    evidence["ledger_after"] = {"start_T": 24.0, "entries": [sell_after, buy_entry]}
+    _problems, expected_ledger, _money = verify_run._independent_expected_ordered(evidence)
+    expected_buy = next(e for e in expected_ledger["entries"] if e["kind"] == "reverse_buy")
+    assert expected_buy["delta"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_t_above_splits_holds_instead_of_negative_effect():
+    """T 가 분할수를 넘으면 음수 효과로 덮지 않고 정산을 보류한다 (원인 확인용)."""
+    state = _state(20.5)
+    reconcile_reverse_fills(state, _history(0, 10))
+    assert state["T"] == 20.5
+    assert state.get("_settlement_hold")
+    assert "reverse_t_target_settled" not in state["orders_meta"]["RBUY"]
+
+
+def test_t_equal_to_splits_is_allowed_with_zero_effect():
+    state = _state(20.0)
+    reconcile_reverse_fills(state, _history(0, 10))
+    assert state["T"] == 20.0
+    assert not state.get("_settlement_hold")
