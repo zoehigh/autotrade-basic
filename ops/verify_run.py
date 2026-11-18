@@ -614,6 +614,8 @@ def _required_settlement_fills(evidence):
         total_qty = _as_int(meta.get("total_qty") or raw_qty)
         t_target = _as_float(meta.get("t_target"))
         expected_delta = 0.0
+        rule2_fraction_delta = 0.0
+        rule2_splits = 0
         expected_factor = None
         kind = None
         expects_entry = False
@@ -637,6 +639,8 @@ def _required_settlement_fills(evidence):
                     # 쿼터매수 T 효과는 '직전 T'(첫 체결 반영 시점) 기준이라 이 목록의 메타(계획값)로는
                     # 기대치를 알 수 없습니다. 원장 재생 기반 검사(기대 원장·T 재계산)가 독립 계산합니다.
                     expected_delta = None
+                    rule2_fraction_delta = max(0.0, effective - applied)
+                    rule2_splits = _as_int(meta.get("reverse_splits"))
                 kind = "reverse_buy"
             elif not is_additional and total_qty > 0 and t_target:
                 expected_delta = round((req_qty / total_qty) * t_target, 4)
@@ -670,6 +674,8 @@ def _required_settlement_fills(evidence):
             "req_amount": req_amount,
             "kind": kind,
             "expected_delta": expected_delta,
+            "rule2_fraction_delta": rule2_fraction_delta,
+            "rule2_splits": rule2_splits,
             "expected_factor": expected_factor,
             "expects_entry": expects_entry,
             "meta": meta,
@@ -828,7 +834,29 @@ def _required_settlement_fills(evidence):
                 for e in new_entries
                 if e.get("kind") == kind and str(e.get("odno")) == odno
             )
-            if item.get("expected_delta") is not None and abs(total - item.get("expected_delta", 0.0)) > 0.015:
+            if item.get("expected_delta") is None:
+                # 쿼터매수 T 효과(reverse_t_rule=2)는 '직전 T' 기준: 이 주문 항목을 뺀 원장을 독립 재생해
+                # 기대 효과를 구하고, 원장 항목이 아예 없거나(누락) 값이 다르면 실패시킵니다.
+                prior_ledger = {
+                    "start_T": _as_float((evidence.get("ledger_before") or {}).get("start_T", evidence.get("T_before"))),
+                    "entries": [
+                        e for e in (list((evidence.get("ledger_before") or {}).get("entries") or []) + new_entries)
+                        if not (e.get("kind") == kind and str(e.get("odno")) == odno)
+                    ],
+                }
+                prior_t = _replay_ledger(prior_ledger)
+                expected_total = (
+                    round((item.get("rule2_splits", 0) - prior_t) * 0.25 * item.get("rule2_fraction_delta", 0.0), 4)
+                    if item.get("rule2_splits", 0) > 0 else None
+                )
+                if expected_total is None:
+                    problems.append(f"{odno} 리버스 쿼터매수의 분할수 기록이 없어 T 효과를 검증할 수 없습니다")
+                elif abs(total - expected_total) > 0.015:
+                    problems.append(
+                        f"{odno} 필수 T효과 원장 불일치: 직전 T({prior_t:.4f}) 기준 기대 {expected_total} "
+                        f"vs 원장 {total} (누락/부분반영)"
+                    )
+            elif abs(total - item.get("expected_delta", 0.0)) > 0.015:
                 problems.append(
                     f"{odno} 필수 T효과 원장 불일치: 기대 {item.get('expected_delta')} "
                     f"vs 원장 {total} (누락/부분반영)"

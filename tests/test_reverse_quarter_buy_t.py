@@ -208,3 +208,34 @@ def test_verifier_independently_recomputes_settled_target():
 
     bad_problems, _, _ = verify_run._recompute_expected(evidence(0.747))   # 매도 체결 가정값
     assert any("쿼터매수 T 효과 불일치" in p for p in bad_problems)
+
+
+def _evidence_for(sell_qty, buy_qty):
+    from trading_bot import build_settlement_evidence
+    state = _state(18.0)
+    state["net_invested"] = 1000.0
+    state["last_updated"] = "2026-11-16T09:00:00+00:00"
+    state["settlement_ledger"] = {"start_T": 18.0, "entries": []}
+    before = deepcopy(state)
+    history = _history(sell_qty, buy_qty)
+    for row in history:
+        row["sll_buy_dvsn_cd_name"] = "매수" if row["odno"] == "RBUY" else "매도"
+    reconcile_reverse_fills(state, history)
+    state["_settlement_deltas"] = state.pop("_reverse_settlement_deltas", [])
+    return build_settlement_evidence("SOXL", state, history, mode="LIVE", before=before, balance_qty=110)
+
+
+def test_verifier_detects_omitted_quarter_buy_t_effect():
+    """Codex P2: 쿼터매수 T 효과 원장 항목을 통째로 빼고 T 를 그대로 보고해도 통과하면 안 된다."""
+    import verify_run
+    evidence = _evidence_for(0, 10)
+    assert verify_run._verify_evidence_ordered(evidence) == []
+    evidence["ledger_after"] = {"start_T": 18.0, "entries": []}
+    evidence["T_after"] = 18.0
+    evidence["applied_seq"] = []
+    for order in evidence["orders"]:
+        order["ledger_seq"] = None
+        order["t_delta"] = 0.0
+        order["ledger_delta"] = 0.0
+    problems = verify_run._verify_evidence_ordered(evidence)
+    assert problems, "누락된 T 효과는 검증 실패여야 합니다"
