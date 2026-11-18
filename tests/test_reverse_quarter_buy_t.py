@@ -239,3 +239,22 @@ def test_verifier_detects_omitted_quarter_buy_t_effect():
         order["ledger_delta"] = 0.0
     problems = verify_run._verify_evidence_ordered(evidence)
     assert problems, "누락된 T 효과는 검증 실패여야 합니다"
+
+
+def test_verifier_accepts_buy_followed_by_later_sell_in_same_batch():
+    """Codex P2: 쿼터매수 뒤에 같은 묶음에서 반영된 매도는 '직전 T' 에 포함되면 안 된다."""
+    import verify_run
+    from trading_bot import build_settlement_evidence
+    state = _state(18.0)
+    state["net_invested"] = 1000.0
+    state["last_updated"] = "2026-11-16T09:00:00+00:00"
+    state["settlement_ledger"] = {"start_T": 18.0, "entries": []}
+    before = deepcopy(state)
+    history = _history(10, 10, ts_buy="2026-11-17T09:30:22+00:00", ts_sell="2026-11-17T09:30:23+00:00")
+    for row in history:
+        row["sll_buy_dvsn_cd_name"] = "매수" if row["odno"] == "RBUY" else "매도"
+    reconcile_reverse_fills(state, history)
+    assert state["T"] == pytest.approx(18.0 + 0.5 - 1.8, abs=1e-3)     # 매수가 먼저(직전 T=18), 이어서 매도
+    state["_settlement_deltas"] = state.pop("_reverse_settlement_deltas", [])
+    evidence = build_settlement_evidence("SOXL", state, history, mode="LIVE", before=before, balance_qty=110)
+    assert verify_run._verify_evidence_ordered(evidence) == []
