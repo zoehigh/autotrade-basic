@@ -629,11 +629,19 @@ def _required_settlement_fills(evidence):
                 expected_delta = round(
                     _as_float(meta.get("reverse_t_target")) * max(0.0, effective - applied), 4
                 )
+                if (
+                    _as_int(meta.get("reverse_t_rule")) == 2
+                    and applied <= 1e-12
+                    and effective > 1e-12
+                ):
+                    # 쿼터매수 T 효과는 '직전 T'(첫 체결 반영 시점) 기준이라 이 목록의 메타(계획값)로는
+                    # 기대치를 알 수 없습니다. 원장 재생 기반 검사(기대 원장·T 재계산)가 독립 계산합니다.
+                    expected_delta = None
                 kind = "reverse_buy"
             elif not is_additional and total_qty > 0 and t_target:
                 expected_delta = round((req_qty / total_qty) * t_target, 4)
                 kind = "buy"
-            expects_entry = abs(expected_delta) > 1e-9
+            expects_entry = expected_delta is None or abs(expected_delta) > 1e-9
         elif side == "매도":
             if reverse_action == "sell":
                 applied = min(1.0, max(0.0, _as_float(meta.get("applied_fill_fraction"))))
@@ -820,7 +828,7 @@ def _required_settlement_fills(evidence):
                 for e in new_entries
                 if e.get("kind") == kind and str(e.get("odno")) == odno
             )
-            if abs(total - item.get("expected_delta", 0.0)) > 0.015:
+            if item.get("expected_delta") is not None and abs(total - item.get("expected_delta", 0.0)) > 0.015:
                 problems.append(
                     f"{odno} 필수 T효과 원장 불일치: 기대 {item.get('expected_delta')} "
                     f"vs 원장 {total} (누락/부분반영)"
@@ -1015,6 +1023,22 @@ def _independent_expected_ordered(evidence):
             delta = round(-base_t * (1.0 - factor) * fraction_delta, 4)
         else:
             target = _as_float(meta.get("reverse_t_target", order.get("reverse_t_target")))
+            if (
+                _as_int(meta.get("reverse_t_rule", order.get("reverse_t_rule"))) == 2
+                and applied <= 1e-12
+                and fraction_delta > 1e-12
+            ):
+                # 원문: 매수 T = 직전 T + (분할수 - 직전 T) × 0.25. 직전 T 는 이 항목 앞까지의 기대 원장을
+                # 독립 재생해 구하고, 정산이 기록한 목표값을 신뢰하지 않습니다.
+                splits_v = _as_int(meta.get("reverse_splits", order.get("reverse_splits")))
+                prior_t = _replay_ledger({
+                    "start_T": round(start_t, 4),
+                    "entries": [
+                        expected_entries[k] for k in sorted(expected_entries, key=lambda value: int(value))
+                        if int(k) < int(seq)
+                    ],
+                })
+                target = round((splits_v - prior_t) * 0.25, 4) if splits_v > 0 else target
             delta = round(target * fraction_delta, 4)
         entry = dict(expected_entries.get(seq) or actual)
         expected_entries[seq] = {
@@ -1419,7 +1443,27 @@ def _recompute_expected(evidence):
                         f"vs 독립 계산 {expected_share:.4f}"
                     )
             elif o.get("reverse"):
-                t_value += float(o.get("reverse_t_target") or 0.0) * float(o.get("fill_fraction_delta") or 0.0)
+                target_used = float(o.get("reverse_t_target") or 0.0)
+                fraction_delta_v = float(o.get("fill_fraction_delta") or 0.0)
+                fraction_v = float(o.get("fill_fraction") or 0.0)
+                if (
+                    int(o.get("reverse_t_rule") or 0) == 2
+                    and fraction_delta_v > 1e-12
+                    and abs(fraction_v - fraction_delta_v) < 1e-9   # 첫 반영: 이후 부분체결은 확정된 목표값을 씁니다
+                ):
+                    # 쿼터매수 T 효과는 원문대로 '직전 T' 기준(직전 T + (분할수 - 직전 T) × 0.25).
+                    # 기록된 목표값을 신뢰하지 않고, 이 지점까지 재생한 T 로 독립 재계산합니다.
+                    splits_v = int(o.get("reverse_splits") or 0)
+                    expected_target = round((splits_v - t_value) * 0.25, 4) if splits_v > 0 else None
+                    if expected_target is None or abs(expected_target - target_used) > 0.01:
+                        problems.append(
+                            f"{odno} 리버스 쿼터매수 T 효과 불일치: 기록 {target_used:.4f} "
+                            f"vs 직전 T({t_value:.4f}) 기준 독립 계산 "
+                            f"{'계산 불가(분할수 없음)' if expected_target is None else f'{expected_target:.4f}'}"
+                        )
+                    if expected_target is not None:
+                        target_used = expected_target
+                t_value += target_used * fraction_delta_v
                 if position is not None:
                     position += qty_delta
             else:
