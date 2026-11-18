@@ -1554,6 +1554,10 @@ def run_one_symbol(broker: Broker, symbol_config):
                     for key in ("reverse_base_t", "reverse_t_factor", "reverse_t_target"):
                         if key in order:
                             order_meta[key] = float(order[key])
+                    # 쿼터매수 T 효과를 정산 시점 T 로 확정하는 규칙 (신규 주문만, 기존 주문은 표식 없음 = 기존 규칙)
+                    if order.get("reverse_t_rule"):
+                        order_meta["reverse_t_rule"] = int(order["reverse_t_rule"])
+                        order_meta["reverse_splits"] = int(order["reverse_splits"])
                     reverse_mode["active"] = True
                     reverse_mode["cycle_id"] = cycle_id
                     reverse_mode["last_planned_session"] = datetime.now(

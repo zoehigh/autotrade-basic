@@ -754,7 +754,12 @@ def reconcile_reverse_fills(state, order_history):
     for odno in marker_held_odnos:
         if str(odno) not in pending_amount_odnos:
             pending_amount_odnos.append(str(odno))
-    for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=lambda item: (item[0], item[1])):
+    # 같은 시각(초 단위 동률)이면 매도를 매수보다 먼저 정산합니다. 쿼터매수 T 효과는 '직전 T'
+    # (같은 세션 매도 체결이 반영된 T) 기준이라 순서가 결과를 바꾸기 때문입니다.
+    def _event_order_key(item):
+        return (item[0], 0 if item[2].get("reverse_action") == "sell" else 1, item[1])
+
+    for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=_event_order_key):
         observed_fraction = min(filled_qty / total_qty, 1.0)
         action = meta.get("reverse_action")
         # 금액 미확정 체결은 마커/원장을 진행시키지 않고 전체 reconcile 을 보류합니다.
@@ -867,6 +872,42 @@ def reconcile_reverse_fills(state, order_history):
             effective_fraction = max(previous_fraction, observed_fraction)
             delta_fraction = max(0.0, effective_fraction - previous_fraction)
             target = float(meta.get("reverse_t_target", 0.0) or 0.0)
+            target_settled_now = False
+            if (
+                meta.get("reverse_t_rule") == 2
+                and not meta.get("reverse_t_target_settled")
+                and delta_fraction > 1e-12
+            ):
+                # 원문: 매수 T = 직전 T + (분할수 - 직전 T) × 0.25. 주문 생성 때 가정한 '매도 체결 후 T'
+                # 가 아니라, 첫 체결을 반영하는 시점의 실제 T(같은 세션 매도 체결 반영분 포함)로 확정합니다.
+                # 부분체결은 확정된 목표값에 누적 체결비율을 적용합니다(체결을 쪼개도 결과가 같음).
+                try:
+                    splits_for_rule = int(meta.get("reverse_splits"))
+                    t_basis = float(state.get("T", 0.0))
+                    if splits_for_rule <= 0 or not math.isfinite(t_basis):
+                        raise ValueError("invalid")
+                    if t_basis > splits_for_rule + 1e-9:
+                        # T 가 분할수를 넘은 상태는 정상 경로로 만들어지지 않습니다. 매수 효과가 음수가 되어
+                        # 오류를 덮을 수 있으므로 자르지 않고 원인 확인을 위해 정산을 보류합니다.
+                        raise ValueError("t_above_splits")
+                except (TypeError, ValueError):
+                    _mark_settlement_hold(
+                        state,
+                        f"리버스 매수 {mask_odno(odno)} 의 분할수(reverse_splits)·기준 T 가 유효하지 않거나 "
+                        f"T 가 분할수를 초과해 T 효과를 확정할 수 없습니다 — 원인 확인 필요",
+                    )
+                    continue
+                settled_target = round((splits_for_rule - t_basis) * 0.25, 4)
+                meta["reverse_t_target_planned"] = target
+                meta["reverse_t_target_basis_t"] = round(t_basis, 4)
+                meta["reverse_t_target"] = settled_target
+                meta["reverse_t_target_settled"] = True
+                target = settled_target
+                target_settled_now = True
+                print(
+                    f"  [정보] 리버스 쿼터매수 {mask_odno(odno)} T 효과 확정: 직전 T {t_basis} 기준 "
+                    f"{settled_target} (계획 시 가정 {meta['reverse_t_target_planned']})"
+                )
             existing_entries = [
                 e for e in (_ensure_settlement_ledger(state).get("entries") or [])
                 if e.get("kind") == "reverse_buy" and str(e.get("odno")) == str(odno)
@@ -917,6 +958,9 @@ def reconcile_reverse_fills(state, order_history):
                     "reverse": True,
                     "is_additional": True,
                     "reverse_t_target": target,
+                    "reverse_t_rule": int(meta.get("reverse_t_rule", 0) or 0),
+                    "reverse_splits": int(meta.get("reverse_splits", 0) or 0),
+                    "target_settled_now": target_settled_now,
                     "fill_fraction": effective_fraction,
                     "fill_fraction_delta": delta_fraction,
                     "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,

@@ -497,3 +497,34 @@ def test_reverse_day3_additional_fill_keeps_t_adds_net_invested_and_passes_verif
     ladder_price = placed[4][3]
     assert with_state["T"] == pytest.approx(without_state["T"]), "추가매수 체결은 T 를 올리지 않는다"
     assert with_state["net_invested"] - without_state["net_invested"] == pytest.approx(ladder_price, abs=0.011)
+
+
+def test_reverse_day3_sell_unfilled_quarter_buy_filled_uses_prior_t_and_passes_verifier(env, monkeypatch, tmp_path):
+    """매도 미체결 + 쿼터매수 체결: T 효과는 '직전 T' 기준(원문), 독립 검증기도 같은 값으로 통과한다."""
+    import json, glob
+    sys.path.append(os.path.join(_repo_root, "ops"))
+    import verify_run
+    holder, saved = env
+    day2_state, placed, history2 = _day2_orders(env, monkeypatch, tmp_path)
+    t_before = float(day2_state["T"])
+
+    rows = list(history2)
+    close = datetime(2026, 11, 13, 21, 0, tzinfo=ZoneInfo("UTC")).isoformat()
+    for i, (odno, side, qty, price) in enumerate(placed):
+        filled = qty if i == 1 else 0                      # 매도(0번)·추가매수 미체결, 쿼터매수만 전량 체결
+        rows.append(_row(odno, "매도" if side == "SELL" else "매수", qty, filled, price, close, "20261113",
+                         "체결" if filled else "미체결"))
+    _CLOCK["now"] = _DAY3_NOW_UTC
+    holder["state"] = deepcopy(day2_state)
+    broker = _broker(rows, last=50.0, qty=144 - 14 + placed[1][2], avg=65.5732, cash=3000.0, close=50.0)
+    trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+    final = saved[-1]
+
+    expected = round(t_before + (20 - t_before) * 0.25, 4)
+    assert final["T"] == pytest.approx(expected, abs=1e-3), "매도 미체결이면 매수 효과는 직전 T 기준이다"
+    evid = sorted(glob.glob(str(tmp_path / "settlement-TQQQ-*.json")))
+    assert evid, "정산 근거 파일이 기록돼야 합니다"
+    with open(evid[-1], encoding="utf-8") as fh:
+        label = json.loads(fh.read()).get("broker")
+    ok, problems = verify_run.verify_evidence_file(evid[-1], label, "LIVE")
+    assert ok is True, problems
