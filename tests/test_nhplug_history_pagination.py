@@ -438,3 +438,25 @@ def test_trading_bot_hook_only_runs_probe_in_dry(monkeypatch):
             raise RuntimeError("x")
     state_module._DIAG_MISSING_REVERSE["Y"] = {"odno": "Y", "session": "", "submitted_at": ""}
     trading_bot._diag_probe_missing_reverse_orders(_Bad(), "SOXL", "AMS")
+
+
+def test_trading_bot_hook_reaches_real_broker_behind_dry_wrapper(monkeypatch):
+    """(2026-11-19 DRY 에서 진단이 실행되지 않은 원인) DRY 의 broker 는 DryBroker 래퍼라 진단 메서드가 바로 보이지 않습니다.
+    래퍼 뒤의 실제 브로커(_real)의 진단 메서드를 찾아 호출해야 합니다."""
+    import trading_bot
+    import state as state_module
+    from broker.base import DryBroker
+
+    calls = []
+
+    class _Real:
+        def diag_probe_missing_orders(self, symbol, exchange, missing):
+            calls.append((symbol, [m["odno"] for m in missing]))
+
+    wrapper = DryBroker.__new__(DryBroker)       # 래퍼는 속성 _real 로 실제 브로커를 가집니다
+    wrapper._real = _Real()
+    assert getattr(wrapper, "diag_probe_missing_orders", None) is None     # 래퍼에는 직접 없음 — 위 문제의 재현
+    state_module._DIAG_MISSING_REVERSE["Z"] = {"odno": "Z", "session": "2026-11-17", "submitted_at": ""}
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    trading_bot._diag_probe_missing_reverse_orders(wrapper, "SOXL", "AMS")
+    assert calls == [("SOXL", ["Z"])]

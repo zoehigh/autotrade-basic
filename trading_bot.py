@@ -817,7 +817,10 @@ def _diag_probe_missing_reverse_orders(broker, symbol, exchange):
     try:
         from state import take_missing_reverse_diag
         missing = take_missing_reverse_diag()
+        # DRY 모드의 broker 는 DryBroker 래퍼(조회는 self._real 에 위임)이므로 실제 브로커의 진단 메서드를 찾아 씁니다.
         probe = getattr(broker, "diag_probe_missing_orders", None)
+        if probe is None:
+            probe = getattr(getattr(broker, "_real", None), "diag_probe_missing_orders", None)
         if TRADE_MODE != "DRY" or not missing or probe is None:
             return
         probe(symbol, exchange, missing)
