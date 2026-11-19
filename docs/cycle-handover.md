@@ -445,7 +445,7 @@ SOXL 정정 결과 (현재가 $94.89, 상한 $112.91):
 
 - **텔레그램**: 로컬/운영 VPS `.env` 모두 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` 비어 있음 → 알림 미발송.
 - **×1.19 BUY 캡 재현**: 별지점 매수 `$82.05 → $81.16`, SOXL `$118.10 → $117.39`.
-  AGENTS.md에 기록된 알려진 동작.
+  `docs/agents/reverse-mode.md`에 기록된 알려진 동작.
 
 ---
 
