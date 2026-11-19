@@ -43,18 +43,21 @@ autotrade-basic/
 | 시세 데이터 | src/market_data.py | Finnhub 5일 이동평균 조회 |
 | 파이프라인 흐름 | trading_bot.py | state→전략→주문→저장 전체 순서 |
 
-## BROKER ERROR HANDLING
-| 브로커 | 성공 코드 | 에러 코드 | 에러 메시지 | 검증 위치 |
-|--------|----------|----------|------------|----------|
-| KIS | `rt_cd == "0"` | `msg_cd` | `msg1` | 각 메서드 |
-| KIWOOM | `return_code == 0` | `return_code` | `return_msg` | `_check_response()` |
-| LS | 조회 `rsp_cd in {"00000","00001","00136"}` / 주문 `{"00000","00040","00050"}`(00050 미실측 추정) / 취소 `{"00000","00156"}` | `rsp_cd` | `rsp_msg` | 조회: `LS_SUCCESS_RSP_CDS`, 주문/취소: 각 메서드 |
-| TOSS | `error` 없음 | `error.code` | `error.message` | `_request_with_rate_retry()` |
-| NHPLUG | `rsp_cd in {"00000","00166","00221","13578","XA102","00048"} or "완료" in rsp_msg/usr_msg` | `rsp_cd`/`msg_code` | `rsp_msg`/`usr_msg` | `_request_with_rate_retry()` |
-| MERITZ | 주문 `rsp_cd=="0001"` AND `data.warn_cls_code==0`, 조회 계열별 상이 (시세 `0000` / 잔고·매수가능 `5766` / 이력·당일 `5766`·`5762`(다음페이지) / 취소 `0001`) — 5820은 data 유무로 판단, EGW00200은 조회만 제한 재시도 | `rsp_cd` | `rsp_msg`+`rsp_sub_msg` | `_check_rsp_cd()` |
+## 상세 문서 — 작업 유형별로 필요한 것만 여세요
 
-**참고**: 주문 시각은 모든 브로커에서 `get_kst_now()` 로컬 시간 사용 (API 응답 시간 미사용)
-**MERITZ 주문 시각**: 합성 주문번호 `YYYYMMDD:제로패딩주문번호`, `oder_exec_ymdh/cntg_ymdh`는 KST 그대로 파싱 (resolve_real_kst_from_ord 미적용, `_ord_dt_is_kst_date=True`)
+아래 문서는 **자동으로 로딩되지 않습니다**(`@` 가져오기·링크 자동 포함 없음). 해당 작업을 시작할 때 파일을 직접 열어 읽으세요.
+안전 규칙은 이 파일(ANTI-PATTERNS, state 저장 원칙, 정산 핵심 규칙, COMMUNICATION RULES)에 남아 있으며, 세부 문서는 그 규칙을 대체하지 않고 보완합니다.
+
+| 작업 유형 | 읽을 문서 |
+|-----------|-----------|
+| 브로커 어댑터·API 에러 코드·주문이력/시각 컨벤션·preflight·MERITZ 만료/정정·`get_daily_closes` | `docs/agents/brokers.md` |
+| 체결 정산·T 갱신·`net_invested`·마커/델타·`ops/verify_run.py`·로그 주문번호 마스킹 세부 | `docs/agents/settlement.md` |
+| 리버스모드·쿼터매수·추가매수·종료 조건·BUY LOC 가격 보정 | `docs/agents/reverse-mode.md` |
+| state 복구·`TRADE_MODE=REPAIR`·`FORCE_T`·`MAX_T`·`STATE_*_ONLY`·복구 워크플로·T 보정 명령 (**이런 작업 전에는 반드시 먼저 읽기**) | `docs/agents/state-repair.md` |
+| 주문 fence·이전 세션 잔여 주문 정리·취소 확정·collar probe | `docs/agents/orders.md` |
+| 운영 절차(크론·사이클 인수인계 등) | 기존 `docs/` 문서(`docs/cron-dispatch-guide.md`, `docs/cycle-handover.md`, `docs/marker-correction-runbook.md`) |
+
+위 표에 없는 일반 작업(코드 읽기·테스트 실행 등)은 이 파일만으로 충분합니다.
 
 ## CONVENTIONS
 - **패키지 의존성**: `requests`, `python-dotenv`, `exchange-calendars` (`uv` 관리)
@@ -90,15 +93,11 @@ autotrade-basic/
   | `LIVE` | 실제 주문·정산 (**`{SYMBOL}_FORCE_T` 금지**) | 허용 | 허용 |
 
   - `{SYMBOL}_FORCE_T` + `TRADE_MODE=DRY` 또는 `LIVE` → state 저장·브로커 호출·주문 **없이 명시적 오류로 중단**(`sys.exit(1)`, 브로커 생성 전). **FORCE_T는 `TRADE_MODE=REPAIR`에서만 허용**. LIVE를 막는 이유: FORCE_T는 T·`orders_meta`·`reverse_mode`·정산 원장·워터마크를 덮어쓰는데, LIVE에서는 같은 실행에서 주문 단계까지 이어져 복구와 주문이 결합됨. `FORCE_T_REINFERENCE=true`로 LIVE가 DRY로 고정된 경우도 동일하게 차단
-  - `FORCE_T_REINFERENCE`: **DRY = 미리보기(저장 없음), REPAIR = 실제 저장**. LIVE + `FORCE_T_REINFERENCE=true`는 주문 방지를 위해 **DRY 미리보기로 고정**되며 state는 저장되지 않음(로그에 명시). 실제 저장은 `TRADE_MODE=REPAIR`
   - REPAIR 재추정(`_repair_reinference`): 재추정 T가 `{SYMBOL}_MAX_T`(기본 분할수)를 **초과하면 저장을 거부**하고 종료 코드 1 (T를 상한으로 **자르지 않음** — 자르면 정산 오류가 숨겨짐). 여러 종목은 **전부 재추정·검증한 뒤에만** 저장하므로 일부 종목만 먼저 저장되지 않음. T/MAX_T가 유한한 유효 숫자가 아니어도 거부. 일반 실행 경로(`run_one_symbol`)는 기존대로 상한으로 조정
-  - REPAIR 재추정은 **정산 보류 표식**(`_settlement_hold`·`_pending_amount_odnos`·`_pending_marker_odnos`·`_position_basis_unknown`)이 있으면 저장을 거부하고 종료 코드 1로 끝납니다. 재추정이 `last_updated`를 비운 뒤 `update_T_from_history`를 부르기 때문에, 보류 시 되돌려진 스냅샷도 `last_updated=""`라 그대로 저장하면 워터마크가 지워집니다
-  - REPAIR 재추정은 전 종목 검증 후 `.state.json`을 **파일 쓰기 1회(`save_states`, 임시 파일→`os.replace`)** 로만 저장합니다. 종료 코드: **1 = 검증 실패**(MAX_T 초과·숫자 오류·보류, 저장 시도 없음), **2 = 파일 저장 실패**(검증은 통과, 원본 파일은 변경되지 않음)
   - ⚠️ **Actions의 `TRADE_MODE=REPAIR`는 차단됩니다** (`trade_base.yml` Resolve 단계, 봇 실행·state 변경·캐시 저장 전 `exit 1`). 이유: REPAIR 핸들러는 `settlement-*.json`(정산 근거)을 만들지 않아 `verify-settlement`가 "정산 근거 파일이 없습니다 — 검증 불가"로 항상 실패하는데, state 캐시는 검증 job보다 앞선 job에서 이미 저장되기 때문입니다. `repository_dispatch` payload·`workflow_dispatch` 입력·`vars.TRADE_MODE` 어디서 지정해도 동일하게 차단됩니다. **REPAIR 전용 독립 검증(후속 PR)이 준비되기 전까지 state 복구·보정은 로컬에서만** 실행하세요 (`docs/marker-correction-runbook.md` 절차)
   - ⚠️ 예외 — **레거시 `STATE_*_ONLY`는 DRY여도 대부분 state를 저장**합니다: 읽기 전용은 `STATE_DIAGNOSTIC_ONLY`·`STATE_REVERSE_AUDIT_ONLY`뿐이고, `STATE_REPAIR_ONLY`·`STATE_CLEAR_FENCE_ONLY`·`STATE_REVERSE_RECONCILE_ONLY`·`STATE_NET_INVESTED_REPAIR_ONLY`·`STATE_ASSUME_REVERSE_EXPIRY_ONLY`·`STATE_SET_CYCLE_START_ONLY`는 저장합니다. 따라서 이들은 **운영 사용을 제한**합니다(`TRADE_MODE=DRY`를 읽기 전용으로 오해하지 말 것 — 사용 전 백업·승인 필수, "확인용" 실행 금지). 후속 작업에서 REPAIR 전용으로 통합 예정
-  - Actions는 확정된 실행 모드(`steps.resolve.outputs.trade_mode`, 봇과 같은 strip+upper 정규화)가 `LIVE`/`REPAIR`일 때만 새 state 캐시를 저장(Actions REPAIR 는 위처럼 Resolve 에서 이미 차단되므로 현재는 LIVE 만 해당)(`always()` 유지 — LIVE가 중간 실패해도 보존). 복원은 모든 모드에서 허용. 잘못된 값은 봇이 DRY로 처리하고 저장도 차단
-  - Resolve 단계의 외부 모드 입력(`inputs.trade_mode`·`vars.TRADE_MODE`·`broker_mode` 등)은 셸 문자열에 `${{ }}`로 삽입하지 않고 **env로만 전달**합니다. 영문 대문자가 아닌 값(개행·특수문자 포함)은 `GITHUB_OUTPUT`에 쓰지 않고 `INVALID`로 치환(봇은 DRY, 캐시 저장 안 함)
   - ⚠️ REPAIR라고 자동으로 안전한 것은 아닙니다. FORCE_T는 `orders_meta`·`reverse_mode`·정산 원장·워터마크까지 바꿉니다 → **실행 전 state 백업(저장소 밖) + 브로커 체결 이력 대조 + 작업자≠승인자 승인**은 그대로 유지 (`docs/marker-correction-runbook.md` §2~§4 참고)
+  - (분리됨) `FORCE_T_REINFERENCE`·REPAIR 재추정 세부·Actions 캐시 저장 가드·Resolve 입력 처리 규칙 → `docs/agents/state-repair.md`
 - 리버스모드(`execute_reverse_mode()`): T>분할수-1 시 발동, 5일 MA 별지점 기반 무한매도+쿼터매수
 - T값 환경변수 보정: `FORCE_T_REINFERENCE`, `{SYMBOL}_FORCE_T`, `{SYMBOL}_MAX_T` (기본 MAX_T=분할수, 리버스모드 진입용 `T=splits` 허용)
 
@@ -115,23 +114,6 @@ TRADE_MODE=LIVE uv run python trading_bot.py
 
 # state 복구·보정은 TRADE_MODE=REPAIR 로 실행합니다 (주문 없음). 실행 전 state 백업·체결 이력 대조·승인 필수.
 
-# T값 보정: 전체 이력 재추정 — 미리보기 (저장하지 않음)
-TRADE_MODE=DRY FORCE_T_REINFERENCE=true uv run python trading_bot.py
-
-# T값 보정: 전체 이력 재추정 — 결과를 state에 실제 저장
-TRADE_MODE=REPAIR FORCE_T_REINFERENCE=true uv run python trading_bot.py
-
-# T값 강제 설정 — 실제 T 보정 및 state 저장, 주문은 실행하지 않음 (1회성 — 보정 RUN 후 env var 즉시 삭제)
-TRADE_MODE=REPAIR TQQQ_FORCE_T=29 SOXL_FORCE_T=20 uv run python trading_bot.py
-# ※ TRADE_MODE=DRY 또는 LIVE 와 {SYMBOL}_FORCE_T 를 함께 쓰면 브로커 생성 전에 오류(종료 코드 1)로 중단됩니다.
-# ※ REPAIR 는 작업 소스가 정확히 1개여야 합니다. {SYMBOL}_FORCE_T 와 REPAIR_ACTION=FORCE_T 를 함께 설정하지 마세요
-#    (작업 소스 2개로 중단). REPAIR_ACTION=FORCE_T 단독은 값을 읽을 곳이 없어 명시적으로 실패합니다(종료 코드 1).
-
-# T값 상한 설정 (기본값은 분할수) — DRY 미리보기는 "원시 추정 T"와 "상한 적용 후 T"를 함께 출력
-TRADE_MODE=DRY SOXL_MAX_T=19 FORCE_T_REINFERENCE=true uv run python trading_bot.py
-# ※ REPAIR 재추정은 추정 T 가 MAX_T 를 넘으면 T 를 자르지 않고 저장을 거부합니다(종료 코드 1, state 변경 없음).
-#    초과 원인(정산 오류 등)을 확인한 뒤 필요하면 별도로 {SYMBOL}_FORCE_T 보정을 승인받아 진행하세요.
-
 # 테스트 실행
 # 기본 `pytest tests/` 는 외부 브로커 API·주문을 **원천 차단**합니다 (유닛/모의 테스트만 실행).
 #  - 외부 HTTP: conftest autouse fixture 가 `requests.Session.request` 를 막음
@@ -144,94 +126,10 @@ uv run pytest tests/ -v                                        # 안전: 유닛/
 RUN_BROKER_API_TESTS=1 uv run pytest tests/ -m kis -v          # 읽기 전용 통합 테스트
 RUN_BROKER_API_TESTS=1 ALLOW_BROKER_ORDERS=1 uv run pytest tests/test_broker_preflight.py -v  # 주문 포함
 
-# 참고: 브로커별 필수 자격증명
-#   kis   = KIS_APP_KEY + KIS_APP_SECRET + KIS_ACCOUNT_NO
-#   kiwoom= KIWOOM_APP_KEY + KIWOOM_APP_SECRET
-#   ls    = LS_APP_KEY + LS_APP_SECRET
-#   toss  = TOSS_APP_KEY + TOSS_APP_SECRET
-#   nhplug= NHPLUG_APP_KEY + NHPLUG_APP_SECRET + NHPLUG_ACCT_NO
-#   meritz= MERITZ_APP_KEY + MERITZ_APP_SECRET (계좌번호 불필요, real 전용, 모의 없음)
-# 유닛/모의 테스트(test_broker_contract, test_reverse_mode, test_state_t_updates 등)는
-# API를 호출하지 않아 자격증명 없이 항상 실행됩니다.
 ```
+T값 보정 명령 예시 → `docs/agents/state-repair.md`, 브로커별 필수 자격증명 → `docs/agents/brokers.md`.
 
-## PREFLIGHT (브로커 검증) — 모의 전 사전 테스트
-
-신규/변경 브로커는 모의 전략 실행 전에 문서 체크리스트 기반 preflight 검증을 1회 통과해야 합니다. 코드 차단(마커)이 아니라 문서·스크립트 기반 사전 점검입니다.
-
-**용어**: `인증` 대신 `preflight` / `브로커 검증` / `API 사전 테스트`를 사용합니다.
-
-**범위 (전략이 실제 호출하는 API만)**:
-- `get_daily_closes(symbol, exchange, days=5) → list[float]` (오래된 순) — 리버스 별지점 fallback
-- `get_balance(symbol, exchange) → Balance | None`
-- `get_purchase_amount(symbol, exchange) → PurchaseAmount` — 리버스 쿼터매수 기준
-- `get_order_history(symbol, exchange, days=30) → list[dict]` — `ord_dt/ord_tmd/odno/ft_ccld_qty` 등 표준 필드. 빈 이력과 체결 후 이력 모두에서 파싱 검증
-- `get_stock_price` / `get_stock_quotation` / `is_trading_day` — 시세/거래일
-
-**주문 사전 테스트 (단일 계좌, 이력 최소화)**:
-- 1순위: 비시장성 `BUY LIMIT 1주(현재가-5% 등)` 제출 → 당일 이력 매칭(`ord_dt/odno` 확인) → `cancel` → `ft_ccld_qty=0, remaining=0, terminal canceled` 재확인. `0체결 취소`는 T/`net_invested`에 영향 없음.
-- 대체: `cancel` 미구현 시 비정상 주문(예: `99999주/$0.01`)으로 `OrderNotAcceptedError` 거부 확인만으로 대체. 성공 접수 경로는 모의 첫 주문으로 위임.
-- 전량매도 복원(`매수 체결→다음날 매도해 잔고 0`)은 사전 필수 아님 — 모의 진입 후 보정으로 위임.
-- 데모 `LOC/MOC→LIMIT` 변환은 어댑터 로그(`요청 타입 vs 실제 전송 타입`)로만 확인. 종가 체결 차이는 실전 소액 LIVE에서 확인.
-- TOSS: 접수 직후 CLOSED 이력에 열린 주문이 잡히지 않음 → `odno` 매칭은 취소 후 이력에서 검증. 취소는 try/finally로 보장하며(실주문 방치 금지), 취소 실패 시 odno를 경고 출력해 수동 취소.
-
-**실행**:
-```bash
-uv run python tests/test_broker_preflight.py --broker kis --symbol TQQQ
-# 또는 pytest
-uv run pytest tests/test_broker_preflight.py -v
-```
-- 자격증명이 설정된 브로커만 실행, 없으면 skip. 이력 오염을 막기 위해 비시장성 가격 사용.
-- 통과 로그를 남기고 모의(`TRADE_MODE=DRY → LIVE demo`) 진입. 중간 운영 중 API 응답 변경은 `balance_mismatch`/`T 경고`/`STATE_REVERSE_AUDIT_ONLY`로 감지·보정.
-
-**실전 소액 LIVE 1세션**: 별도 테스트가 아니라 전략의 첫 실전 주문 자체를 smoke 테스트로 봅니다. `LOC/MOC` 실전 접수 여부와 파이프라인 1회 정상 동작만 확인.
-
-**MERITZ 주문조건구분(`oder_cond_cls_code`)**: 값이 `oder_cls_code`에 따라 고정됩니다 — `01`·`05`·`35~38` → `0`, `31`·`33` → `2`, `32`·`34` → `7`. 위반 시 주문이 `IGW50002`로 거부됩니다 (2026-10-20 LOC 쿼터매도 실측 미접수). 매핑은 `src/broker/meritz/adapter.py`의 `_ODER_COND_CLS_CODE`.
-
-**MERITZ 주문 정정** (`POST /trading/v1/overseas/orders/modify`): `MeritzBroker.modify_order()` 구현. 필수 6필드 `oder_date`/`orgl_oder_no`/`oder_cls_code`/`odqt`/`ovrs_stck_oder_prc`/`oder_cond_cls_code`. **해외는 재정정 시 직전 정정 건의 주문번호를 씁니다** (국내는 최초 주문번호 유지 — 기준이 반대). 정정하면 주문번호가 바뀌므로 `state.json`의 `orders_meta` 키도 새 번호로 옮기고 `total_qty`를 정정 수량으로 갱신해야 합니다.
-
-**MERITZ 정정은 수량을 바꾸지 않습니다**: 가격만 반영되고, `odqt` 증가는 접수(`rsp_cd=0001`·경고 없음)돼도 실제 `oder_dqty`는 원주문 수량 그대로입니다 (2026-10-20 1주→7주 실측). **수량 변경이 필요하면 취소 후 신규 주문**으로 처리하세요. 취소 확인은 상세조회(`/orders/detail`)가 아니라 **이력 기준**입니다 — 취소는 이력에 별도 행(`rctf_cncl_cls_name="취소"`, `orgl_oder_no=취소 대상`)으로 남습니다.
-
-**MERITZ 경고확인값**: 해외주식의 `warn_cnfr_yn` 재전송 값은 **`"Y"`** 입니다 (공식 안내 기준). 응답 설명의 `"A"`는 국내 관례이므로 사용하지 않습니다.
-
-**MERTMS 해외주식 주문 만료/취소 판별 코드** (2026-10-22 실측):
-- `5636` "정정,취소 가능 수량이 없습니다" → **만료됨**(세션 종료) 또는 체결/잔량 0. 취소 대상이 아닙니다.
-- `4062` "원주문이 취소주문으로 정정,취소 주문이 불가능합니다" → **이미 취소됨**(취소 행 존재).
-→ 둘 다 "살아있는 주문이 아님"을 뜻합니다. **이전 세션 주문은 만료이므로 취소 시도 대상이 아닙니다**
-  (시도하면 위 코드로 거절되어 "미확정"으로 잘못 판정되어 그날 주문이 차단됩니다).
-→ 기간 이력은 만료 주문도 `미체결` + 잔량=주문수량 으로 표시합니다 (잔량 필드 없음 → 주문수량−체결수량 계산).
-  그래서 이력만 보면 살아있는 것처럼 보이지만, 실제로는 만료되어 있습니다 (위 코드로 판별).
-
-**MERTMS 해외주식 만료 판정 — 기간 이력은 잔량을 알려주지 않습니다**: 만료된(세션 종료) 주문도
-**기간 이력(`/orders/history`)에서는 `미체결` + 잔량=주문수량 으로 표시**됩니다 (공식 잔량 필드 없음 → `주문수량−체결수량` 계산).
-→ 실제 생존 여부를 판별하는 유일한 방법은 **취소 시도**이며, 만료 주문은 `5636: 정정,취소 가능 수량이 없습니다` 로 거절됩니다 (2026-10-21 실측 10건 전량).
-→ 그래서 봇의 잔여 주문 정리는 **오늘 세션 주문만** 취소 대상으로 삼습니다 (이전 세션 주문은 만료이므로 취소 시도 불필요).
-→ **주의**: 브로커 주문을 날짜 필터 없이 조회하면 수십 건의 만료 주문이 "열린 주문"으로 보입니다. 반드시 주문일자로 필터하세요.
-→ 당일 이력(`/orders/today`)은 해외주식에서 0건을 반환하므로 잔량 확인용으로 쓸 수 없습니다.
-
-**매도 비율 판정의 보유수량 기준 (2026-10-22 수정)**: 쿼터매도/목표매도/전량매도를 구분하는 비율은
-`sell_qty / net_qty` 인데, `net_qty` 를 **주문 이력 조회 구간**에서 계산하면 구간 밖 매수(사이클 이전)가
-빠져 **보유를 과소 계산**합니다 → 쿼터매도(25%)가 목표매도(75%)로 오분류되고 T가 1/4배 됩니다.
-→ **보유수량 기준선은 3단계로 확보**합니다 (`state.py` `_apply_recent_history_dt`).
-  1. **브로커 실제 잔고** 기준 (`balance_qty - 이번 묶음 순변동) — 가장 정확
-  2. **state 의 `position_qty`** (워터마크 기준 보유량, 매 실행마다 기록) — 잔고 조회 실패 시
-  3. 이력 계산값 — 마지막 폴백
-→ **두 기준의 시점이 다릅니다**: 잔고는 "지금"의 보유량이라 이번 묶음 순변동을 빼야 하고,
-  `position_qty` 는 "워터마크 시점" 보유량이라 **다시 되감지 않습니다**.
-→ 기준선에 브로커 잔고를 쓰면 **리버스 체결이 이미 반영**되어 있으므로 별도로 다시 차감하지 않습니다.
-→ 기준선을 끝내 확보하지 못하면(잔고 조회 실패 + 저장값 없음) 매도 분류 후 **정산 저장과 신규 주문을
-  모두 보류**합니다 (`state._position_basis_unknown` → `trading_bot` 이 해당 종목을 중단).
-  먼저 저장하면 다음 실행에서 재처리될 수 없어 잘못된 T 가 고정되기 때문입니다.
-실측(2026-10-22): 실제 81주 → 이력 계산 30주 → 20주 매도가 비율 0.67 로 목표매도 오분류 → T 13.375→3.3438.
-
-**체결 반영은 수량·금액 델타로만** (`processed_filled_qty` + `processed_filled_amount`):
-새로 늘어난 부분만 반영하므로 부분체결이 나중에 늘어나도 중복 가산되지 않습니다.
-이전 버전 메타에는 반영 금액 표식이 없으므로, **신규분만** 누적금액 비율로 추정해 1회 적용하고 표식을 기록합니다.
-신규 주문은 등록 시 `processed_filled_qty=0` + `processed_filled_amount=0.0` + `fill_marker_version=1` 을 함께 기록합니다.
-워터마크 이전 주문의 0 마커는 **이 버전 표식이 있을 때만** 미반영으로 신뢰하고(`_marker_proves_unapplied`),
-기존 state 의 0 마커(버전 표식 없음)는 미반영의 증거가 아니므로 **반영하지 않고 건너뜁니다**(종목 전체를 보류하지 않아 같은 실행의 신규 체결은 정상 정산). 기존 메타는 일괄 마이그레이션 금지.
-마커가 누락·무효인 주문은 자동 반영하지 않고 보류합니다 → 수동 정정 절차는 `docs/marker-correction-runbook.md`
-(마커만 명시 설정, T/net/원장·워터마크 불변, 백업+해시, 직후 reconcile 1회 확인, 환경변수 1회성).
+## 정산 핵심 규칙 (공통 안전)
 
 **공개 로그의 주문번호는 가명 식별자로만 출력**: 정산·체결 복구·보류 경로(`src/state.py`, `trading_bot.py`)의 stdout·예외·알림과
 검증기(`ops/verify_run.py`) 실패 메시지는 `mask_odno()` = `ord#` + HMAC-SHA256(**실행별 무작위 salt**, 주문번호) 앞 10자리만 씁니다
@@ -239,29 +137,11 @@ uv run pytest tests/test_broker_preflight.py -v
 정적 가드 `tests/test_odno_log_masking.py`. 일반 주문 접수·취소·브로커 어댑터 로그는 미적용 → `docs/odno-log-masking-followup.md`.
 **Evidence artifact 는 gpg 암호화본만 업로드**합니다 (tar→gpg 스트리밍, 실패 시 부분 암호문·평문 tgz 잔존 없음, 패스프레이즈 없으면 업로드 없이 실패).
 
-**지연 체결(부분체결 증가) 반영**: 전역 워터마크보다 오래된 주문이라도 **이미 반영된 주문**(processed_filled_qty > 0)의
-누적 체결이 늘면 주문번호별 델타로 반영합니다 (`_apply_late_fill_deltas`). 워터마크 이전에 있고 반영된 적 없는
-주문은 "처리된 범위 밖"이므로 건드리지 않습니다.
-
-**매도 T 효과는 누적 체결 기준으로 판정** (`sell_t_effects` 원장): 주문별 기준선(보유량)·적용 배율을 기록하고,
-누적 비율이 바뀌면 `T × (새 배율 ÷ 기존 배율)` 로 재조정합니다. 그래야 **일괄 반영(75주 1회)과
-부분 반영(5주 → 70주)이 같은 최종 T 를 냅니다** (10/22 실측: 2.0 vs 6.0 로 갈라졌던 문제).
-적용 금액은 실제 체결 증가분만 차감하고, 누적체결금액이 역행하면 차감하지 않습니다(반복 차감 방지).
-
 **불확실한 정산은 어떤 저장 경로에서도 확정하지 않습니다**: `_save_settlement_state()` 가
 `state._position_basis_unknown` 를 확인해 저장과 신규 주문을 함께 막습니다 (reconcile-only 경로 포함).
 먼저 저장하면 다음 실행에서 재처리될 수 없어 잘못된 값이 고정되기 때문입니다.
 
-**자동 검증은 독립 재계산** (`ops/verify_run.py`): 정산이 주문별로 적용한 내역(수량·금액·기준선·배율·T변화)을
-`settlement-*.json` 에 기록하고 (`run_id` 로 실행 구분), 검증기는
-(1) 기준선을 보유량에서 **독립 계산**해 대조, (2) 매도 분류(배율)를 기준선에서 독립 계산해 적용 배율과 대조,
-(3) T 변화·순투입금을 델타로 재계산해 실제 결과와 대조합니다.
-근거 파일이 없거나 실행이 다르면 **"검증 불가"로 실패 처리**합니다 (조용히 통과시키지 않습니다).
-
-**전체 재추정과 증분 반영 분리**: `_infer_T_from_full_history` 는 "처음부터" 다시 계산하므로
-`processed_filled_qty` 를 빼지 않고 전체 체결로 T 를 계산합니다 (빼면 T 가 다시 낮아집니다).
-
-**MERITZ 10/12 신청 게이트 (2026-10-02 기준)**: 메리츠 오픈API는 모바일앱 신청이 차단되고 포털도 미개방 상태라 **실검증 보류**. 유동IP 사용 가능 확인됨 (고정IP 불필요, ubuntu-latest 그대로 사용). MAC 사전등록도 별도 절차 없음 (요청 헤더에 12자리 HEX를 넣어 전송하면 됨). 자격증명 발급 전까지 preflight 주문 단계는 `--live-order-probe`로만 실행하고, 기본 실행은 read-only 조회(1~6단계) + skip 출력으로 통과 처리합니다. 신청 개방 확인 후 preflight 1회 통과 + 실전 소액 LIVE 1세션 검증 순서로 진행.
+세부 정산 규칙(매도 비율 기준선·체결 델타·지연 체결·검증기·전체 재추정) → `docs/agents/settlement.md`.
 
 ## COMMUNICATION RULES
 
@@ -278,144 +158,4 @@ uv run pytest tests/test_broker_preflight.py -v
 - LS 조회 TR(g3101 등)은 초당 1회, 주문 TR은 초당 10회 rate-limit (모의/실전 동일)
 - 복리 재투자: `REINVEST` 기본 활성화 (해제 시 `false`)
 - **시드 설정 필수**: 모든 종목에 `{SYMBOL}_SEED` 설정 필수 (달러 금액만 허용, FULL 미지원)
-- **순투입(net_invested) 시드 캡** (`state.json`의 `net_invested`): 시드 캡은
-  `remaining_seed = seed − net_invested` (net_invested = Σ 매수체결금액 − Σ 매도체결금액, USD) 기준.
-  - 배경: 기존 `seed − position_qty×avg_price`(원가 기준)는 **평단 이하 매도(손절)** 시 매도 회수액이
-    원가보다 작아 시드 여유가 부풀려져 누적 투입이 시드를 초과할 수 있었음
-    (실제 사례: $50,000 시드 vs $56,299.66 사용).
-  - 누적 경로: 일반모드 `_apply_recent_history_dt`(증분), 초기모드 `_infer_T_from_full_history`(재계산),
-    리버스 `reconcile_reverse_fills`(델타). 전량매도(사이클 종료) 시 0.0 리셋.
-  - 마이그레이션: `load_state`가 `net_invested` 키 없음 감지(`_net_invested_missing`) →
-    `update_T_from_history`에서 `_compute_non_reverse_net_invested(cutoff_dt=last_updated)`로 1회 백필.
-    cutoff는 `_apply`의 최근 윈도우와 상보적이어서 **이중 가산 없음**.
-  - 리버스 주문은 `_compute_non_reverse_net_invested`에서 제외, reconcile이 델타 반영.
-- **net_invested 신뢰성(`net_invested_status`)** — SOXL `net_invested=0.00` 손상 사고 대응:
-  - 상태머신: `"valid"`(신뢰) | `"unresolved"`(신뢰 불가). 필드가 없으면 `unresolved`로 처리
-    (기존/마이그레이션 상태는 자동 `unresolved` → **TQQQ도 1회 audit 필요**).
-  - `unresolved`이고 `net_invested<=0`이면 `무한매수법_V4`가 **신규 전략 주문을 차단**합니다
-    (`strategy.py` 게이트, `seed>0`일 때만). 기존 상태에 양수 `net_invested`가 있으면 status 누락만으로
-    기존 운용을 차단하지 않습니다. reconciliation(체결 반영)은 이전처럼 계속 실행됩니다.
-  - `valid` 자동 설정 지점: 신규 상태(파일 없음/종목 미등록), 사이클 종료·전량매도 리셋, `FORCE_T=0` 리셋,
-    `STATE_NET_INVESTED_REPAIR_ONLY` 복구 성공 시.
-  - 도구:
-    - `STATE_REVERSE_AUDIT_ONLY=true`: 브로커 주문이력 vs state `orders_meta` 대조 (read-only,
-      `state_hash` 출력, state 미저장).
-    - `STATE_REVERSE_RECONCILE_ONLY=true`: 기존 reconciliation으로 미반영 체결만 state에 반영·저장
-      (전략/주문 없음). `net_invested_status`는 승격하지 않음.
-    - `STATE_NET_INVESTED_REPAIR_ONLY=true`: canonical `state_hash` + 필드 fingerprint(CAS)가
-      일치할 때만 `net_invested`를 명시 값으로 복구하고 `valid` 전환. 미종결 리버스 주문/fence 있으면 거부.
-      `STATE_NET_INVESTED_REPAIR_SYMBOL`/`_TARGET`/`_EXPECT_HASH`/`_EXPECT_NET_INVESTED`/`_EXPECT_STATUS` 필요.
-    - `STATE_ASSUME_REVERSE_EXPIRY_ONLY=true`: **키움 모의 등 수동 강제 처리용**. 이전 미국 세션의
-      zero-fill 리버스 주문을 `terminal_assumed=true`로 1회성 종결 처리한 뒤 reconcile/repair를
-      진행할 때 사용합니다. `BROKER_MODE=demo`에서는 reconcile이 `_auto_assume_reverse_expiry()`
-      (`src/state.py`)로 **자동** 처리하므로, 이 도구는 실전(real)/비데모, 부분체결·이력 누락 등
-      자동 처리 예외 케이스에만 필요합니다. 실전/다른 브로커에서는 거부되며
-      `STATE_ASSUME_REVERSE_EXPIRY_SYMBOL`/`_ORDER`/`_EXPECT_HASH` 필요.
-  - `canonical_state_hash()` (`src/state.py`): `save_state()`가 기록하는 필드만 SHA-256 — 복구 CAS/audit용.
-    네 복구 모드(`STATE_REVERSE_AUDIT_ONLY`/`RECONCILE_ONLY`/`NET_INVESTED_REPAIR_ONLY`/`ASSUME_REVERSE_EXPIRY_ONLY`)는 **동시 설정 금지**.
-    `STATE_SET_CYCLE_START_ONLY`도 같은 배타 그룹(`_exclusive_modes`)에 포함됩니다.
-- **KIWOOM/LS/TOSS/MERITZ**: `BROKER_CONFIG`에 `account_no` 불필요 (AppKey/Secret만으로 API 호출 가능), **KIS/NHPLUG는 계좌번호 필수** (`KIS_ACCOUNT_NO` / `NHPLUG_ACCT_NO` 없으면 호출 금지)
-- **주문 시각**: 모든 브로커에서 `get_kst_now()` 사용 (API 응답 시간 미사용)
-- **KIS ODNO 정규화**: 주문 접수 API는 leading zero 10자리(`0000052248`), 체결 조회는 trimmed(`52248`) 반환 → `kis/adapter.py`에서 `str(int(odno))`로 정규화 후 반환 (다른 브로커는 해당 없음)
-- **KIWOOM 모의투자 주문이력(ust21150)**: 날짜별 개별 조회, 빈 결과/`501724` 에러 시 `[정보]` 로그 출력 (line 534-545)
-- **해외주식 주문이력 날짜/시각 컨벤션 (`ord_dt` vs KST)** — `kis/ls/kiwoom/toss` 어댑터의
-  `[주문이력 요약]` 출력용 참고사항. 상태 체인(`ord_datetime_utc`/`last_updated`)은 **절대 수정하지 말 것**.
-  - KIS/LS/KIWOOM(실전·모의) 해외주문 조회 응답의 `ord_dt`는 **미국(ET) 영업일**, `ord_tmd`는 **한국(KST) 시각**.
-    봇은 KST 장중(대개 04:10경, 현지 시간으로는 전일 15:xx) 주문하므로 실제 KST 날짜 = `ord_dt+1`.
-    → `[주문이력 요약]`은 `미국영업일 YYYY-MM-DD | 한국시각 YYYY-MM-DD HH:MM:SS KST | odno=…` 형태로 복원 표시.
-  - **상태 체인 비변경 (display-only fix)**: `ord_datetime_kst_iso`/`ord_datetime_utc_iso`(상태 저장용)는
-    기존 식(ord_dt를 그대로 KST로 해석 → +24h shift)을 유지. `last_updated`는 항상 `ord_datetime_utc`에서
-    파생되므로 모든 시간 비교는 동일 convention 간 비교 → 순서·포함 여부 정확, **T 계산에 영향 없음**.
-    (검증: `trading_bot.py`에 fill-vs-`now()` 비교 없음; `state.py:143`의 `datetime.now(UTC)`는
-    `last_updated` 빈 값(초기 모드) fallback 전용.)
-  - `resolve_real_kst_from_ord` (`broker/market_utils.py`): ord_dt(미국영업일)+ord_tmd(KST) → 실제 KST 복원.
-    KST 후보를 ET로 round-trip해 날짜가 ord_dt와 일치하면 선택, 후보 없으면 offset=0(KST) fallback, 실패 시 None.
-  - **브로커별 검증 상태**:
-    - KIS: ✅ 실전 로그 검증 완료 (odno=45025: `20260731 041046` → 실제 KST `2026-08-01 04:10:46`).
-    - TOSS: ✅ `orderedAt`이 timezone-aware ISO8601(`+09:00`) → 이미 정확한 KST → 보정 불필요.
-    - KIWOOM 모의(ust21150): ✅ 실측 검증 완료 (2026-08-20 04:17 KST 제출 주문이 이력에
-      `ord_dt=20260819`로 기록 확인) — **모의도 `ord_dt`는 미국영업일 컨벤션**.
-      기존 "봇 루프가 KST 날짜 주입" 가설은 폐기, 실전과 동일하게 `resolve_real_kst_from_ord`
-      표시 보정 적용 (`_normalize_ust21150_item` → `_ord_dt_is_us_trading_date=True`).
-    - LS 실전 / KIWOOM 실전(ust21100): ⚠️ **미실증** — KIS·LS·KIOM 공통 해외주식 API 컨벤션에서
-      `ord_dt=미국영업일`을 추정 중이나, CI가 실제 체결(fill)을 생산하지 않음.
-      `resolve_real_kst_from_ord` 보정은 display-only이므로 안전하나, 실전 배포 전
-      반드시 실전 API 응답으로 `ord_dt` 의미를 1회 검증할 것.
-  - **리버스 reconciliation 날짜 매칭** (`state.py` `_order_real_kst_date`): `reconcile_reverse_fills._order_for_meta`와
-    `_is_reverse_order`가 `ord_dt == submitted_at[:8]`로 **제출일(KST) vs 이력일(ET영업일)**을 비교하던 것을,
-    `resolve_real_kst_from_ord(ord_dt, ord_tmd)`로 실제 KST 날짜를 복원해 비교하도록 수정.
-    버그 사례(SOXL 모의 odno=000004615): 8/6 04:16 KST 제출(`submitted_at=20260806041650`)한 리버스 1일차
-    MOC→LIMIT 매도가 이력에 `ord_dt=20260805`(ET영업일)로 기록 → 날짜 하루 차이로 "리버스 주문 이력 누락" 오판 →
-    신규 주문 영구 차단 + 리버스 매도가 일반 쿼터매도(×0.75)로 오분류되어 T=15 오반영(정상 ×0.9 → 18).
-    복구: `STATE_REPAIR_TARGET_T=20`으로 T만 보정 후 다음 RUN의 reconciliation이 재계산.
-  - **데모 zero-fill 리버스 주문 자동 만료** (`state.py` `_auto_assume_reverse_expiry`):
-    `BROKER_MODE=demo`에서는 이전 미국 세션의 zero-fill(이력 `ft_ccld_qty`=0 && `processed_filled_qty`=0
-    && `processed_filled_amount`=0) 리버스 주문(매수/매도 모두)이 `reconcile_reverse_fills`에서
-    자동으로 `terminal=true, terminal_assumed=true` 처리되어 "전일 리버스 주문 미종결 → 신규 주문 보류"
-    동결이 발생하지 않습니다. 실전(real) 또는 부분체결·이력 누락 주문은 기존대로 보류 유지.
-    늦은 체결은 odno 단위 `processed_filled_qty` 델타로 다음 RUN에 그대로 반영됩니다(상태 소실 없음).
-- **KIS 체결 전용 이력과 미체결 리버스 주문** (`state._assume_missing_reverse_order_zero_fill`): KIS 주문이력 조회는 `CCLD_NCCS_DVSN="01"`(체결만)이라 **체결되지 않은 주문은 이력에 행 자체가 없습니다**. 그래서 이전 세션 리버스 주문(예: 체결 안 된 쿼터매수)이 "이력 누락 → 신규 주문 보류"로 오판돼 SOXL 이 멈췄습니다(2026-11-12 KIS 데모 실측). `BROKER=kis` + `BROKER_MODE=demo` 에서 이전 세션·미반영(`processed_filled_qty`·`processed_filled_amount` 마커가 **명시된 유한한 숫자 0**이고 `applied_fill_fraction` 은 없거나 0 — 누락·None·문자열·소수 수량은 불명확하므로 보류)·미종결 주문이 행 없이 빠졌고, 이력이 비어 있지 않으며 그 세션 날짜 이전·이후(같은 날 포함)의 행이 모두 있을 때만(조회 구간이 그 세션을 덮는다는 증거) 0체결 만료로 가정해 `terminal`/`terminal_assumed`(사유 `missing_from_filled_only_history_after_session`)로 종결합니다. 이후 체결 행이 나타나면 odno 델타로 반영됩니다. 다른 브로커(이력에 미체결 행 포함)·실전은 기존대로 보류(KIS 실전은 검증 전까지 보수적 유지). **공통 변경(브로커·모드 무관)**: 이미 `terminal` 인 주문이 이력에서 빠진 것은 더 이상 보류하지 않으며, 리버스 이력 행이 없는 실행에서도 현재 cycle 의 모든 리버스 주문이 종결이면 `reconciliation_only` 표식을 해제합니다
-- **ORDER_HISTORY_VERBOSE=true**: LIVE 모드에서도 `[주문이력 요약]` 상세 출력 (DRY는 항상 출력). KIS/KIWOOM/LS/TOSS 공통
-- **텔레그램 재시도**: `send_telegram()`은 타임아웃/연결 오류/서버 5xx 시 최대 3회 재시도(1초 간격). 4xx(설정 오류 등)는 재시도 없이 즉시 실패
-- **T 보정 환경변수**:
-  - `FORCE_T_REINFERENCE=true`: `last_updated` 초기화 → 전체 이력(90일)에서 T 재추정. **DRY=미리보기(저장 없음) / REPAIR=실제 저장** (LIVE는 주문 방지를 위해 DRY로 자동 전환)
-  - `{SYMBOL}_FORCE_T={value}` (**`TRADE_MODE=REPAIR` 전용** — DRY·LIVE에서는 브로커 생성 전 오류로 중단): state.json의 T를 강제 덮어쓰기 (orders_meta/balance_mismatch 초기화, `last_updated`/`last_processed_ordno`를 이력 최신 주문 시각으로 갱신 → 이중 가산 방지, `FORCE_T=0`이면 `cycle_start_date` 초기화)
-  - `{SYMBOL}_MAX_T={value}`: T 자동추정 결과의 상한선 (기본값: `{SYMBOL}_SPLITS` — 리버스모드 진입 위해 `T=splits` 허용, 초과만 방지)
-  - FORCE_T_REINFERENCE 실행 시 small_seed_days(소액 시드 오추정)가 감지되면 포지션 기반 T 추정값이 함께 출력되며, 해당 값을 `{SYMBOL}_FORCE_T`로 설정하여 직접 보정 가능
-  - ⚠️ `{SYMBOL}_FORCE_T`는 **1회성 점화용**입니다. 보정 RUN 1회 실행 후 env var를 **즉시 삭제**하세요. 리버스모드 진행은 `day_count`(state `reverse_mode`)와 체결 이력 기반 T 갱신이 주도하므로 FORCE_T 불필요. 유지하면 리버스모드 종료 → 새 사이클(T=0)에서 T를 다시 `splits`로 강제해 **새 사이클 매수가 영구 차단**됩니다.
-  - ⚠️ GH Actions의 새 state 캐시는 **`LIVE`/`REPAIR` 실행에서만** 저장됩니다. DRY(또는 DRY로 고정된 실행)의 결과는 캐시에 남지 않으므로 Actions에서는 REPAIR 가 차단되므로 T 보정은 로컬에서 `TRADE_MODE=REPAIR`로 실행하세요 (`TRADE_MODE=DRY`/`LIVE` + `FORCE_T` 같은 기존 방식은 더 이상 동작하지 않음).
-  - ⚠️ GH Actions 캐시는 **브랜치별 격리**입니다. `develop` 수동 RUN에서 보정해도 `main`(repository_dispatch) RUN의 캐시에는 반영되지 않습니다. T 보정은 반드시 운영 브랜치(`main`)에서 실행하세요.
-- **리버스모드** (`src/strategy.py execute_reverse_mode()`):
-  - 발동: `T > splits - 1` + position > 0 (20분할 T>19, 40분할 T>39 — 원본 규칙: 마지막 1회 매수도 불가능한 상태)
-  - 1일차: MOC 매도 (보유량 1/10(20분할) or 1/20(40분할)) → T × 0.9/0.95 (MOC 가격은 `adjust_price_to_tick()`으로 호가 단위 보정 후 전달)
-  - 2일차+ (비소진): LOC 매도 @5일MA + 실제 주문가능금액 기준 쿼터매수 @별지점-0.01 + **쿼터매수 아래 1주씩 계단식 추가매수 LOC**(`_build_reverse_additional_buys`, 원문 주문표 기준 — 사용자 제공 PDF 요약, 저장소에 사본 없음). 가격은 일반모드와 같은 `build_additional_loc_prices`(쿼터매수금액 ÷ (쿼터매수 수량+i)), 쿼터매수 가격 아래·단조 감소, 쿼터매수+추가매수 합계 ≤ 주문가능금액(시드 캡 반영). 단계 수는 일반모드와 같은 `{SYMBOL}_ADDITIONAL_LOC_LEVELS`(기본 8, 0=끔). 주문은 `reverse_action=buy` + `reverse_t_target=0` + `[추가매수]` 표식으로 접수되어 **체결돼도 T는 오르지 않고 `net_invested`만 증가**(`state.reconcile_reverse_fills`·`ops/verify_run.py` 독립 검증 포함). 체결되지 않은 추가매수가 대부분이므로 **미체결 주문을 다음 세션에 종결하는 경로가 있는 환경에서만 겁니다**: 데모 전체(자동 만료 가정)와 메리츠 실전(이전 세션 zero-fill 만료 가정, PR #21 선행 조건). KIS·LS·KIWOOM·TOSS·NHPLUG **실전**은 그 경로가 없어(KIS 실전은 체결 전용 이력이라 미체결이 이력에서 빠짐) 추가매수를 걸지 않습니다(`_reverse_ladder_supported`)
-  - 2일차+ (소진): 쿼터매수(잔금의 1/4)로 1개 매수가 불가능하면 매수 시도 없이 MOC 매도만 수행
-  - 리버스모드 날짜는 실행당 1회만 증가하며, DRY 실행으로 저장 상태를 진행시키지 않음
-  - 같은 실행에서 제출한 매도 주문의 예정 매도대금은 매수 가능금액으로 선반영하지 않음
-  - **쿼터매수 잔금**: broker `orderable_cash`(주문가능금액)만 사용하며 `reverse_mode.cumulative_sell_proceeds`를 합산하지 않음 — **의도적 보수 설계** (정산 매도대금은 broker가 `orderable_cash`에 반영함을 전제, `test_reverse_mode.py:50-76`로 고정). 원본(매도금 누적 합산)과 달리 하락장에서 덜 매수 = 더 안전한 쪽
-  - T 갱신은 실제 체결 이력 반영을 기준으로 하며, 전략의 T 계산값만으로 저장하지 않음
-  - **쿼터매수 T 효과는 체결 반영 시점의 '직전 T' 기준** (원문 4~5쪽: 매도 `T=직전 T×0.9`, 매수 `T=직전 T+(분할수−직전 T)×0.25`). 주문 생성 때 `reverse_t_target` 은 '같은 날 매도 전량 체결' 가정의 **계획 추정값**일 뿐이고, 신규 주문(`reverse_t_rule=2`, `reverse_splits` 기록)은 정산이 **첫 체결을 반영할 때** 그 시점 T(같은 세션 매도 체결 반영분 포함)로 목표값을 확정해 `reverse_t_target` 에 덮어씁니다(계획값은 `reverse_t_target_planned`, 기준 T 는 `reverse_t_target_basis_t`). 이후 부분체결은 확정값 × 누적 체결비율만 적용해 체결을 쪼개도 결과가 같습니다. 정산 순서의 시각(`ord_datetime_utc`)은 브로커 이력의 **주문(접수) 시각**(메리츠는 주문일시 우선)이며 체결 시각이 아닙니다 — 봇이 매도를 먼저 접수하므로 매도→매수 순이 되고, 초 단위로 같으면 매도를 먼저 정산합니다. 분할수를 넘는 T(`T>분할수`)는 매수 효과가 음수가 되어 오류를 덮을 수 있으므로 자르지 않고 정산을 보류합니다. 분할수·기준 T 가 무효면 추정하지 않고 정산을 보류하고, 표식이 없는 기존 주문은 기존 규칙(계획값)을 그대로 씁니다. 독립 검증기(`ops/verify_run.py`)는 직전 T 를 원장 재생으로 구해 목표값을 재계산합니다. 배경: 2026-11-17 SOXL 매도 미체결인데 쿼터매수가 +0.747(정상 +0.274) 반영됨
-  - 종료 조건: 종가 > 평단×(1-0.15)(TQQQ) or ×(1-0.20)(SOXL) — 판정은 `last_price`(실시간/최신가) 기준. 런 타이밍: **실전=pre장**(직전 종가 근사), **모의=장 후반**(당일 종가 근사). pre-market이 라이브 시세를 반환하면 종가와 달라질 수 있어 broker별 1회 DRY 검증 필요
-  - 별지점: Finnhub 5일 MA → close_prices(state) → last_price fallback (fallback 시 `[경고]` 로그 출력)
-  - **TOSS MOC 변환**: 토스는 MOC(장마감시장가)를 지원하지 않음. 리버스 1일차 SELL MOC는 `toss/adapter.py place_order()`에서 LOC(장마감지정가) `$0.01`로 자동 변환되어 종가 체결 (MOC와 동일 동작, `_MOC_SELL_PROXY_PRICE`). 변환은 adapter 한 곳에서만 일어나므로 전략은 계속 `order_type="MOC"`를 생성하며, fence(`pending_order_intent/batch`)에는 원본 MOC/현재가가 기록됨 — fence 복구는 세션 날짜만 사용하므로 영향 없음. **BUY MOC는 변환하지 않음** ($0.01 매수 LOC는 체결 불가) → `OrderNotAcceptedError` 유지
-  - **BUY LOC +19% 보정과 쿼터매수 상호작용**: `trading_bot.py`의 BUY LOC 가격 보정(`last_price × 1.19` 초과 시 `last×1.19`로 교정)이 리버스 쿼터매수(`star-0.01`, 별지점=5일MA)에도 적용됨. 하락장이 전제인 리버스에서는 별지점이 현재가보다 19% 이상 높아 **일반모드보다 훨씬 자주 발동** → notify 다발 + 매수가가 의도(별지점 대기)와 다른 `last×1.19`로 보정될 수 있음. 미해결 리스크로 기록 (기능 실패는 아님)
-  - **BUY LOC 1.19 상한 + 추가매수 계단 배치는 `src/strategy.py`에서 처리** (`cap_buy_loc_price` / `build_additional_loc_prices`, 2026-10-20 `c995412`). `trading_bot.py`의 주문 전송 직전 보정은 제거했습니다(이중 보정 방지). 상한에 걸린 추가매수 후보는 **건너뛰고** 정상매수 보정가보다 낮은 단계부터 배치합니다 — 안 하면 정상매수와 같은 가격으로 뭉칩니다. DRY 프리뷰·fence·실제 전송 가격이 모두 이 단계의 결과입니다.
-  - **데모 모드 MOC/LOC→LIMIT 변환**: KIS/KIWOOM 데모는 MOC/LOC/LOO/MOO를 `LIMIT`으로 자동 변환(LS는 `DEMO_UNSUPPORTED_ORDER_TYPES`가 비어 있어 변환 없음). 리버스 "마감 체결" 전제가 깨져 데모(장중 체결 가능)와 실전(마감 체결) 결과가 달라질 수 있음. T 반영은 체결 이력 기준이라 정합성은 유지
-  - **실전 pre-market MOC/LOC 제출 미실증**: `trading_bot.py`는 실전에서 pre-market(ET ~04:00)까지 대기 후 주문. MOC/LOC(마감가 주문)는 통상 정규장에만 접수되므로 ET 04:00 제출 시 브로커가 거부/보류할 수 있음. KIS(33)/LS(M4)/KIWOOM(33) 실전의 "MOC+가격" 전송 및 TOSS CLS 주문의 pre-market 접수 여부는 **실전 배포 전 1회 검증 필요**
-  - **TOSS `prerequisite-required` 실측**: `ETF 거래를 위한 요건이 부족합니다` — 신규 매수 주문에 걸리며 기존 보유와 무관(보유 중이어도 매수 차단). 투자성향(자금투자성향) 앱 등록으로 해소됨 확인 (교육 이수 아님). 해소 후 다음 관문은 `insufficient-buying-power`(주문가능금액 부족). 4xx 응답은 에러 envelope 선파싱 후 `OrderNotAcceptedError` 확정거부로 처리 (`toss/adapter.py _request_with_rate_retry()`)
-  - **LS `08507` 실측**: `ETF/ETN 교육이수 확인 후 매매 가능 합니다` — 레버리지 ETF(TQQQ 등) 매수 시 교육이수 요구. **거래확인서 등록으로 해소됨 확인** (교육이수 불필요). preflight 거부 경로(`99999주/$0.01`)에서도 동일 코드로 확인 가능하며 이력 오염 없음
-- **STATE_DIAGNOSTIC_ONLY=true**: GitHub Actions 캐시의 T/reverse_mode 상태만 출력하고 브로커 API, 전략, 주문을 실행하지 않음. 일회성 진단 후 즉시 해제
-- **STATE_REPAIR_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 리버스 상태를 1회 초기화. `STATE_REPAIR_*` 변수는 실행 직후 삭제
-  - `STATE_REPAIR_TARGET_T={value}` (선택): 기본 초기화 대신 **T만 보정**하고 리버스 cycle/orders_meta를 보존. ord_dt vs submitted_at 날짜 컨벤션 버그로 오반영된 T(예: 20→15)를 되돌려 다음 RUN의 `reconcile_reverse_fills`가 체결 기반으로 재계산(예: 20→18)하도록 하는 용도. fingerprint는 기존과 동일하게 필요
-- **STATE_CLEAR_FENCE_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 주문 fence(`pending_order_intent`/`pending_order_batch`)를 1회 초기화. `STATE_CLEAR_FENCE_SYMBOL` + `STATE_CLEAR_FENCE_EXPECT_T`/`EXPECT_LAST_UPDATED`/`EXPECT_INTENT`/`EXPECT_BATCH` 필요 (intent/batch는 빈 값 = "fence 없음" 의미, env var 존재만 필수). 실행 직후 변수 삭제
-- **STATE_SET_CYCLE_START_ONLY=true**: 지정 fingerprint가 일치할 때만 API/전략/주문 없이 `cycle_start_date`를 1회 설정. `STATE_SET_CYCLE_START_SYMBOL` + `STATE_SET_CYCLE_START_DATE`(YYYY-MM-DD) + `STATE_SET_CYCLE_START_EXPECT_HASH`/`EXPECT_T`/`EXPECT_CURRENT` 필요 (EXPECT_CURRENT는 빈 값 허용 = "현재 값 없음"). `REPAIR_ACTION=CYCLE_START_SET`으로도 실행 가능. 미종결 리버스 주문 또는 pending fence가 있으면 거부하고, date가 기준일(last_updated 날짜, 없으면 오늘)보다 미래면 거부. 실행 직후 변수 삭제
-  - 배경: 수동 주입(REPAIR CAS) 후 `cycle_start_date`가 비면 `generate_cycle_report`가 **전체 이력**을 집계해 B안 시드(`next_cycle_seed = seed + net_profit`)가 틀어짐. `cycle_start_date`는 full-history 추정 경로에서만 자동 설정되므로(현재 T>0인 진행 중 사이클은 미설정), 이 액션으로 정정
-- **REPAIR_ACTION=REVERSE_LEDGER_REWIND** (로컬/복구 워크플로 전용, 주문·브로커 호출 없음): 리버스 매도가 일반 매도(×factor)로 **오분류 정산**된 종목을 재정산 직전으로 되돌립니다(`state.rewind_misclassified_reverse_sell`). 원장의 해당 `sell` 항목(마지막 항목일 때만)·`sell_t_effects`를 제거하고 T를 `reverse_base_t`로, `net_invested`를 반영 전으로, 해당 주문 `processed_filled_*` 마커를 0으로 되돌립니다. 워터마크·`position_qty`·`reverse_mode`는 불변. `REPAIR_REWIND_SYMBOL/ODNO/EXPECT_HASH/EXPECT_T` + **가드 종목** `REPAIR_REWIND_GUARD_SYMBOL/GUARD_HASH`(다른 종목 canonical hash, 저장 전후 불변 검증)가 필요하고, `REPAIR_REWIND_APPLY=true`가 없으면 **미리보기만**(저장 없음). 전제가 하나라도 어긋나면 아무것도 바꾸지 않고 중단. 실행 직후 환경변수 삭제. 배경: 2026-11-06 NHPlug SOXL(odno 2617) T 17.325 → 14.4375 오분류
-- **복구 워크플로** (`.github/workflows/repair_reverse_ledger_rewind.yml`, 수동 `workflow_dispatch`, main·demo 전용): 위 REVERSE_LEDGER_REWIND 를 Actions 캐시에 적용하는 유일한 경로. preview(저장 없음) → approve(Environment `state-repair` — **Required reviewers 는 선택 사항**: 지정하면 apply 직전에 승인 대기, 미지정이면 대기 없이 통과. 정기 거래 실행과 무관) → **backup**(복구 전 state 를 gpg 로 암호화·왕복 검증해 artifact `repair-backup-<broker>-<run_id>-<시도 번호>` 로 30일 보관("Re-run all jobs" 는 run_id 가 같아 이름에 `run_attempt` 를 넣음) — **이 잡이 성공해야 apply 시작**) → apply(복구 → `ops/verify_repair_rewind.py` 독립 검증 → 통과 시에만 새 캐시 `state-<broker>-demo-<run_id>` 저장 → **새 키가 실제로 존재하는지 확인**: `actions/cache/save` 는 장애·예약 충돌에도 경고만 남기고 성공할 수 있어 step 결과만으로는 저장 성공을 알 수 없음). 복원 대상이 해당 브로커 main 의 **최신 캐시**여야 하고 복원본 SHA-256 이 입력과 같아야 하며(승인 대기 중 거래가 돌았으면 apply 가 중단), 거래와 같은 concurrency 그룹을 씁니다(백업 잡은 캐시를 읽기만 하므로 제외). 브로커/텔레그램 시크릿은 주입하지 않고, 백업 passphrase(`STATE_BACKUP_PASSPHRASE`)는 **백업 잡의 암호화 단계에만** 주입합니다(봇을 실행하는 preview/apply 잡에는 시크릿 없음 — 평문 state 는 공개 artifact 로 올리지 않음). 주문번호 원문은 공개 입력으로 받지 않고 봇이 후보 1개를 자동 특정(여러 개면 중단)
-  - **`confirm` 으로 실행 범위를 정함**: (비움) preview 만 / `BACKUP`(종목 생략 가능) preview → backup + hashes(**state 변경 없음**, 시크릿·암호화·왕복 검증·업로드 경로 점검과 복원 state 지문 계산) / `REWIND <종목>` preview → approve → backup → apply. 정확히 일치하지 않으면 미리보기만. 비운 미리보기로는 backup·apply 가 생략되므로 **실제 복구 전에 `BACKUP` 으로 백업 경로부터 확인** (apply 저장 경로는 실제 복구에서 처음 검증). **`BACKUP` 은 복구 대상·T·hash 없이 broker·restore_key 만으로 실행하고, 봇의 복구 미리보기는 건너뜁니다**(미리보기는 복구 대상이 있어야 성공해 정상 state 에서는 실패). 파일 SHA-256 은 `BACKUP` 에서만 생략 가능(입력하면 반드시 대조, 생략하면 "사전 지문 대조 없이 백업"으로 표시). 시크릿 없는 `hashes` 잡이 복원본의 파일 SHA·종목별 canonical hash·T 를 요약에 출력해 REWIND 입력값으로 쓰게 하며, 백업 잡(passphrase 보유)은 저장소 코드를 실행하지 않습니다
-  - **절차는 두 번 실행**: `confirm` 은 실행 시작 시 입력하는 값이라 같은 실행에서 미리보기를 본 뒤 정할 수 없습니다(Required reviewers 없이는 approve 가 즉시 통과). ① `confirm` 비우고 실행 → 미리보기(Summary 에 현재값·목표값 표시) ② 출력을 근거 실행 Evidence 와 **실행자가 직접 대조**(독립된 승인자가 있는 것이 아님) ③ 같은 입력 + `confirm`=`REWIND <종목>` 으로 재실행. ①~③ 사이에 거래가 돌아 새 캐시가 생기면 최신 캐시 검사에서 중단되므로 **다음 거래 슬롯 전에** 끝내고, 거래 슬롯 시간대는 피하세요(같은 concurrency 그룹에서 대기 중 실행은 새 실행에 밀려 취소될 수 있음)
-  - 실행 요약(Summary)에 **복구 적용·독립 검증·캐시 저장·새 캐시 존재 확인 결과를 따로** 기록하며(실패해도 기록, 주문번호 원문 없음, `last_processed_ordno` 는 변경 여부만) "검증 통과 + 저장 실패/미확인"을 구분합니다(저장 성공은 존재 확인 뒤에만 보고). 파일 SHA·canonical hash 는 **입력값과 계산값을 구분**해 복구 전후로 기록하고(별도 `continue-on-error` 단계 — 계산 실패가 복구·검증 판정을 가리지 않음), 마지막 `summary` 잡이 백업 실패로 apply 가 생략된 경우까지 전체 흐름의 최종 결과를 남깁니다
-- **REPAIR_ACTION=REVERSE_WATERMARK_RESTORE** (REVERSE_LEDGER_REWIND 직후 후속, 같은 복구 워크플로의 `action` 선택): 되돌리기 뒤에도 오분류 실행이 올려 둔 워터마크(`last_updated`/`last_processed_ordno`)가 남아 있으면 독립 검증기가 그 리버스 체결을 "워터마크 이전 = 필수 아님"으로 보고 정상 정산을 '과다 반영'으로 실패 처리합니다(2026-11-09 NHPlug SOXL DRY 실측). 이 두 필드만 오분류 직전 값으로 되돌립니다. 전제: 미정산 리버스 매도(마커 0/0, 원장 항목 없음)가 정확히 1개, 목표 시각은 **현재보다 과거**(앞으로 감기 금지), CAS(대상 hash·T)+가드 종목 hash. 목표 `last_processed_ordno` 는 공개 입력으로 받지 않고 **원장 마지막 항목의 주문번호**로 도출합니다(Evidence 의 `watermark_before`/`last_processed_ordno_before` 와 대조). 목표 시각은 Evidence `watermark_before` 값. 워크플로 입력 `evidence_run_id`(숫자)는 **이 동작에서 필수**입니다 — 목표값의 근거가 된 Evidence 가 있는 실행 번호를 남기는 추적용 기록이며 값의 정확성을 증명하지는 않습니다(복구 함수·검증기는 목표가 현재보다 과거인지만 확인하므로, 목표값은 실행자가 Evidence 와 직접 대조해야 합니다)
-- **LIVE 주문 fence**: 주문 전 `pending_order_batch`/`pending_order_intent`를 캐시에 저장하며, fence가 남아 있어도 **전체 중단하지 않고** 해당 종목만 복구를 시도합니다 (다른 종목은 계속 진행)
-- **이전 세션 잔여 주문 정리** (신규 주문 제출 직전, LIVE 전용): 봇은 매 세션마다 새 주문 전체를 새로 내므로, 이전 주문이 살아 있으면 목표매도 LIMIT 등이 **중복**됩니다. 그래서 `state.orders_meta` 에 있는 봇 소유 주문 중 `미체결`/`부분체결`(잔량>0)만 취소한 뒤 신규 주문을 냅니다. 수동 주문·리버스 주문은 제외하고, 취소 실패 시 신규 주문을 내지 않고 해당 종목만 중단(`SymbolScopedError`)합니다. 취소 미지원 브로커는 건너뜁니다 (`trading_bot.py` `_cancel_open_bot_orders`)
-- **취소 확정 확인 조건** (`_cancel_open_bot_orders`): 이력 재조회가 성공했고, 해당 주문 행이 이력에 존재하며,
-  체결수량·잔량이 **유효한 숫자로 읽히고**, 취소 전 대비 체결수량·금액이 증가하지 않았고,
-  주문이 **명시적인 종료 상태**(취소·체결·거부·만료·정정됨) 또는 확인된 잔량 0 이어야 확정입니다.
-  이력 누락·조회 실패·값 파싱 실패·알 수 없는 상태는 "확정"이 아니라 **미확정**으로 처리합니다
-  (조회 누락을 확정으로 보면 중복 주문이 됩니다).
-  취소 도중 체결이 발생하면 포지션이 바뀌므로 **재계획 후** 주문해야 합니다.
-  - **미접수 확정(`OrderNotAcceptedError`)**: 브로커가 명시적으로 거부(사전검증 실패 또는 거부 응답)해 주문이 접수되지 않았음이 보장되면 fence를 해제하고 해당 종목의 남은 주문만 중단 → 다음 종목 계속 진행
-  - **불확실(네트워크 타임아웃/연결 오류, 주문번호 누락)**: fence 유지 → 해당 종목만 중단, 다음 종목은 계속 진행 (`SymbolScopedError`). **다음 RUN에서 자동 복구**를 시도합니다. state 저장 실패(intent/checkpoint)는 공통 장애로 전체 중단 (`GlobalScopedError`, 단일 `.state.json` 공유 때문)
-  - **이전 세션 자동 복구** (`_recover_order_fence`, `trading_bot.py`): 주문이력/잔고 reconciliation(Step 1~3)을 정상 통과한 뒤, fence의 `submitted_session`(intent)/`session`(batch)이 오늘 미국(ET) 세션보다 과거면 이력이 정착된 것으로 보고 fence를 해제하고 정상 진행. 잔고 조회 실패(None) 또는 같은 세션/세션 정보 없음이면 보수적으로 fence 유지 + 해당 종목만 중단
-  - fence 복구는 1일 1회 실행 + 당일 유효 주문(LOC/MOC/LIMIT) 특성상 전일 미확정 주문이 하루 뒤 이력으로 판별 가능하므로 안전합니다
-  - `STATE_CLEAR_FENCE_ONLY`로 수동 해소 가능 (자동 복구가 안 되는 경우)
-  - **collar 경계 probe** (`tests/test_broker_preflight.py`, `COLLAR_PROBES`): 시장성 probe(매수 상단 ×1.19/×1.21, 매도 하단 ×0.80)는 실전에서 실제 체결이 발생하므로 `COLLAR_PROBE_LIVE_FILL=true`일 때만 실행(기본 skip). 비시장성(매수 하단 ×0.90, 매도 상단 ×1.50)만 접수→이력 매칭→취소→0체결 확인. 매도 probe는 보유 수량 있을 때만 시도. KIS 운용 기준: 매수 현재가 −97%~+20%, 매도 −20%~+200% (현지 브로커별 변동, LS FAQ는 브로커별 10~20% 명시)
-- **close_prices**: state.json에 최근 5거래일 종가 저장 (Finnhub fallback용)
-- **`get_daily_closes()`** (`src/broker/base.py`):
-  - Broker 추상 메서드: `(symbol, exchange, days=5) → list[float]` (오래된 종가순)
-  - KIS: HHDFS76240000 → `GET /uapi/overseas-price/v1/quotations/dailyprice` (최신순 → 역순)
-  - LS: g3204 → `POST /overseas-stock/chart` (차트 경로, `gubun="2"` 일봉, 종가 `close`, 오래된순 그대로) + Finnhub candle fallback. 시세 경로(`/market-data`)로 보내면 `IGW00215` 거부됨 (421baf0 실측)
-  - KIWOOM: usa06012 → `POST /api/us/chart` (최신순 → 역순)
-  - TOSS: `GET /api/v1/candles?interval=1d` (최신순 → `reversed()`)
-  - 리버스모드 `_get_reverse_star_point()`에서 close_prices 보강용으로 사용 가능
-- **LS 해외주식 취소** (`src/broker/ls/adapter.py::cancel_order`, 2026-11-03 실측): COSAT00301 + OrdPtnCode=`08`(취소) + OrgOrdNo=원주문번호(필수). 성공 `{"00000","00156"}` (00156="취소주문이 완료되었습니다"). 취소주문도 신규 주문번호를 발급받으며(OrgOrdNo로 원주문 연결), 원주문은 잔량 0·0체결로 확정. **COSMT00300은 "해외증권 매도상환주문"으로 취소와 무관 — 사용 금지**. Place_order 성공 `{"00000","00040","00050"}` (00040 실측="매수 주문이 완료되었습니다", 00050은 매도 대칭 추정 — 첫 실전 매도 시 rsp_cd 확인 필요). 주문번호는 OutBlock2(결과) 우선·OutBlock1(에코) 폴백으로 읽기.
+- 브로커·이력·fence·취소·리버스·복구 세부 NOTES는 위 `상세 문서` 표의 파일로 옮겨졌습니다(내용 동일).
