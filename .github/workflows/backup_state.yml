@@ -17,8 +17,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: nhplug-soxl-repair-before
-            key: state-nhplug-demo-42287486160
+          - label: nhplug-prev-cache-44168234432
+            key: state-nhplug-demo-44168234432
 
     steps:
       - name: Restore the exact snapshot
