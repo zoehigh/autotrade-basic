@@ -767,13 +767,132 @@ class NHPlugBroker(Broker):
                 )
         return rows
 
+    # ── 15건 상한 우회 가능성 진단: 방향(매수/매도) × 체결 여부(체결/미체결) 분할 + 오름·내림 1페이지 ──────────
+    _PAGE_CAP = 15   # 관측값: 한 조회가 돌려주는 최대 행 수 (공식 문서에는 명시되지 않음)
+
+    def _probe_page1(self, symbol, dt, token, overrides) -> dict:
+        """연속조회를 따라가지 않고 **첫 페이지만** 조회합니다 (역순 조회의 cts 반복 오류를 피하기 위한 진단 전용 조회)."""
+        body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt, **overrides))
+        meta: dict = {}
+        data = self._request_with_rate_retry("/gbstock/inquiry/v1/unexecuted", body, token, meta=meta)
+        rows = self._extract_output(data, "Output_0") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        headers = meta.get("headers") or {}
+        flag = (headers.get("cts_flag") or "").strip().upper()
+        return {
+            "rows": rows,
+            "ids": [self._norm_order_id(self._order_id_of(r)) for r in rows],       # 응답 순서 유지
+            "signal": flag == "Y" or bool(meta.get("continue_code")),
+            "flag": flag or "없음",
+            "code": meta.get("continue_code") or "없음",
+            "cts": bool((headers.get("cts") or "").strip()),
+        }
+
+    @staticmethod
+    def _is_monotonic(ids, descending: bool) -> bool:
+        nums = [int(i) for i in ids if i.isdigit()]
+        if len(nums) != len(ids):
+            return False
+        return nums == sorted(nums, reverse=descending)
+
+    def _check_filter_semantics(self, rows, side, fill) -> str:
+        """필터가 실제로 적용됐는지 행 내용으로 확인합니다 (무시되면 모순). 문제가 없으면 빈 문자열."""
+        for row in rows:
+            norm = self._normalize_unexecuted_item(row)
+            if side == "2" and norm.get("sll_buy_dvsn_cd_name") != "매수":
+                return "매수 필터인데 매수가 아닌 행이 있음"
+            if side == "1" and norm.get("sll_buy_dvsn_cd_name") != "매도":
+                return "매도 필터인데 매도가 아닌 행이 있음"
+            try:
+                filled = float(norm.get("ft_ccld_qty") or 0) > 0
+                open_qty = float(norm.get("nccs_qty") or 0) > 0
+            except (TypeError, ValueError):
+                return "수량을 읽을 수 없음"
+            if fill == "1" and not filled:
+                return "체결 필터인데 체결수량 0인 행이 있음"
+            if fill == "2" and not open_qty:
+                return "미체결 필터인데 미체결수량 0인 행이 있음"
+        return ""
+
+    def _judge_partition(self, asc: dict, desc: dict, side: str, fill: str):
+        """분할 하나의 완전성 판정 → (고유 주문 집합, 판정 문구, 완전 여부).
+
+        완전성은 '잔고가 맞다'거나 '결과가 겹친다'는 사실만으로 판정하지 않고 아래를 모두 만족할 때만 인정합니다.
+          - 필터가 실제 적용됐고(행 내용 검증), 오름 응답은 오름·내림 응답은 내림 정렬이며
+          - 페이지네이션 신호와 반환 건수가 모순되지 않을 때:
+              · 상한(15) 미만이면 연속조회 신호가 없어야 하고, 내림 조회도 같은 집합이어야 함
+              · 상한에 닿았으면 오름(가장 작은 15)·내림(가장 큰 15)이 겹쳐야 전체를 덮음 (겹치지 않으면 30건 이상일 수 있어 불완전)
+        """
+        cap = self._PAGE_CAP
+        a_ids, d_ids = asc["ids"], desc["ids"]
+        union = set(a_ids) | set(d_ids)
+        for part in (asc["rows"], desc["rows"]):
+            problem = self._check_filter_semantics(part, side, fill)
+            if problem:
+                return union, f"모순({problem})", False
+        if len(a_ids) != len(set(a_ids)) or len(d_ids) != len(set(d_ids)):
+            return union, "모순(한 응답 안에 중복 주문)", False
+        if not self._is_monotonic(a_ids, False) or not self._is_monotonic(d_ids, True):
+            return union, "모순(정렬 방향이 요청과 다름)", False
+        if len(a_ids) > cap or len(d_ids) > cap:
+            return union, f"모순(한 응답이 {cap}건을 넘음 — 상한 가정이 깨짐)", False
+        if len(a_ids) < cap:
+            if asc["signal"]:
+                return union, "모순(연속조회 신호가 있는데 상한 미만)", False
+            if set(a_ids) != set(d_ids):
+                return union, "모순(상한 미만인데 오름·내림 집합이 다름)", False
+            return union, "완전(상한 미만·신호 없음·오름내림 일치)", True
+        if set(a_ids) & set(d_ids):
+            return union, "완전(상한 도달·오름내림 겹침으로 전체를 덮음)", True
+        return union, f"불완전(상한 도달·오름내림 겹침 없음 — {cap * 2}건 이상일 수 있음)", False
+
+    def _enumerate_day_partitioned(self, symbol, dt, token, label_prefix="", missing_ids=frozenset()):
+        """하루치 이력을 방향×체결 4분할 + 오름·내림 1페이지씩으로 모아 (고유 주문 집합, 완전 여부)를 돌려줍니다 (진단 출력 포함)."""
+        partitions = [("2", "1", "매수·체결"), ("2", "2", "매수·미체결"), ("1", "1", "매도·체결"), ("1", "2", "매도·미체결")]
+        union_by_part: dict[str, set] = {}
+        all_complete = True
+        for side, fill, name in partitions:
+            try:
+                base = {"oss_sby_dit_cd": side, "ost_cns_dit": fill}
+                asc = self._probe_page1(symbol, dt, token, {**base, "sot_dit": "0"})
+                desc = self._probe_page1(symbol, dt, token, {**base, "sot_dit": "1"})
+            except Exception as error:
+                print(f"[주문이력진단·분할] {symbol} {dt} 분할[{name}]: 조회 오류 {type(error).__name__}: {str(error)[:80]} → 불완전")
+                all_complete = False
+                continue
+            ids, verdict, complete = self._judge_partition(asc, desc, side, fill)
+            union_by_part[name] = ids
+            all_complete = all_complete and complete
+            print(
+                f"[주문이력진단·분할] {symbol} {dt} 분할[{name}]: 오름={len(asc['ids'])}건(flag={asc['flag']} 신호={asc['code']}) "
+                f"내림={len(desc['ids'])}건(flag={desc['flag']} 신호={desc['code']} 정렬검증={'정상' if self._is_monotonic(desc['ids'], True) else '이상'}) "
+                f"겹침={len(set(asc['ids']) & set(desc['ids']))} 합집합={len(ids)} 누락주문발견={len(ids & missing_ids)} 판정={verdict}"
+            )
+        # 방향이 다른 분할 간 중복(있으면 방향 필터가 무시된 것) 검사 + 합집합
+        # 방향(매수/매도)이 다른 분할은 서로 겹칠 수 없습니다. 같은 방향의 체결/미체결 분할은 부분체결 주문이
+        # 둘 다에 나오는 것이 정상이므로 겹침을 모순으로 보지 않습니다 (합집합에서 한 번만 셉니다).
+        names = list(union_by_part)
+        overlap = sum(
+            len(union_by_part[a] & union_by_part[b])
+            for i, a in enumerate(names) for b in names[i + 1:] if a[:2] != b[:2]
+        )
+        union = set().union(*union_by_part.values()) if union_by_part else set()
+        if overlap:
+            all_complete = False
+        print(
+            f"[주문이력진단·분할] {symbol} {dt} 분할 합집합: 고유주문={len(union)}건 분할간중복={overlap} "
+            f"누락주문발견={len(union & missing_ids)}/{len(missing_ids)} 전체완전성={'보장' if all_complete and not overlap else '보장 못함'}"
+        )
+        return union, all_complete and not overlap
+
     def diag_probe_missing_orders(self, symbol, exchange, missing) -> None:
         """[진단 전용 — DRY 에서만, 조회만 하며 매매·state 판단에 쓰이지 않습니다]
 
-        '리버스 주문 이력 누락'으로 보류된 주문(state 에는 있는데 이력에 없는 주문)이 조회 방식을 바꾸면 나오는지 비교합니다.
-        가설: 한 번에 15건까지만 돌려주고 연속조회가 비어 와서 날짜 끝쪽 주문이 잘린다.
-          - 기존 전체 조회 / 주문번호 역순(sot_dit=1) / 매수(oss_sby_dit_cd=2) / 미체결(ost_cns_dit=2) / 매수+미체결+역순
-          - 주문번호 직접 조회(orr_no): 먼저 이력에 있는 주문(대조군)으로 필터가 실제 적용되는지 확인한 뒤 누락 주문을 조회
+        '리버스 주문 이력 누락'으로 보류된 주문이 조회 방식을 바꾸면 나오는지, 15건 상한을 우회해 하루치를 완전하게
+        모을 수 있는지 확인합니다 (이전 DRY: 기존 전체 조회 15건에서 잘림, 매수 필터에서 누락 3건 발견, orr_no 직접 조회는
+        필터가 무시됨, 역순은 2페이지에서 cts 반복).
+          ① 기존 전체 조회(연속조회 포함)  ② 전체 역순 **1페이지만**  ③ 방향×체결 4분할 × 오름·내림 1페이지
         주문번호·계좌·cts 원문은 출력하지 않습니다 (가명 식별자·건수만). 어떤 오류도 호출자에게 전파하지 않습니다.
         """
         if not self._is_dry_run() or not missing:
@@ -791,28 +910,24 @@ class NHPlugBroker(Broker):
             for dt, missing_ids in sorted(by_dt.items()):
                 print(f"[주문이력진단·분할] {symbol} {dt} 시작: 누락 리버스 주문 {len(missing_ids)}건 대상")
                 baseline = self._probe_query(symbol, dt, token, "① 기존 전체 조회", {}, missing_ids)
-                self._probe_query(symbol, dt, token, "② 주문번호 역순(sot_dit=1)", {"sot_dit": "1"}, missing_ids)
-                self._probe_query(symbol, dt, token, "③ 매수 필터(oss_sby_dit_cd=2)", {"oss_sby_dit_cd": "2"}, missing_ids)
-                self._probe_query(symbol, dt, token, "④ 미체결 필터(ost_cns_dit=2)", {"ost_cns_dit": "2"}, missing_ids)
-                self._probe_query(
-                    symbol, dt, token, "⑤ 매수+미체결+역순",
-                    {"oss_sby_dit_cd": "2", "ost_cns_dit": "2", "sot_dit": "1"}, missing_ids,
-                )
-                # 대조군: 기존 조회에 이미 있는 주문(처음·마지막 행)을 orr_no 로 직접 조회 → 필터가 실제 적용되는지
-                controls = []
-                for row in (baseline[:1] + baseline[-1:]):
-                    rid = self._norm_order_id(self._order_id_of(row))
-                    if rid.isdigit() and rid not in controls:
-                        controls.append(rid)
-                for rid in controls:
-                    self._probe_query(
-                        symbol, dt, token, f"⑥ 직접조회 대조군 {mask_odno(rid)}", {"orr_no": int(rid)}, missing_ids, expect_id=rid,
+                base_ids = {self._norm_order_id(i) for i in self._unique_order_ids(baseline)}
+                try:
+                    rev = self._probe_page1(symbol, dt, token, {"sot_dit": "1"})
+                    rev_ids = set(rev["ids"])
+                    print(
+                        f"[주문이력진단·분할] {symbol} {dt} ② 전체 역순 1페이지: 반환={len(rev['ids'])}건 고유주문={len(rev_ids)} "
+                        f"정렬={self._id_order_direction(rev['rows'])} flag={rev['flag']} 신호={rev['code']} cts응답={'있음' if rev['cts'] else '없음'} "
+                        f"기존조회와겹침={len(rev_ids & base_ids)} 역순에만={len(rev_ids - base_ids)} "
+                        f"누락주문발견={len(rev_ids & missing_ids)}/{len(missing_ids)}"
                     )
-                for rid in sorted(missing_ids):
-                    if rid.isdigit():
-                        self._probe_query(
-                            symbol, dt, token, f"⑦ 직접조회 누락주문 {mask_odno(rid)}", {"orr_no": int(rid)}, missing_ids,
-                        )
+                except Exception as error:
+                    print(f"[주문이력진단·분할] {symbol} {dt} ② 전체 역순 1페이지: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
+                union, complete = self._enumerate_day_partitioned(symbol, dt, token, missing_ids=missing_ids)
+                print(
+                    f"[주문이력진단·분할] {symbol} {dt} 결론: 기존조회={len(base_ids)}건 분할합집합={len(union)}건 "
+                    f"기존에없던주문={len(union - base_ids)} 누락주문 최종발견={len(union & missing_ids)}/{len(missing_ids)} "
+                    f"완전성={'보장' if complete else '보장 못함'}"
+                )
         except Exception as error:   # 진단은 어떤 경우에도 매매 흐름에 영향을 주지 않습니다
             print(f"[주문이력진단·분할] 진단 중단: {type(error).__name__}: {str(error)[:80]}")
 
