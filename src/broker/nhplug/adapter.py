@@ -786,6 +786,8 @@ class NHPlugBroker(Broker):
                 dt = session.replace("-", "")
                 if len(dt) == 8 and dt.isdigit():
                     by_dt.setdefault(dt, set()).add(self._norm_order_id(item.get("odno")))
+            if not by_dt:
+                print(f"[주문이력진단·분할] {symbol} 진단 대상 날짜 없음: 누락 주문의 세션 정보가 없습니다")
             for dt, missing_ids in sorted(by_dt.items()):
                 print(f"[주문이력진단·분할] {symbol} {dt} 시작: 누락 리버스 주문 {len(missing_ids)}건 대상")
                 baseline = self._probe_query(symbol, dt, token, "① 기존 전체 조회", {}, missing_ids)

@@ -460,3 +460,74 @@ def test_trading_bot_hook_reaches_real_broker_behind_dry_wrapper(monkeypatch):
     monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
     trading_bot._diag_probe_missing_reverse_orders(wrapper, "SOXL", "AMS")
     assert calls == [("SOXL", ["Z"])]
+
+
+# ── DRY 실행 전 검증: DryBroker → _real → NHPlugBroker 실제 경로 (외부 호출 없음) ─────────────
+
+def _real_dry_chain(responses):
+    """실제 DryBroker(래퍼) 가 실제 NHPlugBroker(가짜 세션) 를 감싼 구조 — 운영 DRY 의 broker 와 같은 형태."""
+    from broker.base import DryBroker
+    real = _broker(responses)
+    return DryBroker(real), real
+
+
+def test_full_chain_state_to_hook_to_real_broker_runs_probe_with_start_log(monkeypatch, capsys):
+    """state 가 누락 주문을 수집 → 훅이 DryBroker._real(NHPlugBroker) 의 진단을 호출 → 시작·종료 로그 출력."""
+    import config
+    import trading_bot
+    import state as state_module
+    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    monkeypatch.setattr(config, "BROKER_MODE", "real")          # 자동 만료 가정 경로를 타지 않게 (누락 경고 경로)
+    state_module._DIAG_MISSING_REVERSE.clear()
+    meta = {"side": "BUY", "total_qty": 1, "processed_filled_qty": 0, "reverse_action": "buy", "reverse_day": 4,
+            "cycle_id": "C1", "submitted_at": "20261118052334", "submitted_session": "2026-11-17"}
+    state = {"T": 12.0, "reverse_mode": {"active": True, "cycle_id": "C1", "day_count": 3},
+             "orders_meta": {"1000002": dict(meta), "1000003": dict(meta)}}
+    state_module.reconcile_reverse_fills(state, [{"odno": "OTHER", "ord_dt": "20261117", "ft_ccld_qty": "1"}])
+    dry_broker, real = _real_dry_chain(_scripted_probe_session())
+    assert getattr(dry_broker, "diag_probe_missing_orders", None) is None     # 래퍼에는 직접 없음
+    trading_bot._diag_probe_missing_reverse_orders(dry_broker, "SOXL", "AMS")
+    out = capsys.readouterr().out
+    assert "진단 시작: SOXL 누락 리버스 주문 2건" in out
+    assert "진단 종료: SOXL" in out
+    assert len(real._session.calls) == 9                                       # 실제 NHPlugBroker 경로로 조회가 나감
+    assert "누락주문발견=1/2" in out and "필터적용=예" in out and "필터적용=아니오" in out
+    assert "진단 건너뜀" not in out and "진단 불가" not in out
+    assert "state" not in str(state.get("reverse_mode", {})).lower()           # 진단이 state 를 건드리지 않음
+
+
+def test_hook_reports_when_probe_unavailable_instead_of_silent(monkeypatch, capsys):
+    import trading_bot
+    import state as state_module
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
+    trading_bot._diag_probe_missing_reverse_orders(object(), "SOXL", "AMS")    # 진단 메서드 없는 브로커
+    assert "진단 불가" in capsys.readouterr().out
+
+
+def test_hook_reports_probe_failure_instead_of_silent(monkeypatch, capsys):
+    import trading_bot
+    import state as state_module
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+
+    class _Bad:
+        def diag_probe_missing_orders(self, *a):
+            raise RuntimeError("boom")
+
+    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
+    trading_bot._diag_probe_missing_reverse_orders(_Bad(), "SOXL", "AMS")      # 예외는 밖으로 나가지 않되
+    out = capsys.readouterr().out
+    assert "진단 시작" in out and "진단 건너뜀(오류): RuntimeError" in out        # 조용히 사라지지도 않음
+
+
+def test_hook_is_wired_into_run_one_symbol_after_settlement():
+    """훅이 run_one_symbol 안에서 update_T_from_history(정산·누락 수집) 직후에 호출되도록 연결돼 있어야 합니다."""
+    import ast
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "trading_bot.py").read_text(encoding="utf-8")
+    func = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "run_one_symbol")
+    calls = [n for n in ast.walk(func) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    update = min(c.lineno for c in calls if c.func.id == "update_T_from_history")
+    hook = [c.lineno for c in calls if c.func.id == "_diag_probe_missing_reverse_orders"]
+    assert hook and min(hook) > update and min(hook) - update <= 3
