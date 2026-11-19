@@ -677,6 +677,72 @@ class NHPlugBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
+    def _history_input(self, symbol: str, dt: str) -> dict:
+        """주문체결내역(GSB10030) Input_0 블록."""
+        return self._input_block(
+            orr_dt=dt,
+            oss_sby_dit_cd="0",
+            sot_dit="0",
+            ost_cns_dit="0",
+            iem_cd=symbol.upper(),
+        )
+
+    @staticmethod
+    def _order_id_of(row) -> str:
+        return str((row or {}).get("orr_no", (row or {}).get("odno", "")))
+
+    @classmethod
+    def _unique_order_ids(cls, rows) -> set:
+        """행 목록의 고유 주문번호 집합 (건수 비교용 — 값은 출력하지 않습니다)."""
+        return {cls._order_id_of(row) for row in rows if isinstance(row, dict)}
+
+    @staticmethod
+    def _is_dry_run() -> bool:
+        try:
+            import config
+            return str(getattr(config, "TRADE_MODE", "")).strip().upper() == "DRY"
+        except Exception:
+            return False
+
+    def _diag_probe_continuation(self, symbol, dt, token, page1_rows, page1_cts, page1_flag) -> None:
+        """[진단 전용 — DRY 에서만, 결과에 영향 없음] 연속조회 요청 방식별로 응답을 비교합니다.
+
+        2026-11-18 이후 `20261117` 이 1페이지 15건 + 2페이지 0건으로 끝나는 것이 실제 종료인지(데이터가 15건뿐)
+        요청 방식 때문인지(2페이지가 비어 오는 것) 가르기 위한 읽기 전용 조회입니다. 현재 요청 본문은 공식 명세와
+        달리 tr_cd·tr_key·tr_cont 를 함께 보냅니다(공식 SDK·OpenAPI 는 Input_0 만, 연속조회는 헤더 cts).
+        변형별 응답 건수·고유 주문 수·1페이지와의 겹침·cts_flag·신호만 출력하고 주문번호·cts 원문은 출력하지 않습니다.
+        조회 전용(주문 아님)이며 실패해도 삼킵니다.
+        """
+        base_ids = self._unique_order_ids(page1_rows)
+        input_block = self._history_input(symbol, dt)
+        cts_headers = {"cts": page1_cts}
+        if page1_flag:
+            cts_headers["cts_flag"] = page1_flag
+        path = "/gbstock/inquiry/v1/unexecuted"
+        variants = [
+            ("명세본문(Input_0만)+헤더cts", {"Input_0": input_block}, cts_headers),
+            ("본문tr_cont=Y+헤더cts", {**self._build_body(TR_ID_UNEXECUTED, symbol, input_block), "tr_cont": "Y"}, cts_headers),
+            ("본문tr_cont=Y, 헤더cts없음", {**self._build_body(TR_ID_UNEXECUTED, symbol, input_block), "tr_cont": "Y"}, None),
+            ("1페이지 재조회: 명세본문(Input_0만), cts없음", {"Input_0": input_block}, None),
+        ]
+        for label, body, headers in variants:
+            try:
+                meta: dict = {}
+                data = self._request_with_rate_retry(path, body, token, extra_headers=headers, meta=meta)
+                out = self._extract_output(data, "Output_0") or []
+                if isinstance(out, dict):
+                    out = [out]
+                ids = self._unique_order_ids(out)
+                resp_headers = meta.get("headers") or {}
+                print(
+                    f"[주문이력진단·비교] {symbol} {dt} {label}: 응답건수={len(out)} 고유주문={len(ids)} "
+                    f"1페이지와겹침={len(ids & base_ids)} 새주문={len(ids - base_ids)} "
+                    f"cts_flag={(resp_headers.get('cts_flag') or '').strip().upper() or '없음'} "
+                    f"신호={meta.get('continue_code') or '없음'} cts응답={'있음' if (resp_headers.get('cts') or '').strip() else '없음'}"
+                )
+            except Exception as error:   # 진단은 어떤 경우에도 조회 결과에 영향을 주지 않습니다
+                print(f"[주문이력진단·비교] {symbol} {dt} {label}: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
+
     def _fetch_history_day(self, symbol: str, dt: str, token: str) -> list:
         """하루치(orr_dt) 주문체결내역의 **모든 페이지**를 모아 Output_0 행 목록으로 돌려줍니다.
 
@@ -691,15 +757,18 @@ class NHPlugBroker(Broker):
         cts = None
         cts_flag = None
         page = 0
+
+        def finish(reason: str) -> list:
+            # 진단: 전체 수집 건수와 중복 제거 후 고유 주문 건수를 구분합니다 (주문번호는 출력하지 않습니다).
+            print(
+                f"[주문이력진단] {symbol} {dt} 수집 완료: 페이지={page} 전체수집={len(rows)}건 "
+                f"고유주문={len(self._unique_order_ids(rows))}건 종료사유={reason}"
+            )
+            return rows
+
         while True:
             page += 1
-            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._input_block(
-                orr_dt=dt,
-                oss_sby_dit_cd="0",
-                sot_dit="0",
-                ost_cns_dit="0",
-                iem_cd=symbol.upper(),
-            ))
+            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt))
             headers = {}
             if cts:
                 headers["cts"] = cts
@@ -729,10 +798,17 @@ class NHPlugBroker(Broker):
             next_cts = (resp_headers.get("cts") or "").strip()
             next_flag = (resp_headers.get("cts_flag") or "").strip().upper()
             continue_code = meta.get("continue_code") or ""
+            # 진단: 페이지별 응답 건수, cts_flag(Y/N/없음), 연속조회 신호, cts 응답·전달 여부 (cts 원문은 출력하지 않습니다)
+            print(
+                f"[주문이력진단] {symbol} {dt} 페이지={page} 응답건수={len(output)} "
+                f"고유주문={len(self._unique_order_ids(output))} cts_flag={next_flag or '없음'} "
+                f"신호={continue_code or '없음'} cts응답={'있음' if next_cts else '없음'} "
+                f"cts전달={'예' if cts else '아니오'}"
+            )
             if next_flag == "N":
-                return rows
+                return finish("cts_flag=N")
             if next_flag != "Y" and not continue_code:
-                return rows   # 계속 신호 없음 = 마지막 페이지
+                return finish("계속 신호 없음")   # 마지막 페이지
             # 여기부터는 다음 페이지가 있다는 신호(cts_flag=Y 또는 XA109 등)가 있습니다.
             if not next_cts:
                 raise NHPlugPagingError(
@@ -748,6 +824,8 @@ class NHPlugBroker(Broker):
                     f"{symbol} {dt} 연속조회가 {_MAX_HISTORY_PAGES}페이지를 넘었습니다 — 일부 이력만으로 진행하지 않습니다"
                 )
             print(f"[주문이력] {symbol} {dt} 연속조회 계속: {page}페이지 {len(output)}건 수집 (신호={continue_code or next_flag})")
+            if page == 1 and self._is_dry_run():
+                self._diag_probe_continuation(symbol, dt, token, output, next_cts, next_flag)
             sent_keys.add(next_cts)
             cts = next_cts
             cts_flag = next_flag or None

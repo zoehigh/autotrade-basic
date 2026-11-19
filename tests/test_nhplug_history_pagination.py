@@ -13,6 +13,14 @@ from broker.base import BrokerError
 from broker.nhplug.adapter import NHPlugBroker, NHPlugPagingError
 
 
+@pytest.fixture(autouse=True)
+def _probe_off_by_default(monkeypatch):
+    """진단용 비교 조회는 DRY 에서만 실행됩니다. 기본 테스트 환경의 TRADE_MODE 는 DRY 이므로, 연속조회 로직 테스트에는
+    비교 조회가 응답을 소비하지 않게 LIVE 로 고정합니다 (비교 조회 테스트는 스스로 DRY 로 바꿉니다)."""
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+
+
 class _Resp:
     def __init__(self, data, headers=None, status=200):
         self._data, self.headers, self.status_code = data, headers or {}, status
@@ -36,7 +44,10 @@ class _FakeSession:
         self.calls.append((path, json_body, extra_headers))
         if not self._responses:
             raise AssertionError("준비된 응답보다 많이 호출되었습니다")
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def _broker(responses):
@@ -255,3 +266,73 @@ def test_get_order_history_xa109_full_scenario(monkeypatch):
     ])
     history = _history(broker, monkeypatch)
     assert len(history) == 13
+
+
+# ── 진단 출력 (페이지별 건수·cts_flag·신호, 전체/고유 구분, 비교 조회) ───────────────
+
+def test_diag_per_page_lines_and_totals_without_secrets(capsys):
+    """페이지별 응답건수·cts_flag·신호·cts 응답/전달 여부와 전체/고유 건수를 출력하되 cts·주문번호 원문은 숨깁니다."""
+    broker = _broker([
+        _page([_row("A1"), _row("A2")], cts="SECRET-CTS-1", flag="Y"),
+        _page([_row("A2"), _row("A3")], cts="SECRET-CTS-2", flag="N"),   # A2 가 페이지 경계에서 중복
+    ])
+    broker._fetch_history_day("TQQQ", "20261117", "t")
+    out = capsys.readouterr().out
+    assert "페이지=1 응답건수=2 고유주문=2 cts_flag=Y 신호=없음 cts응답=있음 cts전달=아니오" in out
+    assert "페이지=2 응답건수=2 고유주문=2 cts_flag=N 신호=없음 cts응답=있음 cts전달=예" in out
+    assert "수집 완료: 페이지=2 전체수집=4건 고유주문=3건 종료사유=cts_flag=N" in out
+    assert "SECRET-CTS" not in out and "A1" not in out and "A3" not in out
+
+
+def test_diag_xa109_signal_shown(capsys):
+    broker = _broker([_page([_row("1")], cts="K", code="XA109"), _page([])])
+    broker._fetch_history_day("SOXL", "20261117", "t")
+    out = capsys.readouterr().out
+    assert "신호=XA109" in out and "종료사유=계속 신호 없음" in out
+
+
+def test_probe_runs_only_in_dry_and_never_changes_result(monkeypatch, capsys):
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
+    # 본 조회 2페이지 + 비교 조회 4번 (비교 응답은 각기 다른 형태)
+    broker = _broker([
+        _page([_row("1"), _row("2")], cts="K1", code="XA109"),             # 1페이지
+        _page([_row("1"), _row("9")], cts="K1-b", flag="Y"),               # 비교1: 명세본문+헤더cts
+        _page([]),                                                         # 비교2
+        _Resp({"message": {"msg_code": "14580", "usr_msg": "장종료"}}),     # 비교3 (오류 — 삼켜져야 함)
+        _page([_row("1"), _row("2")]),                                     # 비교4: 1페이지 재조회
+        _page([_row("3")]),                                                # 본 조회 2페이지
+    ])
+    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
+    assert [r["orr_no"] for r in rows] == ["1", "2", "3"]                  # 비교 조회가 결과에 섞이지 않음
+    out = capsys.readouterr().out
+    assert "명세본문(Input_0만)+헤더cts: 응답건수=2 고유주문=2 1페이지와겹침=1 새주문=1 cts_flag=Y" in out
+    assert "본문tr_cont=Y, 헤더cts없음: 조회 오류" in out
+    calls = broker._session.calls
+    assert calls[1][1] == {"Input_0": calls[0][1]["Input_0"]}              # 명세 본문은 Input_0 만
+    assert calls[2][1]["tr_cont"] == "Y" and calls[2][2] == {"cts": "K1"}
+    assert calls[3][2] is None and calls[3][1]["tr_cont"] == "Y"
+
+
+def test_probe_skipped_outside_dry(monkeypatch, capsys):
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    broker = _broker([_page([_row("1")], cts="K1", code="XA109"), _page([_row("2")])])
+    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
+    assert len(rows) == 2 and len(broker._session.calls) == 2              # 비교 조회 없음
+    assert "진단·비교" not in capsys.readouterr().out
+
+
+def test_probe_exceptions_are_swallowed(monkeypatch, capsys):
+    """비교 조회가 예외를 내도 본 조회 결과·흐름에 영향이 없습니다 (진단은 부수 효과 없음)."""
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
+    broker = _broker([
+        _page([_row("1")], cts="K1", code="XA109"),    # 본 조회 1페이지
+        ValueError("boom"),                            # 비교1: 예외
+        _page([]), _page([]), _page([]),               # 비교2~4
+        _page([_row("2")]),                            # 본 조회 2페이지
+    ])
+    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
+    assert [r["orr_no"] for r in rows] == ["1", "2"]
+    assert "조회 오류 ValueError" in capsys.readouterr().out

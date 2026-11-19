@@ -615,6 +615,27 @@ def _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, activ
             state["reverse_mode"] = {}
 
 
+def _missing_reverse_order_diag(masked_odno, meta, rows):
+    """[진단, 로그 전용] '리버스 주문 이력 누락' 주문이 정말 이력에 없는지, 있는데 날짜 대조에서 탈락했는지 구분합니다.
+
+    state 의 주문정보(방향·수량·제출 시각·세션·반영 수량·종결 여부)와, 같은 주문번호 행(`rows`)이 이력에 있는지(있다면
+    그 행의 ord_dt·체결수량·날짜 대조 통과 여부)를 한 줄로 출력합니다. 호출자가 가명 식별자(`masked_odno`)만 넘깁니다.
+    """
+    submitted_at = str(meta.get("submitted_at", ""))
+    session = meta.get("submitted_session", "")
+    row_info = ", ".join(
+        f"ord_dt={r.get('ord_dt', '')} 체결={r.get('ft_ccld_qty', '')} "
+        f"날짜대조={'통과' if _order_matches_submitted_date(r, submitted_at, session) else '탈락'}"
+        for r in rows[:3]
+    ) or "없음"
+    return (
+        f"  [진단] 누락 주문 {masked_odno}: 방향={meta.get('side', '')} 수량={meta.get('total_qty', '')} "
+        f"리버스일차={meta.get('reverse_day', '')} 동작={meta.get('reverse_action', '')} "
+        f"제출={submitted_at} 세션={session} 반영수량={meta.get('processed_filled_qty', '')} "
+        f"종결={bool(meta.get('terminal'))} | 이력의 같은 주문번호 행: {len(rows)}건 ({row_info})"
+    )
+
+
 def reconcile_reverse_fills(state, order_history):
     """리버스모드 주문의 실제 누적 체결만 상태에 반영합니다.
 
@@ -674,6 +695,8 @@ def reconcile_reverse_fills(state, order_history):
                     reverse_mode["reconciliation_error"] = "reverse_order_history_missing"
                     reverse_mode["reconciliation_only"] = True
                     print(f"[경고] 리버스 주문 이력 누락: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
+                    diag_line = _missing_reverse_order_diag(mask_odno(odno), meta, history_by_odno.get(str(odno), []))
+                    print(diag_line)
             continue
         submitted_at = str(meta.get("submitted_at", ""))
         today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
