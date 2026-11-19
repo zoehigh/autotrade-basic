@@ -69,6 +69,17 @@ from broker.nhplug.order_types import (
 # 00048: 실측 확인 — 모의투자 매수주문이완료 (GH 로그 2026-08-31 00048/완료 + 잔고 3주/2주 보유 실증)
 _SUCCESS_RSP_CODES = {"00000", "00166", "00221", "13578", "XA102", "00048"}
 
+# 연속조회(다음 페이지 있음)를 응답 코드로 알리는 코드 (공식 SDK CONTINUE_CODES, XA109=모의투자).
+# 연속조회를 처리하는 호출(meta 를 넘긴 호출)에서만 오류가 아닌 "계속"으로 받습니다. 그 외 호출은 기존대로 오류입니다.
+_CONTINUE_CODES = {"XA109", "00165", "00218"}
+
+# 날짜 하나의 주문체결내역 연속조회 페이지 상한 — 넘으면 조용히 자르지 않고 실패시킵니다(Fail-Closed).
+_MAX_HISTORY_PAGES = 30
+
+
+class NHPlugPagingError(BrokerError):
+    """연속조회를 끝까지 완료하지 못했습니다 (키 누락·키 반복·페이지 상한). 일부 데이터로 진행하면 안 됩니다."""
+
 
 class NHPlugBroker(Broker):
     """
@@ -175,6 +186,15 @@ class NHPlugBroker(Broker):
         return None
 
     @staticmethod
+    def _response_headers(resp) -> dict:
+        """응답 헤더를 소문자 키 dict 로 돌려줍니다 (읽을 수 없으면 빈 dict)."""
+        headers = getattr(resp, "headers", None)
+        try:
+            return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+        except (TypeError, ValueError):
+            return {}
+
+    @staticmethod
     def _is_rate_limit_error(code: str, message: str) -> bool:
         """rate-limit 오류 여부를 판단합니다 (HTTP 429 또는 error envelope)."""
         code_l = (code or "").lower()
@@ -214,9 +234,16 @@ class NHPlugBroker(Broker):
         token: str,
         retry_network: bool = True,
         domain: str | None = None,
+        extra_headers: dict | None = None,
+        meta: dict | None = None,
     ) -> dict:
         """
         NHPLUG API 요청 래퍼 — rate-limit/타임아웃 재시도 포함.
+
+        연속조회(cts)를 쓰는 호출만 `extra_headers`(요청 헤더 cts·cts_flag)와 `meta`(출력용 dict)를 넘깁니다.
+        meta 를 넘기면 응답 헤더(`meta["headers"]`, 소문자 키)와 연속조회 응답코드(`meta["continue_code"]`,
+        XA109 등)를 돌려받고, 그 코드는 오류가 아니라 "다음 페이지 있음"으로 받습니다.
+        meta 를 넘기지 않는 기존 호출은 동작이 달라지지 않습니다.
 
         - rate-limit(HTTP 429 또는 message 봉투의 rate-limit 코드):
           fixed-wait 후 재시도 (최대 3회)
@@ -249,9 +276,15 @@ class NHPlugBroker(Broker):
             try:
                 for _ in range(MAX_RETRIES + 1):
                     time.sleep(self._rate_limit_wait)
-                    resp = self._session.request(
-                        "POST", path, token, json_body=body, domain=domain
-                    )
+                    if extra_headers:
+                        resp = self._session.request(
+                            "POST", path, token, json_body=body, domain=domain,
+                            extra_headers=extra_headers,
+                        )
+                    else:
+                        resp = self._session.request(
+                            "POST", path, token, json_body=body, domain=domain
+                        )
 
                     # rate-limit (HTTP 429) 처리
                     if resp.status_code == 429:
@@ -297,7 +330,15 @@ class NHPlugBroker(Broker):
                     message_block = data.get("message") or {}
                     msg_code = str(message_block.get("msg_code", "") or "")
                     usr_msg = str(message_block.get("usr_msg", "알 수 없는 오류"))
-                    if msg_code and msg_code != "00000" and "완료" not in usr_msg:
+                    cont_code = ""
+                    if meta is not None:
+                        # 연속조회 호출: 응답 헤더(cts·cts_flag)와 "다음 페이지 있음" 응답코드를 돌려줍니다.
+                        meta["headers"] = self._response_headers(resp)
+                        for candidate in (msg_code, str(data.get("rsp_cd", "") or "")):
+                            if candidate in _CONTINUE_CODES:
+                                cont_code = candidate
+                        meta["continue_code"] = cont_code
+                    if msg_code and msg_code != "00000" and "완료" not in usr_msg and msg_code != cont_code:
                         dvlp_msg = str(message_block.get("dvlp_msg", ""))
                         if self._is_rate_limit_error(msg_code, usr_msg):
                             print(f"⏳ NHPLUG rate-limit 감지 ({msg_code}), 재시도...")
@@ -312,7 +353,7 @@ class NHPlugBroker(Broker):
                     #    아니면 실패 (예: "14580" 모의투자 장종료) — 단 rsp_msg에 "완료" 포함이면 성공 (공식 SDK 안전망)
                     rsp_cd = str(data.get("rsp_cd", "") or "")
                     rsp_msg = str(data.get("rsp_msg", "알 수 없는 오류"))
-                    if rsp_cd and rsp_cd not in _SUCCESS_RSP_CODES and "완료" not in rsp_msg:
+                    if rsp_cd and rsp_cd not in _SUCCESS_RSP_CODES and "완료" not in rsp_msg and rsp_cd != cont_code:
                         if self._is_rate_limit_error(rsp_cd, rsp_msg):
                             print(f"⏳ NHPLUG rate-limit 감지 ({rsp_cd}), 재시도...")
                             time.sleep(self._rate_limit_wait)
@@ -636,6 +677,81 @@ class NHPlugBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
+    def _fetch_history_day(self, symbol: str, dt: str, token: str) -> list:
+        """하루치(orr_dt) 주문체결내역의 **모든 페이지**를 모아 Output_0 행 목록으로 돌려줍니다.
+
+        연속조회 규약(공식 llms.txt·SDK): 응답 *헤더*의 `cts`·`cts_flag`(Y=다음 페이지, N=끝)를 다음 요청 *헤더*에
+        그대로 실어 보냅니다. 헤더 없이 응답코드(XA109 등)로만 "계속"을 알리는 경우도 같은 방식입니다.
+
+        Fail-Closed: 계속해야 하는데 cts 가 없거나, 같은 cts 가 반복되거나, 페이지 상한(_MAX_HISTORY_PAGES)을
+        넘으면 NHPlugPagingError 로 실패시킵니다 (일부 페이지만으로 이력을 확정하지 않음).
+        """
+        rows: list = []
+        sent_keys: set[str] = set()
+        cts = None
+        cts_flag = None
+        page = 0
+        while True:
+            page += 1
+            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._input_block(
+                orr_dt=dt,
+                oss_sby_dit_cd="0",
+                sot_dit="0",
+                ost_cns_dit="0",
+                iem_cd=symbol.upper(),
+            ))
+            headers = {}
+            if cts:
+                headers["cts"] = cts
+            if cts_flag:
+                headers["cts_flag"] = cts_flag
+            meta: dict = {}
+            try:
+                data = self._request_with_rate_retry(
+                    "/gbstock/inquiry/v1/unexecuted", body, token,
+                    extra_headers=headers or None, meta=meta,
+                )
+            except NHPlugPagingError:
+                raise
+            except BrokerError as error:
+                if page > 1:
+                    # 첫 페이지는 받았는데 이어받기에 실패 — 날짜 전체를 '건너뜀'으로 넘기면 일부 이력이 사라집니다.
+                    raise NHPlugPagingError(
+                        f"{symbol} {dt} 연속조회 {page}페이지 조회 실패: {error} — 일부 이력만으로 진행하지 않습니다"
+                    ) from error
+                raise
+            output = self._extract_output(data, "Output_0") or []
+            if isinstance(output, dict):
+                output = [output]
+            rows.extend(output)
+
+            resp_headers = meta.get("headers") or {}
+            next_cts = (resp_headers.get("cts") or "").strip()
+            next_flag = (resp_headers.get("cts_flag") or "").strip().upper()
+            continue_code = meta.get("continue_code") or ""
+            if next_flag == "N":
+                return rows
+            if next_flag != "Y" and not continue_code:
+                return rows   # 계속 신호 없음 = 마지막 페이지
+            # 여기부터는 다음 페이지가 있다는 신호(cts_flag=Y 또는 XA109 등)가 있습니다.
+            if not next_cts:
+                raise NHPlugPagingError(
+                    f"{symbol} {dt} 연속조회가 필요하지만 응답에 cts 키가 없습니다 "
+                    f"(page={page}, code={continue_code or next_flag}) — 일부 이력만으로 진행하지 않습니다"
+                )
+            if next_cts == cts or next_cts in sent_keys:
+                raise NHPlugPagingError(
+                    f"{symbol} {dt} 연속조회 키가 반복되었습니다 (page={page}) — 일부 이력만으로 진행하지 않습니다"
+                )
+            if page >= _MAX_HISTORY_PAGES:
+                raise NHPlugPagingError(
+                    f"{symbol} {dt} 연속조회가 {_MAX_HISTORY_PAGES}페이지를 넘었습니다 — 일부 이력만으로 진행하지 않습니다"
+                )
+            print(f"[주문이력] {symbol} {dt} 연속조회 계속: {page}페이지 {len(output)}건 수집 (신호={continue_code or next_flag})")
+            sent_keys.add(next_cts)
+            cts = next_cts
+            cts_flag = next_flag or None
+
     def get_order_history(
         self,
         symbol: str,
@@ -675,25 +791,17 @@ class NHPlugBroker(Broker):
             # days일치 루프: orr_dt를 하루씩 조회 (과거→현재 순)
             for offset in range(days, -1, -1):
                 dt = (now_kst - timedelta(days=offset)).strftime("%Y%m%d")
-                body = self._build_body(TR_ID_UNEXECUTED, symbol, self._input_block(
-                    orr_dt=dt,
-                    oss_sby_dit_cd="0",
-                    sot_dit="0",
-                    ost_cns_dit="0",
-                    iem_cd=symbol.upper(),
-                ))
                 try:
-                    data = self._request_with_rate_retry(
-                        "/gbstock/inquiry/v1/unexecuted", body, token
-                    )
+                    output = self._fetch_history_day(symbol, dt, token)
+                except NHPlugPagingError:
+                    # 연속조회를 끝내지 못한 날짜는 일부 데이터로 진행하지 않습니다 (Fail-Closed).
+                    # 건너뛰면 이력이 비어 포지션 불일치·잘못된 정산으로 이어집니다.
+                    raise
                 except BrokerError as e:
                     # 0건/조회불가 등은 빈 결과로 처리, 치명 오류는 상위로
                     # "조회할 내역이 없습니다"(13578) 등은 성공 코드로 이미 처리됨
                     print(f"[주문이력] {symbol} {dt} 조회 중 BrokerError: {e} → 건너뜀")
                     continue
-                output = self._extract_output(data, "Output_0") or []
-                if isinstance(output, dict):
-                    output = [output]
                 if output:
                     print(f"[주문이력] {symbol} {dt} 조회 성공: {len(output)}건")
                 for item in output:
