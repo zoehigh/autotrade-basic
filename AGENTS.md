@@ -53,7 +53,7 @@ autotrade-basic/
 | 브로커 어댑터·API 에러 코드·주문이력/시각 컨벤션·preflight·MERITZ 만료/정정·`get_daily_closes` | `docs/agents/brokers.md` |
 | 체결 정산·T 갱신·`net_invested`·마커/델타·`ops/verify_run.py`·로그 주문번호 마스킹 세부 | `docs/agents/settlement.md` |
 | 리버스모드·쿼터매수·추가매수·종료 조건·BUY LOC 가격 보정 | `docs/agents/reverse-mode.md` |
-| state 복구·`TRADE_MODE=REPAIR`·`FORCE_T`·`MAX_T`·`STATE_*_ONLY`·복구 워크플로·T 보정 명령 (**이런 작업 전에는 반드시 먼저 읽기**) | `docs/agents/state-repair.md` |
+| state 복구·`TRADE_MODE=REPAIR`·`FORCE_T`·`MAX_T`·`STATE_*_ONLY`·복구 워크플로·T 보정 명령 (**이런 작업 전에는 반드시 먼저 읽기**) | `docs/agents/state-repair.md` + `STATE_*_ONLY` 사용 시 `docs/agents/settlement.md`(감사·reconcile·net_invested·만료 모드의 CAS/적용 조건/상호배타 규칙)도 함께 |
 | 주문 접수·취소 로직 수정·주문 fence·이전 세션 잔여 주문 정리·취소 확정·collar probe | `docs/agents/orders.md` |
 | 운영 절차(크론·사이클 인수인계 등) | 기존 `docs/` 문서(`docs/cron-dispatch-guide.md`, `docs/cycle-handover.md`, `docs/marker-correction-runbook.md`) |
 
