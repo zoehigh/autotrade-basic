@@ -148,7 +148,7 @@ class SettledState:
     next_cycle_seed: Optional[float] = None
     halt_reason: Optional[str] = None
     order_history: list = field(default_factory=list)
-    additional_loc_levels: int = 3
+    additional_loc_levels: int = 8
     settlement_run_id: str = ""
     session: str = ""
     # SETTLE 이 정산한(이미 마감된) 세션. `session` 은 실행 대상(다음) 세션입니다.
@@ -334,6 +334,8 @@ COMPARE_EXACT_REVERSE_FIELDS = (
     "reverse_base_t",    # 배율 적용 기준 T
     "reverse_t_factor",  # 매도 배율 (T × factor)
     "reverse_t_target",  # 리버스 쿼터매수 T 증가분
+    "reverse_t_rule",    # 쿼터매수 T 효과 규칙 (2=직전 T 기준, 코드 리뷰 지적 반영)
+    "reverse_splits",    # 규칙 적용 분할수 (정산 배율 기준)
 )
 # T 반영 기준값(t_target)도 허용오차 없이 비교합니다 (주문별 T 가산 근거).
 COMPARE_EXACT_NUMERIC_ORDER_FIELDS = ("t_target",)
@@ -2734,7 +2736,7 @@ def _settle_positions(
     splits = symbol_config["splits"]
     symbol_type = symbol_config["symbol_type"]
     seed = symbol_config["seed"]
-    additional_loc_levels = symbol_config.get("additional_loc_levels", 3)
+    additional_loc_levels = symbol_config.get("additional_loc_levels", 8)
 
     # FORCE_T 는 운영자가 이력을 확인한 뒤 쓰는 **수동 보정**이며, REPAIR 단독
     # 경로(`trading_bot._repair_force_t()`)에서만 허용합니다. SETTLE 파이프라인에서
@@ -3771,7 +3773,7 @@ def settled_from_state(symbol_config, state=None, *, settlement_run_id=None):
         reverse_mode=deepcopy(state.get("reverse_mode", {}) or {}),
         close_prices=list(state.get("close_prices", []) or []),
         position_basis=state.get("position_qty"),
-        additional_loc_levels=symbol_config.get("additional_loc_levels", 3),
+        additional_loc_levels=symbol_config.get("additional_loc_levels", 8),
         settlement_run_id=committed_run_id,
         evidence_id=committed_run_id,
         evidence_path=evidence_file_for_run(symbol, committed_run_id),

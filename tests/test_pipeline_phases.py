@@ -683,6 +683,7 @@ class TestPhaseDispatcher:
         assert approval["consumed"] is False
         assert broker.place_order.call_count == 0
 
+
     def _patch_verify_evidence(self, monkeypatch):
         monkeypatch.setattr(
             trading_bot, "verify_evidence_file_with_ops", lambda *a, **k: (True, [])
@@ -738,6 +739,83 @@ class TestPhaseDispatcher:
         broker = _make_broker()
         assert trading_bot._dispatch_pipeline_phase("EXECUTE", broker) == 1
         assert broker.place_order.call_count == 0
+class TestPreviewHoldAccounting:
+    """PREVIEW 디스패처 보류 집계 — 정상 무주문과 구분, exit 0 방지, 중복 알림 없음.
+
+    `_preview_symbol_plan` 이 보류에서 `(plan, None)` 을 반환해도 디스패처가
+    `approval_file is None` 만 보고 조용히 넘기면 exit 0이 됩니다 (재현 회귀).
+    보류는 실패 1건으로 집계하고, 알림은 `_report_reverse_hold` 1회만 냅니다.
+    """
+
+    def _hold_plan(self, symbol="TQQQ"):
+        return SimpleNamespace(
+            symbol=symbol, plan_id="hold-plan", orders=[],
+            state_hash="hash",
+            strategy_result={"reverse_hold": "EXIT_UNCONFIRMED"},
+        )
+
+    def _empty_plan(self, symbol="TQQQ"):
+        return SimpleNamespace(
+            symbol=symbol, plan_id="empty-plan", orders=[],
+            state_hash="hash",
+            strategy_result={},
+        )
+
+    def _prepare(self, monkeypatch, plan):
+        monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+        monkeypatch.setattr(trading_bot, "_settled_from_state", lambda cfg: cfg)
+        monkeypatch.setattr(trading_bot, "build_order_plan", lambda cfg, broker: plan)
+        monkeypatch.setattr(trading_bot, "write_order_plan", lambda *a, **k: "plan.json")
+        monkeypatch.setattr(
+            trading_bot, "approve_plan_file", lambda *a, **k: "approval.json"
+        )
+        calls = []
+        monkeypatch.setattr(
+            trading_bot, "notify",
+            lambda message, urgent=False, **kw: calls.append((message, urgent)),
+        )
+        return calls
+
+    def test_preview_hold_counts_failure_and_notifies_once(self, io, monkeypatch):
+        """수동 PREVIEW 보류: 실패 1건(exit 0 방지), 승인 없음, urgent 알림 정확히 1회."""
+        monkeypatch.setattr(trading_bot, "AUTO_EXECUTE", False)
+        calls = self._prepare(monkeypatch, self._hold_plan())
+        assert trading_bot._dispatch_pipeline_phase("PREVIEW", _make_broker()) == 1
+        hold_alerts = [c for c in calls if "리버스 보류" in c[0]]
+        assert len(hold_alerts) == 1 and hold_alerts[0][1] is True
+
+    def test_preview_normal_no_order_stays_zero(self, io, monkeypatch):
+        """수동 PREVIEW 정상 무주문: 실패 0, 알림 없음 (기존 동작 유지)."""
+        monkeypatch.setattr(trading_bot, "AUTO_EXECUTE", False)
+        calls = self._prepare(monkeypatch, self._empty_plan())
+        assert trading_bot._dispatch_pipeline_phase("PREVIEW", _make_broker()) == 0
+        assert [c for c in calls if "리버스 보류" in c[0]] == []
+
+    def test_preview_auto_execute_hold_blocks_approval(self, io, monkeypatch):
+        """AUTO_EXECUTE 보류: 승인 미생성, 주문 없음, 실패 1건, 알림 1회."""
+        monkeypatch.setattr(trading_bot, "AUTO_EXECUTE", True)
+        approved = []
+        monkeypatch.setattr(trading_bot, "SYMBOLS", [_symbol_config()])
+        monkeypatch.setattr(trading_bot, "_settled_from_state", lambda cfg: cfg)
+        monkeypatch.setattr(
+            trading_bot, "build_order_plan",
+            lambda cfg, broker: self._hold_plan(),
+        )
+        monkeypatch.setattr(trading_bot, "write_order_plan", lambda *a, **k: "plan.json")
+        monkeypatch.setattr(
+            trading_bot, "approve_plan_file",
+            lambda *a, **k: approved.append(1) or "approval.json",
+        )
+        calls = []
+        monkeypatch.setattr(
+            trading_bot, "notify",
+            lambda message, urgent=False, **kw: calls.append((message, urgent)),
+        )
+        assert trading_bot._dispatch_pipeline_phase("PREVIEW", _make_broker()) == 1
+        assert approved == []
+        assert len([c for c in calls if "리버스 보류" in c[0]]) == 1
+
+
 
 
 # ── EXECUTE ───────────────────────────────────────────────────────

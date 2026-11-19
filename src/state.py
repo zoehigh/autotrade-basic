@@ -513,8 +513,29 @@ def _is_terminal_reverse_order(order):
         return False
 
 
+def _is_explicit_zero_number(value):
+    """state 마커용: bool 이 아닌 유한한 숫자 0 만 True (None·문자열·NaN·0 이 아닌 값은 False)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value == 0
+    )
+
+
+def _is_explicit_zero_text(value):
+    """브로커 이력용: '0'·0·'0.0' 처럼 명시적으로 파싱되는 유한한 0 만 True (빈 문자열·None·bool·이상값은 False)."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        return False
+    return math.isfinite(number) and number == 0
+
+
 def _auto_assume_reverse_expiry(meta, order):
-    """데모 환경에서 이전 세션의 zero-fill 리버스 주문을 만료로 가정해 자동 종결합니다.
+    """데모·메리츠 실전에서 이전 세션의 zero-fill 리버스 주문을 만료로 가정해 자동 종결합니다.
 
     데모(특히 키움 모의)는 일중 주문(LOC/LOO/MOC→LIMIT 자동 변환)이 마감 후
     만료돼도 상태를 "미체결"로 남겨 _is_terminal_reverse_order()가 영구 False가
@@ -522,32 +543,57 @@ def _auto_assume_reverse_expiry(meta, order):
     차단과 만나면 리버스모드가 무기한 동결됩니다.
 
     이를 막기 위해, 이전 미국 세션에서 체결 기회가 지나고 체결량/체결금액이
-    0인 주문(BROKER_MODE=demo 한정)은 terminal_assumed=True로 자동 종결 처리합니다.
+    0인 주문(BROKER_MODE=demo 또는 BROKER=meritz+real 한정)은 terminal_assumed=True로 자동 종결 처리합니다.
+    부분체결 주문은 대상이 아니며 기존대로 보류합니다(day_count·T 반영 경로가 달라 수동 확인이 필요).
     늦은 체결은 reconcile의 odno 단위 processed_filled_qty 델타가 다음 RUN에
     그대로 반영하므로 상태가 소실되지 않습니다. 매수/매도 모두 대상입니다.
     """
     try:
-        from config import BROKER_MODE
+        from config import BROKER, BROKER_MODE
     except Exception:
-        BROKER_MODE = ""
-    if BROKER_MODE != "demo":
+        BROKER = BROKER_MODE = ""
+    is_demo = BROKER_MODE == "demo"
+    # 메리츠 실전: 이전 미국 세션의 LOC/MOC 일중 주문은 세션 종료로 만료됩니다
+    # (기간 이력은 만료 주문도 '미체결'+잔량=주문수량으로 보여 주며, 만료 여부는 취소 시도 시
+    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — AGENTS.md). 호출부가 이전 세션임을 보장합니다.
+    is_meritz_real = BROKER == "meritz" and BROKER_MODE == "real"
+    if not (is_demo or is_meritz_real):
         return False
     if meta.get("terminal"):
         return False
-    try:
-        history_filled = int(float(order.get("ft_ccld_qty", "0") or 0))
-    except (TypeError, ValueError):
-        history_filled = 0
-    if history_filled != 0:
-        return False
-    if int(meta.get("processed_filled_qty", 0) or 0) != 0:
-        return False
-    if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
-        return False
+    if is_meritz_real:
+        # 실전은 '명시적으로 0체결이 확인된 경우에만' 만료로 봅니다. 누락·None·문자열·NaN·소수 등
+        # 불명확한 값을 0 으로 해석하면 체결된 주문을 미체결로 오판해 T·순투입금 반영이 어긋납니다
+        # (KIS 의 _assume_missing_reverse_order_zero_fill 과 같은 엄격한 마커 규칙).
+        if "ft_ccld_qty" not in order or not _is_explicit_zero_text(order.get("ft_ccld_qty")):
+            return False
+        # 체결수량 0 인데 체결금액이 0 이 아니거나 읽을 수 없는 비정상 응답도 0체결로 보지 않습니다
+        # (실측: 메리츠 미체결 행은 ft_ccld_amt3='0.0' 으로 내려옵니다).
+        if "ft_ccld_amt3" not in order or not _is_explicit_zero_text(order.get("ft_ccld_amt3")):
+            return False
+        for key in ("processed_filled_qty", "processed_filled_amount"):
+            if key not in meta or not _is_explicit_zero_number(meta.get(key)):
+                return False
+        if "applied_fill_fraction" in meta and not _is_explicit_zero_number(meta.get("applied_fill_fraction")):
+            return False
+    else:
+        try:
+            history_filled = int(float(order.get("ft_ccld_qty", "0") or 0))
+        except (TypeError, ValueError):
+            history_filled = 0
+        if history_filled != 0:
+            return False
+        if int(meta.get("processed_filled_qty", 0) or 0) != 0:
+            return False
+        if float(meta.get("processed_filled_amount", 0.0) or 0.0) != 0.0:
+            return False
     meta["terminal"] = True
     meta["terminal_assumed"] = True
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
-    meta["terminal_assumption_reason"] = "auto_expired_demo_day_order_after_session"
+    meta["terminal_assumption_reason"] = (
+        "auto_expired_meritz_day_order_after_session" if is_meritz_real
+        else "auto_expired_demo_day_order_after_session"
+    )
     return True
 
 
@@ -705,7 +751,7 @@ def reconcile_reverse_fills(state, order_history):
             elif _auto_assume_reverse_expiry(meta, order):
                 print(
                     f"[경고] 이전 세션 미체결 리버스 주문을 만료로 가정합니다: "
-                    f"odno={mask_odno(odno)} → 자동 종결 처리 (데모 일중 주문)"
+                    f"odno={mask_odno(odno)} → 자동 종결 처리 (이전 세션 일중 주문, 체결 0)"
                 )
             else:
                 reverse_mode["reconciliation_error"] = "reverse_order_not_terminal"
@@ -771,7 +817,12 @@ def reconcile_reverse_fills(state, order_history):
     for odno in marker_held_odnos:
         if str(odno) not in pending_amount_odnos:
             pending_amount_odnos.append(str(odno))
-    for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=lambda item: (item[0], item[1])):
+    # 같은 시각(초 단위 동률)이면 매도를 매수보다 먼저 정산합니다. 쿼터매수 T 효과는 '직전 T'
+    # (같은 세션 매도 체결이 반영된 T) 기준이라 순서가 결과를 바꾸기 때문입니다.
+    def _event_order_key(item):
+        return (item[0], 0 if item[2].get("reverse_action") == "sell" else 1, item[1])
+
+    for _, odno, meta, order, filled_qty, processed_qty, total_qty in sorted(events, key=_event_order_key):
         observed_fraction = min(filled_qty / total_qty, 1.0)
         action = meta.get("reverse_action")
         # 금액 미확정 체결은 마커/원장을 진행시키지 않고 전체 reconcile 을 보류합니다.
@@ -884,6 +935,42 @@ def reconcile_reverse_fills(state, order_history):
             effective_fraction = max(previous_fraction, observed_fraction)
             delta_fraction = max(0.0, effective_fraction - previous_fraction)
             target = float(meta.get("reverse_t_target", 0.0) or 0.0)
+            target_settled_now = False
+            if (
+                meta.get("reverse_t_rule") == 2
+                and not meta.get("reverse_t_target_settled")
+                and delta_fraction > 1e-12
+            ):
+                # 원문: 매수 T = 직전 T + (분할수 - 직전 T) × 0.25. 주문 생성 때 가정한 '매도 체결 후 T'
+                # 가 아니라, 첫 체결을 반영하는 시점의 실제 T(같은 세션 매도 체결 반영분 포함)로 확정합니다.
+                # 부분체결은 확정된 목표값에 누적 체결비율을 적용합니다(체결을 쪼개도 결과가 같음).
+                try:
+                    splits_for_rule = int(meta.get("reverse_splits"))
+                    t_basis = float(state.get("T", 0.0))
+                    if splits_for_rule <= 0 or not math.isfinite(t_basis):
+                        raise ValueError("invalid")
+                    if t_basis > splits_for_rule + 1e-9:
+                        # T 가 분할수를 넘은 상태는 정상 경로로 만들어지지 않습니다. 매수 효과가 음수가 되어
+                        # 오류를 덮을 수 있으므로 자르지 않고 원인 확인을 위해 정산을 보류합니다.
+                        raise ValueError("t_above_splits")
+                except (TypeError, ValueError):
+                    _mark_settlement_hold(
+                        state,
+                        f"리버스 매수 {mask_odno(odno)} 의 분할수(reverse_splits)·기준 T 가 유효하지 않거나 "
+                        f"T 가 분할수를 초과해 T 효과를 확정할 수 없습니다 — 원인 확인 필요",
+                    )
+                    continue
+                settled_target = round((splits_for_rule - t_basis) * 0.25, 4)
+                meta["reverse_t_target_planned"] = target
+                meta["reverse_t_target_basis_t"] = round(t_basis, 4)
+                meta["reverse_t_target"] = settled_target
+                meta["reverse_t_target_settled"] = True
+                target = settled_target
+                target_settled_now = True
+                print(
+                    f"  [정보] 리버스 쿼터매수 {mask_odno(odno)} T 효과 확정: 직전 T {t_basis} 기준 "
+                    f"{settled_target} (계획 시 가정 {meta['reverse_t_target_planned']})"
+                )
             existing_entries = [
                 e for e in (_ensure_settlement_ledger(state).get("entries") or [])
                 if e.get("kind") == "reverse_buy" and str(e.get("odno")) == str(odno)
@@ -934,6 +1021,9 @@ def reconcile_reverse_fills(state, order_history):
                     "reverse": True,
                     "is_additional": True,
                     "reverse_t_target": target,
+                    "reverse_t_rule": int(meta.get("reverse_t_rule", 0) or 0),
+                    "reverse_splits": int(meta.get("reverse_splits", 0) or 0),
+                    "target_settled_now": target_settled_now,
                     "fill_fraction": effective_fraction,
                     "fill_fraction_delta": delta_fraction,
                     "ledger_seq": ledger_entry.get("seq") if ledger_entry else None,

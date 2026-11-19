@@ -587,6 +587,15 @@ def _execute_approved_plan(
             raise RuntimeError(
                 f"{symbol} 실행 전 계획 재계산 실패 — 주문을 실행하지 않습니다: {error}"
             ) from error
+        # 실행 직전 재계산에서 리버스 보류가 확인되면 승인된 주문이라도 실행하지
+        # 않습니다 (승인 이후 조건이 바뀐 stale 실행 방지). 드리프트 오류보다
+        # 먼저 판정해 보류 사유가 그대로 드러나게 합니다.
+        rebuilt_hold = (getattr(rebuilt, "strategy_result", None) or {}).get("reverse_hold")
+        if rebuilt_hold:
+            raise RuntimeError(
+                f"{symbol} 리버스 보류({rebuilt_hold}) — 신규 주문을 실행하지 않습니다. "
+                "재승인(PREVIEW→APPROVE)이 필요합니다."
+            )
         drift = compare_order_plans(
             approval.get("orders") or [],
             rebuilt.orders,
@@ -808,6 +817,9 @@ def _execute_approved_plan(
                                 for key in ("reverse_base_t", "reverse_t_factor", "reverse_t_target"):
                                     if key in order:
                                         order_meta[key] = float(order[key])
+                                for key in ("reverse_t_rule", "reverse_splits"):
+                                    if key in order:
+                                        order_meta[key] = int(order[key])
                                 reverse_mode["active"] = True
                                 reverse_mode["cycle_id"] = cycle_id
                                 # 중복방지 기준은 **실행 세션**입니다 (전략의

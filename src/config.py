@@ -131,11 +131,11 @@ HTTP_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 #   TQQQ_SPLITS=40        → TQQQ 분할 수
 #   TQQQ_SYMBOL_TYPE=TQQQ → 별지점 공식 타입
 #   TQQQ_SEED=10000       → TQQQ에 투입할 시드 (달러, 필수)
-#   TQQQ_ADDITIONAL_LOC_LEVELS=3  → TQQQ 급락 대비 추가 LOC 단계 수
+#   TQQQ_ADDITIONAL_LOC_LEVELS=8  → TQQQ 급락 대비 추가 LOC 단계 수 (일반모드·리버스모드 공통, 기본 8, 0=끔)
 #   SOXL_SPLITS=20
 #   SOXL_SYMBOL_TYPE=SOXL
 #   SOXL_SEED=5000
-#   SOXL_ADDITIONAL_LOC_LEVELS=3
+#   SOXL_ADDITIONAL_LOC_LEVELS=8
 def _parse_symbols():
 	"""
 	환경변수에서 종목 목록을 읽어 종목별 설정 dict 리스트로 반환합니다.
@@ -237,11 +237,12 @@ def _parse_symbols():
 			# 미설정 시 종목코드를 그대로 사용 (TQQQ → "TQQQ", SOXL → "SOXL")
 			"symbol_type": (os.getenv(f"{sym}_SYMBOL_TYPE") or sym).strip().upper(),
 			# 급락 대비 추가 LOC 주문 단계 수
-			# 종목별 설정({SYMBOL}_ADDITIONAL_LOC_LEVELS) → 글로벌(ADDITIONAL_LOC_LEVELS) → 기본값 3
+			# 종목별 설정({SYMBOL}_ADDITIONAL_LOC_LEVELS) → 글로벌(ADDITIONAL_LOC_LEVELS) → 기본값 8
+			# (일반모드 추가매수와 리버스모드 쿼터매수 아래 추가매수가 같은 설정을 씁니다)
 			"additional_loc_levels": int(
 				os.getenv(f"{sym}_ADDITIONAL_LOC_LEVELS")
 				or os.getenv("ADDITIONAL_LOC_LEVELS")
-				or "3"
+				or "8"
 			),
 			# T값 강제 설정 (환경변수, 1회성 보정)
 			# {SYMBOL}_FORCE_T: 설정 시 state.json의 T를 이 값으로 덮어씁니다

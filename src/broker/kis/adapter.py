@@ -574,7 +574,9 @@ class KISBroker(Broker):
             "AUTH": "",
             "EXCD": exchange,
             "SYMB": symbol,
-            "GUBN": "0",
+            "GUBN": "0",   # 일봉
+            "BYMD": "",    # 조회 기준일자 — 필수 입력(없으면 'INPUT FIELD NOT FOUND [BYMD]'), 공란이면 오늘 기준
+            "MODP": "0",   # 수정주가 미반영 (필수 입력)
         }
 
         try:
@@ -588,7 +590,8 @@ class KISBroker(Broker):
                 msg = response_data.get("msg1", "알 수 없는 에러")
                 raise BrokerError(f"일자별종가 조회 실패: {msg}")
 
-            output = response_data.get("output", [])
+            # 일봉 목록은 output2(최신순)에 담깁니다 (output1 은 요약). 예전 형태(output)도 함께 읽습니다.
+            output = response_data.get("output2") or response_data.get("output") or []
             closes = []
             for item in output:
                 try:

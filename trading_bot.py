@@ -853,6 +853,35 @@ def _order_detail_lines(symbol, order) -> str:
     return "\n".join(lines)
 
 
+# 리버스 보류 사유별 안내문 — 전략(`strategy.HOLD_*`)이 반환한 `reverse_hold`
+# 코드를 운영자가 조치할 수 있는 문장으로 풉니다. 테스트 파일의 동일 매핑과
+# 문구를 일치시킵니다 (테스트가 `[보류] {symbol}: {사유코드}` 형태를 단언).
+_REVERSE_HOLD_MESSAGES = {
+    "EXIT_UNCONFIRMED": "확정된 직전 정규장 종가를 확인하지 못해 리버스 종료 판정을 보류했습니다 (일봉 조회·날짜 확인 필요).",
+    "RECONCILIATION_PENDING": "리버스 체결 반영·주문이력 확인(reconcile)이 끝나지 않아 신규 주문을 보류했습니다 (전일 리버스 주문 미종결·이력 누락 등 — 체결·이력 확인 필요).",
+    "UNRESOLVED_REVERSE_ORDERS": "terminal 확정되지 않은 리버스 주문이 있어 신규 주문과 종료 판정을 보류했습니다 (체결 반영·이력 확인 필요).",
+}
+
+
+def _report_reverse_hold(symbol, hold_reason):
+    """리버스 보류를 로그·urgent 알림·`held` 결과로 보고합니다 (부수효과 없음).
+
+    주문·승인·state 저장을 하지 않습니다 — 호출자는 신규 주문을 내지 않고
+    이 함수가 반환한 `held` 결과를 그대로 상위에 전달합니다. 정상 무주문
+    (동일 세션 중복 등, `hold_reason` 없음)과 구분됩니다.
+    """
+    hold_text = _REVERSE_HOLD_MESSAGES.get(hold_reason, hold_reason)
+    print(f"[보류] {symbol}: {hold_text}")
+    if TRADE_MODE == "LIVE":
+        notify(
+            f"⚠️ 리버스 보류 {symbol}\n{hold_text}\n"
+            "이번 실행은 신규 주문이 없습니다. 확인 후 조치가 필요합니다.",
+            urgent=True,
+        )
+    return {"symbol": symbol, "executed": 0, "reserved": 0, "failed": 0,
+            "errors": [], "held": hold_reason}
+
+
 def run_one_symbol(broker: Broker, symbol_config, approval=None):
     """단일 종목 통합 실행 (레거시 경로).
 
@@ -889,6 +918,11 @@ def run_one_symbol(broker: Broker, symbol_config, approval=None):
 
     plan = build_order_plan(settled, read_only_broker)
     if not plan.orders:
+        # 리버스 보류는 정상 무주문과 구분해 보고합니다 (신규 주문·승인 없음,
+        # state 저장 없음 — 체결·이력 확인 후 다음 실행에서 재개).
+        hold_reason = (getattr(plan, "strategy_result", None) or {}).get("reverse_hold")
+        if hold_reason:
+            return _report_reverse_hold(symbol, hold_reason)
         # 주문이 없어도 리버스 종료 상태 변경은 기존처럼 저장합니다.
         if TRADE_MODE == "LIVE" and plan.strategy_result.get("reverse_exit"):
             save_state(symbol, settled.state)
@@ -3240,6 +3274,14 @@ def _preview_symbol_plan(symbol_config, read_only_broker, plans_dir):
             f"file={plan_file}"
         )
 
+        # 리버스 보류는 승인·자동실행하지 않습니다. PREVIEW 산출물(위 파일)은
+        # 기존처럼 남기되 (수동 검토·DRY 검증용), 로그·urgent 알림으로 정상
+        # 무주문과 구분합니다. state 저장·주문 없음.
+        hold_reason = (getattr(plan, "strategy_result", None) or {}).get("reverse_hold")
+        if not plan.orders and hold_reason:
+            _report_reverse_hold(plan.symbol, hold_reason)
+            return plan, None
+
         # AUTO_EXECUTE(opt-in): PREVIEW 후 자동 APPROVE → EXECUTE.
         # 차단 사유(hold/mismatch/tolerance/세션 드리프트 등)가 있으면
         # 해당 종목만 AUTO_BLOCKED 로 중단하고 다음 종목은 계속 진행합니다.
@@ -3543,6 +3585,18 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
                     symbol_config, read_only_broker, plans_dir
                 )
                 if not approval_file:
+                    # 승인 없음이 곧 실패는 아닙니다 (수동 PREVIEW·DRY·주문 없음).
+                    # 리버스 보류만 실패로 집계합니다 — `_preview_symbol_plan` 이
+                    # 이미 로그·urgent 알림을 했으므로 여기서 중복 알림하지 않습니다.
+                    hold_reason = (
+                        getattr(plan, "strategy_result", None) or {}
+                    ).get("reverse_hold")
+                    if hold_reason and not getattr(plan, "orders", []):
+                        print(
+                            f"[PREVIEW] {plan.symbol} 리버스 보류({hold_reason}) → "
+                            "실패 1건으로 집계합니다 (exit 0 방지)"
+                        )
+                        failures += 1
                     continue
                 # 자동 실행은 **잠금 밖**에서: 프리장 개장 대기(최대 ~7.5시간)를
                 # 잠금을 든 채 하면 그동안 다른 실행이 전부 막힙니다.
@@ -3974,6 +4028,9 @@ def _main_locked():
         print(
             f"  합계: 성공 {total_executed}건 / 예약 {total_reserved}건 / 실패 {total_failed}건"
         )
+        for r in run_results:
+            if r.get("held"):
+                print(f"  [보류] {r.get('symbol')}: {r['held']} — 정상 무주문이 아니라 리버스 보류입니다 (알림 발송됨)")
 
         if total_failed > 0:
             summary = "\n".join(
