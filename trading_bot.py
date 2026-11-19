@@ -809,6 +809,22 @@ def _order_detail_lines(symbol, order) -> str:
     return "\n".join(lines)
 
 
+def _diag_probe_missing_reverse_orders(broker, symbol, exchange):
+    """[진단 전용] DRY 에서만, '리버스 주문 이력 누락' 주문을 브로커 조회 방식별로 비교 조회합니다.
+
+    조회만 하며 결과는 로그로만 남고 state·정산·주문 판단에 쓰이지 않습니다. 어떤 오류도 삼킵니다.
+    """
+    try:
+        from state import take_missing_reverse_diag
+        missing = take_missing_reverse_diag()
+        probe = getattr(broker, "diag_probe_missing_orders", None)
+        if TRADE_MODE != "DRY" or not missing or probe is None:
+            return
+        probe(symbol, exchange, missing)
+    except Exception as error:
+        print(f"[주문이력진단·분할] 진단 건너뜀: {type(error).__name__}: {str(error)[:80]}")
+
+
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -962,6 +978,7 @@ def run_one_symbol(broker: Broker, symbol_config):
     }
 
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
+    _diag_probe_missing_reverse_orders(broker, symbol, exchange)
 
     # 금액 미확정 체결 게이트 — update 경로가 놓친 경우에도 저장/주문을 막습니다.
     pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])

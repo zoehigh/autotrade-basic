@@ -677,15 +677,17 @@ class NHPlugBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
-    def _history_input(self, symbol: str, dt: str) -> dict:
-        """주문체결내역(GSB10030) Input_0 블록."""
-        return self._input_block(
-            orr_dt=dt,
-            oss_sby_dit_cd="0",
-            sot_dit="0",
-            ost_cns_dit="0",
-            iem_cd=symbol.upper(),
-        )
+    def _history_input(self, symbol: str, dt: str, **overrides) -> dict:
+        """주문체결내역(GSB10030) Input_0 블록. overrides 는 진단 조회용(sot_dit·oss_sby_dit_cd·ost_cns_dit·orr_no)."""
+        fields = {
+            "orr_dt": dt,
+            "oss_sby_dit_cd": "0",
+            "sot_dit": "0",
+            "ost_cns_dit": "0",
+            "iem_cd": symbol.upper(),
+        }
+        fields.update(overrides)
+        return self._input_block(**fields)
 
     @staticmethod
     def _order_id_of(row) -> str:
@@ -703,6 +705,114 @@ class NHPlugBroker(Broker):
             return str(getattr(config, "TRADE_MODE", "")).strip().upper() == "DRY"
         except Exception:
             return False
+
+    @staticmethod
+    def _norm_order_id(value) -> str:
+        """주문번호 비교용 정규화 (선행 0 제거). 숫자가 아니면 문자열 그대로."""
+        text = str(value or "").strip()
+        return str(int(text)) if text.isdigit() else text
+
+    @classmethod
+    def _id_order_direction(cls, rows) -> str:
+        """행 순서가 주문번호 기준 오름/내림/혼합인지 (진단용 — 값은 출력하지 않습니다)."""
+        ids = []
+        for row in rows:
+            text = cls._norm_order_id(cls._order_id_of(row))
+            if text.isdigit():
+                ids.append(int(text))
+        if len(ids) < 2:
+            return "판정불가"
+        if ids == sorted(ids):
+            return "오름"
+        if ids == sorted(ids, reverse=True):
+            return "내림"
+        return "혼합"
+
+    def _probe_query(self, symbol, dt, token, label, overrides, missing_ids, expect_id=None):
+        """[진단] 조회 방식 하나를 실행하고 결과 요약을 출력합니다 (주문번호·cts 원문 없음). 조회된 행 목록을 돌려줍니다."""
+        try:
+            rows = self._fetch_history_day(symbol, dt, token, overrides=overrides, quiet=True)
+        except Exception as error:
+            print(f"[주문이력진단·분할] {symbol} {dt} {label}: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
+            return []
+        ids = {self._norm_order_id(i) for i in self._unique_order_ids(rows)}
+        found = ids & missing_ids
+        sides: dict[str, int] = {}
+        open_rows = 0
+        for row in rows:
+            norm = self._normalize_unexecuted_item(row)
+            side = str(norm.get("sll_buy_dvsn_cd_name") or "기타")
+            sides[side] = sides.get(side, 0) + 1
+            try:
+                if float(norm.get("nccs_qty") or 0) > 0:
+                    open_rows += 1
+            except (TypeError, ValueError):
+                pass
+        summary = (
+            f"[주문이력진단·분할] {symbol} {dt} {label}: 반환={len(rows)}건 고유주문={len(ids)} "
+            f"누락주문발견={len(found)}/{len(missing_ids)} 방향별={dict(sorted(sides.items()))} "
+            f"미체결잔량행={open_rows} 정렬={self._id_order_direction(rows)}"
+        )
+        if expect_id is not None:
+            summary += f" 필터적용={'예' if rows and ids == {expect_id} else '아니오'}"
+        print(summary)
+        for row in rows:
+            rid = self._norm_order_id(self._order_id_of(row))
+            if rid in found:
+                print(
+                    f"[주문이력진단·분할]   발견 {mask_odno(rid)}: 상태={row.get('orr_sts_nm', '')!r} "
+                    f"정정취소={row.get('cor_can_dit_nm', '')!r} 주문수량={row.get('orr_qty', '')} 체결수량={row.get('cns_qty', '')} "
+                    f"미체결수량={row.get('ny_cns_orr_qty', '')} 취소수량={row.get('can_qty', '')} "
+                    f"거부사유={'있음' if str(row.get('rjt_rsn_cts', '') or '').strip() else '없음'}"
+                )
+        return rows
+
+    def diag_probe_missing_orders(self, symbol, exchange, missing) -> None:
+        """[진단 전용 — DRY 에서만, 조회만 하며 매매·state 판단에 쓰이지 않습니다]
+
+        '리버스 주문 이력 누락'으로 보류된 주문(state 에는 있는데 이력에 없는 주문)이 조회 방식을 바꾸면 나오는지 비교합니다.
+        가설: 한 번에 15건까지만 돌려주고 연속조회가 비어 와서 날짜 끝쪽 주문이 잘린다.
+          - 기존 전체 조회 / 주문번호 역순(sot_dit=1) / 매수(oss_sby_dit_cd=2) / 미체결(ost_cns_dit=2) / 매수+미체결+역순
+          - 주문번호 직접 조회(orr_no): 먼저 이력에 있는 주문(대조군)으로 필터가 실제 적용되는지 확인한 뒤 누락 주문을 조회
+        주문번호·계좌·cts 원문은 출력하지 않습니다 (가명 식별자·건수만). 어떤 오류도 호출자에게 전파하지 않습니다.
+        """
+        if not self._is_dry_run() or not missing:
+            return
+        try:
+            token = self._get_token()
+            by_dt: dict[str, set] = {}
+            for item in missing:
+                session = str(item.get("session", "") or "")
+                dt = session.replace("-", "")
+                if len(dt) == 8 and dt.isdigit():
+                    by_dt.setdefault(dt, set()).add(self._norm_order_id(item.get("odno")))
+            for dt, missing_ids in sorted(by_dt.items()):
+                print(f"[주문이력진단·분할] {symbol} {dt} 시작: 누락 리버스 주문 {len(missing_ids)}건 대상")
+                baseline = self._probe_query(symbol, dt, token, "① 기존 전체 조회", {}, missing_ids)
+                self._probe_query(symbol, dt, token, "② 주문번호 역순(sot_dit=1)", {"sot_dit": "1"}, missing_ids)
+                self._probe_query(symbol, dt, token, "③ 매수 필터(oss_sby_dit_cd=2)", {"oss_sby_dit_cd": "2"}, missing_ids)
+                self._probe_query(symbol, dt, token, "④ 미체결 필터(ost_cns_dit=2)", {"ost_cns_dit": "2"}, missing_ids)
+                self._probe_query(
+                    symbol, dt, token, "⑤ 매수+미체결+역순",
+                    {"oss_sby_dit_cd": "2", "ost_cns_dit": "2", "sot_dit": "1"}, missing_ids,
+                )
+                # 대조군: 기존 조회에 이미 있는 주문(처음·마지막 행)을 orr_no 로 직접 조회 → 필터가 실제 적용되는지
+                controls = []
+                for row in (baseline[:1] + baseline[-1:]):
+                    rid = self._norm_order_id(self._order_id_of(row))
+                    if rid.isdigit() and rid not in controls:
+                        controls.append(rid)
+                for rid in controls:
+                    self._probe_query(
+                        symbol, dt, token, f"⑥ 직접조회 대조군 {mask_odno(rid)}", {"orr_no": int(rid)}, missing_ids, expect_id=rid,
+                    )
+                for rid in sorted(missing_ids):
+                    if rid.isdigit():
+                        self._probe_query(
+                            symbol, dt, token, f"⑦ 직접조회 누락주문 {mask_odno(rid)}", {"orr_no": int(rid)}, missing_ids,
+                        )
+        except Exception as error:   # 진단은 어떤 경우에도 매매 흐름에 영향을 주지 않습니다
+            print(f"[주문이력진단·분할] 진단 중단: {type(error).__name__}: {str(error)[:80]}")
 
     def _diag_probe_continuation(self, symbol, dt, token, page1_rows, page1_cts, page1_flag) -> None:
         """[진단 전용 — DRY 에서만, 결과에 영향 없음] 연속조회 요청 방식별로 응답을 비교합니다.
@@ -743,7 +853,7 @@ class NHPlugBroker(Broker):
             except Exception as error:   # 진단은 어떤 경우에도 조회 결과에 영향을 주지 않습니다
                 print(f"[주문이력진단·비교] {symbol} {dt} {label}: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
 
-    def _fetch_history_day(self, symbol: str, dt: str, token: str) -> list:
+    def _fetch_history_day(self, symbol: str, dt: str, token: str, overrides: dict | None = None, quiet: bool = False) -> list:
         """하루치(orr_dt) 주문체결내역의 **모든 페이지**를 모아 Output_0 행 목록으로 돌려줍니다.
 
         연속조회 규약(공식 llms.txt·SDK): 응답 *헤더*의 `cts`·`cts_flag`(Y=다음 페이지, N=끝)를 다음 요청 *헤더*에
@@ -751,6 +861,8 @@ class NHPlugBroker(Broker):
 
         Fail-Closed: 계속해야 하는데 cts 가 없거나, 같은 cts 가 반복되거나, 페이지 상한(_MAX_HISTORY_PAGES)을
         넘으면 NHPlugPagingError 로 실패시킵니다 (일부 페이지만으로 이력을 확정하지 않음).
+
+        overrides/quiet 는 진단 조회 전용입니다(Input_0 일부 값 대체, 페이지별 진단 출력 생략).
         """
         rows: list = []
         sent_keys: set[str] = set()
@@ -760,6 +872,8 @@ class NHPlugBroker(Broker):
 
         def finish(reason: str) -> list:
             # 진단: 전체 수집 건수와 중복 제거 후 고유 주문 건수를 구분합니다 (주문번호는 출력하지 않습니다).
+            if quiet:
+                return rows
             print(
                 f"[주문이력진단] {symbol} {dt} 수집 완료: 페이지={page} 전체수집={len(rows)}건 "
                 f"고유주문={len(self._unique_order_ids(rows))}건 종료사유={reason}"
@@ -768,7 +882,7 @@ class NHPlugBroker(Broker):
 
         while True:
             page += 1
-            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt))
+            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt, **(overrides or {})))
             headers = {}
             if cts:
                 headers["cts"] = cts
@@ -799,12 +913,13 @@ class NHPlugBroker(Broker):
             next_flag = (resp_headers.get("cts_flag") or "").strip().upper()
             continue_code = meta.get("continue_code") or ""
             # 진단: 페이지별 응답 건수, cts_flag(Y/N/없음), 연속조회 신호, cts 응답·전달 여부 (cts 원문은 출력하지 않습니다)
-            print(
-                f"[주문이력진단] {symbol} {dt} 페이지={page} 응답건수={len(output)} "
-                f"고유주문={len(self._unique_order_ids(output))} cts_flag={next_flag or '없음'} "
-                f"신호={continue_code or '없음'} cts응답={'있음' if next_cts else '없음'} "
-                f"cts전달={'예' if cts else '아니오'}"
-            )
+            if not quiet:
+                print(
+                    f"[주문이력진단] {symbol} {dt} 페이지={page} 응답건수={len(output)} "
+                    f"고유주문={len(self._unique_order_ids(output))} cts_flag={next_flag or '없음'} "
+                    f"신호={continue_code or '없음'} cts응답={'있음' if next_cts else '없음'} "
+                    f"cts전달={'예' if cts else '아니오'}"
+                )
             if next_flag == "N":
                 return finish("cts_flag=N")
             if next_flag != "Y" and not continue_code:
@@ -823,8 +938,9 @@ class NHPlugBroker(Broker):
                 raise NHPlugPagingError(
                     f"{symbol} {dt} 연속조회가 {_MAX_HISTORY_PAGES}페이지를 넘었습니다 — 일부 이력만으로 진행하지 않습니다"
                 )
-            print(f"[주문이력] {symbol} {dt} 연속조회 계속: {page}페이지 {len(output)}건 수집 (신호={continue_code or next_flag})")
-            if page == 1 and self._is_dry_run():
+            if not quiet:
+                print(f"[주문이력] {symbol} {dt} 연속조회 계속: {page}페이지 {len(output)}건 수집 (신호={continue_code or next_flag})")
+            if page == 1 and not quiet and not overrides and self._is_dry_run():
                 self._diag_probe_continuation(symbol, dt, token, output, next_cts, next_flag)
             sent_keys.add(next_cts)
             cts = next_cts

@@ -336,3 +336,105 @@ def test_probe_exceptions_are_swallowed(monkeypatch, capsys):
     rows = broker._fetch_history_day("TQQQ", "20261117", "t")
     assert [r["orr_no"] for r in rows] == ["1", "2"]
     assert "조회 오류 ValueError" in capsys.readouterr().out
+
+
+# ── 누락 주문 분할 진단 (DRY 한정, 조회 전용) ─────────────────────────────────
+
+def _dry(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
+
+
+def _missing(*ids, session="2026-11-17"):
+    return [{"odno": i, "session": session, "submitted_at": "20261118052334"} for i in ids]
+
+
+def _scripted_probe_session():
+    """① 기존 ② 역순 ③ 매수 ④ 미체결 ⑤ 조합 ⑥ 대조군 2개 ⑦ 누락 주문 2개 — 요청 순서와 같은 응답."""
+    found = {**_row("1000003"), "orr_sts_nm": "접수", "cor_can_dit_nm": "", "rjt_rsn_cts": "", "ny_cns_orr_qty": "1"}
+    return [
+        _page([_row("1000001"), _row("1000004")]),                    # ① 기존 전체 조회
+        _page([_row("1000004"), found]),                              # ② 역순 → 누락 1건 발견
+        _page([]),                                                    # ③ 매수 필터
+        _page([_row("1000002", cns="0")]),                            # ④ 미체결 필터 → 누락 1건 발견
+        _page([]),                                                    # ⑤ 조합
+        _page([_row("1000001")]),                                     # ⑥ 대조군1 (필터 적용: 1건)
+        _page([_row("1000001"), _row("1000004")]),                    # ⑥ 대조군2 (필터 무시: 2건)
+        _page([_row("1000002")]),                                     # ⑦ 직접 조회 누락1
+        _page([]),                                                    # ⑦ 직접 조회 누락2
+    ]
+
+
+def test_split_probe_sends_each_filter_and_reports_findings(monkeypatch, capsys):
+    _dry(monkeypatch)
+    broker = _broker(_scripted_probe_session())
+    broker.diag_probe_missing_orders("SOXL", "AMS", _missing("1000002", "1000003"))
+    inputs = [c[1]["Input_0"] for c in broker._session.calls]
+    assert len(inputs) == 9
+    assert inputs[0]["sot_dit"] == "0" and inputs[0]["oss_sby_dit_cd"] == "0" and inputs[0]["ost_cns_dit"] == "0"
+    assert inputs[1]["sot_dit"] == "1"
+    assert inputs[2]["oss_sby_dit_cd"] == "2"
+    assert inputs[3]["ost_cns_dit"] == "2"
+    assert (inputs[4]["oss_sby_dit_cd"], inputs[4]["ost_cns_dit"], inputs[4]["sot_dit"]) == ("2", "2", "1")
+    assert inputs[5]["orr_no"] == 1000001 and inputs[6]["orr_no"] == 1000004      # 대조군: 이력에 있던 처음·마지막 주문
+    assert inputs[7]["orr_no"] == 1000002 and inputs[8]["orr_no"] == 1000003      # 누락 주문 직접 조회
+    assert all(i["orr_dt"] == "20261117" and i["iem_cd"] == "SOXL" for i in inputs)
+    out = capsys.readouterr().out
+    assert "① 기존 전체 조회: 반환=2건 고유주문=2 누락주문발견=0/2" in out
+    assert "② 주문번호 역순(sot_dit=1): 반환=2건 고유주문=2 누락주문발견=1/2" in out and "정렬=내림" in out
+    assert "④ 미체결 필터(ost_cns_dit=2): 반환=1건 고유주문=1 누락주문발견=1/2" in out
+    assert "필터적용=예" in out and "필터적용=아니오" in out                       # 대조군 하나는 필터 적용, 하나는 무시
+    assert "발견 ord#" in out and "상태='접수'" in out and "미체결수량=1" in out and "거부사유=없음" in out
+
+
+def test_split_probe_never_prints_raw_ids_or_account(monkeypatch, capsys):
+    _dry(monkeypatch)
+    broker = _broker(_scripted_probe_session())
+    broker.diag_probe_missing_orders("SOXL", "AMS", _missing("1000002", "1000003"))
+    out = capsys.readouterr().out
+    for secret in ("1000001", "1000002", "1000003", "1000004", "12345678901"):
+        assert secret not in out
+
+
+def test_split_probe_is_dry_only_and_noop_without_missing(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
+    broker = _broker(_scripted_probe_session())
+    broker.diag_probe_missing_orders("SOXL", "AMS", _missing("1000002"))
+    assert broker._session.calls == []                                           # LIVE 에서는 조회조차 하지 않음
+    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
+    broker.diag_probe_missing_orders("SOXL", "AMS", [])
+    assert broker._session.calls == []
+
+
+def test_split_probe_swallows_errors(monkeypatch, capsys):
+    _dry(monkeypatch)
+    broker = _broker([ValueError("boom")] * 9)
+    broker.diag_probe_missing_orders("SOXL", "AMS", _missing("1000002"))        # 예외 전파 없음
+    assert "조회 오류 ValueError" in capsys.readouterr().out
+
+
+def test_trading_bot_hook_only_runs_probe_in_dry(monkeypatch):
+    import trading_bot
+    import state as state_module
+
+    calls = []
+
+    class _B:
+        def diag_probe_missing_orders(self, symbol, exchange, missing):
+            calls.append((symbol, exchange, missing))
+
+    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
+    trading_bot._diag_probe_missing_reverse_orders(_B(), "SOXL", "AMS")
+    assert calls == [] and state_module._DIAG_MISSING_REVERSE == {}               # LIVE: 호출 없이 비움
+    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
+    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
+    trading_bot._diag_probe_missing_reverse_orders(_B(), "SOXL", "AMS")
+    assert len(calls) == 1 and calls[0][2][0]["odno"] == "X"
+    # 진단 오류는 매매 흐름으로 새지 않음
+    class _Bad:
+        def diag_probe_missing_orders(self, *a):
+            raise RuntimeError("x")
+    state_module._DIAG_MISSING_REVERSE["Y"] = {"odno": "Y", "session": "", "submitted_at": ""}
+    trading_bot._diag_probe_missing_reverse_orders(_Bad(), "SOXL", "AMS")

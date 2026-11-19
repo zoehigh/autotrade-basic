@@ -615,6 +615,18 @@ def _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, activ
             state["reverse_mode"] = {}
 
 
+# [진단 전용] '리버스 주문 이력 누락'으로 보류된 주문 — DRY 실행에서 브로커 진단 조회가 읽어 갑니다. state 에 저장하지 않으며
+# 매매·정산 판단에 쓰이지 않습니다.
+_DIAG_MISSING_REVERSE: dict = {}
+
+
+def take_missing_reverse_diag():
+    """수집된 누락 리버스 주문 목록([{odno, session, submitted_at}])을 돌려주고 비웁니다 (진단 전용)."""
+    items = list(_DIAG_MISSING_REVERSE.values())
+    _DIAG_MISSING_REVERSE.clear()
+    return items
+
+
 def _missing_reverse_order_diag(masked_odno, meta, rows):
     """[진단, 로그 전용] '리버스 주문 이력 누락' 주문이 정말 이력에 없는지, 있는데 날짜 대조에서 탈락했는지 구분합니다.
 
@@ -697,6 +709,9 @@ def reconcile_reverse_fills(state, order_history):
                     print(f"[경고] 리버스 주문 이력 누락: odno={mask_odno(odno)} → 신규 주문을 보류합니다.")
                     diag_line = _missing_reverse_order_diag(mask_odno(odno), meta, history_by_odno.get(str(odno), []))
                     print(diag_line)
+                    _DIAG_MISSING_REVERSE[str(odno)] = {
+                        "odno": str(odno), "session": meta.get("submitted_session", ""), "submitted_at": submitted_at,
+                    }
             continue
         submitted_at = str(meta.get("submitted_at", ""))
         today_session = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
