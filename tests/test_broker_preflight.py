@@ -28,7 +28,7 @@
   - 매수 하단 ×0.90 (1주, 비시장성): 접수 → 이력 매칭 → cancel → 0체결 terminal 확인
   - 매도 상단 ×1.50 / 매도 하단 ×0.80 (1주, 비시장성): 보유 수량 있을 때만 접수 → cancel
   - cancel 미구현 브로커(KIS/KIWOOM/NHPLUG)는 비정상 주문(99999주/$0.01) 거부
-    확인으로 대체 (AGENTS.md PREFLIGHT 규칙)
+    확인으로 대체 (docs/agents/brokers.md PREFLIGHT 규칙)
     ※ LS는 COSAT00301 OrdPtnCode=08 취소 경로 실측 완료 (2026-11-03, 주문 1054/1055 → 취소 1152/1147 "취소완료",
       ExecQty=0, UnercQty=0). 취소 성공 rsp_cd=00156 ("취소주문이 완료되었습니다")
 
@@ -424,7 +424,7 @@ def _run_collar_probe(
 
     # cancel 미구현 브로커의 비시장성 probe — 접수 후 취소가 불가하므로
     # 비정상 주문(99999주/$0.01)으로 OrderNotAcceptedError 거부 확인만으로 대체
-    # (AGENTS.md PREFLIGHT: cancel 미구현 시 거부 확인으로 대체)
+    # (docs/agents/brokers.md PREFLIGHT: cancel 미구현 시 거부 확인으로 대체)
     if not has_cancel and not marketable:
         try:
             _assert_order_allowed(broker)

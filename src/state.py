@@ -492,7 +492,7 @@ def _auto_assume_reverse_expiry(meta, order):
     is_demo = BROKER_MODE == "demo"
     # 메리츠 실전: 이전 미국 세션의 LOC/MOC 일중 주문은 세션 종료로 만료됩니다
     # (기간 이력은 만료 주문도 '미체결'+잔량=주문수량으로 보여 주며, 만료 여부는 취소 시도 시
-    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — AGENTS.md). 호출부가 이전 세션임을 보장합니다.
+    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — docs/agents/brokers.md). 호출부가 이전 세션임을 보장합니다.
     is_meritz_real = BROKER == "meritz" and BROKER_MODE == "real"
     if not (is_demo or is_meritz_real):
         return False
