@@ -809,32 +809,6 @@ def _order_detail_lines(symbol, order) -> str:
     return "\n".join(lines)
 
 
-def _diag_probe_missing_reverse_orders(broker, symbol, exchange):
-    """[진단 전용] DRY 에서만, '리버스 주문 이력 누락' 주문을 브로커 조회 방식별로 비교 조회합니다.
-
-    조회만 하며 결과는 로그로만 남고 state·정산·주문 판단에 쓰이지 않습니다.
-    진단 조건(DRY + 누락 주문 있음)이 충족되면 시작 로그가 반드시 출력되고, 진단을 못 하거나 실패해도
-    조용히 넘어가지 않고 사유를 출력합니다 (매매 흐름에는 영향을 주지 않도록 예외는 삼킵니다).
-    """
-    try:
-        from state import take_missing_reverse_diag
-        missing = take_missing_reverse_diag()
-        if TRADE_MODE != "DRY" or not missing:
-            return
-        # DRY 모드의 broker 는 DryBroker 래퍼(조회는 self._real 에 위임)이므로 실제 브로커의 진단 메서드를 찾아 씁니다.
-        probe = getattr(broker, "diag_probe_missing_orders", None)
-        if probe is None:
-            probe = getattr(getattr(broker, "_real", None), "diag_probe_missing_orders", None)
-        if probe is None:
-            print(f"[주문이력진단·분할] 진단 불가: {symbol} 누락 리버스 주문 {len(missing)}건이 있으나 이 브로커에 진단 조회가 없습니다")
-            return
-        print(f"[주문이력진단·분할] 진단 시작: {symbol} 누락 리버스 주문 {len(missing)}건 (DRY·조회 전용, 매매 판단에 쓰이지 않음)")
-        probe(symbol, exchange, missing)
-        print(f"[주문이력진단·분할] 진단 종료: {symbol}")
-    except Exception as error:
-        print(f"[주문이력진단·분할] 진단 건너뜀(오류): {type(error).__name__}: {str(error)[:80]}")
-
-
 def run_one_symbol(broker: Broker, symbol_config):
     """
     단일 종목에 대해 전략을 실행하고 주문을 넣는 함수입니다.
@@ -988,7 +962,6 @@ def run_one_symbol(broker: Broker, symbol_config):
     }
 
     state = update_T_from_history(symbol, state, order_history, balance_qty=live_qty)
-    _diag_probe_missing_reverse_orders(broker, symbol, exchange)
 
     # 금액 미확정 체결 게이트 — update 경로가 놓친 경우에도 저장/주문을 막습니다.
     pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])

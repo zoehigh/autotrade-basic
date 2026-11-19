@@ -1,24 +1,19 @@
-"""NHPlug 주문체결내역(GSB10030) 연속조회 회귀 테스트 (외부 호출 없음).
+"""NHPlug 주문체결내역(GSB10030) 하루치 완전 수집 회귀 테스트 (외부 호출 없음).
 
 배경: 2026-11-18 NHPlug 모의 실행이 `20261117` 이력 조회에서 XA109("모의투자 조회가 계속 됩니다")를 받았는데
-어댑터가 연속조회를 처리하지 않고 날짜를 "건너뜀"으로 넘겨 이력이 비었고, 포지션 불일치(TQQQ 108↔113)로 중단됐습니다.
+어댑터가 날짜를 "건너뜀"으로 넘겨 이력이 비었고, 포지션 불일치(TQQQ 108↔113)로 중단됐다. 이어진 DRY 진단에서
+서버는 한 조회에 **15건까지만** 돌려주고(연속조회는 비어 오거나 키가 반복) 하루 21건 중 가장 새 주문 6건(SOXL 리버스
+추가매수)이 이력에서 빠져 `RECONCILIATION_PENDING` 이 되는 것이 확인됐다.
 
-연속조회 규약(공식 llms.txt·SDK): 응답 헤더의 cts·cts_flag(Y=다음, N=끝)를 다음 요청 헤더에 그대로 실어 보냅니다.
-헤더 없이 응답코드(XA109 등)로만 계속을 알리는 경우도 있습니다. 연속조회를 끝내지 못하면 Fail-Closed 입니다.
+수집 방식: 오름·내림 **첫 페이지**(가장 작은 15건 + 가장 큰 15건)를 조합해 겹치면 하루치 전체로 증명하고, 겹치지 않으면
+방향(매수/매도)으로 분할해 같은 규칙을 적용하며, 증명하지 못하면 NHPlugPagingError(Fail-Closed). 전제: 한 응답 최대
+15건(관측값), 정렬은 주문번호 기준(응답으로 검증).
 """
 import pytest
 
 import broker.nhplug.adapter as adapter_mod
 from broker.base import BrokerError
 from broker.nhplug.adapter import NHPlugBroker, NHPlugPagingError
-
-
-@pytest.fixture(autouse=True)
-def _probe_off_by_default(monkeypatch):
-    """진단용 비교 조회는 DRY 에서만 실행됩니다. 기본 테스트 환경의 TRADE_MODE 는 DRY 이므로, 연속조회 로직 테스트에는
-    비교 조회가 응답을 소비하지 않게 LIVE 로 고정합니다 (비교 조회 테스트는 스스로 DRY 로 바꿉니다)."""
-    import config
-    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
 
 
 class _Resp:
@@ -79,10 +74,10 @@ def _page(rows, cts=None, flag=None, code=None, code_in="message"):
     return _Resp(data, headers)
 
 
-# ── _request_with_rate_retry: 연속조회 신호 처리 ──────────────────────────────
+# ── _request_with_rate_retry: 계속 신호 처리 ─────────────────────────────────────────────
 
 def test_continue_code_is_not_an_error_only_when_meta_is_passed():
-    """meta 를 넘긴 연속조회 호출에서만 XA109 가 '계속'입니다. 넘기지 않는 기존 호출은 그대로 오류입니다 (회귀)."""
+    """meta 를 넘긴 이력 조회에서만 XA109 가 '계속 신호'입니다. 넘기지 않는 기존 호출은 그대로 오류입니다 (회귀)."""
     broker = _broker([_page([], code="XA109"), _page([], code="XA109")])
     meta = {}
     data = broker._request_with_rate_retry("/x", {}, "t", meta=meta)
@@ -100,332 +95,106 @@ def test_continue_code_in_either_envelope(code_in):
 
 
 def test_other_error_codes_still_raise_even_with_meta():
-    """연속조회 코드가 아닌 오류는 meta 가 있어도 오류입니다."""
     resp = _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
     broker = _broker([resp])
     with pytest.raises(BrokerError, match="14580"):
         broker._request_with_rate_retry("/x", {}, "t", meta={})
 
 
-def test_request_headers_forwarded_and_response_headers_lowercased():
+def test_response_headers_are_returned_lowercased():
     broker = _broker([_page([], cts="K1", flag="Y")])
     meta = {}
-    broker._request_with_rate_retry("/x", {}, "t", extra_headers={"cts": "K0", "cts_flag": "Y"}, meta=meta)
-    assert broker._session.calls[0][2] == {"cts": "K0", "cts_flag": "Y"}
+    broker._request_with_rate_retry("/x", {}, "t", meta=meta)
     assert meta["headers"] == {"cts": "K1", "cts_flag": "Y"}
 
 
-def test_no_extra_headers_keeps_original_session_call():
-    """연속조회가 아닌 호출은 extra_headers 인자 없이 세션을 부릅니다 (기존 동작·기존 테스트 보존)."""
-    broker = _broker([_Resp({"Output_0": []})])
-    broker._request_with_rate_retry("/x", {}, "t")
-    assert broker._session.calls[0][2] is None
-
-
-# ── _fetch_history_day: 연속조회 루프 ────────────────────────────────────────
-
-def test_single_page_without_continuation_headers():
-    broker = _broker([_page([_row("1"), _row("2")])])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert [r["orr_no"] for r in rows] == ["1", "2"]
-    assert len(broker._session.calls) == 1
-    assert broker._session.calls[0][2] is None            # 첫 요청에는 cts 헤더가 없습니다
+# ── _probe_page1: 첫 페이지만, cts 미전송 ────────────────────────────────────────────────
 
+def test_probe_page1_reads_only_the_first_page_and_never_sends_cts():
+    broker = _broker([_page([_row("1"), _row("2")], cts="K1", flag="Y", code="XA109")])
+    page = broker._probe_page1("TQQQ", "20261117", "t", {"sot_dit": "1"})
+    assert page["ids"] == ["1", "2"] and page["signal"] is True and page["flag"] == "Y" and page["cts"] is True
+    assert len(broker._session.calls) == 1 and broker._session.calls[0][2] is None
+    assert broker._session.calls[0][1]["Input_0"]["sot_dit"] == "1"
 
-def test_single_page_flag_N_stops():
-    broker = _broker([_page([_row("1")], cts="K", flag="N")])
-    assert len(broker._fetch_history_day("TQQQ", "20261117", "t")) == 1
-    assert len(broker._session.calls) == 1
 
+# ── _judge_partition: 완전성 판정 규칙 (단위) ──────────────────────────────────────────────
 
-def test_flag_N_overrides_continue_code():
-    """cts_flag=N 이 명시되면 XA109 코드가 같이 와도 끝입니다 (SDK has_next 규칙과 동일)."""
-    broker = _broker([_page([_row("1")], cts="K", flag="N", code="XA109")])
-    assert len(broker._fetch_history_day("TQQQ", "20261117", "t")) == 1
-    assert len(broker._session.calls) == 1
+def _resp(ids, signal=False, flag="없음", side="2"):
+    rows = [{"orr_no": i, "sby_dit_nm": side, "cns_qty": "0", "ny_cns_orr_qty": "1"} for i in ids]
+    return {"rows": rows, "ids": [str(i) for i in ids], "signal": signal, "flag": flag, "code": "없음", "cts": False}
 
 
-def test_multi_page_collects_all_pages_and_forwards_keys():
-    broker = _broker([
-        _page([_row("1"), _row("2")], cts="K1", flag="Y"),
-        _page([_row("3")], cts="K2", flag="Y"),
-        _page([_row("4")], cts="K2", flag="N"),            # 마지막 페이지 (flag=N 이면 cts 는 무시)
-    ])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert [r["orr_no"] for r in rows] == ["1", "2", "3", "4"]
-    sent = [c[2] for c in broker._session.calls]
-    assert sent == [None, {"cts": "K1", "cts_flag": "Y"}, {"cts": "K2", "cts_flag": "Y"}]
+def _judge(asc_ids, desc_ids, **kw):
+    broker = _broker([])
+    asc, desc = _resp([str(i) for i in asc_ids], **kw), _resp([str(i) for i in desc_ids])
+    return broker._judge_partition(asc, desc, "0", "0")
 
 
-def test_xa109_code_only_continuation():
-    """실제 장애 형태: 응답코드 XA109(+cts 헤더)로 다음 페이지를 알립니다. 마지막 페이지에는 코드가 없습니다."""
-    broker = _broker([
-        _page([_row("1"), _row("2")], cts="K1", code="XA109"),
-        _page([_row("3")]),
-    ])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert [r["orr_no"] for r in rows] == ["1", "2", "3"]
-    assert broker._session.calls[1][2] == {"cts": "K1"}
+def test_judge_under_cap_equal_sets_is_complete():
+    _union, verdict, complete = _judge(range(1, 9), range(8, 0, -1))
+    assert complete is True and verdict.startswith("완전")
 
 
-def test_missing_key_fails_closed():
-    """계속해야 하는데 cts 가 없으면 일부 이력으로 진행하지 않고 실패합니다 (SDK 는 조용히 멈춥니다)."""
-    for first in (_page([_row("1")], code="XA109"), _page([_row("1")], flag="Y"),
-                  _page([_row("1")], cts="  ", flag="Y")):
-        broker = _broker([first])
-        with pytest.raises(NHPlugPagingError, match="cts"):
-            broker._fetch_history_day("TQQQ", "20261117", "t")
+def test_judge_under_cap_with_signal_or_different_sets_is_contradiction():
+    assert _judge(range(1, 9), range(8, 0, -1), signal=True)[1].startswith("모순")
+    assert _judge(range(1, 9), range(7, 0, -1))[1].startswith("모순")
 
 
-def test_error_on_continuation_page_fails_closed_not_skipped(monkeypatch):
-    """(Codex P1) 1페이지는 받았는데 2페이지 조회가 오류면, 날짜 전체를 '건너뜀'으로 넘기지 않고 실패합니다."""
-    err = _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
-    broker = _broker([_page([_row("1")], cts="K1", flag="Y"), err])
-    with pytest.raises(NHPlugPagingError, match="2페이지"):
-        broker._fetch_history_day("TQQQ", "20261117", "t")
-    # 호출부(get_order_history)에서도 '건너뜀'으로 삼켜지지 않습니다
-    broker = _broker([_page([_row("1")], cts="K1", flag="Y"), err])
-    with pytest.raises(NHPlugPagingError):
-        _history(broker, monkeypatch)
+def test_judge_cap_hit_with_consistent_overlap_is_complete_and_covers_all():
+    """21건 재현: 오름 1~15, 내림 21~7 — 겹침 구간(7~15)이 양쪽에 모두 있고 합집합이 전체 21건."""
+    union, verdict, complete = _judge(range(1, 16), range(21, 6, -1))
+    assert complete is True and union == {str(i) for i in range(1, 22)}
 
 
+def test_judge_exactly_cap_orders_same_sets_is_complete():
+    assert _judge(range(1, 16), range(15, 0, -1))[2] is True
 
 
-def test_repeated_key_fails_closed():
-    broker = _broker([_page([_row("1")], cts="K1", flag="Y"), _page([_row("2")], cts="K1", flag="Y")])
-    with pytest.raises(NHPlugPagingError, match="반복"):
-        broker._fetch_history_day("TQQQ", "20261117", "t")
-    # 이전에 보냈던 키로 되돌아가는 순환도 막습니다
-    broker = _broker([_page([_row("1")], cts="A", flag="Y"), _page([_row("2")], cts="B", flag="Y"),
-                      _page([_row("3")], cts="A", flag="Y")])
-    with pytest.raises(NHPlugPagingError, match="반복"):
-        broker._fetch_history_day("TQQQ", "20261117", "t")
-
-
-def test_page_cap_fails_closed(monkeypatch):
-    monkeypatch.setattr(adapter_mod, "_MAX_HISTORY_PAGES", 3)
-    broker = _broker([_page([_row(str(i))], cts=f"K{i}", flag="Y") for i in range(1, 10)])
-    with pytest.raises(NHPlugPagingError, match="3페이지"):
-        broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert len(broker._session.calls) == 3
-
-
-def test_exactly_at_page_cap_succeeds(monkeypatch):
-    monkeypatch.setattr(adapter_mod, "_MAX_HISTORY_PAGES", 3)
-    broker = _broker([_page([_row("1")], cts="K1", flag="Y"), _page([_row("2")], cts="K2", flag="Y"),
-                      _page([_row("3")], flag="N")])
-    assert len(broker._fetch_history_day("TQQQ", "20261117", "t")) == 3
+def test_judge_cap_hit_without_overlap_is_incomplete_not_contradiction():
+    _union, verdict, complete = _judge(range(1, 16), range(40, 25, -1))
+    assert complete is False and verdict.startswith("불완전")
 
 
-# ── get_order_history: 호출부 ────────────────────────────────────────────────
+def test_judge_asymmetric_counts_fail_closed_even_when_sets_overlap():
+    """오름 15건·내림 5건: 오름이 상한이면 내림도 15건이어야 한다 — 겹치더라도 완전성을 증명하지 못한다."""
+    _union, verdict, complete = _judge(range(1, 16), range(15, 10, -1))
+    assert complete is False and "비대칭" in verdict
+    _union, verdict, complete = _judge(range(1, 16), [])                      # 내림이 비어 있는 경우
+    assert complete is False and verdict.startswith("모순")
 
-def _history(broker, monkeypatch, days=1):
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    monkeypatch.setattr(adapter_mod, "get_kst_now", lambda: datetime(2026, 11, 18, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")))
-    return broker.get_order_history("TQQQ", "NAS", days=days)
 
+def test_judge_inconsistent_overlap_range_fails_closed():
+    """오름 1~15, 내림이 10~14·16~25 (15 가 겹침 구간인데 내림에 없음) — 서로 일관되지 않은 응답."""
+    desc = [25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 14, 13, 12, 11, 10]
+    _union, verdict, complete = _judge(range(1, 16), desc)
+    assert complete is False and "겹침 구간" in verdict
 
 
+def test_judge_interleaved_ranges_without_common_order_fail_closed():
+    """오름 {1,3,..,29}, 내림 {2,4,..,30}: 구간은 겹치는데 공통 주문이 없음 (정렬 가정이 깨진 응답) — 겹침 구간 일관성 검사로 걸립니다."""
+    _union, verdict, complete = _judge(range(1, 30, 2), range(30, 0, -2))
+    assert complete is False and verdict.startswith("모순")
 
 
+def test_judge_response_above_cap_or_unsorted_or_duplicated_is_contradiction():
+    assert _judge(range(1, 17), range(16, 0, -1))[1].startswith("모순")        # 16건 > 상한
+    assert _judge([1, 3, 2], [3, 2, 1])[1].startswith("모순")                  # 오름 정렬 위반
+    assert _judge([1, 2, 2], [2, 1])[1].startswith("모순")                     # 중복
 
 
+def test_judge_filter_semantics_are_checked_for_partitions():
+    broker = _broker([])
+    asc = _resp(["1", "2"], side="1")                                        # 매수 필터인데 매도 행
+    desc = _resp(["2", "1"], side="1")
+    assert broker._judge_partition(asc, desc, "2", "0")[1].startswith("모순")
 
 
-
-# ── 진단 출력 (페이지별 건수·cts_flag·신호, 전체/고유 구분, 비교 조회) ───────────────
-
-def test_diag_per_page_lines_and_totals_without_secrets(capsys):
-    """페이지별 응답건수·cts_flag·신호·cts 응답/전달 여부와 전체/고유 건수를 출력하되 cts·주문번호 원문은 숨깁니다."""
-    broker = _broker([
-        _page([_row("A1"), _row("A2")], cts="SECRET-CTS-1", flag="Y"),
-        _page([_row("A2"), _row("A3")], cts="SECRET-CTS-2", flag="N"),   # A2 가 페이지 경계에서 중복
-    ])
-    broker._fetch_history_day("TQQQ", "20261117", "t")
-    out = capsys.readouterr().out
-    assert "페이지=1 응답건수=2 고유주문=2 cts_flag=Y 신호=없음 cts응답=있음 cts전달=아니오" in out
-    assert "페이지=2 응답건수=2 고유주문=2 cts_flag=N 신호=없음 cts응답=있음 cts전달=예" in out
-    assert "수집 완료: 페이지=2 전체수집=4건 고유주문=3건 종료사유=cts_flag=N" in out
-    assert "SECRET-CTS" not in out and "A1" not in out and "A3" not in out
-
-
-def test_diag_xa109_signal_shown(capsys):
-    broker = _broker([_page([_row("1")], cts="K", code="XA109"), _page([])])
-    broker._fetch_history_day("SOXL", "20261117", "t")
-    out = capsys.readouterr().out
-    assert "신호=XA109" in out and "종료사유=계속 신호 없음" in out
-
-
-def test_probe_runs_only_in_dry_and_never_changes_result(monkeypatch, capsys):
-    import config
-    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
-    # 본 조회 2페이지 + 비교 조회 4번 (비교 응답은 각기 다른 형태)
-    broker = _broker([
-        _page([_row("1"), _row("2")], cts="K1", code="XA109"),             # 1페이지
-        _page([_row("1"), _row("9")], cts="K1-b", flag="Y"),               # 비교1: 명세본문+헤더cts
-        _page([]),                                                         # 비교2
-        _Resp({"message": {"msg_code": "14580", "usr_msg": "장종료"}}),     # 비교3 (오류 — 삼켜져야 함)
-        _page([_row("1"), _row("2")]),                                     # 비교4: 1페이지 재조회
-        _page([_row("3")]),                                                # 본 조회 2페이지
-    ])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert [r["orr_no"] for r in rows] == ["1", "2", "3"]                  # 비교 조회가 결과에 섞이지 않음
-    out = capsys.readouterr().out
-    assert "명세본문(Input_0만)+헤더cts: 응답건수=2 고유주문=2 1페이지와겹침=1 새주문=1 cts_flag=Y" in out
-    assert "본문tr_cont=Y, 헤더cts없음: 조회 오류" in out
-    calls = broker._session.calls
-    assert calls[1][1] == {"Input_0": calls[0][1]["Input_0"]}              # 명세 본문은 Input_0 만
-    assert calls[2][1]["tr_cont"] == "Y" and calls[2][2] == {"cts": "K1"}
-    assert calls[3][2] is None and calls[3][1]["tr_cont"] == "Y"
-
-
-def test_probe_skipped_outside_dry(monkeypatch, capsys):
-    import config
-    monkeypatch.setattr(config, "TRADE_MODE", "LIVE")
-    broker = _broker([_page([_row("1")], cts="K1", code="XA109"), _page([_row("2")])])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert len(rows) == 2 and len(broker._session.calls) == 2              # 비교 조회 없음
-    assert "진단·비교" not in capsys.readouterr().out
-
-
-def test_probe_exceptions_are_swallowed(monkeypatch, capsys):
-    """비교 조회가 예외를 내도 본 조회 결과·흐름에 영향이 없습니다 (진단은 부수 효과 없음)."""
-    import config
-    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
-    broker = _broker([
-        _page([_row("1")], cts="K1", code="XA109"),    # 본 조회 1페이지
-        ValueError("boom"),                            # 비교1: 예외
-        _page([]), _page([]), _page([]),               # 비교2~4
-        _page([_row("2")]),                            # 본 조회 2페이지
-    ])
-    rows = broker._fetch_history_day("TQQQ", "20261117", "t")
-    assert [r["orr_no"] for r in rows] == ["1", "2"]
-    assert "조회 오류 ValueError" in capsys.readouterr().out
-
-
-# ── 누락 주문 분할 진단 (DRY 한정, 조회 전용) ─────────────────────────────────
-
-def _dry(monkeypatch):
-    import config
-    monkeypatch.setattr(config, "TRADE_MODE", "DRY")
-
-
-def _missing(*ids, session="2026-11-17"):
-    return [{"odno": i, "session": session, "submitted_at": "20261118052334"} for i in ids]
-
-
-
-
-
-
-
-
-
-
-
-
-def test_trading_bot_hook_only_runs_probe_in_dry(monkeypatch):
-    import trading_bot
-    import state as state_module
-
-    calls = []
-
-    class _B:
-        def diag_probe_missing_orders(self, symbol, exchange, missing):
-            calls.append((symbol, exchange, missing))
-
-    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "LIVE")
-    trading_bot._diag_probe_missing_reverse_orders(_B(), "SOXL", "AMS")
-    assert calls == [] and state_module._DIAG_MISSING_REVERSE == {}               # LIVE: 호출 없이 비움
-    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-    trading_bot._diag_probe_missing_reverse_orders(_B(), "SOXL", "AMS")
-    assert len(calls) == 1 and calls[0][2][0]["odno"] == "X"
-    # 진단 오류는 매매 흐름으로 새지 않음
-    class _Bad:
-        def diag_probe_missing_orders(self, *a):
-            raise RuntimeError("x")
-    state_module._DIAG_MISSING_REVERSE["Y"] = {"odno": "Y", "session": "", "submitted_at": ""}
-    trading_bot._diag_probe_missing_reverse_orders(_Bad(), "SOXL", "AMS")
-
-
-def test_trading_bot_hook_reaches_real_broker_behind_dry_wrapper(monkeypatch):
-    """(2026-11-19 DRY 에서 진단이 실행되지 않은 원인) DRY 의 broker 는 DryBroker 래퍼라 진단 메서드가 바로 보이지 않습니다.
-    래퍼 뒤의 실제 브로커(_real)의 진단 메서드를 찾아 호출해야 합니다."""
-    import trading_bot
-    import state as state_module
-    from broker.base import DryBroker
-
-    calls = []
-
-    class _Real:
-        def diag_probe_missing_orders(self, symbol, exchange, missing):
-            calls.append((symbol, [m["odno"] for m in missing]))
-
-    wrapper = DryBroker.__new__(DryBroker)       # 래퍼는 속성 _real 로 실제 브로커를 가집니다
-    wrapper._real = _Real()
-    assert getattr(wrapper, "diag_probe_missing_orders", None) is None     # 래퍼에는 직접 없음 — 위 문제의 재현
-    state_module._DIAG_MISSING_REVERSE["Z"] = {"odno": "Z", "session": "2026-11-17", "submitted_at": ""}
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-    trading_bot._diag_probe_missing_reverse_orders(wrapper, "SOXL", "AMS")
-    assert calls == [("SOXL", ["Z"])]
-
-
-# ── DRY 실행 전 검증: DryBroker → _real → NHPlugBroker 실제 경로 (외부 호출 없음) ─────────────
-
-def _real_dry_chain(responses):
-    """실제 DryBroker(래퍼) 가 실제 NHPlugBroker(가짜 세션) 를 감싼 구조 — 운영 DRY 의 broker 와 같은 형태."""
-    from broker.base import DryBroker
-    real = _broker(responses)
-    return DryBroker(real), real
-
-
-
-
-def test_hook_reports_when_probe_unavailable_instead_of_silent(monkeypatch, capsys):
-    import trading_bot
-    import state as state_module
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
-    trading_bot._diag_probe_missing_reverse_orders(object(), "SOXL", "AMS")    # 진단 메서드 없는 브로커
-    assert "진단 불가" in capsys.readouterr().out
-
-
-def test_hook_reports_probe_failure_instead_of_silent(monkeypatch, capsys):
-    import trading_bot
-    import state as state_module
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-
-    class _Bad:
-        def diag_probe_missing_orders(self, *a):
-            raise RuntimeError("boom")
-
-    state_module._DIAG_MISSING_REVERSE["X"] = {"odno": "X", "session": "2026-11-17", "submitted_at": ""}
-    trading_bot._diag_probe_missing_reverse_orders(_Bad(), "SOXL", "AMS")      # 예외는 밖으로 나가지 않되
-    out = capsys.readouterr().out
-    assert "진단 시작" in out and "진단 건너뜀(오류): RuntimeError" in out        # 조용히 사라지지도 않음
-
-
-def test_hook_is_wired_into_run_one_symbol_after_settlement():
-    """훅이 run_one_symbol 안에서 update_T_from_history(정산·누락 수집) 직후에 호출되도록 연결돼 있어야 합니다."""
-    import ast
-    import pathlib
-    src = (pathlib.Path(__file__).resolve().parents[1] / "trading_bot.py").read_text(encoding="utf-8")
-    func = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "run_one_symbol")
-    calls = [n for n in ast.walk(func) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-    update = min(c.lineno for c in calls if c.func.id == "update_T_from_history")
-    hook = [c.lineno for c in calls if c.func.id == "_diag_probe_missing_reverse_orders"]
-    assert hook and min(hook) > update and min(hook) - update <= 3
-
-
-
-# ── 15건 상한 우회(방향×체결 분할 + 오름·내림 1페이지) — 서버 동작을 흉내 낸 합성 데이터 ─────────────
+# ── 서버 동작을 흉내 낸 합성 데이터 (15건 상한·정렬·필터·신호) ──────────────────────────────────
 
 class _FakeServer:
     """GSB10030 흉내: 한 조회 15건 상한, 정렬·방향·체결 필터 적용, orr_no 필터는 무시,
-    상한을 넘으면 1페이지에 cts_flag=Y + XA109 신호를 주고 cts 를 실은 2페이지는 비어 있음 (2026-11-19 DRY 관측과 같은 동작)."""
+    상한을 넘으면 1페이지에 cts_flag=Y + XA109 신호 (2026-11-19 DRY 관측과 같은 동작)."""
 
     def __init__(self, rows, cap=15, ignore_sort=False, ignore_side=False, signal_below_cap=False):
         self.rows, self.cap = rows, cap
@@ -435,8 +204,6 @@ class _FakeServer:
     def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
         inp = json_body["Input_0"]
         self.calls.append((inp, extra_headers))
-        if extra_headers and extra_headers.get("cts"):
-            return _page([], flag="N")
         rows = [r for r in self.rows if r["orr_dt"] == inp["orr_dt"]]
         if not self.ignore_side and inp["oss_sby_dit_cd"] in ("1", "2"):
             rows = [r for r in rows if r["sby_dit_nm"] == inp["oss_sby_dit_cd"]]
@@ -453,7 +220,7 @@ class _FakeServer:
 
 
 def _dataset(buy_open=0, buy_filled=0, sell_open=0, sell_filled=0, buy_canceled=0, sell_canceled=0, start=1000001):
-    """주문번호가 종류별로 섞이도록 번갈아 배정한 합성 이력."""
+    """주문번호가 종류별로 섞이도록 배정한 합성 이력."""
     # (방향, 체결수량, 미체결수량): 0체결 종결(취소·거부)은 체결수량·미체결수량이 모두 0 — 체결/미체결 필터 어디에도 들지 않음
     kinds = ([("2", 0, 1)] * buy_open + [("2", 1, 0)] * buy_filled + [("1", 0, 1)] * sell_open + [("1", 1, 0)] * sell_filled
              + [("2", 0, 0)] * buy_canceled + [("1", 0, 0)] * sell_canceled)
@@ -476,140 +243,6 @@ def _ids(rows):
     return {str(r["orr_no"]) for r in rows}
 
 
-def test_partitioning_recovers_rows_beyond_the_cap_when_each_partition_fits(monkeypatch):
-    """22건(15건 상한 초과): 기존 전체 조회는 15건에서 잘리지만, 분할하면 모든 분할이 상한 미만이라 전부 모입니다."""
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=12, buy_filled=5, sell_open=3, sell_filled=2)
-    server = _FakeServer(rows)
-    broker = _server_broker(server)
-    assert len(broker._fetch_history_day("SOXL", "20261117", "t", quiet=True)) == 15          # 기존 방식은 잘림
-    union, complete = broker._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is True and union == _ids(rows) and len(union) == 22
-
-
-def test_partition_hitting_cap_is_complete_only_when_ascending_and_descending_overlap(monkeypatch):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=20, buy_filled=1, sell_open=2)                                    # 매수·미체결 20건 → 오름15·내림15 겹침
-    union, complete = _server_broker(_FakeServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is True and union == _ids(rows) and len(union) == 23                       # 겹친 주문은 한 번만 셈
-
-
-def test_partition_with_30_or_more_is_incomplete_fail_closed(monkeypatch):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=40, sell_open=2)                                                  # 오름15·내림15 겹침 없음 → 가운데 10건 미확인
-    union, complete = _server_broker(_FakeServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False and len(union) < 42
-
-
-def test_filter_ignored_is_a_contradiction_not_complete(monkeypatch, capsys):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=3, sell_open=3)
-    _, complete = _server_broker(_FakeServer(rows, ignore_side=True))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False
-    assert "모순(" in capsys.readouterr().out
-
-
-def test_sort_ignored_is_a_contradiction_not_complete(monkeypatch, capsys):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=5, buy_filled=1)
-    _, complete = _server_broker(_FakeServer(rows, ignore_sort=True))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False and "정렬 방향이 요청과 다름" in capsys.readouterr().out
-
-
-def test_pagination_signal_contradicting_row_count_is_incomplete(monkeypatch, capsys):
-    """연속조회 신호는 있는데 반환이 상한 미만 — 신호와 데이터가 모순이므로 완전하다고 보지 않습니다."""
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=4)
-    _, complete = _server_broker(_FakeServer(rows, signal_below_cap=True))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False and "연속조회 신호가 있는데 상한 미만" in capsys.readouterr().out
-
-
-def test_probe_reads_only_first_page_and_never_sends_cts(monkeypatch):
-    """역순 조회의 cts 반복 오류를 피하려고 진단 조회는 첫 페이지만 읽고 cts 를 보내지 않습니다."""
-    _dry(monkeypatch)
-    server = _FakeServer(_dataset(buy_open=20))
-    _server_broker(server)._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert len(server.calls) == 4                                                              # 2분할(매수·매도) × (오름, 내림)
-    assert all(extra is None for _inp, extra in server.calls)
-    descs = [inp for inp, _ in server.calls if inp["sot_dit"] == "1"]
-    assert len(descs) == 2
-
-
-def test_full_probe_through_dry_broker_chain_reports_final_findings_without_secrets(monkeypatch, capsys):
-    """DryBroker → _real(NHPlugBroker) 경로에서 진단 전체(기존 조회 / 역순 1페이지 / 분할)가 돌고, 시작 로그가 나오며,
-    원문 주문번호·cts 가 출력되지 않습니다."""
-    import trading_bot
-    import state as state_module
-    from broker.base import DryBroker
-    _dry(monkeypatch)
-    monkeypatch.setattr(trading_bot, "TRADE_MODE", "DRY")
-    rows = _dataset(buy_open=13, buy_filled=4, sell_open=3, sell_filled=2)                      # 22건 > 15
-    known = sorted(_ids(rows))
-    missing_ids = [known[-1], known[-2], known[-3]]                                            # 기존 조회(오름 15건)에는 안 나오는 가장 새 주문들
-    state_module._DIAG_MISSING_REVERSE.clear()
-    for odno in missing_ids:
-        state_module._DIAG_MISSING_REVERSE[odno] = {"odno": odno, "session": "2026-11-17", "submitted_at": ""}
-    real = _server_broker(_FakeServer(rows))
-    trading_bot._diag_probe_missing_reverse_orders(DryBroker(real), "SOXL", "AMS")
-    out = capsys.readouterr().out
-    assert "진단 시작: SOXL 누락 리버스 주문 3건" in out and "진단 종료: SOXL" in out
-    assert "① 기존 전체 조회: 반환=15건" in out and "누락주문발견=0/3" in out                    # 기존 조회로는 못 찾음
-    assert "② 전체 역순 1페이지: 반환=15건" in out and "정렬=내림" in out and "누락주문발견=3/3" in out  # 역순 1페이지는 가장 새 주문을 줌
-    assert "누락주문 최종발견=3/3 완전성=보장" in out
-    for odno in known:
-        assert odno not in out
-
-
-def test_partial_fill_appears_in_both_fill_partitions_and_is_counted_once(monkeypatch):
-    """부분체결 주문(체결수량>0 이면서 미체결수량>0)은 체결·미체결 분할 양쪽에 나오는 것이 정상입니다 — 합집합에서 한 번만 셉니다."""
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=3)
-    rows.append({"orr_no": "1000099", "orr_dt": "20261117", "iem_nm": "SOXL", "sby_dit_nm": "2",
-                 "orr_qty": "2", "cns_qty": "1", "cns_pr": "50.0", "ny_cns_orr_qty": "1"})
-    union, complete = _server_broker(_FakeServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is True and union == _ids(rows) and len(union) == 4
-
-
-class _SideOverlapServer(_FakeServer):
-    """매수·매도 필터는 무시하지 않지만 매도 분할에도 같은 주문을 돌려주는 모순된 서버."""
-
-    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
-        inp = json_body["Input_0"]
-        if inp["oss_sby_dit_cd"] == "1":
-            inp = {**inp, "oss_sby_dit_cd": "2"}
-            json_body = {**json_body, "Input_0": inp}
-        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
-
-
-def test_same_order_in_buy_and_sell_partitions_is_a_contradiction(monkeypatch, capsys):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=4)
-    # 매도 분할이 매수 행을 돌려주면 행 내용 검증(매도 필터인데 매수 행)에서 이미 모순으로 걸립니다
-    _, complete = _server_broker(_SideOverlapServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False and "모순(" in capsys.readouterr().out
-
-
-class _DescDiffersServer(_FakeServer):
-    """상한 미만인데 내림 조회가 오름 조회와 다른 집합을 돌려주는 서버."""
-
-    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
-        page = super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
-        if json_body["Input_0"]["sot_dit"] == "1" and page.json()["Output_0"]:
-            data = page.json()
-            data["Output_0"] = data["Output_0"][:-1]                  # 한 건 빠짐 (내림 정렬은 유지)
-            return _Resp(data, page.headers)
-        return page
-
-
-def test_below_cap_but_descending_set_differs_is_a_contradiction(monkeypatch, capsys):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=5)
-    _, complete = _server_broker(_DescDiffersServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert complete is False and "상한 미만인데 오름·내림 집합이 다름" in capsys.readouterr().out
-
-
-# ── get_order_history 실제 수집 경로 (오름·내림 조합 / 분할 / Fail-Closed) ─────────────────────────
-
 def _history_via_server(server, monkeypatch, days=1):
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -621,16 +254,16 @@ def _history_ids(history):
     return {h["odno"] for h in history}
 
 
+# ── get_order_history 실제 수집 경로 (오름·내림 조합 / 분할 / Fail-Closed) ─────────────────────────
+
 def test_21_orders_all_restored_in_history_path_including_the_six_missing(monkeypatch, capsys):
-    """2026-11-17 SOXL 재현: 하루 21건(미체결 다수). 기존 방식은 15건에서 잘려 가장 새 주문 6건이 빠졌지만,
+    """2026-11-17 SOXL 재현: 하루 21건(미체결 다수). 오름 첫 페이지만으로는 15건에서 잘려 가장 새 주문 6건이 빠지지만,
     수집 경로가 오름·내림 첫 페이지를 조합해 21건 전부를 정산용 이력 행으로 돌려줍니다."""
-    _dry(monkeypatch)
     rows = _dataset(buy_open=15, buy_filled=3, sell_open=3)
     assert len(rows) == 21
     newest_six = sorted(_ids(rows), key=int)[-6:]
-    server = _FakeServer(rows)
-    broker = _server_broker(server)
-    assert not (set(newest_six) & {r["orr_no"] for r in broker._fetch_history_day("SOXL", "20261117", "t", quiet=True)})  # 기존 방식은 6건 누락
+    first_page = _server_broker(_FakeServer(rows))._probe_page1("SOXL", "20261117", "t", {"sot_dit": "0"})
+    assert not (set(newest_six) & set(first_page["ids"]))                       # 오름 첫 페이지에는 6건이 없다
     history = _history_via_server(_FakeServer(rows), monkeypatch)
     assert _history_ids(history) == _ids(rows) and len(history) == 21
     assert set(newest_six) <= _history_ids(history)
@@ -639,7 +272,6 @@ def test_21_orders_all_restored_in_history_path_including_the_six_missing(monkey
 
 def test_history_rows_keep_settlement_fields_for_filled_open_and_partial(monkeypatch):
     """체결·미체결·부분체결 행이 정산에 필요한 수량·상태 필드로 그대로 보존됩니다."""
-    _dry(monkeypatch)
     rows = _dataset(buy_open=14, buy_filled=2)
     rows.append({"orr_no": "1000099", "orr_dt": "20261117", "iem_nm": "SOXL", "sby_dit_nm": "2",
                  "orr_qty": "4", "cns_qty": "1", "cns_pr": "51.5", "ny_cns_orr_qty": "3"})            # 부분체결
@@ -656,37 +288,57 @@ def test_history_rows_keep_settlement_fields_for_filled_open_and_partial(monkeyp
 
 def test_under_cap_day_is_returned_directly_without_extra_calls(monkeypatch):
     """15건 미만이고 계속 신호도 없는 날짜는 기존처럼 한 번의 조회로 끝납니다 (추가 호출 없음)."""
-    _dry(monkeypatch)
     server = _FakeServer(_dataset(buy_open=8))
-    history = _history_via_server(server, monkeypatch)
-    assert len(history) == 8
-    assert len(server.calls) == 2                                                                  # 두 날짜(20261117·20261118) × 1회
+    assert len(_history_via_server(server, monkeypatch)) == 8
+    assert len(server.calls) == 2                                                  # 두 날짜(20261117·20261118) × 1회
 
 
-def test_30_or_more_orders_recovered_by_partition_when_each_partition_fits(monkeypatch, capsys):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=20, buy_filled=8, sell_open=7)                                        # 35건: 전체 오름15·내림15 는 겹치지 않음
+def test_exactly_cap_orders_day_is_complete(monkeypatch):
+    rows = _dataset(buy_open=10, sell_open=5)                                      # 정확히 15건
+    assert _history_ids(_history_via_server(_FakeServer(rows), monkeypatch)) == _ids(rows)
+
+
+def test_30_or_more_orders_recovered_by_side_partition_when_each_side_fits(monkeypatch, capsys):
+    rows = _dataset(buy_open=20, buy_filled=8, sell_open=7)                        # 35건: 전체 오름15·내림15 는 겹치지 않음
     history = _history_via_server(_FakeServer(rows), monkeypatch)
     assert _history_ids(history) == _ids(rows) and len(history) == 35
     assert "방향(매수/매도) 분할로 완전 수집: 35건" in capsys.readouterr().out
 
 
-def test_30_or_more_in_one_partition_fails_closed(monkeypatch):
-    _dry(monkeypatch)
+def test_30_or_more_in_one_side_fails_closed(monkeypatch):
     with pytest.raises(NHPlugPagingError, match="완전성 확인 실패"):
         _history_via_server(_FakeServer(_dataset(buy_open=40)), monkeypatch)
 
 
+def test_zero_fill_terminal_orders_are_preserved_when_partitioning(monkeypatch):
+    """(Codex P1) 체결수량·미체결수량이 모두 0인 취소·거부 주문은 체결/미체결 필터에 안 걸립니다. 30건 이상 날짜를
+    방향으로만 분할해 이런 주문(리버스 취소 기록 등)이 조용히 빠지지 않아야 합니다."""
+    rows = _dataset(buy_filled=6, buy_open=6, buy_canceled=8, sell_filled=4, sell_open=4, sell_canceled=3)   # 31건
+    history = _history_via_server(_FakeServer(rows), monkeypatch)
+    assert _history_ids(history) == _ids(rows) and len(history) == 31
+    assert len([h for h in history if h["ft_ccld_qty"] == "0" and h["nccs_qty"] == "0"]) == 11
+
+
 def test_filter_mismatch_in_partition_fails_closed(monkeypatch):
-    _dry(monkeypatch)
     with pytest.raises(NHPlugPagingError, match="모순"):
         _history_via_server(_FakeServer(_dataset(buy_open=20, buy_filled=8, sell_open=7), ignore_side=True), monkeypatch)
 
 
 def test_sort_mismatch_fails_closed(monkeypatch):
-    _dry(monkeypatch)
     with pytest.raises(NHPlugPagingError, match="정렬 방향"):
         _history_via_server(_FakeServer(_dataset(buy_open=16), ignore_sort=True), monkeypatch)
+
+
+def test_unsorted_response_below_cap_fails_closed(monkeypatch):
+    """상한 미만이어도 요청한 정렬(오름)이 지켜지지 않은 응답은 믿지 않습니다."""
+    with pytest.raises(NHPlugPagingError, match="정렬 방향"):
+        _history_via_server(_FakeServer(list(reversed(_dataset(buy_open=8))), ignore_sort=True), monkeypatch)
+
+
+def test_continuation_signal_with_under_cap_rows_is_not_trusted(monkeypatch):
+    """15건 미만인데 연속조회 신호가 있으면(신호와 데이터 모순) 바로 반환하지 않고 완전성 확인으로 넘어가 실패합니다."""
+    with pytest.raises(NHPlugPagingError, match="연속조회 신호가 있는데 상한 미만"):
+        _history_via_server(_FakeServer(_dataset(buy_open=4), signal_below_cap=True), monkeypatch)
 
 
 class _AsymmetricServer(_FakeServer):
@@ -700,9 +352,26 @@ class _AsymmetricServer(_FakeServer):
 
 
 def test_asymmetric_response_fails_closed(monkeypatch):
-    _dry(monkeypatch)
     with pytest.raises(NHPlugPagingError):
         _history_via_server(_AsymmetricServer(_dataset(buy_open=18)), monkeypatch)
+
+
+class _ShortDescServer(_FakeServer):
+    """내림 조회가 가장 큰 5건만 돌려주는 서버 (상한 15 보다 적게 — 오름과는 겹칠 수 있음)."""
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        page = super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+        if json_body["Input_0"]["sot_dit"] == "1" and len(page.json()["Output_0"]) == 15:
+            data = page.json()
+            data["Output_0"] = data["Output_0"][:5]
+            return _Resp(data, page.headers)
+        return page
+
+
+def test_overlapping_but_asymmetric_counts_fail_closed_in_history_path(monkeypatch):
+    """오름 15건·내림 5건이 겹쳐도(내림이 잘렸을 가능성) 완전하다고 보지 않고 실패합니다."""
+    with pytest.raises(NHPlugPagingError):
+        _history_via_server(_ShortDescServer(_dataset(buy_open=17)), monkeypatch)
 
 
 class _ConflictServer(_FakeServer):
@@ -719,60 +388,14 @@ class _ConflictServer(_FakeServer):
 
 
 def test_conflicting_duplicate_order_fails_closed(monkeypatch):
-    _dry(monkeypatch)
     with pytest.raises(NHPlugPagingError):
         _history_via_server(_ConflictServer(_dataset(buy_open=20)), monkeypatch)
 
 
 def test_identical_duplicate_across_ascending_and_descending_is_counted_once(monkeypatch):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=20)                                                                    # 오름·내림이 10건 겹침
+    rows = _dataset(buy_open=20)                                                   # 오름·내림이 10건 겹침
     history = _history_via_server(_FakeServer(rows), monkeypatch)
     assert len(history) == 20 and _history_ids(history) == _ids(rows)
-
-
-class _FailingServer(_FakeServer):
-    def __init__(self, rows, fail_on):
-        super().__init__(rows)
-        self.fail_on = fail_on
-
-    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
-        inp = json_body["Input_0"]
-        if self.fail_on(inp):
-            return _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
-        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
-
-
-@pytest.mark.parametrize("fail_on", [
-    lambda inp: True,                                                                               # 첫(오름) 조회부터 오류
-    lambda inp: inp["sot_dit"] == "1" and inp["oss_sby_dit_cd"] == "0",                              # 내림 조회 오류
-    lambda inp: inp["oss_sby_dit_cd"] == "2" and inp["sot_dit"] == "1",                              # 분할(매수·내림) 조회 오류
-])
-def test_query_failure_fails_closed_instead_of_skipping_the_date(monkeypatch, fail_on):
-    """날짜별 BrokerError 를 '건너뜀'으로 넘기지 않습니다 — 그 날짜의 체결이 이력에서 사라져 정산이 틀어지는 것을 막습니다."""
-    _dry(monkeypatch)
-    with pytest.raises(NHPlugPagingError, match="일부 이력만으로 진행하지 않습니다"):
-        _history_via_server(_FailingServer(_dataset(buy_open=20, buy_filled=8, sell_open=7), fail_on), monkeypatch)
-
-
-def test_other_dates_still_work_when_no_error(monkeypatch):
-    _dry(monkeypatch)
-    rows = _dataset(buy_open=3) + [{**r, "orr_dt": "20261118", "orr_no": str(2000000 + i)} for i, r in enumerate(_dataset(sell_open=2))]
-    assert len(_history_via_server(_FakeServer(rows), monkeypatch)) == 5
-
-
-def test_continuation_signal_with_under_cap_rows_is_not_trusted(monkeypatch):
-    """15건 미만인데 연속조회 신호가 있으면(신호와 데이터 모순) 바로 반환하지 않고 완전성 확인으로 넘어가 실패합니다."""
-    _dry(monkeypatch)
-    with pytest.raises(NHPlugPagingError, match="연속조회 신호가 있는데 상한 미만"):
-        _history_via_server(_FakeServer(_dataset(buy_open=4), signal_below_cap=True), monkeypatch)
-
-
-def test_unsorted_response_below_cap_fails_closed(monkeypatch):
-    """상한 미만이어도 요청한 정렬(오름)이 지켜지지 않은 응답은 믿지 않습니다."""
-    _dry(monkeypatch)
-    with pytest.raises(NHPlugPagingError, match="정렬 방향"):
-        _history_via_server(_FakeServer(list(reversed(_dataset(buy_open=8))), ignore_sort=True), monkeypatch)   # 오름 요청에 내림으로 응답
 
 
 class _BadAllDescServer(_FakeServer):
@@ -787,29 +410,84 @@ class _BadAllDescServer(_FakeServer):
 
 def test_contradiction_in_all_orders_check_is_not_rescued_by_partitions(monkeypatch):
     """전체 오름·내림 조합이 모순(정렬 위반)이면 분할이 정상이어도 서버 응답을 신뢰할 수 없으므로 실패합니다."""
-    _dry(monkeypatch)
     with pytest.raises(NHPlugPagingError, match="모순"):
         _history_via_server(_BadAllDescServer(_dataset(buy_open=20)), monkeypatch)
 
 
-def test_zero_fill_terminal_orders_are_preserved_when_partitioning(monkeypatch):
-    """(Codex P1) 체결수량·미체결수량이 모두 0인 취소·거부 주문은 체결/미체결 필터에 안 걸립니다. 30건 이상 날짜를
-    방향으로만 분할해 이런 주문(리버스 취소 기록 등)이 조용히 빠지지 않아야 합니다."""
-    _dry(monkeypatch)
-    rows = _dataset(buy_filled=6, buy_open=6, buy_canceled=8, sell_filled=4, sell_open=4, sell_canceled=3)   # 31건
-    assert len(rows) == 31
+class _FailingServer(_FakeServer):
+    def __init__(self, rows, fail_on):
+        super().__init__(rows)
+        self.fail_on = fail_on
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        if self.fail_on(json_body["Input_0"]):
+            return _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
+        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+
+
+@pytest.mark.parametrize("fail_on", [
+    lambda inp: True,                                                              # 첫(오름) 조회부터 오류
+    lambda inp: inp["sot_dit"] == "1" and inp["oss_sby_dit_cd"] == "0",            # 내림 조회 오류
+    lambda inp: inp["oss_sby_dit_cd"] == "2" and inp["sot_dit"] == "1",            # 분할(매수·내림) 조회 오류
+])
+def test_query_failure_fails_closed_instead_of_skipping_the_date(monkeypatch, fail_on):
+    """날짜별 BrokerError 를 '건너뜀'으로 넘기지 않습니다 — 그 날짜의 체결이 이력에서 사라져 정산이 틀어지는 것을 막습니다."""
+    with pytest.raises(NHPlugPagingError, match="일부 이력만으로 진행하지 않습니다"):
+        _history_via_server(_FailingServer(_dataset(buy_open=20, buy_filled=8, sell_open=7), fail_on), monkeypatch)
+
+
+def test_multiple_dates_are_collected_independently(monkeypatch):
+    rows = _dataset(buy_open=3) + [{**r, "orr_dt": "20261118", "orr_no": str(2000000 + i)} for i, r in enumerate(_dataset(sell_open=2))]
+    assert len(_history_via_server(_FakeServer(rows), monkeypatch)) == 5
+
+
+# ── SOXL 리버스 미체결 주문 정산 회귀 (2026-11-17: 누락 6건 → RECONCILIATION_PENDING) ────────────────
+
+def _history_with_open_tail():
+    """21건: 앞쪽 3건은 체결, 나머지 18건은 미체결 (가장 새 주문 6건은 전부 미체결 리버스 추가매수)."""
+    rows = []
+    for n in range(21):
+        filled = n < 3
+        rows.append({"orr_no": str(1000001 + n), "orr_dt": "20261117", "iem_nm": "SOXL", "sby_dit_nm": "2",
+                     "orr_qty": "1", "cns_qty": "1" if filled else "0", "cns_pr": "50.0", "ny_cns_orr_qty": "0" if filled else "1"})
+    return rows
+
+
+def _soxl_reverse_state(order_ids):
+    meta = {"side": "BUY", "total_qty": 1, "processed_filled_qty": 0, "reverse_action": "buy", "reverse_day": 4,
+            "cycle_id": "C1", "submitted_at": "20261118052334", "submitted_session": "2026-11-17"}
+    return {"T": 18.0, "reverse_mode": {"active": True, "cycle_id": "C1", "day_count": 3},
+            "orders_meta": {oid: dict(meta) for oid in order_ids}}
+
+
+def test_soxl_reverse_unfilled_orders_settle_when_history_is_complete(monkeypatch):
+    """하루 21건 중 가장 새 주문 6건이 SOXL 리버스 추가매수(미체결): 완전한 이력이면 6건 모두 이전 세션 미체결로 확인되어
+    만료 가정(자동 종결)되고 보류(reverse_order_history_missing)가 생기지 않습니다."""
+    import config
+    from state import reconcile_reverse_fills
+    monkeypatch.setattr(config, "BROKER_MODE", "demo")
+    rows = _history_with_open_tail()
+    newest_six = sorted(_ids(rows), key=int)[-6:]
     history = _history_via_server(_FakeServer(rows), monkeypatch)
-    assert _history_ids(history) == _ids(rows) and len(history) == 31
-    canceled = [h for h in history if h["ft_ccld_qty"] == "0" and h["nccs_qty"] == "0"]
-    assert len(canceled) == 11                                                                      # 0체결 종결 11건 보존
+    state = _soxl_reverse_state(newest_six)
+    reconcile_reverse_fills(state, history)
+    metas = state["orders_meta"]
+    assert all(metas[i].get("terminal") and metas[i].get("terminal_assumed") for i in newest_six)
+    assert state["reverse_mode"].get("reconciliation_error") is None
+    assert state["reverse_mode"].get("reconciliation_only") is None
+    assert state["T"] == 18.0                                                      # 체결 0 → T 변화 없음
 
 
-def test_fill_based_partitions_would_have_lost_zero_fill_orders(monkeypatch):
-    """회귀 근거: 체결/미체결로만 나누면 0체결 종결 주문은 어느 쪽에도 없다 (서버 흉내가 실제 필터 의미를 따름)."""
-    rows = _dataset(buy_filled=2, buy_open=2, buy_canceled=3)
-    server = _FakeServer(rows)
-    for fill in ("1", "2"):
-        page = server.request("POST", "/x", "t", {"Input_0": {"orr_dt": "20261117", "oss_sby_dit_cd": "0", "sot_dit": "0",
-                                                                 "ost_cns_dit": fill, "iem_cd": "SOXL", "orr_no": None}})
-        got = {str(r["orr_no"]) for r in page.json()["Output_0"]}
-        assert not (got & {r["orr_no"] for r in rows if r["cns_qty"] == "0" and r["ny_cns_orr_qty"] == "0"})
+def test_soxl_reverse_orders_still_hold_when_history_is_truncated(monkeypatch):
+    """대조: 오름 첫 페이지(15건)만 쓰던 이전 방식에서는 같은 6건이 이력에 없어 보류됩니다 (수정 전 증상)."""
+    import config
+    from state import reconcile_reverse_fills
+    monkeypatch.setattr(config, "BROKER_MODE", "real")                             # 만료 가정 경로를 타지 않게
+    rows = _history_with_open_tail()
+    newest_six = sorted(_ids(rows), key=int)[-6:]
+    first_page = _server_broker(_FakeServer(rows))._probe_page1("SOXL", "20261117", "t", {"sot_dit": "0"})
+    broker = _broker([])
+    truncated = [broker._normalize_unexecuted_item(r) for r in first_page["rows"]]
+    state = _soxl_reverse_state(newest_six)
+    reconcile_reverse_fills(state, truncated)
+    assert state["reverse_mode"].get("reconciliation_error") == "reverse_order_history_missing"

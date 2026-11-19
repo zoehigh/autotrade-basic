@@ -69,16 +69,13 @@ from broker.nhplug.order_types import (
 # 00048: 실측 확인 — 모의투자 매수주문이완료 (GH 로그 2026-08-31 00048/완료 + 잔고 3주/2주 보유 실증)
 _SUCCESS_RSP_CODES = {"00000", "00166", "00221", "13578", "XA102", "00048"}
 
-# 연속조회(다음 페이지 있음)를 응답 코드로 알리는 코드 (공식 SDK CONTINUE_CODES, XA109=모의투자).
-# 연속조회를 처리하는 호출(meta 를 넘긴 호출)에서만 오류가 아닌 "계속"으로 받습니다. 그 외 호출은 기존대로 오류입니다.
+# "다음 페이지 있음"을 응답 코드로 알리는 코드 (공식 SDK CONTINUE_CODES, XA109=모의투자).
+# 주문이력 조회(meta 를 넘긴 호출)에서만 오류가 아닌 "계속 신호"로 받아 완전성 판정에 씁니다. 그 외 호출은 기존대로 오류입니다.
 _CONTINUE_CODES = {"XA109", "00165", "00218"}
-
-# 날짜 하나의 주문체결내역 연속조회 페이지 상한 — 넘으면 조용히 자르지 않고 실패시킵니다(Fail-Closed).
-_MAX_HISTORY_PAGES = 30
 
 
 class NHPlugPagingError(BrokerError):
-    """연속조회를 끝까지 완료하지 못했습니다 (키 누락·키 반복·페이지 상한). 일부 데이터로 진행하면 안 됩니다."""
+    """하루치 주문이력을 완전하게 모았다고 증명하지 못했습니다 (필터·정렬·건수 모순, 조회 오류 등). 일부 이력으로 정산하면 안 됩니다."""
 
 
 class NHPlugBroker(Broker):
@@ -234,15 +231,13 @@ class NHPlugBroker(Broker):
         token: str,
         retry_network: bool = True,
         domain: str | None = None,
-        extra_headers: dict | None = None,
         meta: dict | None = None,
     ) -> dict:
         """
         NHPLUG API 요청 래퍼 — rate-limit/타임아웃 재시도 포함.
 
-        연속조회(cts)를 쓰는 호출만 `extra_headers`(요청 헤더 cts·cts_flag)와 `meta`(출력용 dict)를 넘깁니다.
-        meta 를 넘기면 응답 헤더(`meta["headers"]`, 소문자 키)와 연속조회 응답코드(`meta["continue_code"]`,
-        XA109 등)를 돌려받고, 그 코드는 오류가 아니라 "다음 페이지 있음"으로 받습니다.
+        주문이력 조회만 `meta`(출력용 dict)를 넘깁니다. meta 를 넘기면 응답 헤더(`meta["headers"]`, 소문자 키)와
+        "다음 페이지 있음" 응답코드(`meta["continue_code"]`, XA109 등)를 돌려받고, 그 코드는 오류로 처리하지 않습니다.
         meta 를 넘기지 않는 기존 호출은 동작이 달라지지 않습니다.
 
         - rate-limit(HTTP 429 또는 message 봉투의 rate-limit 코드):
@@ -276,15 +271,9 @@ class NHPlugBroker(Broker):
             try:
                 for _ in range(MAX_RETRIES + 1):
                     time.sleep(self._rate_limit_wait)
-                    if extra_headers:
-                        resp = self._session.request(
-                            "POST", path, token, json_body=body, domain=domain,
-                            extra_headers=extra_headers,
-                        )
-                    else:
-                        resp = self._session.request(
-                            "POST", path, token, json_body=body, domain=domain
-                        )
+                    resp = self._session.request(
+                        "POST", path, token, json_body=body, domain=domain
+                    )
 
                     # rate-limit (HTTP 429) 처리
                     if resp.status_code == 429:
@@ -332,7 +321,7 @@ class NHPlugBroker(Broker):
                     usr_msg = str(message_block.get("usr_msg", "알 수 없는 오류"))
                     cont_code = ""
                     if meta is not None:
-                        # 연속조회 호출: 응답 헤더(cts·cts_flag)와 "다음 페이지 있음" 응답코드를 돌려줍니다.
+                        # 주문이력 조회: 응답 헤더(cts_flag 등)와 "다음 페이지 있음" 응답코드를 돌려줍니다.
                         meta["headers"] = self._response_headers(resp)
                         for candidate in (msg_code, str(data.get("rsp_cd", "") or "")):
                             if candidate in _CONTINUE_CODES:
@@ -678,7 +667,7 @@ class NHPlugBroker(Broker):
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
     def _history_input(self, symbol: str, dt: str, **overrides) -> dict:
-        """주문체결내역(GSB10030) Input_0 블록. overrides 는 진단 조회용(sot_dit·oss_sby_dit_cd·ost_cns_dit·orr_no)."""
+        """주문체결내역(GSB10030) Input_0 블록. overrides 로 정렬(sot_dit)·방향(oss_sby_dit_cd) 분할 조회 값을 바꿉니다."""
         fields = {
             "orr_dt": dt,
             "oss_sby_dit_cd": "0",
@@ -693,88 +682,20 @@ class NHPlugBroker(Broker):
     def _order_id_of(row) -> str:
         return str((row or {}).get("orr_no", (row or {}).get("odno", "")))
 
-    @classmethod
-    def _unique_order_ids(cls, rows) -> set:
-        """행 목록의 고유 주문번호 집합 (건수 비교용 — 값은 출력하지 않습니다)."""
-        return {cls._order_id_of(row) for row in rows if isinstance(row, dict)}
-
-    @staticmethod
-    def _is_dry_run() -> bool:
-        try:
-            import config
-            return str(getattr(config, "TRADE_MODE", "")).strip().upper() == "DRY"
-        except Exception:
-            return False
-
     @staticmethod
     def _norm_order_id(value) -> str:
         """주문번호 비교용 정규화 (선행 0 제거). 숫자가 아니면 문자열 그대로."""
         text = str(value or "").strip()
         return str(int(text)) if text.isdigit() else text
 
-    @classmethod
-    def _id_order_direction(cls, rows) -> str:
-        """행 순서가 주문번호 기준 오름/내림/혼합인지 (진단용 — 값은 출력하지 않습니다)."""
-        ids = []
-        for row in rows:
-            text = cls._norm_order_id(cls._order_id_of(row))
-            if text.isdigit():
-                ids.append(int(text))
-        if len(ids) < 2:
-            return "판정불가"
-        if ids == sorted(ids):
-            return "오름"
-        if ids == sorted(ids, reverse=True):
-            return "내림"
-        return "혼합"
-
-    def _probe_query(self, symbol, dt, token, label, overrides, missing_ids, expect_id=None):
-        """[진단] 조회 방식 하나를 실행하고 결과 요약을 출력합니다 (주문번호·cts 원문 없음). 조회된 행 목록을 돌려줍니다."""
-        try:
-            rows = self._fetch_history_day(symbol, dt, token, overrides=overrides, quiet=True)
-        except Exception as error:
-            print(f"[주문이력진단·분할] {symbol} {dt} {label}: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
-            return []
-        ids = {self._norm_order_id(i) for i in self._unique_order_ids(rows)}
-        found = ids & missing_ids
-        sides: dict[str, int] = {}
-        open_rows = 0
-        for row in rows:
-            norm = self._normalize_unexecuted_item(row)
-            side = str(norm.get("sll_buy_dvsn_cd_name") or "기타")
-            sides[side] = sides.get(side, 0) + 1
-            try:
-                if float(norm.get("nccs_qty") or 0) > 0:
-                    open_rows += 1
-            except (TypeError, ValueError):
-                pass
-        summary = (
-            f"[주문이력진단·분할] {symbol} {dt} {label}: 반환={len(rows)}건 고유주문={len(ids)} "
-            f"누락주문발견={len(found)}/{len(missing_ids)} 방향별={dict(sorted(sides.items()))} "
-            f"미체결잔량행={open_rows} 정렬={self._id_order_direction(rows)}"
-        )
-        if expect_id is not None:
-            summary += f" 필터적용={'예' if rows and ids == {expect_id} else '아니오'}"
-        print(summary)
-        for row in rows:
-            rid = self._norm_order_id(self._order_id_of(row))
-            if rid in found:
-                print(
-                    f"[주문이력진단·분할]   발견 {mask_odno(rid)}: 상태={row.get('orr_sts_nm', '')!r} "
-                    f"정정취소={row.get('cor_can_dit_nm', '')!r} 주문수량={row.get('orr_qty', '')} 체결수량={row.get('cns_qty', '')} "
-                    f"미체결수량={row.get('ny_cns_orr_qty', '')} 취소수량={row.get('can_qty', '')} "
-                    f"거부사유={'있음' if str(row.get('rjt_rsn_cts', '') or '').strip() else '없음'}"
-                )
-        return rows
-
-    # ── 15건 상한 우회 가능성 진단: 방향(매수/매도) × 체결 여부(체결/미체결) 분할 + 오름·내림 1페이지 ──────────
+    # ── 하루치 이력 수집: 15건 상한 대응용 상수·첫 페이지 조회·완전성 판정 ──────────────────────────────────────
     _PAGE_CAP = 15   # 관측값: 한 조회가 돌려주는 최대 행 수 (공식 문서에는 명시되지 않음)
     # 분할은 **전체를 빠짐없이 나누는** 방향(매수/매도)으로만 합니다. 체결/미체결로 나누면 체결수량·미체결수량이 모두 0인
     # 취소·거부 주문(0체결 종결 주문)이 어느 분할에도 들지 않아 조용히 빠집니다 (Codex P1).
     _EXHAUSTIVE_PARTITIONS = (("2", "0", "매수"), ("1", "0", "매도"))
 
     def _probe_page1(self, symbol, dt, token, overrides) -> dict:
-        """연속조회를 따라가지 않고 **첫 페이지만** 조회합니다 (역순 조회의 cts 반복 오류를 피하기 위한 진단 전용 조회)."""
+        """연속조회를 따라가지 않고 **첫 페이지만** 조회합니다 (관측: 연속조회는 비어 오거나 키가 반복되어 신뢰할 수 없음)."""
         body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt, **overrides))
         meta: dict = {}
         data = self._request_with_rate_retry("/gbstock/inquiry/v1/unexecuted", body, token, meta=meta)
@@ -912,7 +833,8 @@ class NHPlugBroker(Broker):
           - 필터가 실제 적용됐고(행 내용 검증), 오름 응답은 오름·내림 응답은 내림 정렬이며
           - 페이지네이션 신호와 반환 건수가 모순되지 않을 때:
               · 상한(15) 미만이면 연속조회 신호가 없어야 하고, 내림 조회도 같은 집합이어야 함
-              · 상한에 닿았으면 오름(가장 작은 15)·내림(가장 큰 15)이 겹쳐야 전체를 덮음 (겹치지 않으면 30건 이상일 수 있어 불완전)
+              · 상한에 닿았으면 내림도 정확히 15건이어야 하고(비대칭이면 모순), 오름(가장 작은 15)·내림(가장 큰 15)이 겹치고
+                겹침 구간이 일관돼야 전체를 덮음 (겹치지 않으면 30건 이상일 수 있어 불완전)
         """
         cap = self._PAGE_CAP
         a_ids, d_ids = asc["ids"], desc["ids"]
@@ -933,225 +855,18 @@ class NHPlugBroker(Broker):
             if set(a_ids) != set(d_ids):
                 return union, "모순(상한 미만인데 오름·내림 집합이 다름)", False
             return union, "완전(상한 미만·신호 없음·오름내림 일치)", True
-        if set(a_ids) & set(d_ids):
+        # 오름이 상한(15건)에 닿았다면 전체는 15건 이상이므로 내림도 정확히 15건이어야 합니다. 건수가 비대칭이면
+        # (예: 오름 15건·내림 5건) 겹치더라도 한쪽이 잘렸거나 서버 응답을 믿을 수 없다는 뜻이라 완전성을 증명하지 못합니다.
+        if len(d_ids) != cap:
+            return union, f"모순(오름 {len(a_ids)}건·내림 {len(d_ids)}건 — 비대칭 응답)", False
+        # 오름=전체의 가장 작은 15건, 내림=가장 큰 15건 이므로 두 응답은 정렬 순서상 연속 구간입니다. 겹침 구간
+        # [내림의 최소, 오름의 최대] 안의 주문은 양쪽에 모두 있어야 합니다 (아니면 서로 일관되지 않은 응답).
+        lo, hi = min(int(i) for i in d_ids), max(int(i) for i in a_ids)
+        if hi >= lo:
+            if not all(i in set(d_ids) for i in a_ids if int(i) >= lo) or not all(i in set(a_ids) for i in d_ids if int(i) <= hi):
+                return union, "모순(오름·내림의 겹침 구간이 일치하지 않음)", False
             return union, "완전(상한 도달·오름내림 겹침으로 전체를 덮음)", True
         return union, f"불완전(상한 도달·오름내림 겹침 없음 — {cap * 2}건 이상일 수 있음)", False
-
-    def _enumerate_day_partitioned(self, symbol, dt, token, label_prefix="", missing_ids=frozenset()):
-        """하루치 이력을 방향(매수/매도) 분할 + 오름·내림 1페이지씩으로 모아 (고유 주문 집합, 완전 여부)를 돌려줍니다 (진단 출력 포함)."""
-        partitions = list(self._EXHAUSTIVE_PARTITIONS)
-        union_by_part: dict[str, set] = {}
-        all_complete = True
-        for side, fill, name in partitions:
-            try:
-                base = {"oss_sby_dit_cd": side, "ost_cns_dit": fill}
-                asc = self._probe_page1(symbol, dt, token, {**base, "sot_dit": "0"})
-                desc = self._probe_page1(symbol, dt, token, {**base, "sot_dit": "1"})
-            except Exception as error:
-                print(f"[주문이력진단·분할] {symbol} {dt} 분할[{name}]: 조회 오류 {type(error).__name__}: {str(error)[:80]} → 불완전")
-                all_complete = False
-                continue
-            ids, verdict, complete = self._judge_partition(asc, desc, side, fill)
-            union_by_part[name] = ids
-            all_complete = all_complete and complete
-            print(
-                f"[주문이력진단·분할] {symbol} {dt} 분할[{name}]: 오름={len(asc['ids'])}건(flag={asc['flag']} 신호={asc['code']}) "
-                f"내림={len(desc['ids'])}건(flag={desc['flag']} 신호={desc['code']} 정렬검증={'정상' if self._is_monotonic(desc['ids'], True) else '이상'}) "
-                f"겹침={len(set(asc['ids']) & set(desc['ids']))} 합집합={len(ids)} 누락주문발견={len(ids & missing_ids)} 판정={verdict}"
-            )
-        # 방향이 다른 분할 간 중복(있으면 방향 필터가 무시된 것) 검사 + 합집합
-        # 방향(매수/매도)이 다른 분할은 서로 겹칠 수 없습니다. 같은 방향의 체결/미체결 분할은 부분체결 주문이
-        # 둘 다에 나오는 것이 정상이므로 겹침을 모순으로 보지 않습니다 (합집합에서 한 번만 셉니다).
-        names = list(union_by_part)
-        overlap = sum(
-            len(union_by_part[a] & union_by_part[b])
-            for i, a in enumerate(names) for b in names[i + 1:] if a[:2] != b[:2]
-        )
-        union = set().union(*union_by_part.values()) if union_by_part else set()
-        if overlap:
-            all_complete = False
-        print(
-            f"[주문이력진단·분할] {symbol} {dt} 분할 합집합: 고유주문={len(union)}건 분할간중복={overlap} "
-            f"누락주문발견={len(union & missing_ids)}/{len(missing_ids)} 전체완전성={'보장' if all_complete and not overlap else '보장 못함'}"
-        )
-        return union, all_complete and not overlap
-
-    def diag_probe_missing_orders(self, symbol, exchange, missing) -> None:
-        """[진단 전용 — DRY 에서만, 조회만 하며 매매·state 판단에 쓰이지 않습니다]
-
-        '리버스 주문 이력 누락'으로 보류된 주문이 조회 방식을 바꾸면 나오는지, 15건 상한을 우회해 하루치를 완전하게
-        모을 수 있는지 확인합니다 (이전 DRY: 기존 전체 조회 15건에서 잘림, 매수 필터에서 누락 3건 발견, orr_no 직접 조회는
-        필터가 무시됨, 역순은 2페이지에서 cts 반복).
-          ① 기존 전체 조회(연속조회 포함)  ② 전체 역순 **1페이지만**  ③ 방향×체결 4분할 × 오름·내림 1페이지
-        주문번호·계좌·cts 원문은 출력하지 않습니다 (가명 식별자·건수만). 어떤 오류도 호출자에게 전파하지 않습니다.
-        """
-        if not self._is_dry_run() or not missing:
-            return
-        try:
-            token = self._get_token()
-            by_dt: dict[str, set] = {}
-            for item in missing:
-                session = str(item.get("session", "") or "")
-                dt = session.replace("-", "")
-                if len(dt) == 8 and dt.isdigit():
-                    by_dt.setdefault(dt, set()).add(self._norm_order_id(item.get("odno")))
-            if not by_dt:
-                print(f"[주문이력진단·분할] {symbol} 진단 대상 날짜 없음: 누락 주문의 세션 정보가 없습니다")
-            for dt, missing_ids in sorted(by_dt.items()):
-                print(f"[주문이력진단·분할] {symbol} {dt} 시작: 누락 리버스 주문 {len(missing_ids)}건 대상")
-                baseline = self._probe_query(symbol, dt, token, "① 기존 전체 조회", {}, missing_ids)
-                base_ids = {self._norm_order_id(i) for i in self._unique_order_ids(baseline)}
-                try:
-                    rev = self._probe_page1(symbol, dt, token, {"sot_dit": "1"})
-                    rev_ids = set(rev["ids"])
-                    print(
-                        f"[주문이력진단·분할] {symbol} {dt} ② 전체 역순 1페이지: 반환={len(rev['ids'])}건 고유주문={len(rev_ids)} "
-                        f"정렬={self._id_order_direction(rev['rows'])} flag={rev['flag']} 신호={rev['code']} cts응답={'있음' if rev['cts'] else '없음'} "
-                        f"기존조회와겹침={len(rev_ids & base_ids)} 역순에만={len(rev_ids - base_ids)} "
-                        f"누락주문발견={len(rev_ids & missing_ids)}/{len(missing_ids)}"
-                    )
-                except Exception as error:
-                    print(f"[주문이력진단·분할] {symbol} {dt} ② 전체 역순 1페이지: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
-                union, complete = self._enumerate_day_partitioned(symbol, dt, token, missing_ids=missing_ids)
-                print(
-                    f"[주문이력진단·분할] {symbol} {dt} 결론: 기존조회={len(base_ids)}건 분할합집합={len(union)}건 "
-                    f"기존에없던주문={len(union - base_ids)} 누락주문 최종발견={len(union & missing_ids)}/{len(missing_ids)} "
-                    f"완전성={'보장' if complete else '보장 못함'}"
-                )
-        except Exception as error:   # 진단은 어떤 경우에도 매매 흐름에 영향을 주지 않습니다
-            print(f"[주문이력진단·분할] 진단 중단: {type(error).__name__}: {str(error)[:80]}")
-
-    def _diag_probe_continuation(self, symbol, dt, token, page1_rows, page1_cts, page1_flag) -> None:
-        """[진단 전용 — DRY 에서만, 결과에 영향 없음] 연속조회 요청 방식별로 응답을 비교합니다.
-
-        2026-11-18 이후 `20261117` 이 1페이지 15건 + 2페이지 0건으로 끝나는 것이 실제 종료인지(데이터가 15건뿐)
-        요청 방식 때문인지(2페이지가 비어 오는 것) 가르기 위한 읽기 전용 조회입니다. 현재 요청 본문은 공식 명세와
-        달리 tr_cd·tr_key·tr_cont 를 함께 보냅니다(공식 SDK·OpenAPI 는 Input_0 만, 연속조회는 헤더 cts).
-        변형별 응답 건수·고유 주문 수·1페이지와의 겹침·cts_flag·신호만 출력하고 주문번호·cts 원문은 출력하지 않습니다.
-        조회 전용(주문 아님)이며 실패해도 삼킵니다.
-        """
-        base_ids = self._unique_order_ids(page1_rows)
-        input_block = self._history_input(symbol, dt)
-        cts_headers = {"cts": page1_cts}
-        if page1_flag:
-            cts_headers["cts_flag"] = page1_flag
-        path = "/gbstock/inquiry/v1/unexecuted"
-        variants = [
-            ("명세본문(Input_0만)+헤더cts", {"Input_0": input_block}, cts_headers),
-            ("본문tr_cont=Y+헤더cts", {**self._build_body(TR_ID_UNEXECUTED, symbol, input_block), "tr_cont": "Y"}, cts_headers),
-            ("본문tr_cont=Y, 헤더cts없음", {**self._build_body(TR_ID_UNEXECUTED, symbol, input_block), "tr_cont": "Y"}, None),
-            ("1페이지 재조회: 명세본문(Input_0만), cts없음", {"Input_0": input_block}, None),
-        ]
-        for label, body, headers in variants:
-            try:
-                meta: dict = {}
-                data = self._request_with_rate_retry(path, body, token, extra_headers=headers, meta=meta)
-                out = self._extract_output(data, "Output_0") or []
-                if isinstance(out, dict):
-                    out = [out]
-                ids = self._unique_order_ids(out)
-                resp_headers = meta.get("headers") or {}
-                print(
-                    f"[주문이력진단·비교] {symbol} {dt} {label}: 응답건수={len(out)} 고유주문={len(ids)} "
-                    f"1페이지와겹침={len(ids & base_ids)} 새주문={len(ids - base_ids)} "
-                    f"cts_flag={(resp_headers.get('cts_flag') or '').strip().upper() or '없음'} "
-                    f"신호={meta.get('continue_code') or '없음'} cts응답={'있음' if (resp_headers.get('cts') or '').strip() else '없음'}"
-                )
-            except Exception as error:   # 진단은 어떤 경우에도 조회 결과에 영향을 주지 않습니다
-                print(f"[주문이력진단·비교] {symbol} {dt} {label}: 조회 오류 {type(error).__name__}: {str(error)[:80]}")
-
-    def _fetch_history_day(self, symbol: str, dt: str, token: str, overrides: dict | None = None, quiet: bool = False) -> list:
-        """하루치(orr_dt) 주문체결내역의 **모든 페이지**를 모아 Output_0 행 목록으로 돌려줍니다.
-
-        연속조회 규약(공식 llms.txt·SDK): 응답 *헤더*의 `cts`·`cts_flag`(Y=다음 페이지, N=끝)를 다음 요청 *헤더*에
-        그대로 실어 보냅니다. 헤더 없이 응답코드(XA109 등)로만 "계속"을 알리는 경우도 같은 방식입니다.
-
-        Fail-Closed: 계속해야 하는데 cts 가 없거나, 같은 cts 가 반복되거나, 페이지 상한(_MAX_HISTORY_PAGES)을
-        넘으면 NHPlugPagingError 로 실패시킵니다 (일부 페이지만으로 이력을 확정하지 않음).
-
-        overrides/quiet 는 진단 조회 전용입니다(Input_0 일부 값 대체, 페이지별 진단 출력 생략).
-        """
-        rows: list = []
-        sent_keys: set[str] = set()
-        cts = None
-        cts_flag = None
-        page = 0
-
-        def finish(reason: str) -> list:
-            # 진단: 전체 수집 건수와 중복 제거 후 고유 주문 건수를 구분합니다 (주문번호는 출력하지 않습니다).
-            if quiet:
-                return rows
-            print(
-                f"[주문이력진단] {symbol} {dt} 수집 완료: 페이지={page} 전체수집={len(rows)}건 "
-                f"고유주문={len(self._unique_order_ids(rows))}건 종료사유={reason}"
-            )
-            return rows
-
-        while True:
-            page += 1
-            body = self._build_body(TR_ID_UNEXECUTED, symbol, self._history_input(symbol, dt, **(overrides or {})))
-            headers = {}
-            if cts:
-                headers["cts"] = cts
-            if cts_flag:
-                headers["cts_flag"] = cts_flag
-            meta: dict = {}
-            try:
-                data = self._request_with_rate_retry(
-                    "/gbstock/inquiry/v1/unexecuted", body, token,
-                    extra_headers=headers or None, meta=meta,
-                )
-            except NHPlugPagingError:
-                raise
-            except BrokerError as error:
-                if page > 1:
-                    # 첫 페이지는 받았는데 이어받기에 실패 — 날짜 전체를 '건너뜀'으로 넘기면 일부 이력이 사라집니다.
-                    raise NHPlugPagingError(
-                        f"{symbol} {dt} 연속조회 {page}페이지 조회 실패: {error} — 일부 이력만으로 진행하지 않습니다"
-                    ) from error
-                raise
-            output = self._extract_output(data, "Output_0") or []
-            if isinstance(output, dict):
-                output = [output]
-            rows.extend(output)
-
-            resp_headers = meta.get("headers") or {}
-            next_cts = (resp_headers.get("cts") or "").strip()
-            next_flag = (resp_headers.get("cts_flag") or "").strip().upper()
-            continue_code = meta.get("continue_code") or ""
-            # 진단: 페이지별 응답 건수, cts_flag(Y/N/없음), 연속조회 신호, cts 응답·전달 여부 (cts 원문은 출력하지 않습니다)
-            if not quiet:
-                print(
-                    f"[주문이력진단] {symbol} {dt} 페이지={page} 응답건수={len(output)} "
-                    f"고유주문={len(self._unique_order_ids(output))} cts_flag={next_flag or '없음'} "
-                    f"신호={continue_code or '없음'} cts응답={'있음' if next_cts else '없음'} "
-                    f"cts전달={'예' if cts else '아니오'}"
-                )
-            if next_flag == "N":
-                return finish("cts_flag=N")
-            if next_flag != "Y" and not continue_code:
-                return finish("계속 신호 없음")   # 마지막 페이지
-            # 여기부터는 다음 페이지가 있다는 신호(cts_flag=Y 또는 XA109 등)가 있습니다.
-            if not next_cts:
-                raise NHPlugPagingError(
-                    f"{symbol} {dt} 연속조회가 필요하지만 응답에 cts 키가 없습니다 "
-                    f"(page={page}, code={continue_code or next_flag}) — 일부 이력만으로 진행하지 않습니다"
-                )
-            if next_cts == cts or next_cts in sent_keys:
-                raise NHPlugPagingError(
-                    f"{symbol} {dt} 연속조회 키가 반복되었습니다 (page={page}) — 일부 이력만으로 진행하지 않습니다"
-                )
-            if page >= _MAX_HISTORY_PAGES:
-                raise NHPlugPagingError(
-                    f"{symbol} {dt} 연속조회가 {_MAX_HISTORY_PAGES}페이지를 넘었습니다 — 일부 이력만으로 진행하지 않습니다"
-                )
-            if not quiet:
-                print(f"[주문이력] {symbol} {dt} 연속조회 계속: {page}페이지 {len(output)}건 수집 (신호={continue_code or next_flag})")
-            if page == 1 and not quiet and not overrides and self._is_dry_run():
-                self._diag_probe_continuation(symbol, dt, token, output, next_cts, next_flag)
-            sent_keys.add(next_cts)
-            cts = next_cts
-            cts_flag = next_flag or None
 
     def get_order_history(
         self,
