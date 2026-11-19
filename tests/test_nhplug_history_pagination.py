@@ -189,11 +189,6 @@ def test_error_on_continuation_page_fails_closed_not_skipped(monkeypatch):
         _history(broker, monkeypatch)
 
 
-def test_error_on_first_page_is_still_skippable_as_before(monkeypatch):
-    """첫 페이지 오류는 기존대로 그 날짜만 건너뜁니다(연속조회와 무관 — 최소 변경)."""
-    err = _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
-    broker = _broker([err, _page([_row("7", dt="20261118")])])
-    assert [h["odno"] for h in _history(broker, monkeypatch)] == ["7"]
 
 
 def test_repeated_key_fails_closed():
@@ -231,41 +226,12 @@ def _history(broker, monkeypatch, days=1):
     return broker.get_order_history("TQQQ", "NAS", days=days)
 
 
-def test_get_order_history_dedups_rows_repeated_across_pages(monkeypatch):
-    """페이지 경계에서 같은 주문이 다시 내려와도 1건으로 셉니다 (중복 가산 방지)."""
-    broker = _broker([
-        _page([_row("1"), _row("2")], cts="K1", flag="Y"),     # 20261117 1페이지
-        _page([_row("2"), _row("3")], flag="N"),               # 20261117 2페이지 (2번 중복)
-        _page([]),                                             # 20261118
-    ])
-    history = _history(broker, monkeypatch)
-    assert sorted(h["odno"] for h in history) == ["1", "2", "3"]
 
 
-def test_get_order_history_paging_failure_is_not_skipped(monkeypatch):
-    """연속조회 실패는 '건너뜀'으로 삼키지 않고 호출자에게 올립니다 — 이력 누락으로 포지션 불일치가 되기 전에 멈춥니다."""
-    broker = _broker([_page([_row("1")], code="XA109")])       # 계속 신호는 있는데 cts 없음
-    with pytest.raises(NHPlugPagingError):
-        _history(broker, monkeypatch)
 
 
-def test_get_order_history_other_broker_errors_still_skipped(monkeypatch):
-    """연속조회와 무관한 날짜별 오류는 기존대로 건너뜁니다 (최소 변경)."""
-    err = _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
-    broker = _broker([err, _page([_row("9", dt="20261118")])])
-    history = _history(broker, monkeypatch)
-    assert [h["odno"] for h in history] == ["9"]
 
 
-def test_get_order_history_xa109_full_scenario(monkeypatch):
-    """11-18 장애 재현: 한 날짜가 XA109 로 이어지는 두 페이지. 수정 후에는 모든 행이 모입니다."""
-    broker = _broker([
-        _page([_row(str(i)) for i in range(1, 12)], cts="CTS-1", code="XA109"),
-        _page([_row("12"), _row("13")]),
-        _page([]),
-    ])
-    history = _history(broker, monkeypatch)
-    assert len(history) == 13
 
 
 # ── 진단 출력 (페이지별 건수·cts_flag·신호, 전체/고유 구분, 비교 조회) ───────────────
@@ -471,7 +437,7 @@ class _FakeServer:
         self.calls.append((inp, extra_headers))
         if extra_headers and extra_headers.get("cts"):
             return _page([], flag="N")
-        rows = list(self.rows)
+        rows = [r for r in self.rows if r["orr_dt"] == inp["orr_dt"]]
         if not self.ignore_side and inp["oss_sby_dit_cd"] in ("1", "2"):
             rows = [r for r in rows if r["sby_dit_nm"] == inp["oss_sby_dit_cd"]]
         if inp["ost_cns_dit"] == "1":
@@ -486,9 +452,11 @@ class _FakeServer:
         return _page(page)
 
 
-def _dataset(buy_open=0, buy_filled=0, sell_open=0, sell_filled=0, start=1000001):
+def _dataset(buy_open=0, buy_filled=0, sell_open=0, sell_filled=0, buy_canceled=0, sell_canceled=0, start=1000001):
     """주문번호가 종류별로 섞이도록 번갈아 배정한 합성 이력."""
-    kinds = ([("2", 0, 1)] * buy_open + [("2", 1, 0)] * buy_filled + [("1", 0, 1)] * sell_open + [("1", 1, 0)] * sell_filled)
+    # (방향, 체결수량, 미체결수량): 0체결 종결(취소·거부)은 체결수량·미체결수량이 모두 0 — 체결/미체결 필터 어디에도 들지 않음
+    kinds = ([("2", 0, 1)] * buy_open + [("2", 1, 0)] * buy_filled + [("1", 0, 1)] * sell_open + [("1", 1, 0)] * sell_filled
+             + [("2", 0, 0)] * buy_canceled + [("1", 0, 0)] * sell_canceled)
     order = sorted(range(len(kinds)), key=lambda i: (i * 7) % max(len(kinds), 1) * 1000 + i)   # 결정적으로 섞기
     rows = []
     for n, idx in enumerate(order):
@@ -561,10 +529,10 @@ def test_probe_reads_only_first_page_and_never_sends_cts(monkeypatch):
     _dry(monkeypatch)
     server = _FakeServer(_dataset(buy_open=20))
     _server_broker(server)._enumerate_day_partitioned("SOXL", "20261117", "t")
-    assert len(server.calls) == 8                                                              # 4분할 × (오름, 내림)
+    assert len(server.calls) == 4                                                              # 2분할(매수·매도) × (오름, 내림)
     assert all(extra is None for _inp, extra in server.calls)
     descs = [inp for inp, _ in server.calls if inp["sot_dit"] == "1"]
-    assert len(descs) == 4
+    assert len(descs) == 2
 
 
 def test_full_probe_through_dry_broker_chain_reports_final_findings_without_secrets(monkeypatch, capsys):
@@ -638,3 +606,210 @@ def test_below_cap_but_descending_set_differs_is_a_contradiction(monkeypatch, ca
     rows = _dataset(buy_open=5)
     _, complete = _server_broker(_DescDiffersServer(rows))._enumerate_day_partitioned("SOXL", "20261117", "t")
     assert complete is False and "상한 미만인데 오름·내림 집합이 다름" in capsys.readouterr().out
+
+
+# ── get_order_history 실제 수집 경로 (오름·내림 조합 / 분할 / Fail-Closed) ─────────────────────────
+
+def _history_via_server(server, monkeypatch, days=1):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    monkeypatch.setattr(adapter_mod, "get_kst_now", lambda: datetime(2026, 11, 18, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+    return _server_broker(server).get_order_history("SOXL", "AMS", days=days)
+
+
+def _history_ids(history):
+    return {h["odno"] for h in history}
+
+
+def test_21_orders_all_restored_in_history_path_including_the_six_missing(monkeypatch, capsys):
+    """2026-11-17 SOXL 재현: 하루 21건(미체결 다수). 기존 방식은 15건에서 잘려 가장 새 주문 6건이 빠졌지만,
+    수집 경로가 오름·내림 첫 페이지를 조합해 21건 전부를 정산용 이력 행으로 돌려줍니다."""
+    _dry(monkeypatch)
+    rows = _dataset(buy_open=15, buy_filled=3, sell_open=3)
+    assert len(rows) == 21
+    newest_six = sorted(_ids(rows), key=int)[-6:]
+    server = _FakeServer(rows)
+    broker = _server_broker(server)
+    assert not (set(newest_six) & {r["orr_no"] for r in broker._fetch_history_day("SOXL", "20261117", "t", quiet=True)})  # 기존 방식은 6건 누락
+    history = _history_via_server(_FakeServer(rows), monkeypatch)
+    assert _history_ids(history) == _ids(rows) and len(history) == 21
+    assert set(newest_six) <= _history_ids(history)
+    assert "오름·내림 조합으로 완전 수집: 21건" in capsys.readouterr().out
+
+
+def test_history_rows_keep_settlement_fields_for_filled_open_and_partial(monkeypatch):
+    """체결·미체결·부분체결 행이 정산에 필요한 수량·상태 필드로 그대로 보존됩니다."""
+    _dry(monkeypatch)
+    rows = _dataset(buy_open=14, buy_filled=2)
+    rows.append({"orr_no": "1000099", "orr_dt": "20261117", "iem_nm": "SOXL", "sby_dit_nm": "2",
+                 "orr_qty": "4", "cns_qty": "1", "cns_pr": "51.5", "ny_cns_orr_qty": "3"})            # 부분체결
+    assert len(rows) == 17
+    history = {h["odno"]: h for h in _history_via_server(_FakeServer(rows), monkeypatch)}
+    assert len(history) == 17
+    filled = next(h for h in history.values() if h["ft_ccld_qty"] == "1" and h["nccs_qty"] == "0")
+    assert filled["prcs_stat_name"] == "체결"
+    opened = next(h for h in history.values() if h["ft_ccld_qty"] == "0" and h["nccs_qty"] == "1")
+    assert opened["prcs_stat_name"] == "미체결"
+    partial = history["1000099"]
+    assert (partial["ft_ord_qty"], partial["ft_ccld_qty"], partial["nccs_qty"], partial["ft_ccld_unpr3"]) == ("4", "1", "3", "51.5")
+
+
+def test_under_cap_day_is_returned_directly_without_extra_calls(monkeypatch):
+    """15건 미만이고 계속 신호도 없는 날짜는 기존처럼 한 번의 조회로 끝납니다 (추가 호출 없음)."""
+    _dry(monkeypatch)
+    server = _FakeServer(_dataset(buy_open=8))
+    history = _history_via_server(server, monkeypatch)
+    assert len(history) == 8
+    assert len(server.calls) == 2                                                                  # 두 날짜(20261117·20261118) × 1회
+
+
+def test_30_or_more_orders_recovered_by_partition_when_each_partition_fits(monkeypatch, capsys):
+    _dry(monkeypatch)
+    rows = _dataset(buy_open=20, buy_filled=8, sell_open=7)                                        # 35건: 전체 오름15·내림15 는 겹치지 않음
+    history = _history_via_server(_FakeServer(rows), monkeypatch)
+    assert _history_ids(history) == _ids(rows) and len(history) == 35
+    assert "방향(매수/매도) 분할로 완전 수집: 35건" in capsys.readouterr().out
+
+
+def test_30_or_more_in_one_partition_fails_closed(monkeypatch):
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="완전성 확인 실패"):
+        _history_via_server(_FakeServer(_dataset(buy_open=40)), monkeypatch)
+
+
+def test_filter_mismatch_in_partition_fails_closed(monkeypatch):
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="모순"):
+        _history_via_server(_FakeServer(_dataset(buy_open=20, buy_filled=8, sell_open=7), ignore_side=True), monkeypatch)
+
+
+def test_sort_mismatch_fails_closed(monkeypatch):
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="정렬 방향"):
+        _history_via_server(_FakeServer(_dataset(buy_open=16), ignore_sort=True), monkeypatch)
+
+
+class _AsymmetricServer(_FakeServer):
+    """오름 조회는 15건을 주는데 내림 조회는 비어 있는 비대칭 서버."""
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        if json_body["Input_0"]["sot_dit"] == "1":
+            self.calls.append((json_body["Input_0"], extra_headers))
+            return _page([])
+        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+
+
+def test_asymmetric_response_fails_closed(monkeypatch):
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError):
+        _history_via_server(_AsymmetricServer(_dataset(buy_open=18)), monkeypatch)
+
+
+class _ConflictServer(_FakeServer):
+    """같은 주문이 내림 응답에서는 체결수량이 다르게 보이는 서버."""
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        page = super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+        if json_body["Input_0"]["sot_dit"] == "1" and page.json()["Output_0"]:
+            data = page.json()
+            data["Output_0"] = [dict(r) for r in data["Output_0"]]
+            data["Output_0"][-1]["cns_qty"] = "5"                      # 오름·내림 겹치는 주문 중 하나의 체결수량이 다름
+            return _Resp(data, page.headers)
+        return page
+
+
+def test_conflicting_duplicate_order_fails_closed(monkeypatch):
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError):
+        _history_via_server(_ConflictServer(_dataset(buy_open=20)), monkeypatch)
+
+
+def test_identical_duplicate_across_ascending_and_descending_is_counted_once(monkeypatch):
+    _dry(monkeypatch)
+    rows = _dataset(buy_open=20)                                                                    # 오름·내림이 10건 겹침
+    history = _history_via_server(_FakeServer(rows), monkeypatch)
+    assert len(history) == 20 and _history_ids(history) == _ids(rows)
+
+
+class _FailingServer(_FakeServer):
+    def __init__(self, rows, fail_on):
+        super().__init__(rows)
+        self.fail_on = fail_on
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        inp = json_body["Input_0"]
+        if self.fail_on(inp):
+            return _Resp({"message": {"msg_code": "14580", "usr_msg": "모의투자 장종료"}})
+        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+
+
+@pytest.mark.parametrize("fail_on", [
+    lambda inp: True,                                                                               # 첫(오름) 조회부터 오류
+    lambda inp: inp["sot_dit"] == "1" and inp["oss_sby_dit_cd"] == "0",                              # 내림 조회 오류
+    lambda inp: inp["oss_sby_dit_cd"] == "2" and inp["sot_dit"] == "1",                              # 분할(매수·내림) 조회 오류
+])
+def test_query_failure_fails_closed_instead_of_skipping_the_date(monkeypatch, fail_on):
+    """날짜별 BrokerError 를 '건너뜀'으로 넘기지 않습니다 — 그 날짜의 체결이 이력에서 사라져 정산이 틀어지는 것을 막습니다."""
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="일부 이력만으로 진행하지 않습니다"):
+        _history_via_server(_FailingServer(_dataset(buy_open=20, buy_filled=8, sell_open=7), fail_on), monkeypatch)
+
+
+def test_other_dates_still_work_when_no_error(monkeypatch):
+    _dry(monkeypatch)
+    rows = _dataset(buy_open=3) + [{**r, "orr_dt": "20261118", "orr_no": str(2000000 + i)} for i, r in enumerate(_dataset(sell_open=2))]
+    assert len(_history_via_server(_FakeServer(rows), monkeypatch)) == 5
+
+
+def test_continuation_signal_with_under_cap_rows_is_not_trusted(monkeypatch):
+    """15건 미만인데 연속조회 신호가 있으면(신호와 데이터 모순) 바로 반환하지 않고 완전성 확인으로 넘어가 실패합니다."""
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="연속조회 신호가 있는데 상한 미만"):
+        _history_via_server(_FakeServer(_dataset(buy_open=4), signal_below_cap=True), monkeypatch)
+
+
+def test_unsorted_response_below_cap_fails_closed(monkeypatch):
+    """상한 미만이어도 요청한 정렬(오름)이 지켜지지 않은 응답은 믿지 않습니다."""
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="정렬 방향"):
+        _history_via_server(_FakeServer(list(reversed(_dataset(buy_open=8))), ignore_sort=True), monkeypatch)   # 오름 요청에 내림으로 응답
+
+
+class _BadAllDescServer(_FakeServer):
+    """전체 조회의 내림 응답만 오름차순으로 돌려주는 서버 (분할 조회는 정상)."""
+
+    def request(self, method, path, token, json_body=None, extra_headers=None, domain=None):
+        inp = json_body["Input_0"]
+        if inp["sot_dit"] == "1" and inp["oss_sby_dit_cd"] == "0":
+            json_body = {**json_body, "Input_0": {**inp, "sot_dit": "0"}}
+        return super().request(method, path, token, json_body=json_body, extra_headers=extra_headers, domain=domain)
+
+
+def test_contradiction_in_all_orders_check_is_not_rescued_by_partitions(monkeypatch):
+    """전체 오름·내림 조합이 모순(정렬 위반)이면 분할이 정상이어도 서버 응답을 신뢰할 수 없으므로 실패합니다."""
+    _dry(monkeypatch)
+    with pytest.raises(NHPlugPagingError, match="모순"):
+        _history_via_server(_BadAllDescServer(_dataset(buy_open=20)), monkeypatch)
+
+
+def test_zero_fill_terminal_orders_are_preserved_when_partitioning(monkeypatch):
+    """(Codex P1) 체결수량·미체결수량이 모두 0인 취소·거부 주문은 체결/미체결 필터에 안 걸립니다. 30건 이상 날짜를
+    방향으로만 분할해 이런 주문(리버스 취소 기록 등)이 조용히 빠지지 않아야 합니다."""
+    _dry(monkeypatch)
+    rows = _dataset(buy_filled=6, buy_open=6, buy_canceled=8, sell_filled=4, sell_open=4, sell_canceled=3)   # 31건
+    assert len(rows) == 31
+    history = _history_via_server(_FakeServer(rows), monkeypatch)
+    assert _history_ids(history) == _ids(rows) and len(history) == 31
+    canceled = [h for h in history if h["ft_ccld_qty"] == "0" and h["nccs_qty"] == "0"]
+    assert len(canceled) == 11                                                                      # 0체결 종결 11건 보존
+
+
+def test_fill_based_partitions_would_have_lost_zero_fill_orders(monkeypatch):
+    """회귀 근거: 체결/미체결로만 나누면 0체결 종결 주문은 어느 쪽에도 없다 (서버 흉내가 실제 필터 의미를 따름)."""
+    rows = _dataset(buy_filled=2, buy_open=2, buy_canceled=3)
+    server = _FakeServer(rows)
+    for fill in ("1", "2"):
+        page = server.request("POST", "/x", "t", {"Input_0": {"orr_dt": "20261117", "oss_sby_dit_cd": "0", "sot_dit": "0",
+                                                                 "ost_cns_dit": fill, "iem_cd": "SOXL", "orr_no": None}})
+        got = {str(r["orr_no"]) for r in page.json()["Output_0"]}
+        assert not (got & {r["orr_no"] for r in rows if r["cns_qty"] == "0" and r["ny_cns_orr_qty"] == "0"})

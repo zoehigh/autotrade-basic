@@ -769,6 +769,9 @@ class NHPlugBroker(Broker):
 
     # ── 15건 상한 우회 가능성 진단: 방향(매수/매도) × 체결 여부(체결/미체결) 분할 + 오름·내림 1페이지 ──────────
     _PAGE_CAP = 15   # 관측값: 한 조회가 돌려주는 최대 행 수 (공식 문서에는 명시되지 않음)
+    # 분할은 **전체를 빠짐없이 나누는** 방향(매수/매도)으로만 합니다. 체결/미체결로 나누면 체결수량·미체결수량이 모두 0인
+    # 취소·거부 주문(0체결 종결 주문)이 어느 분할에도 들지 않아 조용히 빠집니다 (Codex P1).
+    _EXHAUSTIVE_PARTITIONS = (("2", "0", "매수"), ("1", "0", "매도"))
 
     def _probe_page1(self, symbol, dt, token, overrides) -> dict:
         """연속조회를 따라가지 않고 **첫 페이지만** 조회합니다 (역순 조회의 cts 반복 오류를 피하기 위한 진단 전용 조회)."""
@@ -788,6 +791,93 @@ class NHPlugBroker(Broker):
             "code": meta.get("continue_code") or "없음",
             "cts": bool((headers.get("cts") or "").strip()),
         }
+
+    # ── 하루치 이력 완전 수집 (15건 상한 대응) ────────────────────────────────────────────────────────
+    # 관측(2026-11-19 DRY): 한 조회는 최대 15건만 돌려주고 연속조회(cts)는 비어 오거나 신호가 일관되지 않아 믿을 수 없습니다.
+    # 그래서 연속조회 대신 **오름·내림 첫 페이지**(가장 작은 15건 + 가장 큰 15건)를 조합하고, 겹치면 하루치 전체를 덮은 것으로
+    # 증명합니다. 겹치지 않으면(30건 이상) 방향(매수/매도)으로 분할해 같은 규칙을 적용하고, 그래도 증명 못 하면 실패합니다.
+    # 전제: 한 응답 최대 15건(관측값), 오름/내림 정렬이 주문번호 기준(응답으로 검증).
+    _ROW_CONSISTENCY_FIELDS = (
+        "orr_no", "orr_dt", "sby_dit_nm", "iem_cd", "orr_qty", "cns_qty", "cns_pr", "ny_cns_orr_qty",
+        "orr_sts_nm", "cor_can_dit_cd", "can_qty", "orr_tm",
+    )
+
+    @classmethod
+    def _merge_rows_by_id(cls, responses) -> list:
+        """여러 응답의 실제 이력 행을 주문번호로 합칩니다. 같은 주문이 여러 응답에 있으면 수량·상태가 같아야 하며,
+        다르면 NHPlugPagingError(Fail-Closed). 주문번호 오름차순으로 돌려줍니다 (행은 정산에 쓰이도록 원본 그대로 보존)."""
+        merged: dict = {}
+        for rows in responses:
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise NHPlugPagingError("이력 행 형식이 올바르지 않습니다")
+                rid = cls._norm_order_id(cls._order_id_of(row))
+                if not rid:
+                    raise NHPlugPagingError("주문번호가 없는 이력 행이 있습니다")
+                previous = merged.get(rid)
+                if previous is None:
+                    merged[rid] = row
+                    continue
+                sig_a = tuple(str(previous.get(k, "")) for k in cls._ROW_CONSISTENCY_FIELDS)
+                sig_b = tuple(str(row.get(k, "")) for k in cls._ROW_CONSISTENCY_FIELDS)
+                if sig_a != sig_b:
+                    raise NHPlugPagingError("같은 주문이 응답마다 수량·상태가 다릅니다 — 이력 일관성을 확인할 수 없습니다")
+        return [merged[k] for k in sorted(merged, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))]
+
+    def _validate_single_response(self, resp: dict) -> str:
+        """한 응답 안의 모순(중복·오름 정렬 위반·상한 초과)을 찾습니다. 문제가 없으면 빈 문자열."""
+        ids = resp["ids"]
+        if len(ids) != len(set(ids)):
+            return "한 응답 안에 중복 주문"
+        if not self._is_monotonic(ids, False):
+            return "정렬 방향이 요청(오름)과 다름"
+        if len(ids) > self._PAGE_CAP:
+            return f"한 응답이 {self._PAGE_CAP}건을 넘음 — 상한 가정이 깨짐"
+        return ""
+
+    def _page1_or_fail(self, symbol, dt, token, overrides) -> dict:
+        try:
+            return self._probe_page1(symbol, dt, token, overrides)
+        except NHPlugPagingError:
+            raise
+        except BrokerError as error:
+            raise NHPlugPagingError(f"{symbol} {dt} 주문이력 조회 오류: {error} — 일부 이력만으로 진행하지 않습니다") from error
+
+    def _collect_day_rows(self, symbol: str, dt: str, token: str) -> list:
+        """하루치(orr_dt) 주문체결내역을 **완전성을 확인하며** 모아 실제 이력 행 목록으로 돌려줍니다 (완전성을 못 증명하면 NHPlugPagingError)."""
+        cap = self._PAGE_CAP
+        asc = self._page1_or_fail(symbol, dt, token, {"sot_dit": "0"})
+        problem = self._validate_single_response(asc)
+        if problem:
+            raise NHPlugPagingError(f"{symbol} {dt} 이력 응답 모순: {problem} — 일부 이력만으로 진행하지 않습니다")
+        if len(asc["ids"]) < cap and not asc["signal"]:
+            return self._merge_rows_by_id([asc["rows"]])     # 상한 미만이고 계속 신호도 없으면 하루치 전체 (이전 동작과 같음)
+
+        # 상한(15건)에 닿았거나 계속 신호가 있음 → 내림 첫 페이지와 조합해 전체를 덮는지 증명합니다.
+        desc = self._page1_or_fail(symbol, dt, token, {"sot_dit": "1"})
+        _union, verdict, complete = self._judge_partition(asc, desc, "0", "0")
+        if complete:
+            rows = self._merge_rows_by_id([asc["rows"], desc["rows"]])
+            print(f"[주문이력] {symbol} {dt} 상한({cap}건) 도달 → 오름·내림 조합으로 완전 수집: {len(rows)}건 ({verdict})")
+            return rows
+        if verdict.startswith("모순"):
+            raise NHPlugPagingError(f"{symbol} {dt} 이력 완전성 확인 실패: {verdict} — 일부 이력만으로 진행하지 않습니다")
+
+        # 30건 이상일 수 있음 → 방향(매수/매도)으로 분할하고 각 분할에 같은 규칙 적용 (빠짐없이 나누는 분할만 사용)
+        responses = []
+        for side, fill, name in self._EXHAUSTIVE_PARTITIONS:
+            base = {"oss_sby_dit_cd": side, "ost_cns_dit": fill}
+            p_asc = self._page1_or_fail(symbol, dt, token, {**base, "sot_dit": "0"})
+            p_desc = self._page1_or_fail(symbol, dt, token, {**base, "sot_dit": "1"})
+            _ids, part_verdict, part_complete = self._judge_partition(p_asc, p_desc, side, fill)
+            if not part_complete:
+                raise NHPlugPagingError(
+                    f"{symbol} {dt} 분할[{name}] 이력 완전성 확인 실패: {part_verdict} — 일부 이력만으로 진행하지 않습니다"
+                )
+            responses += [p_asc["rows"], p_desc["rows"]]
+        rows = self._merge_rows_by_id(responses)
+        print(f"[주문이력] {symbol} {dt} 30건 이상 의심 → 방향(매수/매도) 분할로 완전 수집: {len(rows)}건")
+        return rows
 
     @staticmethod
     def _is_monotonic(ids, descending: bool) -> bool:
@@ -848,8 +938,8 @@ class NHPlugBroker(Broker):
         return union, f"불완전(상한 도달·오름내림 겹침 없음 — {cap * 2}건 이상일 수 있음)", False
 
     def _enumerate_day_partitioned(self, symbol, dt, token, label_prefix="", missing_ids=frozenset()):
-        """하루치 이력을 방향×체결 4분할 + 오름·내림 1페이지씩으로 모아 (고유 주문 집합, 완전 여부)를 돌려줍니다 (진단 출력 포함)."""
-        partitions = [("2", "1", "매수·체결"), ("2", "2", "매수·미체결"), ("1", "1", "매도·체결"), ("1", "2", "매도·미체결")]
+        """하루치 이력을 방향(매수/매도) 분할 + 오름·내림 1페이지씩으로 모아 (고유 주문 집합, 완전 여부)를 돌려줍니다 (진단 출력 포함)."""
+        partitions = list(self._EXHAUSTIVE_PARTITIONS)
         union_by_part: dict[str, set] = {}
         all_complete = True
         for side, fill, name in partitions:
@@ -1103,16 +1193,14 @@ class NHPlugBroker(Broker):
             for offset in range(days, -1, -1):
                 dt = (now_kst - timedelta(days=offset)).strftime("%Y%m%d")
                 try:
-                    output = self._fetch_history_day(symbol, dt, token)
+                    output = self._collect_day_rows(symbol, dt, token)
                 except NHPlugPagingError:
-                    # 연속조회를 끝내지 못한 날짜는 일부 데이터로 진행하지 않습니다 (Fail-Closed).
-                    # 건너뛰면 이력이 비어 포지션 불일치·잘못된 정산으로 이어집니다.
+                    # 하루치 이력을 완전하게 모으지 못한 날짜는 일부 데이터로 진행하지 않습니다 (Fail-Closed).
                     raise
                 except BrokerError as e:
-                    # 0건/조회불가 등은 빈 결과로 처리, 치명 오류는 상위로
-                    # "조회할 내역이 없습니다"(13578) 등은 성공 코드로 이미 처리됨
-                    print(f"[주문이력] {symbol} {dt} 조회 중 BrokerError: {e} → 건너뜀")
-                    continue
+                    # 예전에는 날짜별 오류를 '건너뜀'으로 넘겼지만, 그러면 그 날짜의 체결이 이력에서 사라져
+                    # 포지션 불일치·잘못된 정산이 됩니다(2026-11-18 XA109). 최근 실행에서 건너뛴 사례는 이 장애뿐이었으므로 실패시킵니다.
+                    raise NHPlugPagingError(f"{symbol} {dt} 주문이력 조회 오류: {e} — 일부 이력만으로 진행하지 않습니다") from e
                 if output:
                     print(f"[주문이력] {symbol} {dt} 조회 성공: {len(output)}건")
                 for item in output:
