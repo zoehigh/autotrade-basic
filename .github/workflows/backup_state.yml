@@ -1,8 +1,9 @@
 name: Backup state caches (encrypted)
 
-# Read-only recovery of known cache snapshots. Never executes trading.
-# 이전 키(40009255811 등 6개)는 캐시 보존기간(7일 미사용)으로 이미 만료돼 제거했습니다.
-# 현재 대상: NHPlug 데모 SOXL 복구 전 스냅샷 (11/6 실행 직후 캐시, 복구 전 백업용)
+# 임시 검증 브랜치 전용 수정 — 거래 실행 없음.
+# 최신 KIS/Kiwoom/NHPlug Demo 캐시 3개를 정확한 키로 읽기 전용 복원해
+# 개발 VPS 공개키로 암호화한 뒤 암호문+SHA만 artifact로 업로드합니다.
+# 기존 캐시 저장/삭제 없음, 평문 state 업로드 없음.
 on:
   workflow_dispatch:
 
@@ -17,61 +18,80 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: nhplug-soxl-repair-before
-            key: state-nhplug-demo-42287486160
+          - label: kis-demo
+            key: state-kis-demo-44595508646
+          - label: kiwoom-demo
+            key: state-kiwoom-demo-44606757297
+          - label: nhplug-demo
+            key: state-nhplug-demo-44607643459
 
     steps:
       - name: Restore the exact snapshot
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: .state.json
           key: ${{ matrix.key }}
           fail-on-cache-miss: true
 
-      - name: Validate and encrypt without printing state
+      - name: Verify cache hit and state integrity
         shell: bash
-        env:
-          PASSPHRASE: ${{ secrets.STATE_BACKUP_PASSPHRASE }}
         run: |
           set -euo pipefail
-          test -s .state.json
-          python3 -m json.tool .state.json > /dev/null
-          if [[ -z "$PASSPHRASE" ]]; then
-            echo "::error::STATE_BACKUP_PASSPHRASE is empty or unavailable"
+          if [[ "${{ steps.restore.outputs.cache-hit }}" != "true" ]]; then
+            echo "::error::cache-hit=false for ${{ matrix.key }}"
             exit 1
           fi
+          test -s .state.json
+          python3 -m json.tool .state.json > /dev/null
+          python3 -c "import json;d=json.load(open('.state.json'));print('포함 종목:', sorted(k for k in d if isinstance(d[k],dict)))"
 
-          printf '%s' "$PASSPHRASE" |
-            gpg --batch --yes --pinentry-mode loopback \
-              --passphrase-fd 0 --symmetric \
-              --cipher-algo AES256 --s2k-digest-algo SHA256 \
-              --output "backup-${{ matrix.label }}.gpg" .state.json
+      - name: Import verification public key
+        shell: bash
+        env:
+          PUBLIC_KEY: |
+            -----BEGIN PGP PUBLIC KEY BLOCK-----
+            
+            mQENBGsAVgABCAC6yF9IqqxzvIiBCYQbn4eaGhkgr0xJcuv3lap4eQW+oWaSvoi4
+            WgKRrve/j+Zw+PSP1CCDdPnlv6q0EGBC6zzzp7gnKBqwYTV4vfKHBHrcFeN6cRb7
+            ehjwy1WRaLFfrjbgfKl49Vuex+kyc7cXxcTYpVq1FMBwxcOK7QuNbSniZoZ2oo9E
+            BJ06/bTOmtbivKCLu8caRxzSBLnmBHerl9TKfwS1Nqv+DmRXNGyMY1+XWxLKaPu7
+            RWM42EGTKZ5RFTFgjR34K2sq5jQQXqDkevxk+JnP86yLPy9hnh1Oo9k1o93kfQKm
+            pbFJp+rsb1Lx72tKAOyVFhfWbWiHxPK69VAJABEBAAG0J0RlbW8gU3RhdGUgUmVz
+            dG9yZSA8ZGVtby1yZXN0b3JlQGxvY2FsPokBUQQTAQoAOxYhBEzmyQ1bVlTgK2iu
+            lLgVSGdHS4SABQJrAFYAAhsNBQsJCAcCAiICBhUKCQgLAgQWAgMBAh4HAheAAAoJ
+            ELgVSGdHS4SA0scH/0VcMfk0QwEtCxgt30kj7NTSAKnNE7LmdGes4qSZOTV8hPbn
+            UPm/YeePrLIkx6Dp/eZCdVYqM/+EoeguVuGTEhL+6caV+VBffW0IMN8kaEi0iEEl
+            C4eKynSenu6pLQhWkftu3bdHMBJ83E86y9WkSpvmdGzrQv/LayMbSeZ/1/J0b/0S
+            0KYL3z3y83gYfNqCUdjvuNTzZo0BO6bU3sFxqG8+Ag+LeouzoX/vwCyttobGnHkb
+            ne9FZ2qXZ9SG/736tk+39FySGA0NU+K50PRshP+676q+L4Q3pgZLCuzmifU/bOnb
+            pICdFMVqJpw5b5pdL81J7CfoTiT8jfUzNi4GA4w=
+            =bu2B
+            -----END PGP PUBLIC KEY BLOCK-----
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PUBLIC_KEY" | gpg --batch --import
+
+      - name: Encrypt state to verification key
+        shell: bash
+        env:
+          FPR: 4CE6C90D5B5654E02B68AE94B8154867474B8480
+        run: |
+          set -euo pipefail
+          gpg --batch --yes --trust-model always --encrypt --recipient "$FPR" \
+            --output "backup-${{ matrix.label }}.gpg" .state.json
           test -s "backup-${{ matrix.label }}.gpg"
-
-          # 왕복 검증: 방금 만든 암호문을 다시 복호화해 원본과 바이트 단위로 같은지 확인합니다.
-          # (업로드 후 복호화 불가·손상 백업을 뒤늦게 발견하는 일을 막습니다)
-          printf '%s' "$PASSPHRASE" |
-            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-              --decrypt --output roundtrip.state.json "backup-${{ matrix.label }}.gpg"
-          cmp .state.json roundtrip.state.json
-          rm -f roundtrip.state.json
-
-          # 원본 SHA-256 을 artifact 안의 파일로만 남깁니다 (공개 로그에는 값을 출력하지 않음).
-          # 복구 전 복호화본이 원본과 같은지 대조하는 기준값입니다.
           sha256sum .state.json | awk '{print $1}' > "backup-${{ matrix.label }}.state.sha256"
           sha256sum "backup-${{ matrix.label }}.gpg" | awk '{print $1}' > "backup-${{ matrix.label }}.gpg.sha256"
-
-          # 포함 종목만 로그에 표시 (값은 출력하지 않음). 이후 복구는 SOXL 만 수정하고 나머지는 보존해야 합니다.
-          python3 -c "import json;d=json.load(open('.state.json'));print('포함 종목:', sorted(k for k in d if isinstance(d[k], dict)))"
-          echo "왕복 검증 통과: 복호화본 == 원본"
+          echo "암호화 완료 (평문 state 는 업로드하지 않음)"
 
       - name: Upload encrypted snapshot only
         uses: actions/upload-artifact@v4
         with:
-          name: backup-${{ matrix.label }}
+          name: verify-state-${{ matrix.label }}
           path: |
             backup-${{ matrix.label }}.gpg
             backup-${{ matrix.label }}.state.sha256
             backup-${{ matrix.label }}.gpg.sha256
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
