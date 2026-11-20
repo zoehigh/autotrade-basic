@@ -888,6 +888,57 @@ def _required_settlement_fills(evidence):
     return problems, required, round(max(0.0, money), 2)
 
 
+def _full_reinference_sell_bases(evidence):
+    """full_reinference 매도 기준선을 원시 체결에서 **독립 재구성**합니다 (odno → basis).
+
+    정산 코드(`state._infer_T_from_full_history`)와 동일한 규칙을 따릅니다:
+      - 날짜(ord_dt)별로 그룹화해 오래된 날부터 처리
+      - 같은 날은 **매도를 먼저** (기준선 = 그 시점 보유량), 그 다음 매수
+      - T 효과 없는 추가매수도 보유량에 포함 (단, 그 날 매도 기준선에는 미포함)
+      - `sell_t_effects_before` 같은 낡은 마커는 무시하고 처음부터 다시 계산
+      - 리버스 주문은 reconcile 이 별도 관리하므로 제외
+
+    `_required_settlement_fills` 의 basis 는 시간순(ts)이고 낡은 마커를 우선하므로
+    full_reinference 검증에 그대로 쓰면 같은 날 매수·매도 순서나 재실행 시 어긋납니다.
+    """
+    fills = list(evidence.get("fills") or [])
+    by_date = {}
+    for fill in fills:
+        side = str(fill.get("side") or "")
+        if side in ("BUY", "SELL"):
+            side = "매수" if side == "BUY" else "매도"
+        if side not in ("매수", "매도"):
+            continue
+        ord_dt = str(fill.get("ord_dt") or "")
+        if not ord_dt and fill.get("ts"):
+            ord_dt = str(fill.get("ts"))[:10].replace("-", "")
+        by_date.setdefault(ord_dt, []).append((side, fill))
+
+    net_qty = 0
+    bases = {}
+    for ord_dt in sorted(by_date.keys()):
+        day = by_date[ord_dt]
+        # 정산 코드(_infer_T_from_full_history) 순서와 동일:
+        # 리버스 매도 → 리버스 매수 → 일반 매도(기준선 기록) → 일반 매수
+        # 리버스 체결은 T 효과가 별도 reconcile 되지만 보유량(net_qty)에는 반영됩니다.
+        rev_sells = [f for side, f in day if side == "매도" and f.get("reverse_action")]
+        rev_buys = [f for side, f in day if side == "매수" and f.get("reverse_action")]
+        sells = [f for side, f in day if side == "매도" and not f.get("reverse_action")]
+        buys = [f for side, f in day if side == "매수" and not f.get("reverse_action")]
+        for f in rev_sells:
+            net_qty = max(0, net_qty - _as_int(f.get("qty")))
+        for f in rev_buys:
+            net_qty += _as_int(f.get("qty"))
+        # 일반 매도 우선: 기준선은 그날 일반 매수가 반영되기 전 보유량
+        for f in sorted(sells, key=lambda x: (str(x.get("ts") or ""), str(x.get("odno") or ""))):
+            bases[str(f.get("odno"))] = net_qty
+            net_qty = max(0, net_qty - _as_int(f.get("qty")))
+        # 그 다음 일반 매수 (추가매수 포함, 모두 보유량 증가)
+        for f in sorted(buys, key=lambda x: (str(x.get("ts") or ""), str(x.get("odno") or ""))):
+            net_qty += _as_int(f.get("qty"))
+    return bases
+
+
 def _independent_expected_ordered(evidence):
     """정산 후 원장을 신뢰하지 않고 **정산 전 원장 + 원시 체결 + 이전 마커**로 재구성합니다.
 
@@ -926,6 +977,15 @@ def _independent_expected_ordered(evidence):
         evidence["ledger_after"] = ledger_after
     required_problems, _required, expected_money = _required_settlement_fills(evidence)
     problems.extend(required_problems)
+    # full_reinference 매도 기준선은 원시 체결에서 정산 코드와 같은 규칙(날짜별
+    # 매도 우선 + 추가매수 포함, 낡은 마커 무시)으로 독립 재구성합니다. 아래 원장
+    # seq 순 재구성은 ledger_seq 가 없는 추가매수를 놓쳐 기준선이 과소 계산되므로
+    # (KIS 실측 +3/+4/+11주) 이 맵을 우선 사용합니다. incremental 은 기존 동작 유지.
+    required_sell_basis = (
+        _full_reinference_sell_bases(evidence)
+        if mode == "full_reinference"
+        else {}
+    )
     before_entries = (
         {}
         if mode == "full_reinference"
@@ -1007,6 +1067,9 @@ def _independent_expected_ordered(evidence):
                 else (evidence.get("sell_t_effects_before") or {}).get(odno) or {}
             )
             basis = _as_int(marker.get("basis"))
+            if basis <= 0 and mode == "full_reinference":
+                # 전체 재추정은 추가매수까지 반영한 필수 체결 궤적의 기준선을 씁니다.
+                basis = required_sell_basis.get(odno, 0)
             if basis <= 0:
                 basis = position if position is not None else _as_int(order.get("basis"))
             expected_factor = _classify_sell_ratio(
