@@ -40,6 +40,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     resolve_real_kst_from_ord,
+    normalize_daily_candle_date,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -77,6 +78,8 @@ class LSBroker(Broker):
 
     DRY 모드는 DryBroker 래퍼로 처리 — LSBroker 자체는 항상 LIVE로 동작.
     """
+
+    provides_daily_candle_dates = True   # g3204 의 date / Finnhub 의 t 를 세션 날짜로 제공
 
     def __init__(self):
         self._session = requests.Session()
@@ -181,28 +184,27 @@ class LSBroker(Broker):
     # 일봉 종가
     # ══════════════════════════════════════════════════════════════════
 
-    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """
-        해외주식 일별주가를 조회합니다 -> list[float] (오래된 순).
+    def _fetch_daily_rows(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉 원본 행을 {"date", "close"}로 정규화해 조회합니다 (응답 순서 = 최신순).
 
-        1차: LS g3204 TR
-        2차: Finnhub candle API fallback
+        1차: LS g3204 TR (차트 경로, 일봉 gubun=2) — date 필드(YYYYMMDD) 사용
+        2차: Finnhub candle API fallback — t(Unix 초)를 미국 세션 날짜로 변환
         """
         try:
-            return self._get_daily_closes_ls(symbol, exchange, days)
+            return self._fetch_daily_rows_ls(symbol, exchange, days)
         except BrokerError:
             pass
 
         if FINNHUB_API_KEY:
             try:
-                return self._get_daily_closes_finnhub(symbol, days)
+                return self._fetch_daily_rows_finnhub(symbol, days)
             except BrokerError as e:
                 print(f"[Finnhub Fallback] 일별종가 조회 실패: {e}")
 
-        raise BrokerError(f"일별종가 조회 실패: LS g3204 및 Finnhub 모두 실패")
+        raise BrokerError("일별종가 조회 실패: LS g3204 및 Finnhub 모두 실패")
 
-    def _get_daily_closes_ls(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """LS g3204 TR로 일별주가 조회 (차트 경로, 일봉 gubun=2)."""
+    def _fetch_daily_rows_ls(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """LS g3204 TR로 일봉 행을 조회합니다 (응답은 오래된순 → 최신순으로 뒤집어 반환)."""
         ls_exch, _ = convert_exchange_code(exchange)
         keysymbol = build_symbol(symbol, ls_exch)
 
@@ -232,23 +234,28 @@ class LSBroker(Broker):
                 raise BrokerError(f"일별주가 조회 실패: {data.get('rsp_msg', '')}")
 
             output = data.get("g3204OutBlock1", [])
-            closes = []
+            rows = []
             for item in output:
                 try:
                     close = float(item.get("close", "0"))
-                    if close > 0:
-                        closes.append(close)
                 except (ValueError, TypeError):
                     continue
+                if close <= 0:
+                    continue
+                rows.append({
+                    "date": normalize_daily_candle_date(item.get("date")),
+                    "close": close,
+                })
 
-            # g3204은 오래된순(ascending) 반환 -> 마지막 days개가 최근
-            return closes[-days:]
+            # g3204은 오래된순(ascending) 반환 → 공통 규칙(최신순)에 맞게 뒤집습니다.
+            rows.reverse()
+            return rows
 
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"일별주가 조회 실패 (네트워크): {str(e)}")
 
-    def _get_daily_closes_finnhub(self, symbol: str, days: int = 5) -> list[float]:
-        """Finnhub candle API로 일봉 종가 조회 (fallback)."""
+    def _fetch_daily_rows_finnhub(self, symbol: str, days: int = 5) -> list[dict]:
+        """Finnhub candle API로 일봉 행을 조회합니다 (응답은 오래된순 → 최신순으로 뒤집어 반환)."""
         now = int(time.time())
         from_ts = now - (days * 2 + 5) * 86400
 
@@ -269,14 +276,47 @@ class LSBroker(Broker):
             if data.get("s") != "ok":
                 raise BrokerError(f"Finnhub candle s!=ok: {symbol}")
 
-            closes = [float(c) for c in data.get("c", []) if isinstance(c, (int, float)) and c > 0]
-            if not closes:
+            closes = data.get("c", [])
+            timestamps = data.get("t", [])
+            rows = []
+            for index, close in enumerate(closes):
+                if not isinstance(close, (int, float)) or isinstance(close, bool) or close <= 0:
+                    continue
+                date_str = None
+                if index < len(timestamps):
+                    try:
+                        # Finnhub 일봉 t 는 해당 세션의 Unix 초 — UTC 기준 날짜가 미국 세션 날짜와 같습니다.
+                        date_str = datetime.fromtimestamp(
+                            float(timestamps[index]), tz=ZoneInfo("UTC")
+                        ).strftime("%Y-%m-%d")
+                    except (ValueError, TypeError, OSError, OverflowError):
+                        date_str = None
+                rows.append({"date": date_str, "close": float(close)})
+
+            if not rows:
                 raise BrokerError(f"Finnhub 유효한 종가 없음: {symbol}")
 
-            return closes[-days:]
+            rows.reverse()   # Finnhub 는 오래된순 → 최신순
+            return rows
 
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"Finnhub API 호출 실패 ({symbol}): {e}")
+
+    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+        """해외주식 일별주가 종가를 조회합니다 → list[float] (오래된 순)."""
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [row["close"] for row in reversed(rows)][-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉을 날짜 포함으로 조회합니다 → [{"date", "close"}] (오래된 순).
+
+        g3204 의 date(YYYYMMDD) 또는 Finnhub t 를 'YYYY-MM-DD'로 정규화합니다.
+        """
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [
+            {"date": row["date"], "close": row["close"]}
+            for row in reversed(rows)
+        ][-days:]
 
     # ══════════════════════════════════════════════════════════════════
     # 조회 API

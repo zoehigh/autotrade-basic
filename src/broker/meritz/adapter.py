@@ -163,6 +163,8 @@ class MeritzBroker(Broker):
     모의투자 계좌가 없어 BROKER_MODE != "real"이면 생성자에서 즉시 실패합니다.
     """
 
+    provides_daily_candle_dates = True   # 일봉 date(YYYYMMDD)를 미국 세션 날짜로 제공
+
     def __init__(self):
         from config import BROKER_CONFIG, BROKER_MODE, HTTP_TIMEOUT, MERITZ_DEFAULT_BASE_URL
 

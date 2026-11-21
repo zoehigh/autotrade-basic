@@ -222,3 +222,28 @@ def us_session_last_closed_date(now_utc: datetime | None = None) -> str | None:
             return None
         session_str = nxt.strftime("%Y-%m-%d")
     return None
+
+
+def normalize_daily_candle_date(value) -> str | None:
+    """브로커 일봉 날짜 필드를 미국 세션 날짜 'YYYY-MM-DD'로 정규화합니다.
+
+    YYYYMMDD(문자열·숫자)와 YYYY-MM-DD를 모두 받습니다.
+    값이 없거나 형식·날짜가 유효하지 않으면 None (날짜 미확정 — 종료 판정 보류 대상).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        # 20261113.0 같은 실수형도 정수 날짜로 허용
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        value = int(value)
+    text = str(value).strip()
+    if "T" in text or " " in text:      # ISO datetime 접미 제거
+        text = text[:10]
+    digits = text.replace("-", "").replace("/", "").replace(".", "")
+    if len(digits) != 8 or not digits.isdigit():
+        return None
+    try:
+        return _date(int(digits[:4]), int(digits[4:6]), int(digits[6:8])).isoformat()
+    except ValueError:
+        return None

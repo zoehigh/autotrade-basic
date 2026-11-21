@@ -38,6 +38,7 @@ autotrade-basic/
 | 브로커 구현 | src/broker/{kis,kiwoom,ls,toss,nhplug,meritz}/ | 각 브로커별 API 어댑터 |
 | 공통 인터페이스 | src/broker/base.py | `Broker`, `OrderResult`, `BrokerError`, `get_daily_closes()` |
 | 일봉 종가 조회 | src/broker/base.py `get_daily_closes()` | TR: KIS=HHDFS76240000, LS=g3204, KIWOOM=usa06012, TOSS=GET /api/v1/candles, MERITZ=GET /market/v1/overseas/candles/days |
+| 날짜 포함 일봉 | src/broker/base.py `get_daily_candles()` | `[{"date": "YYYY-MM-DD"\|None, "close": float}]` (오래된 순). 6개 브로커 모두 날짜 제공(`provides_daily_candle_dates=True`) — 리버스 종료 판정은 확정된 직전 XNYS 세션 종가만 사용 |
 | 상태 파일 관리 | src/state.py | state.json 로드/저장, T 갱신, reverse_mode 상태 |
 | 환경변수 설정 | src/config.py | 종목 설정, 모드, 수수료, T 보정 env var |
 | 시세 데이터 | src/market_data.py | Finnhub 5일 이동평균 조회 |

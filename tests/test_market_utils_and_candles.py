@@ -196,6 +196,18 @@ class TestDryBrokerGetDailyCandles:
         dry = DryBroker(real)
         assert dry.get_daily_candles("TQQQ", "NAS") == dated
 
+    def test_capability_flag_delegates_to_real_broker(self):
+        """DRY에서도 날짜 제공 여부가 실제 브로커와 동일해야 합니다 (종료 판정 일관성)."""
+        real = MagicMock()
+        real.provides_daily_candle_dates = True
+        assert DryBroker(real).provides_daily_candle_dates is True
+
+        real.provides_daily_candle_dates = False
+        assert DryBroker(real).provides_daily_candle_dates is False
+
+        # 플래그가 없는 브로커는 기본값 False (기존 현재가 폴백 유지)
+        assert DryBroker(object()).provides_daily_candle_dates is False
+
 
 # ═══════════════════════════════════════════════════════════════════
 # toss.adapter: TossBroker.get_daily_candles (mocked)
