@@ -124,6 +124,7 @@ _MOC_SELL_PROXY_PRICE = 0.01
 class TossBroker(Broker):
     # TOSS 는 status=OPEN 조회를 지원합니다 (실측 2026-10-23).
     supports_open_orders_query = True
+    provides_daily_candle_dates = True   # 일봉 timestamp 를 미국 세션 날짜로 제공
     """
     토스증권 미국주식 REST API Broker 구현체.
 

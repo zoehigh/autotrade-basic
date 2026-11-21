@@ -31,6 +31,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     resolve_real_kst_from_ord,
+    normalize_daily_candle_date,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -70,6 +71,8 @@ class KISBroker(Broker):
 
     DRY 모드는 DryBroker 래퍼로 처리 — KISBroker 자체는 항상 LIVE로 동작.
     """
+
+    provides_daily_candle_dates = True   # 일봉 응답의 xymd(YYYYMMDD)를 세션 날짜로 제공
 
     def __init__(self):
         self._session = KISSession()
@@ -552,12 +555,8 @@ class KISBroker(Broker):
     # 일봉 종가
     # ═══════════════════════════════════════════════════════════════════════
 
-    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """
-        해외주식 일자별종가를 조회합니다 → list[float] (오래된 순).
-
-        TR: HHDFS76240000 (해외주식 일자별종가)
-        """
+    def _fetch_daily_rows(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉 원본 행을 {"date", "close"}로 정규화해 조회합니다 (응답 순서 = 최신순)."""
         access_token = self._get_token()
 
         path = "/uapi/overseas-price/v1/quotations/dailyprice"
@@ -587,20 +586,39 @@ class KISBroker(Broker):
 
             # 일봉 목록은 output2(최신순)에 담깁니다 (output1 은 요약). 예전 형태(output)도 함께 읽습니다.
             output = response_data.get("output2") or response_data.get("output") or []
-            closes = []
+            rows = []
             for item in output:
                 try:
                     close = float(item.get("clos", "0"))
-                    if close > 0:
-                        closes.append(close)
                 except (ValueError, TypeError):
                     continue
-
-            closes.reverse()
-            return closes[-days:]
+                if close <= 0:
+                    continue
+                rows.append({
+                    "date": normalize_daily_candle_date(item.get("xymd")),
+                    "close": close,
+                })
+            return rows
 
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"일자별종가 조회 실패: {str(e)}")
+
+    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+        """해외주식 일자별종가를 조회합니다 → list[float] (오래된 순). TR: HHDFS76240000."""
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [row["close"] for row in reversed(rows)][-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉을 날짜 포함으로 조회합니다 → [{"date", "close"}] (오래된 순).
+
+        xymd(미국 영업일, YYYYMMDD)를 'YYYY-MM-DD'로 정규화합니다. 날짜를 못 읽은 행은
+        date=None 으로 남겨 날짜 미제공 브로커의 기존 폴백 동작을 보존합니다.
+        """
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [
+            {"date": row["date"], "close": row["close"]}
+            for row in reversed(rows)
+        ][-days:]
 
     # ═══════════════════════════════════════════════════════════════════════
     # 주문 API

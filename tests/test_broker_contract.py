@@ -539,13 +539,25 @@ class TestKISBrokerContract(BrokerContractTest):
         with pytest.raises(BrokerError):
             broker.get_daily_closes("SOXL", "AMS", days=5)
 
-    def test_daily_candles_have_no_dates(self):
-        """KIS 일봉은 날짜 없이(date=None) 돌려줍니다 — 리버스 종료 판정(PR #16)이 'KIS 는 날짜 미제공 브로커'로
-        보고 기존 방식으로 판정하는 전제입니다. 일봉이 비어 있으면(=조회 실패와 구분 불가) 그 전제가 깨집니다."""
-        self._set_mock_response({"rt_cd": "0", "output2": [{"xymd": "20261113", "clos": "55.00"}, {"clos": "54.00"}]})
+    def test_daily_candles_include_xymd_dates(self):
+        """KIS 일봉은 xymd(YYYYMMDD)를 'YYYY-MM-DD' 세션 날짜로 제공합니다 (오래된 순)."""
+        self._set_mock_response({"rt_cd": "0", "output2": [
+            {"xymd": "20261113", "clos": "55.00"},
+            {"xymd": "20261112", "clos": "54.00"},
+        ]})
         broker = self._create_broker()
         candles = broker.get_daily_candles("SOXL", "AMS", days=5)
-        assert len(candles) == 2 and all(c.get("date") is None for c in candles)
+        assert candles == [
+            {"date": "2026-11-12", "close": 54.0},
+            {"date": "2026-11-13", "close": 55.0},
+        ]
+
+    def test_daily_candles_keep_none_when_xymd_missing(self):
+        """xymd 가 없는 레거시 행은 date=None 으로 남겨 날짜 미제공 폴백을 보존합니다."""
+        self._set_mock_response({"rt_cd": "0", "output": [{"clos": "52.00"}, {"clos": "51.00"}]})
+        broker = self._create_broker()
+        candles = broker.get_daily_candles("SOXL", "AMS", days=5)
+        assert candles == [{"date": None, "close": 51.0}, {"date": None, "close": 52.0}]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -899,6 +911,20 @@ class TestKiwoomBrokerContract(BrokerContractTest):
     def test_exchange_code_ams_to_na(self):
         broker = self._create_broker()
         assert broker.exchange_code("AMS") == "NA"
+
+    def test_daily_candles_include_dt_dates(self):
+        """키움 일봉은 dt(YYYYMMDD)를 세션 날짜로, cur_prc(부호 포함)를 종가로 제공합니다."""
+        self._set_mock_response({"return_code": 0, "result_list": [
+            {"dt": "20261113", "cur_prc": "+55.00"},
+            {"dt": "20261112", "cur_prc": "-54.00"},
+        ]})
+        broker = self._create_broker()
+        assert broker.get_daily_candles("TQQQ", "NAS", days=5) == [
+            {"date": "2026-11-12", "close": 54.0},
+            {"date": "2026-11-13", "close": 55.0},
+        ]
+        # 기존 get_daily_closes 반환 형식·값은 그대로입니다.
+        assert broker.get_daily_closes("TQQQ", "NAS", days=5) == [54.0, 55.0]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2132,6 +2158,22 @@ class TestNHPlugBrokerContract(BrokerContractTest):
         closes = broker.get_daily_closes("TQQQ", "NAS", days=5)
         assert closes == [51.0, 52.0, 53.0, 54.0, 55.0]
 
+    def test_daily_candles_include_trade_date(self):
+        """NHPLUG 일봉은 trade_date(YYYYMMDD)를 세션 날짜로 제공합니다 (오래된 순)."""
+        self._set_mock_response({
+            "Output_1": [
+                {"trade_date": "20261113", "close_prc": "55.00"},
+                {"trade_date": "20261112", "close_prc": "54.00"},
+            ],
+            "message": {"msg_code": "", "usr_msg": "", "dvlp_msg": ""},
+        })
+        broker = self._create_broker()
+        assert broker.get_daily_candles("TQQQ", "NAS", days=5) == [
+            {"date": "2026-11-12", "close": 54.0},
+            {"date": "2026-11-13", "close": 55.0},
+        ]
+        assert broker.get_daily_closes("TQQQ", "NAS", days=5) == [54.0, 55.0]
+
     # ── NHPLUG 거래소 코드 매핑 (NHPLUG 전용) ─────────────────────────
     # NHPLUG는 미국 주식 모두 fc_sec_trd_nat_cd="200"을 사용합니다 (NAS/NYS/AMS 구분 없음)
 
@@ -2244,6 +2286,34 @@ class TestLSBrokerContract:
         """side_effect를 제거하고 return_value로 단일 응답을 설정합니다."""
         self._mock_post.side_effect = None
         self._mock_post.return_value = _make_response(json_data, status_code, headers)
+
+    def test_daily_candles_include_g3204_date(self):
+        """LS g3204 일봉은 date(YYYYMMDD)를 세션 날짜로 제공합니다 (응답은 오래된순)."""
+        self._set_mock_response({"rsp_cd": "00000", "g3204OutBlock1": [
+            {"date": "20261112", "close": "54.00"},
+            {"date": "20261113", "close": "55.00"},
+        ]})
+        broker = self._create_broker()
+        assert broker.get_daily_candles("TQQQ", "NAS", days=5) == [
+            {"date": "2026-11-12", "close": 54.0},
+            {"date": "2026-11-13", "close": 55.0},
+        ]
+        assert broker.get_daily_closes("TQQQ", "NAS", days=5) == [54.0, 55.0]
+
+    def test_daily_candles_finnhub_fallback_uses_timestamps(self, monkeypatch):
+        """g3204 실패 시 Finnhub fallback 도 t(Unix 초)를 세션 날짜로 변환합니다."""
+        monkeypatch.setattr("broker.ls.adapter.FINNHUB_API_KEY", "fake-key")
+        self._set_mock_response({"rsp_cd": "IGW00215", "rsp_msg": "거부"})
+        broker = self._create_broker()
+        t12 = int(datetime(2026, 11, 12, tzinfo=timezone.utc).timestamp())
+        t13 = int(datetime(2026, 11, 13, tzinfo=timezone.utc).timestamp())
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"s": "ok", "c": [54.0, 55.0], "t": [t12, t13]}
+        broker._session.get = MagicMock(return_value=fake_resp)
+        assert broker.get_daily_candles("TQQQ", "NAS", days=5) == [
+            {"date": "2026-11-12", "close": 54.0},
+            {"date": "2026-11-13", "close": 55.0},
+        ]
 
     # ── COSOQ02701 1차 / COSOQ00201 폴백 ─────────────────────────────
 

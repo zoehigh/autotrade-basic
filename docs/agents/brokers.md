@@ -146,4 +146,9 @@ uv run pytest tests/test_broker_preflight.py -v
   - KIWOOM: usa06012 → `POST /api/us/chart` (최신순 → 역순)
   - TOSS: `GET /api/v1/candles?interval=1d` (최신순 → `reversed()`)
   - 리버스모드 `_get_reverse_star_point()`에서 close_prices 보강용으로 사용 가능
+- **`get_daily_candles()`** (`src/broker/base.py`): `(symbol, exchange, days=5) → [{"date": "YYYY-MM-DD"|None, "close": float}]` (오래된 순).
+  - 기본 구현은 `get_daily_closes()`를 쓰고 `date=None` — 날짜 미제공 브로커는 현재가 폴백 유지.
+  - 6개 브로커 모두 `provides_daily_candle_dates=True`: KIS=`xymd`, KIWOOM=`dt`, NHPLUG=`trade_date`, LS=`date`(g3204)/`t`(Finnhub), TOSS=`timestamp`, MERITZ=`date` → `normalize_daily_candle_date()` 로 `YYYY-MM-DD` 정규화.
+  - 각 어댑터는 `_fetch_daily_rows()`(LS는 g3204/Finnhub 분기) 한 번만 호출하고 `get_daily_closes()`/`get_daily_candles()`가 같은 행을 공유 — 일봉 API 중복 조회 없음.
+  - 리버스 종료 판정(`strategy._resolve_exit_close`)은 일봉 1회 조회로 확정 종가와 날짜 제공 여부를 함께 판단하고, 날짜 제공 브로커는 확정 직전 XNYS 세션 종가가 없으면 `EXIT_UNCONFIRMED` 보류(현재가 미사용).
 - **LS 해외주식 취소** (`src/broker/ls/adapter.py::cancel_order`, 2026-11-03 실측): COSAT00301 + OrdPtnCode=`08`(취소) + OrgOrdNo=원주문번호(필수). 성공 `{"00000","00156"}` (00156="취소주문이 완료되었습니다"). 취소주문도 신규 주문번호를 발급받으며(OrgOrdNo로 원주문 연결), 원주문은 잔량 0·0체결로 확정. **COSMT00300은 "해외증권 매도상환주문"으로 취소와 무관 — 사용 금지**. Place_order 성공 `{"00000","00040","00050"}` (00040 실측="매수 주문이 완료되었습니다", 00050은 매도 대칭 추정 — 첫 실전 매도 시 rsp_cd 확인 필요). 주문번호는 OutBlock2(결과) 우선·OutBlock1(에코) 폴백으로 읽기.
