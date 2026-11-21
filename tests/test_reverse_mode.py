@@ -31,6 +31,7 @@ class _FakePurchaseAmount:
 
 def _make_broker_mock(last_price, position_qty, avg_price, orderable_cash):
     broker = MagicMock()
+    broker.provides_daily_candle_dates = False   # 기본은 날짜 미제공 브로커 (필요한 테스트에서 True로 설정)
     broker.get_stock_quotation.return_value = _FakeQuotation()
     broker.get_stock_price.return_value = _FakePrice(last_price)
     broker.get_balance.return_value = _FakeBalance(position_qty, avg_price)
@@ -1391,6 +1392,7 @@ def test_dated_broker_without_matching_session_still_holds(monkeypatch):
     monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
     from strategy import _resolve_exit_close
     broker = MagicMock()
+    broker.provides_daily_candle_dates = True   # 날짜 제공 브로커로 명시 (날짜 불일치로 보류되는지 검증)
     broker.get_daily_candles.return_value = [{"date": "2020-01-02", "close": 50.0}]
     assert _resolve_exit_close(broker, "TQQQ", "NAS", last_price=59.26) is None
     broker.get_daily_candles.return_value = []

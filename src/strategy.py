@@ -266,7 +266,7 @@ def _resolve_exit_close(broker, symbol, exchange_code, last_price):
     if confirmed is not None:
         close_price, close_date = confirmed
         return close_price, f"확정 종가[{close_date}]"
-    if _candles_lack_dates(candles) and getattr(broker, "provides_daily_candle_dates", False) is not True:
+    if _candles_lack_dates(candles) and not getattr(broker, "provides_daily_candle_dates", False):
         print(
             f"[경고] {symbol} 이 브로커는 일봉 날짜를 제공하지 않아 확정 종가를 검증할 수 없습니다 "
             f"→ 기존 방식(현재가 ${last_price:.2f})으로 종료를 판정합니다 (프리마켓 가격 영향 가능)."

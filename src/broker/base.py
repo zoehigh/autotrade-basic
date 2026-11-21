@@ -280,6 +280,11 @@ class DryBroker(Broker):
     def name(self) -> str:
         return self._real.name
 
+    @property
+    def provides_daily_candle_dates(self) -> bool:
+        """일봉 날짜 제공 여부도 실제 브로커에 위임 (DRY/LIVE 종료 판정 일관성)."""
+        return getattr(self._real, "provides_daily_candle_dates", False)
+
     # ── 시장 정보: 실제 브로커에 위임 ──
     def is_trading_day(self) -> bool:
         return self._real.is_trading_day()

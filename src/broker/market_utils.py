@@ -232,7 +232,15 @@ def normalize_daily_candle_date(value) -> str | None:
     """
     if value is None or isinstance(value, bool):
         return None
-    digits = str(value).strip().replace("-", "").replace("/", "").replace(".", "")
+    if isinstance(value, (int, float)):
+        # 20261113.0 같은 실수형도 정수 날짜로 허용
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        value = int(value)
+    text = str(value).strip()
+    if "T" in text or " " in text:      # ISO datetime 접미 제거
+        text = text[:10]
+    digits = text.replace("-", "").replace("/", "").replace(".", "")
     if len(digits) != 8 or not digits.isdigit():
         return None
     try:

@@ -114,6 +114,19 @@ def test_undated_broker_keeps_legacy_last_price_fallback():
     assert result["orders"] == []
 
 
+def test_dry_broker_wrapper_holds_like_live_on_missing_date():
+    """DryBroker로 감싸도 날짜 제공 브로커는 LIVE와 동일하게 보류 (DRY 현재가 폴백 방지)."""
+    from broker.base import DryBroker
+
+    real = MagicMock()
+    real.provides_daily_candle_dates = True
+    real.get_daily_candles.return_value = [{"date": None, "close": ABOVE}]
+    result, _ = _run(None, ABOVE, broker=DryBroker(real))
+    assert result["exit"] is False
+    assert result["orders"] == []
+    assert result["hold_reason"] == HOLD_EXIT_UNCONFIRMED
+
+
 # ── 8. 당일 미확정 봉이 포함된 응답 ────────────────────────────────────────────
 def test_today_unconfirmed_candle_is_ignored():
     candles = [
@@ -142,6 +155,8 @@ def test_last_closed_session_calendar(now_utc, expected):
     ("2026-11-13", "2026-11-13"),
     (20261113, "2026-11-13"),
     ("2026/11/13", "2026-11-13"),
+    (20261113.0, "2026-11-13"),
+    ("2026-11-13T00:00:00", "2026-11-13"),
     ("20260230", None),       # 유효하지 않은 날짜
     ("", None),
     (None, None),
