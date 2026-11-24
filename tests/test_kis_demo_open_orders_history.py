@@ -306,3 +306,39 @@ def test_파이프라인_해소_후_반복_실행해도_T와_마커가_변하지
     assert second["orders_meta"][odno]["processed_filled_qty"] == 0
     assert second["orders_meta"][odno]["terminal_assumed"] is True
     assert placed_before > 0
+
+
+# ───────────────────────── 모의 주문번호 재사용(날짜가 달라도 같은 번호) ─────────────────────────
+
+def test_모의_같은_번호의_미체결_행은_체결_행을_가리지_않는다():
+    """실측: KIS 모의 주문번호는 날짜가 달라도 재사용됩니다(90일 중 3건). 체결 행이 있는 번호의 미체결 행은 제외합니다."""
+    rows = [
+        _item("14455", 7, 7, ord_dt="20260921", side="매도", price="60.00"),      # 체결
+        _item("14455", 0, 3, ord_dt="20260929", side="매수", price="55.00"),      # 같은 번호의 다른 날 미체결
+        _item("777", 0, 5, ord_dt="20261105", side="매수", price="50.00"),        # 번호가 겹치지 않는 미체결은 유지
+        _item("888", 2, 2, ord_dt="20261106", side="매수", price="50.00"),        # 체결 두 건이 같은 번호면 둘 다 유지
+        _item("888", 3, 3, ord_dt="20261107", side="매수", price="50.00"),
+    ]
+    history = _normalize_via_adapter(rows)
+    assert [(h["odno"], h["ord_dt"], h["ft_ccld_qty"]) for h in history] == [
+        ("14455", "20260921", "7"), ("777", "20261105", "0"), ("888", "20261106", "2"), ("888", "20261107", "3"),
+    ]
+
+
+def test_실전은_행을_제외하지_않는다():
+    broker, _ = _kis("real", [_response([_item("1", 7, 7), _item("1", 0, 3, ord_dt="20261121")])])
+    assert len(broker.get_order_history("TQQQ", "NAS", days=8)) == 2
+
+
+def test_번호_재사용에도_지연_체결의_건너뜀_감사_목록이_01과_같다():
+    """레거시 0 마커 체결(증명 불가)은 건너뜀 목록에 올라야 합니다. 미체결 행이 같은 번호여도 01 결과와 동일해야 합니다."""
+    rows = [_item("14455", 7, 7, ord_dt="20260921", side="매도", price="60.00"),
+            _item("14455", 0, 3, ord_dt="20260929", side="매수", price="55.00")]
+    state = {"orders_meta": {"14455": {"side": "SELL", "total_qty": 7, "processed_filled_qty": 0,
+                                       "processed_filled_amount": 0.0}}}
+    results = {}
+    for label, history in (("00", _normalize_via_adapter(rows)), ("01", _normalize_via_adapter(rows[:1]))):
+        skipped = []
+        pending, *_ = state_module._apply_late_fill_deltas(deepcopy(state), history, set(), skipped)
+        results[label] = ([p[0] for p in pending], [e["odno"] for e in skipped])
+    assert results["00"] == results["01"] == ([], ["14455"])
