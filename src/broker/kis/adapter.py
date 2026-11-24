@@ -361,24 +361,6 @@ class KISBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"매수가능금액 조회 실패: {str(e)}")
 
-    @staticmethod
-    def _drop_unfilled_rows_sharing_filled_odno(order_history: list[dict]) -> list[dict]:
-        """모의 전체 조회("00")에서 체결 행과 주문번호가 같은 미체결 행을 제외합니다.
-
-        KIS 모의 주문번호는 4~5자리라 날짜가 달라도 같은 번호가 다시 나옵니다(2026-11-24 실측: 90일 중 3건).
-        정산은 주문번호로 이력 행을 찾고 같은 번호면 마지막 행이 이기므로, 다른 날의 미체결 행이 체결 행을
-        가리면 체결을 놓칩니다. 체결 전용("01") 조회에서는 없던 현상이라, 체결 행이 있는 번호의 미체결 행은
-        버려 기존 체결 정산과 같은 입력을 유지합니다. (체결 행과 겹치지 않는 미체결 행은 그대로 둡니다.)
-        """
-        def _filled(row):
-            try:
-                return float(row.get("ft_ccld_qty") or 0) > 0
-            except (TypeError, ValueError):
-                return False
-
-        filled_odnos = {row.get("odno") for row in order_history if _filled(row)}
-        return [row for row in order_history if _filled(row) or row.get("odno") not in filled_odnos]
-
     def get_order_history(
         self,
         symbol: str,
@@ -516,9 +498,6 @@ class KISBroker(Broker):
                 ctx_area_nk200 = response_data.get("ctx_area_nk200", "")
                 ctx_area_fk200 = response_data.get("ctx_area_fk200", "")
                 is_first_call = False
-
-            if self._mode == "demo":
-                order_history = self._drop_unfilled_rows_sharing_filled_odno(order_history)
 
             print(f"[주문이력] {symbol} 체결내역 총 {len(order_history)}건 조회 완료")
 

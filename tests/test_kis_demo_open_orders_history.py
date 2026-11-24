@@ -310,28 +310,29 @@ def test_파이프라인_해소_후_반복_실행해도_T와_마커가_변하지
 
 # ───────────────────────── 모의 주문번호 재사용(날짜가 달라도 같은 번호) ─────────────────────────
 
-def test_모의_같은_번호의_미체결_행은_체결_행을_가리지_않는다():
-    """실측: KIS 모의 주문번호는 날짜가 달라도 재사용됩니다(90일 중 3건). 체결 행이 있는 번호의 미체결 행은 제외합니다."""
-    rows = [
-        _item("14455", 7, 7, ord_dt="20260921", side="매도", price="60.00"),      # 체결
-        _item("14455", 0, 3, ord_dt="20260929", side="매수", price="55.00"),      # 같은 번호의 다른 날 미체결
-        _item("777", 0, 5, ord_dt="20261105", side="매수", price="50.00"),        # 번호가 겹치지 않는 미체결은 유지
-        _item("888", 2, 2, ord_dt="20261106", side="매수", price="50.00"),        # 체결 두 건이 같은 번호면 둘 다 유지
-        _item("888", 3, 3, ord_dt="20261107", side="매수", price="50.00"),
-    ]
+def test_어댑터는_번호가_같은_행도_모두_돌려준다():
+    rows = [_item("14455", 7, 7, ord_dt="20260921", side="매도", price="60.00"),
+            _item("14455", 0, 3, ord_dt="20260929", side="매수", price="55.00")]
     history = _normalize_via_adapter(rows)
     assert [(h["odno"], h["ord_dt"], h["ft_ccld_qty"]) for h in history] == [
-        ("14455", "20260921", "7"), ("777", "20261105", "0"), ("888", "20261106", "2"), ("888", "20261107", "3"),
-    ]
+        ("14455", "20260921", "7"), ("14455", "20260929", "0")]
 
 
-def test_실전은_행을_제외하지_않는다():
-    broker, _ = _kis("real", [_response([_item("1", 7, 7), _item("1", 0, 3, ord_dt="20261121")])])
-    assert len(broker.get_order_history("TQQQ", "NAS", days=8)) == 2
+def test_체결_정산_조회표는_같은_번호의_체결_행을_우선한다():
+    rows = _normalize_via_adapter([
+        _item("14455", 7, 7, ord_dt="20260921"), _item("14455", 0, 3, ord_dt="20260929"),      # 체결 → 미체결
+        _item("500", 0, 3, ord_dt="20261001"), _item("500", 4, 4, ord_dt="20261002"),          # 미체결 → 체결
+        _item("888", 2, 2, ord_dt="20261106"), _item("888", 3, 3, ord_dt="20261107"),          # 체결 둘 → 마지막
+        _item("777", 0, 5, ord_dt="20261105"), _item("777", 0, 6, ord_dt="20261106"),          # 미체결 둘 → 마지막
+    ])
+    index = state_module._index_history_by_odno(rows)
+    assert (index["14455"]["ord_dt"], index["14455"]["ft_ccld_qty"]) == ("20260921", "7")
+    assert (index["500"]["ord_dt"], index["500"]["ft_ccld_qty"]) == ("20261002", "4")
+    assert (index["888"]["ord_dt"], index["888"]["ft_ccld_qty"]) == ("20261107", "3")
+    assert (index["777"]["ord_dt"], index["777"]["ft_ccld_qty"]) == ("20261106", "0")
 
 
 def test_번호_재사용에도_지연_체결의_건너뜀_감사_목록이_01과_같다():
-    """레거시 0 마커 체결(증명 불가)은 건너뜀 목록에 올라야 합니다. 미체결 행이 같은 번호여도 01 결과와 동일해야 합니다."""
     rows = [_item("14455", 7, 7, ord_dt="20260921", side="매도", price="60.00"),
             _item("14455", 0, 3, ord_dt="20260929", side="매수", price="55.00")]
     state = {"orders_meta": {"14455": {"side": "SELL", "total_qty": 7, "processed_filled_qty": 0,
@@ -342,3 +343,48 @@ def test_번호_재사용에도_지연_체결의_건너뜀_감사_목록이_01�
         pending, *_ = state_module._apply_late_fill_deltas(deepcopy(state), history, set(), skipped)
         results[label] = ([p[0] for p in pending], [e["odno"] for e in skipped])
     assert results["00"] == results["01"] == ([], ["14455"])
+
+
+def test_과거_체결_주문과_번호가_같은_현재_리버스_미체결_주문도_종결된다():
+    """이전 필터 방식의 결함: 번호가 같은 과거 체결 행이 있으면 현재 리버스 미체결 행이 제거돼 보류가 재발했습니다."""
+    past = _item("43210", 7, 7, ord_dt="20260921", side="매수", price="60.00")      # 과거에 체결된 같은 번호
+    history = _normalize_via_adapter(_buy_rows() + [past, _item("43210", 0, 12)])
+    state = _reconcile(_incident_state(), history)
+    meta = state["orders_meta"]["43210"]
+    assert meta["terminal"] is True and meta["terminal_assumed"] is True
+    assert meta["processed_filled_qty"] == 0 and state["T"] == 19.2773
+    assert "reconciliation_only" not in state["reverse_mode"]
+
+
+def test_번호가_같은_서로_다른_날짜의_미체결_주문은_제출일로_구분한다():
+    other = _item("43210", 0, 3, ord_dt="20261118", side="매수", price="40.00")     # 다른 날, 같은 번호, 미체결
+    history = _normalize_via_adapter(_buy_rows() + [other, _item("43210", 5, 12, price="43.22")])
+    state = _reconcile(_incident_state(), history)
+    meta = state["orders_meta"]["43210"]
+    assert meta["processed_filled_qty"] == 5          # 11/20 주문의 부분체결 5주만 반영 (11/18 행과 섞이지 않음)
+    assert meta.get("terminal") is not True
+
+
+# ───────────────────────── 정산 기준 시각(워터마크) ─────────────────────────
+
+def test_0체결_리버스_행은_KIS_모의에서_정산_기준_시각을_옮기지_않는다():
+    state = _incident_state()
+    state["last_processed_ordno"] = "9"
+    before = state["last_updated"]
+    state = _reconcile(state, _history_00())
+    assert state["orders_meta"]["43210"]["terminal_assumed"] is True
+    assert state["last_updated"] == before and state["last_processed_ordno"] == "9"
+
+
+def test_체결된_리버스_행은_기존처럼_정산_기준_시각을_옮긴다():
+    history = _normalize_via_adapter(_buy_rows() + [_item("43210", 12, 12, price="43.22")])
+    state = _reconcile(_incident_state(), history)
+    assert state["last_updated"] > "2026-11-19T19:10:00+00:00"
+    assert state["last_processed_ordno"] == "43210"
+
+
+def test_다른_브로커나_실전의_정산_기준_시각_동작은_그대로다():
+    for broker, mode in (("nhplug", "demo"), ("kis", "real")):
+        state = _reconcile(_incident_state(), _history_00(), broker=broker, mode=mode)
+        # 이전 동작: 0체결 행도 이벤트로 기준 시각을 옮김 (이 PR 은 KIS 모의만 바꿈)
+        assert state["last_updated"] > "2026-11-19T19:10:00+00:00", (broker, mode)
