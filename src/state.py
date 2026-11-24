@@ -535,7 +535,8 @@ def _auto_assume_reverse_expiry(meta, order):
 
 
 # 주문이력이 **체결된 주문만** 돌려주는 브로커 (미체결·만료 주문은 이력에 행 자체가 없음).
-# KIS: 조회 조건 CCLD_NCCS_DVSN="01"(체결) 이라 체결되지 않은 주문은 나타나지 않습니다.
+# KIS 실전: 조회 조건 CCLD_NCCS_DVSN="01"(체결) 이라 체결되지 않은 주문은 나타나지 않습니다.
+# (KIS 모의는 "00"(전체)로 조회해 미체결 행도 오지만, 이 가정은 안전망으로 유지합니다.)
 _FILLED_ONLY_HISTORY_BROKERS = {"kis"}
 
 
