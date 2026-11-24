@@ -325,11 +325,20 @@ def test_체결_정산_조회표는_같은_번호의_체결_행을_우선한다(
         _item("888", 2, 2, ord_dt="20261106"), _item("888", 3, 3, ord_dt="20261107"),          # 체결 둘 → 마지막
         _item("777", 0, 5, ord_dt="20261105"), _item("777", 0, 6, ord_dt="20261106"),          # 미체결 둘 → 마지막
     ])
-    index = state_module._index_history_by_odno(rows)
+    with patch("config.BROKER", "kis"), patch("config.BROKER_MODE", "demo"):
+        index = state_module._index_history_by_odno(rows)
     assert (index["14455"]["ord_dt"], index["14455"]["ft_ccld_qty"]) == ("20260921", "7")
     assert (index["500"]["ord_dt"], index["500"]["ft_ccld_qty"]) == ("20261002", "4")
     assert (index["888"]["ord_dt"], index["888"]["ft_ccld_qty"]) == ("20261107", "3")
     assert (index["777"]["ord_dt"], index["777"]["ft_ccld_qty"]) == ("20261106", "0")
+
+
+def test_KIS_실전과_다른_브로커는_같은_번호면_기존처럼_마지막_행이_이긴다():
+    rows = _normalize_via_adapter([_item("14455", 7, 7, ord_dt="20260921"), _item("14455", 0, 3, ord_dt="20260929")])
+    for broker, mode in (("kis", "real"), ("kiwoom", "demo"), ("nhplug", "demo"), ("meritz", "real")):
+        with patch("config.BROKER", broker), patch("config.BROKER_MODE", mode):
+            index = state_module._index_history_by_odno(rows)
+        assert index["14455"]["ord_dt"] == "20260929" and index["14455"]["ft_ccld_qty"] == "0", (broker, mode)
 
 
 def test_번호_재사용에도_지연_체결의_건너뜀_감사_목록이_01과_같다():
@@ -338,10 +347,13 @@ def test_번호_재사용에도_지연_체결의_건너뜀_감사_목록이_01�
     state = {"orders_meta": {"14455": {"side": "SELL", "total_qty": 7, "processed_filled_qty": 0,
                                        "processed_filled_amount": 0.0}}}
     results = {}
+    patcher = patch("config.BROKER", "kis"), patch("config.BROKER_MODE", "demo")
+    patcher[0].start(); patcher[1].start()
     for label, history in (("00", _normalize_via_adapter(rows)), ("01", _normalize_via_adapter(rows[:1]))):
         skipped = []
         pending, *_ = state_module._apply_late_fill_deltas(deepcopy(state), history, set(), skipped)
         results[label] = ([p[0] for p in pending], [e["odno"] for e in skipped])
+    patcher[0].stop(); patcher[1].stop()
     assert results["00"] == results["01"] == ([], ["14455"])
 
 

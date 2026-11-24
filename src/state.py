@@ -437,6 +437,7 @@ def _index_history_by_odno(order_history):
     KIS 모의 주문번호는 날짜가 달라도 재사용되고, 전체 조회("00")는 미체결 행까지 돌려줍니다.
     단순히 마지막 행이 이기면 다른 날의 미체결 행이 체결 행을 가려 체결 정산·감사가 누락됩니다.
     체결 전용 조회와 같은 입력이 되도록, 체결 행이 있으면 그중 마지막 행을, 없으면 마지막 행을 씁니다.
+    KIS 모의에만 적용하고, 그 외 브로커·모드는 기존 last-wins 입니다.
     (리버스 정산은 이 표 대신 모든 행을 submitted_at/submitted_session 날짜로 매칭합니다.)
     """
     def _filled(row):
@@ -444,6 +445,10 @@ def _index_history_by_odno(order_history):
             return float(row.get("ft_ccld_qty") or 0) > 0
         except (TypeError, ValueError):
             return False
+
+    if not _zero_fill_rows_are_new_in_history():
+        # KIS 모의 외(실전·다른 브로커)는 기존 동작(같은 번호면 마지막 행이 이김)을 그대로 유지합니다.
+        return {str(row.get("odno", "")): row for row in (order_history or [])}
 
     index = {}
     for row in order_history or []:
