@@ -399,7 +399,10 @@ class KISBroker(Broker):
             "ORD_STRT_DT": ord_strt_dt,
             "ORD_END_DT": ord_end_dt,
             "SLL_BUY_DVSN": "00",
-            "CCLD_NCCS_DVSN": "01",
+            # 모의: "00"(전체). 공식 모의 허용값이며, "01"(체결만)은 체결 안 된 리버스 주문이 이력에서
+            # 통째로 빠져 "이력 누락 → 신규 주문 보류"가 반복됐습니다(2026-11-20 TQQQ). 미체결 행은
+            # ft_ccld_qty=0 이라 체결 정산에 반영되지 않습니다. 실전은 기존 "01" 동작을 유지합니다.
+            "CCLD_NCCS_DVSN": "00" if self._mode == "demo" else "01",
             "OVRS_EXCG_CD": api_exchange_code,
             "SORT_SQN": "AS",
             "ORD_DT": "",
