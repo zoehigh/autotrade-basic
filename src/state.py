@@ -494,6 +494,35 @@ def _is_reverse_order(state, odno, order=None):
     return bool(meta.get("reverse_action"))
 
 
+def _index_history_by_odno(order_history):
+    """주문번호 → 이력 행 (체결 정산용 조회표). 같은 번호가 여러 행이면 **체결 행을 우선**합니다.
+
+    KIS 모의 주문번호는 날짜가 달라도 재사용되고, 전체 조회("00")는 미체결 행까지 돌려줍니다.
+    단순히 마지막 행이 이기면 다른 날의 미체결 행이 체결 행을 가려 체결 정산·감사가 누락됩니다.
+    체결 전용 조회와 같은 입력이 되도록, 체결 행이 있으면 그중 마지막 행을, 없으면 마지막 행을 씁니다.
+    KIS 모의에만 적용하고, 그 외 브로커·모드는 기존 last-wins 입니다.
+    (리버스 정산은 이 표 대신 모든 행을 submitted_at/submitted_session 날짜로 매칭합니다.)
+    """
+    def _filled(row):
+        try:
+            return float(row.get("ft_ccld_qty") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if not _zero_fill_rows_are_new_in_history():
+        # KIS 모의 외(실전·다른 브로커)는 기존 동작(같은 번호면 마지막 행이 이김)을 그대로 유지합니다.
+        return {str(row.get("odno", "")): row for row in (order_history or [])}
+
+    index = {}
+    for row in order_history or []:
+        odno = str(row.get("odno", ""))
+        previous = index.get(odno)
+        if previous is not None and _filled(previous) and not _filled(row):
+            continue
+        index[odno] = row
+    return index
+
+
 def _is_terminal_reverse_order(order):
     """브로커 표준 필드로 리버스 주문의 최종 상태를 판정합니다."""
     status = str(order.get("prcs_stat_name", "")).strip().upper()
@@ -555,7 +584,7 @@ def _auto_assume_reverse_expiry(meta, order):
     is_demo = BROKER_MODE == "demo"
     # 메리츠 실전: 이전 미국 세션의 LOC/MOC 일중 주문은 세션 종료로 만료됩니다
     # (기간 이력은 만료 주문도 '미체결'+잔량=주문수량으로 보여 주며, 만료 여부는 취소 시도 시
-    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — AGENTS.md). 호출부가 이전 세션임을 보장합니다.
+    #  5636 "정정,취소 가능 수량이 없습니다"로 확인된 실측 — docs/agents/brokers.md). 호출부가 이전 세션임을 보장합니다.
     is_meritz_real = BROKER == "meritz" and BROKER_MODE == "real"
     if not (is_demo or is_meritz_real):
         return False
@@ -598,7 +627,8 @@ def _auto_assume_reverse_expiry(meta, order):
 
 
 # 주문이력이 **체결된 주문만** 돌려주는 브로커 (미체결·만료 주문은 이력에 행 자체가 없음).
-# KIS: 조회 조건 CCLD_NCCS_DVSN="01"(체결) 이라 체결되지 않은 주문은 나타나지 않습니다.
+# KIS 실전: 조회 조건 CCLD_NCCS_DVSN="01"(체결) 이라 체결되지 않은 주문은 나타나지 않습니다.
+# (KIS 모의는 "00"(전체)로 조회해 미체결 행도 오지만, 이 가정은 안전망으로 유지합니다.)
 _FILLED_ONLY_HISTORY_BROKERS = {"kis"}
 
 
@@ -658,6 +688,15 @@ def _assume_missing_reverse_order_zero_fill(meta, order_history):
     meta["terminal_assumed_at"] = datetime.now(ZoneInfo("UTC")).isoformat()
     meta["terminal_assumption_reason"] = "missing_from_filled_only_history_after_session"
     return True
+
+
+def _zero_fill_rows_are_new_in_history():
+    """KIS 모의: 예전 체결 전용("01") 이력에서 전체("00") 이력으로 바뀌어 0체결 행이 새로 보이는 브로커·모드인지."""
+    try:
+        from config import BROKER, BROKER_MODE
+    except Exception:
+        return False
+    return str(BROKER).lower() in _FILLED_ONLY_HISTORY_BROKERS and BROKER_MODE == "demo"
 
 
 def _clear_resolved_reconciliation_flags(state, reverse_mode, orders_meta, active_cycle_id):
@@ -1059,8 +1098,13 @@ def reconcile_reverse_fills(state, order_history):
     # 리버스 주문 체결 처리 후 last_updated 갱신
     # _apply_recent_history_dt는 리버스 주문을 필터링하므로,
     # 리버스만 처리된 상태에서 last_updated가 진하지 않으면 매 RUN 경고가 반복됩니다.
-    if events:
-        sorted_events = sorted(events, key=lambda item: (item[0], item[1]))
+    # 체결 전용 이력 브로커(KIS 모의)가 전체 조회로 새로 보게 된 0체결 주문은 정산 기준 시각을 옮기지 않습니다.
+    # (옮기면 그보다 먼저 접수된 미등록 일반 주문이 나중에 체결될 때 "기간외"로 빠질 수 있음 — Codex P2)
+    watermark_events = events
+    if _zero_fill_rows_are_new_in_history():
+        watermark_events = [event for event in events if event[4] > 0]
+    if watermark_events:
+        sorted_events = sorted(watermark_events, key=lambda item: (item[0], item[1]))
         latest_ord_dt = sorted_events[-1][0]
         latest_odno = sorted_events[-1][1]
         if latest_ord_dt:
@@ -1419,7 +1463,7 @@ def _has_unconfirmed_amount_fills(state, order_history):
     - 기존 캐시의 ``processed_filled_amount == 0`` 레거시 표식은 **변경하지 않습니다**
       (감사 도구가 별도로 식별). 금액이 확정된 체결은 여기에 포함되지 않습니다.
     """
-    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    history_by_odno = _index_history_by_odno(order_history)
     pending = []
     for odno, meta in (state.get("orders_meta") or {}).items():
         row = history_by_odno.get(str(odno))
@@ -1439,7 +1483,7 @@ def _has_unconfirmed_amount_fills(state, order_history):
 
 def _legacy_amount_markers(state, order_history):
     """감사 전용 — 금액 확정 체결인데 processed_filled_amount=0 인 레거시 메타."""
-    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    history_by_odno = _index_history_by_odno(order_history)
     legacy = []
     for odno, meta in (state.get("orders_meta") or {}).items():
         row = history_by_odno.get(str(odno))
@@ -2864,7 +2908,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos, skipped_unverified
     orders_meta = state.get("orders_meta", {})
     if not orders_meta:
         return [], 0, 0.0, []
-    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    history_by_odno = _index_history_by_odno(order_history)
     pending: list[tuple[str, dict, dict, int, float]] = []
     held_odnos: list[str] = []
     net_qty = 0
@@ -3116,7 +3160,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     # 워터마크 이전 등록 주문의 지연 체결도 금액 확정이 필수입니다.
     # 마커 누락·무효 주문도 자동 반영하지 않고 보류합니다 (리버스 주문은 제외 —
     # 리버스 reconciliation이 별도 가드로 담당합니다).
-    history_by_odno = {str(o.get("odno", "")): o for o in (order_history or [])}
+    history_by_odno = _index_history_by_odno(order_history)
     for odno, meta in (state.get("orders_meta") or {}).items():
         row = history_by_odno.get(str(odno))
         if row is None or not _fill_amount_is_available(row):
