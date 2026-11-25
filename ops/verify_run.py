@@ -1281,8 +1281,11 @@ def _recompute_expected_ordered(evidence):
             problems.append(
                 f"정산 전 원장 재생값 {replay_before:.4f} ≠ 기록 T_before {t_before:.4f}"
             )
-        # 정산 전 원장에 start_T 가 아직 없으면(항목 없는 빈 원장) 이번 정산의 첫 기준 확정이므로 비교 대상이 아닙니다.
-        if ledger_before and ledger_before.get("start_T") is not None and abs(
+        # 정산 전 원장이 완전히 비어 있고(start_T·entries 없음) 이번 정산이 처음 기준을 확정하는 경우만 비교에서 제외합니다.
+        # start_T 가 없는데 entries 가 있는 원장은 비정상이므로 계속 비교(실패)합니다.
+        if ledger_before and (
+            ledger_before.get("start_T") is not None or ledger_before.get("entries")
+        ) and abs(
             float(ledger_after.get("start_T") or 0.0)
             - float(ledger_before.get("start_T") or 0.0)
         ) > 1e-9:

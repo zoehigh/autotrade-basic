@@ -1978,6 +1978,9 @@ class TestHistorySettledness:
                 "submitted_at": "20261024040000",
             }
         }
+        # 이력 조회 구간(30일)이 실제 오늘 날짜를 기준으로 계산돼, 고정 세션(2026-10-24)이 시간이 지나면 구간 밖으로 밀립니다.
+        # 기준 시각을 고정해 날짜 경과와 무관하게 합니다.
+        monkeypatch.setattr(trading_bot, "datetime", _FixedDateTime)
         io["load"]("TQQQ", deepcopy(state))
         monkeypatch.setenv("HISTORY_SETTLEDNESS_CHECK", "true")
         monkeypatch.setenv("HISTORY_SETTLEDNESS_DELAY_SECONDS", "0")
