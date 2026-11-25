@@ -1281,6 +1281,9 @@ def _recompute_expected_ordered(evidence):
             problems.append(
                 f"정산 전 원장 재생값 {replay_before:.4f} ≠ 기록 T_before {t_before:.4f}"
             )
+        if ledger_before.get("entries") and ledger_before.get("start_T") is None:
+            # entries 가 있는데 기준 start_T 가 없는 원장은, 정산 후 start_T 값(0 포함)과 무관하게 비정상입니다.
+            problems.append("원장 start_T 가 정산 전 항목이 있는 원장에서 비어 있습니다 (비정상 원장)")
         # 정산 전 원장이 완전히 비어 있고(start_T·entries 없음) 이번 정산이 처음 기준을 확정하는 경우만 비교에서 제외합니다.
         # start_T 가 없는데 entries 가 있는 원장은 비정상이므로 계속 비교(실패)합니다.
         if ledger_before and (

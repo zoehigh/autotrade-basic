@@ -75,3 +75,14 @@ def test_full_reinference_는_start_T_0을_계속_요구한다():
         ledger_after={"start_T": 5.0, "entries": [], "next_seq": 1},
     )
     assert any("start_T 가 0이 아닙니다" in p for p in _start_t_problems(evidence))
+
+
+def test_start_T가_없고_entries가_있으면_after_start_T가_0이어도_실패():
+    entry = {"seq": 1, "kind": "buy", "delta": 1.0}
+    for after_start in (0.0, 5.0, 4.0):
+        evidence = _evidence(
+            T_before=0.0, T_after=1.0,
+            ledger_before={"entries": [entry], "next_seq": 2},
+            ledger_after={"start_T": after_start, "entries": [entry], "next_seq": 2},
+        )
+        assert any("비정상 원장" in p for p in _start_t_problems(evidence)), after_start
