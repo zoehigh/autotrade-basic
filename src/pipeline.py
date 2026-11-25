@@ -33,6 +33,7 @@ import config
 from state import (
     _fill_amount,
     _has_unconfirmed_amount_fills,
+    _index_history_by_odno,
     _order_us_session_date,
     _parse_processed_qty_marker,
     canonical_state_hash,
@@ -1111,7 +1112,8 @@ def _history_new_fill_odnos(state, order_history):
         odnos.add(str(row.get("odno") or ""))
 
     # 워터마크 이전 등록 주문의 지연 체결(부분체결 증가)도 "새 체결" 입니다.
-    by_odno = {str(row.get("odno") or ""): row for row in (order_history or [])}
+    # 정산과 같은 조회표를 써야 합니다 (KIS 모의: 같은 번호의 체결 행 우선, 그 외는 마지막 행).
+    by_odno = _index_history_by_odno(order_history)
     for odno, meta in (state.get("orders_meta") or {}).items():
         row = by_odno.get(str(odno))
         if row is None:
