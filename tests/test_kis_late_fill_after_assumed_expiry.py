@@ -6,7 +6,7 @@
   - A 가 나중에 체결돼도 상태가 소실되거나 중복 반영되지 않는지(주문번호 단위 누적 체결 델타),
     KIS 모의의 주문번호 재사용(날짜가 다르면 다른 주문)을 날짜로 구분하는지 고정합니다.
 
-이 파일은 정산 로직을 바꾸지 않고 **현재 동작을 고정**합니다. 결함으로 확인된 항목은 xfail(strict) 로 표시했습니다.
+일반 주문 지연 체결 복구의 번호 재사용 결함(제출일 미대조)은 KIS 모의 한정으로 수정돼 이 파일이 고정합니다.
 """
 from copy import deepcopy
 from datetime import datetime
@@ -197,10 +197,6 @@ def _normal_meta(**extra):
     return meta
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "결함 후보: 일반 주문의 지연 체결 복구(_apply_late_fill_deltas)는 주문번호만으로 이력 행을 찾고 "
-    "제출 날짜를 대조하지 않음 — KIS 모의의 번호 재사용 시 이전 날짜의 체결 행이 새 미체결 주문에 반영될 수 있음 "
-    "(리버스 경로 reconcile_reverse_fills 는 _order_matches_submitted_date 로 막고 있음)"))
 def test_일반_주문_번호가_같은_이전_날짜_체결_행은_새_주문의_지연_체결로_반영되지_않는다():
     st = {"T": 5.0, "net_invested": 500.0, "last_updated": "2026-11-23T19:00:00+00:00",
           "last_processed_ordno": "1", "reverse_mode": {}, "orders_meta": {"777": _normal_meta()}}

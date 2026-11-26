@@ -494,6 +494,39 @@ def _is_reverse_order(state, odno, order=None):
     return bool(meta.get("reverse_action"))
 
 
+def _row_filled(row):
+    try:
+        return float(row.get("ft_ccld_qty") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+class _HistoryIndex(dict):
+    """주문번호 → 이력 행 조회표. 기존처럼 `.get(odno)` 로 쓸 수 있고, 같은 번호의 **모든 행**도 보존합니다.
+
+    등록 주문(orders_meta)의 체결을 찾을 때는 `_history_row_for_meta()` 로 제출일/세션이 맞는 행을 먼저 고릅니다.
+    """
+
+    def __init__(self, order_history):
+        super().__init__()
+        self.candidates = {}
+        for row in order_history or []:
+            self.candidates.setdefault(str(row.get("odno", "")), []).append(row)
+        if not _zero_fill_rows_are_new_in_history():
+            # KIS 모의 외(실전·다른 브로커)는 기존 동작(같은 번호면 마지막 행이 이김)을 그대로 유지합니다.
+            for odno, rows in self.candidates.items():
+                self[odno] = rows[-1]
+            return
+        for odno, rows in self.candidates.items():
+            self[odno] = _pick_filled_or_last(rows)
+
+
+def _pick_filled_or_last(rows):
+    """체결 행이 있으면 그중 마지막 행을, 없으면 마지막 행을 돌려줍니다."""
+    filled = [row for row in rows if _row_filled(row)]
+    return (filled or rows)[-1]
+
+
 def _index_history_by_odno(order_history):
     """주문번호 → 이력 행 (체결 정산용 조회표). 같은 번호가 여러 행이면 **체결 행을 우선**합니다.
 
@@ -501,26 +534,68 @@ def _index_history_by_odno(order_history):
     단순히 마지막 행이 이기면 다른 날의 미체결 행이 체결 행을 가려 체결 정산·감사가 누락됩니다.
     체결 전용 조회와 같은 입력이 되도록, 체결 행이 있으면 그중 마지막 행을, 없으면 마지막 행을 씁니다.
     KIS 모의에만 적용하고, 그 외 브로커·모드는 기존 last-wins 입니다.
-    (리버스 정산은 이 표 대신 모든 행을 submitted_at/submitted_session 날짜로 매칭합니다.)
+    (등록 주문의 행을 찾을 때는 이 값을 그대로 쓰지 말고 `_history_row_for_meta()` 로 제출일을 먼저 대조하세요.
+     리버스 정산도 모든 행을 submitted_at/submitted_session 날짜로 매칭합니다.)
     """
-    def _filled(row):
-        try:
-            return float(row.get("ft_ccld_qty") or 0) > 0
-        except (TypeError, ValueError):
-            return False
+    return _HistoryIndex(order_history)
 
+
+def _meta_has_date_info(meta):
+    """제출일을 알 수 있는 메타인지 (submitted_at 또는 유효한 submitted_session)."""
+    meta = meta or {}
+    return bool(str(meta.get("submitted_at", "") or "")) or _submitted_us_session_date("", meta.get("submitted_session", "")) is not None
+
+
+def _row_matches_meta_date(row, meta):
+    """KIS 모의 한정: 같은 번호라도 제출일/세션이 다른 행은 **다른 주문**입니다.
+
+    - 리버스 주문 메타(submitted_at 있음): 기존 `_order_matches_submitted_date` (실제 KST 날짜 대조).
+    - 일반 주문 메타(submitted_session 만 있음): 행의 미국 세션 날짜(`_order_us_session_date`)와 대조.
+      행의 세션을 알 수 없으면 제외하지 않습니다.
+    - 날짜 정보가 전혀 없는 레거시 메타는 대조할 근거가 없으므로 True (기존 동작).
+    KIS 모의 외 브로커·모드는 항상 True (기존 동작 유지).
+    """
     if not _zero_fill_rows_are_new_in_history():
-        # KIS 모의 외(실전·다른 브로커)는 기존 동작(같은 번호면 마지막 행이 이김)을 그대로 유지합니다.
-        return {str(row.get("odno", "")): row for row in (order_history or [])}
+        return True
+    meta = meta or {}
+    submitted_at = str(meta.get("submitted_at", "") or "")
+    if submitted_at:
+        return _order_matches_submitted_date(row, submitted_at, meta.get("submitted_session", ""))
+    session = _submitted_us_session_date("", meta.get("submitted_session", ""))
+    if session is None:
+        return True
+    row_session = _order_us_session_date(row)
+    return row_session is None or row_session == session
 
-    index = {}
-    for row in order_history or []:
-        odno = str(row.get("odno", ""))
-        previous = index.get(odno)
-        if previous is not None and _filled(previous) and not _filled(row):
-            continue
-        index[odno] = row
-    return index
+
+def _meta_for_row(state, odno, row):
+    """이력 행에 대응하는 등록 메타. KIS 모의에서 제출일이 다르면(같은 번호의 다른 주문) None(미등록 취급)."""
+    meta = (state.get("orders_meta") or {}).get(str(odno))
+    if meta is not None and not _row_matches_meta_date(row, meta):
+        return None
+    return meta
+
+
+def _history_row_for_meta(history_index, odno, meta):
+    """등록 주문(메타)의 이력 행을 고릅니다 — **같은 번호의 전체 후보에서 제출일이 맞는 행을 먼저** 고른 뒤
+    그중 체결 행(없으면 마지막 행)을 결정합니다.
+
+    KIS 모의 한정 규칙 (그 외 브로커·모드, 일반 dict 는 기존처럼 번호로 바로 찾음):
+      - 메타에 제출일 정보가 있으면 날짜가 맞는 행만 후보입니다. 맞는 행이 없으면 None
+        (같은 번호의 다른 날짜 행을 이 주문의 체결로 쓰지 않음).
+      - 제출일 정보가 전혀 없는 레거시 메타는 대조할 근거가 없어 기존 조회표와 같이 체결 행 우선입니다
+        (전체 조회("00")와 체결 전용 조회("01")가 같은 결과가 되는 불변식 유지).
+    """
+    candidates_by_odno = getattr(history_index, "candidates", None)
+    if candidates_by_odno is None or not _zero_fill_rows_are_new_in_history():
+        return history_index.get(str(odno))
+    candidates = candidates_by_odno.get(str(odno)) or []
+    if not candidates:
+        return None
+    if _meta_has_date_info(meta):
+        matched = [row for row in candidates if _row_matches_meta_date(row, meta)]
+        return _pick_filled_or_last(matched) if matched else None
+    return _pick_filled_or_last(candidates)
 
 
 def _is_terminal_reverse_order(order):
@@ -1466,7 +1541,7 @@ def _has_unconfirmed_amount_fills(state, order_history):
     history_by_odno = _index_history_by_odno(order_history)
     pending = []
     for odno, meta in (state.get("orders_meta") or {}).items():
-        row = history_by_odno.get(str(odno))
+        row = _history_row_for_meta(history_by_odno, odno, meta)
         if row is None:
             continue
         if _fill_amount_is_available(row):
@@ -1486,7 +1561,7 @@ def _legacy_amount_markers(state, order_history):
     history_by_odno = _index_history_by_odno(order_history)
     legacy = []
     for odno, meta in (state.get("orders_meta") or {}).items():
-        row = history_by_odno.get(str(odno))
+        row = _history_row_for_meta(history_by_odno, odno, meta)
         if row is None or _is_reverse_order(state, str(odno), row):
             continue
         if not _fill_amount_is_available(row):
@@ -2916,7 +2991,7 @@ def _apply_late_fill_deltas(state, order_history, skip_odnos, skipped_unverified
     for odno, meta in list(orders_meta.items()):
         if str(odno) in skip_odnos:
             continue
-        row = history_by_odno.get(str(odno))
+        row = _history_row_for_meta(history_by_odno, odno, meta)
         if row is None:
             continue
         if not _fill_amount_is_available(row):
@@ -3162,7 +3237,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     # 리버스 reconciliation이 별도 가드로 담당합니다).
     history_by_odno = _index_history_by_odno(order_history)
     for odno, meta in (state.get("orders_meta") or {}).items():
-        row = history_by_odno.get(str(odno))
+        row = _history_row_for_meta(history_by_odno, odno, meta)
         if row is None or not _fill_amount_is_available(row):
             if row is None:
                 continue
@@ -3242,7 +3317,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
     deltas: dict[str, tuple[int, float]] = {}
     batch_net_qty = 0
     for _o, odno, order in recent_candidates:
-        meta = (state.get("orders_meta") or {}).get(str(odno))
+        meta = _meta_for_row(state, odno, order)
         if meta is not None:
             dq, da, _est = _fill_delta(meta, order, str(odno))
         else:
@@ -3621,7 +3696,7 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         # 목표매도: 보유량의 ~75% → 0.5 <= 비율 < 1.0 → T × 0.25
         # 전량매도: 보유량 100% → 비율 >= 1.0 → T = 0 (사이클 종료)
         for o_dt, odno, order in day_sells:
-            meta = orders_meta.get(str(odno))
+            meta = _meta_for_row(state, odno, order)
             sell_qty, sell_amt = deltas.get(str(odno), (0, 0.0))
             if sell_qty <= 0 and abs(sell_amt) < 1e-9:
                 # 이미 반영된 매도 (부분체결 후 추가 체결 없음) → 재분류하지 않습니다.
@@ -3734,15 +3809,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
 
         skip_buys   = [
             (o_dt, odno, o) for o_dt, odno, o in day_buys
-            if str(odno) in additional_loc_odno or orders_meta.get(str(odno), {}).get("is_additional")
+            if str(odno) in additional_loc_odno or (_meta_for_row(state, odno, o) or {}).get("is_additional")
         ]
         normal_buys = [
             (o_dt, odno, o) for o_dt, odno, o in day_buys
-            if str(odno) not in additional_loc_odno and not orders_meta.get(str(odno), {}).get("is_additional")
+            if str(odno) not in additional_loc_odno and not (_meta_for_row(state, odno, o) or {}).get("is_additional")
         ]
 
         for o_dt, odno, order in skip_buys:
-            meta = orders_meta.get(str(odno))
+            meta = _meta_for_row(state, odno, order)
             buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
             if buy_qty <= 0 and abs(buy_amt) < 1e-9:
                 continue
@@ -3779,15 +3854,15 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 print(f"  → 새 사이클 시작일 기록: {cycle_start}")
 
             # meta가 있는 주문: t_target 기반으로 각각 반영 (부분체결 비례 처리)
-            meta_buys         = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if orders_meta.get(str(odno))]
-            unregistered_buys = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if not orders_meta.get(str(odno))]
+            meta_buys         = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if _meta_for_row(state, odno, o)]
+            unregistered_buys = [(o_dt, odno, o) for o_dt, odno, o in normal_buys if not _meta_for_row(state, odno, o)]
             if meta_buys:
                 print(f"  [디버그] orders_meta 매칭: 정상매수 {len(meta_buys)}건")
             if unregistered_buys:
                 print(f"  [디버그] orders_meta 미매칭(미등록매수): {len(unregistered_buys)}건")
 
             for o_dt, odno, order in meta_buys:
-                meta = orders_meta[str(odno)]
+                meta = _meta_for_row(state, odno, order)
                 buy_qty, buy_amt = deltas.get(str(odno), (0, 0.0))
                 if buy_qty <= 0 and abs(buy_amt) < 1e-9:
                     continue
