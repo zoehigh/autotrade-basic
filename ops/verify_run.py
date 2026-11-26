@@ -1025,6 +1025,24 @@ def _required_settlement_fills(evidence):
                 ]
                 if len(same_side) == 1:
                     session = _verifier_fill_session(same_side[0])
+                if session is None:
+                    # 실제 settlement delta 에는 세션 식별자가 없습니다.
+                    # 같은 번호·방향의 필수 체결 중 수량·금액이 일치하는 항목이
+                    # 하나뿐이면 그 인스턴스로 확정합니다. 후보가 여럿이면 모호하므로
+                    # 확정하지 않고 아래 고유 키 경로로 fail-closed 합니다.
+                    qty = _as_int(order.get("qty_delta"))
+                    amount = _as_float(order.get("amount_delta"))
+                    keys = {
+                        item["instance_key"]
+                        for item in required
+                        if item.get("instance_key")
+                        and item["instance_key"][0] == odno
+                        and item["instance_key"][1] == side
+                        and item["req_qty"] == qty
+                        and abs(item["req_amount"] - amount) <= 0.02
+                    }
+                    if len(keys) == 1:
+                        session = next(iter(keys))[2]
         key = _instance_key(odno, side, session)
         if session is None and len((fill_index or {}).get(odno) or []) > 1:
             # 후보가 여럿인데 식별 불가 — 다른 인스턴스와 상쇄되지 않도록

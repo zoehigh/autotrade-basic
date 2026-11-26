@@ -463,3 +463,20 @@ def test_p13_reverse_expected_seen_distinct_instances():
     # 그대로 신뢰해 복사되지 않아야 합니다.
     assert abs(entries["19"]["delta"] - 1.0) < 1e-6, entries
     assert abs(entries["20"]["delta"] - 1.0) < 1e-6, entries
+
+
+def test_oracle_same_side_reuse_delta_without_session_is_not_false_positive():
+    """정상 same-side 재사용 정산이 delta에 세션이 없어 오탐되지 않아야 합니다."""
+    ev = _ev(
+        watermark_before="2026-11-24T19:10:00+00:00",
+        fills=[
+            _fill("7000", "매수", 1, 10.0, "2026-11-24T19:10:00+00:00", ord_dt="20261124"),
+            _fill("7000", "매수", 1, 12.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125"),
+        ],
+        orders_meta_before={"7000": _meta("2026-11-24", qty=1, amount=10.0)},
+        # 실제 settlement delta 형식: ord_dt/ord_tmd/submitted_session 없음
+        orders=[{"odno": "7000", "side": "매수", "qty_delta": 1, "amount_delta": 12.0,
+                 "ledger_seq": 19}],
+    )
+    problems, _required, _money = verify_run._required_settlement_fills(ev)
+    assert not any("7000" in p and "필수 체결 불일치" in p for p in problems), problems
