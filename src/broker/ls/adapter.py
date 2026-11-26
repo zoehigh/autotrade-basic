@@ -199,7 +199,8 @@ class LSBroker(Broker):
             try:
                 return self._fetch_daily_rows_finnhub(symbol, days)
             except BrokerError as e:
-                print(f"[Finnhub Fallback] 일별종가 조회 실패: {e}")
+                # HTTP 예외 메시지에는 token= 이 포함된 URL 이 들어갈 수 있어 유형만 남깁니다.
+                print(f"[Finnhub Fallback] 일별종가 조회 실패: {type(e).__name__}")
 
         raise BrokerError("일별종가 조회 실패: LS g3204 및 Finnhub 모두 실패")
 
@@ -300,7 +301,8 @@ class LSBroker(Broker):
             return rows
 
         except requests.exceptions.RequestException as e:
-            raise BrokerError(f"Finnhub API 호출 실패 ({symbol}): {e}")
+            # 예외 메시지의 URL 에 token= 이 노출될 수 있어 유형만 남깁니다.
+            raise BrokerError(f"Finnhub API 호출 실패 ({symbol}): {type(e).__name__}")
 
     def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
         """해외주식 일별주가 종가를 조회합니다 → list[float] (오래된 순)."""

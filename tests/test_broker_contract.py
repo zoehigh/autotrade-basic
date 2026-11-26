@@ -2454,6 +2454,25 @@ class TestLSBrokerContract:
             {"date": "2026-11-13", "close": 55.0},
         ]
 
+    def test_finnhub_fallback_error_does_not_leak_token(self, monkeypatch, capsys):
+        """g3204+Finnhub 이중 실패 시 HTTP 예외의 token= URL 이 로그에 노출되지 않습니다."""
+        token = "synthetic-token-12345"
+        monkeypatch.setattr("broker.ls.adapter.FINNHUB_API_KEY", token)
+        self._set_mock_response({"rsp_cd": "IGW00215", "rsp_msg": "거부"})
+        broker = self._create_broker()
+
+        def _raise(url, **kwargs):
+            raise requests.exceptions.RequestException(
+                f"403 Client Error for url: {url}?token={token}"
+            )
+
+        broker._session.get = MagicMock(side_effect=_raise)
+        with pytest.raises(BrokerError):
+            broker.get_daily_candles("TQQQ", "NAS", days=5)
+
+        out = capsys.readouterr().out
+        assert token not in out, "Finnhub 토큰이 로그에 노출되면 안 됩니다"
+
     # ── COSOQ02701 1차 / COSOQ00201 폴백 ─────────────────────────────
 
     def test_get_purchase_amount_cosq02701_success(self):
