@@ -186,7 +186,8 @@ def test_사이클_종료로_매도_효과가_비워진_뒤_번호가_재사용�
 
 
 def test_매도_효과_기록을_정리하면_같은_행이_정상_정산으로_복귀한다():
-    """보류는 매 실행 같은 조건으로 반복되므로 해소 경로(기록 정리 = REPAIR 절차)가 필요합니다."""
+    """보류는 매 실행 같은 조건으로 반복됩니다. 아래 기록 정리는 **로직 동작을 보여 주는 단위 수준 시뮬레이션**일 뿐
+    승인된 운영 복구 절차가 아닙니다(전용 복구 도구 없음 — 실제 복구는 별도 분석·백업·사용자 승인 후)."""
     st = _state(_sell_meta(0), last_updated=MID_WM)
     st["sell_t_effects"] = {N: {"basis": 20, "factor": 0.75}}
     for _ in range(2):                                        # 같은 입력은 매 실행 같은 보류 (워터마크가 전진하지 않음)
@@ -204,7 +205,11 @@ def test_두_행_중_하나만_메타와_날짜가_맞아도_번호_키_충돌�
     st = _state(_meta(0, 0.0), last_updated=EARLY_WM)
     result = _settle(st, [_old_row(10, 50.0), _new_row(5, 10.0)])
     assert result["_pending_amount_odnos"] == [N]
-    assert "REPAIR" in result["_settlement_hold_reason"]
+    reason = result["_settlement_hold_reason"]
+    # 지원되지 않는 복구 절차를 안내하지 않고, 수동 확인·전용 도구 없음·승인 필요를 알린다.
+    assert "브로커 앱" in reason and "전용 복구 도구는 아직 없습니다" in reason and "사용자 승인" in reason
+    assert "REPAIR 절차" not in reason and "docs/agents/state-repair.md" not in reason
+    assert "권장하지 않습니다" in reason           # FORCE_T_REINFERENCE·sell_t_effects 삭제·워터마크 수동 변경은 안내하지 않음
 
 
 def test_메타가_없는_매도_행은_효과_기록이_있어도_기존_동작이다():
