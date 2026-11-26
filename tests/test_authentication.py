@@ -40,7 +40,7 @@ def test_authentication():
         
         if missing_fields:
             print(f"❌ 응답에 필수 필드가 부족합니다: {missing_fields}")
-            return False
+            pytest.fail(f"토큰 응답에 필수 필드 누락: {missing_fields}")
         
         # Step 3: 첫 번째 토큰 정보 출력
         print("\n✅ 첫 번째 토큰 발급 성공!")
@@ -81,7 +81,7 @@ def test_authentication():
         print("3. 앱키와 앱시크릿이 올바른 값인지 확인")
         print("4. EGW00133 오류는 자동으로 1분 대기 후 재시도됩니다")
         
-        return False
+        pytest.fail(f"한국투자증권 API 인증 실패: {e}")
 
 
 if __name__ == "__main__":

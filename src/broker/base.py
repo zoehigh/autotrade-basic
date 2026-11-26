@@ -151,6 +151,11 @@ class Broker(ABC):
             prdt_name, sll_buy_dvsn_cd_name, ft_ord_qty, ft_ccld_qty,
             ft_ccld_unpr3, ft_ccld_amt3, nccs_qty, prcs_stat_name,
             tr_mket_name, tr_crcy_cd, odno, ovrs_excg_cd
+
+        단, `ft_ord_qty`(원주문 수량)는 브로커 응답이 제공하지 않을 때 **키를
+        생략**합니다. "0"을 합성하면 VERIFY 가 "필드 없음(관대)"과
+        "필드 있으나 0(실패)"을 구분하지 못하기 때문입니다.
+        필드가 있으면 값이 "0"이어도 그대로 전달합니다.
         """
         pass
 
@@ -355,3 +360,97 @@ class DryBroker(Broker):
 
     def close(self):
         self._real.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ReadOnlyBroker (Decorator) — SETTLE / PREVIEW 단계 전용
+# ═══════════════════════════════════════════════════════════════════════
+
+class ReadOnlyBroker(Broker):
+    """조회 전용 브로커 데코레이터.
+
+    SETTLE / PREVIEW 단계는 시세·잔고·이력만 필요합니다. 이 래퍼는 모든 조회를
+    실제 브로커에 위임하고, 주문 계열 API 는 **호출 즉시 예외**로 막습니다.
+    실제 주문은 `pipeline_execute.execute_approved_plan()` 만 받습니다.
+    """
+
+    # 내부 브로커는 name-mangling 으로 숨깁니다 — 외부에서 `._real` 로 꺼내
+    # 주문 API 를 우회하지 못하게 합니다 (기존 DryBroker 와 달리 조회 전용 보장).
+    __slots__ = ("__real",)
+
+    def __init__(self, real: Broker):
+        self.__real = real
+
+    @property
+    def name(self) -> str:
+        return self.__real.name
+
+    @property
+    def supports_open_orders_query(self) -> bool:
+        return getattr(self.__real, "supports_open_orders_query", False)
+
+    @property
+    def provides_daily_candle_dates(self) -> bool:
+        """일봉 날짜 제공 여부도 실제 브로커에 위임 (PREVIEW/EXECUTE 종료 판정 일관성)."""
+        return getattr(self.__real, "provides_daily_candle_dates", False)
+
+    def is_trading_day(self) -> bool:
+        return self.__real.is_trading_day()
+
+    def get_stock_price(self, symbol: str, exchange: str) -> StockPrice:
+        return self.__real.get_stock_price(symbol, exchange)
+
+    def get_stock_quotation(self, symbol: str, exchange: str) -> StockQuotation:
+        return self.__real.get_stock_quotation(symbol, exchange)
+
+    def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
+        return self.__real.get_balance(symbol, exchange)
+
+    def get_purchase_amount(self, symbol: str, exchange: str) -> PurchaseAmount:
+        return self.__real.get_purchase_amount(symbol, exchange)
+
+    def get_order_history(
+        self, symbol: str, exchange: str,
+        days: int = 30, verbose: bool = False, limit: int = 100,
+    ) -> list[dict]:
+        return self.__real.get_order_history(symbol, exchange, days, verbose, limit)
+
+    def get_open_orders(
+        self, symbol: str, exchange: str, days: int = 30, limit: int = 100,
+    ) -> list[dict]:
+        target = getattr(self.__real, "get_open_orders", None)
+        if callable(target):
+            return target(symbol, exchange, days=days, limit=limit)
+        return []
+
+    def get_daily_closes(
+        self, symbol: str, exchange: str, days: int = 5,
+    ) -> list[float]:
+        return self.__real.get_daily_closes(symbol, exchange, days)
+
+    def get_daily_candles(
+        self, symbol: str, exchange: str, days: int = 5,
+    ) -> list[dict]:
+        return self.__real.get_daily_candles(symbol, exchange, days)
+
+    # ── 주문 API: 전부 차단 ──
+    def place_order(
+        self, symbol: str, exchange: str,
+        side: str, quantity: int, price: float, order_type: str,
+    ) -> Optional[OrderResult]:
+        raise RuntimeError(
+            "ReadOnlyBroker: 이 단계에서는 주문을 실행할 수 없습니다 "
+            f"(symbol={symbol}, side={side}, qty={quantity})."
+        )
+
+    def modify_order(self, *args, **kwargs):
+        raise RuntimeError("ReadOnlyBroker: 이 단계에서는 주문 정정을 실행할 수 없습니다.")
+
+    def cancel_order(self, *args, **kwargs):
+        raise RuntimeError("ReadOnlyBroker: 이 단계에서는 주문 취소를 실행할 수 없습니다.")
+
+    def exchange_code(self, user_code: str) -> str:
+        return self.__real.exchange_code(user_code)
+
+    def close(self):
+        self.__real.close()

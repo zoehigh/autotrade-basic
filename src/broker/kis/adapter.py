@@ -402,7 +402,10 @@ class KISBroker(Broker):
             "ORD_STRT_DT": ord_strt_dt,
             "ORD_END_DT": ord_end_dt,
             "SLL_BUY_DVSN": "00",
-            "CCLD_NCCS_DVSN": "01",
+            # 모의: "00"(전체). 공식 모의 허용값이며, "01"(체결만)은 체결 안 된 리버스 주문이 이력에서
+            # 통째로 빠져 "이력 누락 → 신규 주문 보류"가 반복됐습니다(2026-11-20 TQQQ). 미체결 행은
+            # ft_ccld_qty=0 이라 체결 정산에 반영되지 않습니다. 실전은 기존 "01" 동작을 유지합니다.
+            "CCLD_NCCS_DVSN": "00" if self._mode == "demo" else "01",
             "OVRS_EXCG_CD": api_exchange_code,
             "SORT_SQN": "AS",
             "ORD_DT": "",
@@ -471,14 +474,13 @@ class KISBroker(Broker):
                         except Exception as e:
                             print(f"[주문이력] {symbol} ord_dt/ord_tmd 파싱 실패: ord_dt={ord_dt}, ord_tmd={ord_tmd_raw} ({e})")
 
-                    order_history.append({
+                    row = {
                         "ord_dt": ord_dt,
                         "ord_tmd": ord_tmd_raw,
                         "ord_datetime_kst": ord_datetime_kst_iso,
                         "ord_datetime_utc": ord_datetime_utc_iso,
                         "prdt_name": item.get("prdt_name", ""),
                         "sll_buy_dvsn_cd_name": item.get("sll_buy_dvsn_cd_name", ""),
-                        "ft_ord_qty": item.get("ft_ord_qty", "0"),
                         "ft_ccld_qty": item.get("ft_ccld_qty", "0"),
                         "ft_ccld_unpr3": item.get("ft_ccld_unpr3", "0"),
                         "ft_ccld_amt3": item.get("ft_ccld_amt3", "0"),
@@ -488,7 +490,13 @@ class KISBroker(Broker):
                         "tr_crcy_cd": item.get("tr_crcy_cd", ""),
                         "odno": str(int(item.get("odno", "0"))) if item.get("odno", "").isdigit() else item.get("odno", ""),
                         "ovrs_excg_cd": item.get("ovrs_excg_cd", ""),
-                    })
+                    }
+                    # 원주문 수량은 응답에 있을 때만 보존합니다. 없으면 "0"을
+                    # 합성하지 않고 키를 생략해 VERIFY가 lenient(필드 없음)로
+                    # 판정하도록 합니다. (0을 합성하면 "읽을 수 없음" 실패가 됨)
+                    if "ft_ord_qty" in item:
+                        row["ft_ord_qty"] = item["ft_ord_qty"]
+                    order_history.append(row)
 
                 # 다음 페이지 여부 확인
                 tr_cont = response.headers.get("tr_cont", "")

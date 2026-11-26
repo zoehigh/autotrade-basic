@@ -208,6 +208,21 @@ class TestDryBrokerGetDailyCandles:
         # 플래그가 없는 브로커는 기본값 False (기존 현재가 폴백 유지)
         assert DryBroker(object()).provides_daily_candle_dates is False
 
+    def test_readonly_broker_delegates_capability_and_blocks_orders(self):
+        """ReadOnlyBroker도 날짜 제공 여부를 위임하되 주문 차단은 그대로입니다."""
+        from broker.base import ReadOnlyBroker
+
+        real = MagicMock()
+        real.provides_daily_candle_dates = True
+        readonly = ReadOnlyBroker(real)
+        assert readonly.provides_daily_candle_dates is True
+        with pytest.raises(RuntimeError, match="주문"):
+            readonly.place_order("TQQQ", "NASD", "BUY", 1, 50.0, "LIMIT")
+        assert real.place_order.call_count == 0
+
+        real.provides_daily_candle_dates = False
+        assert readonly.provides_daily_candle_dates is False
+
 
 # ═══════════════════════════════════════════════════════════════════
 # toss.adapter: TossBroker.get_daily_candles (mocked)

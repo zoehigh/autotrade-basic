@@ -127,6 +127,19 @@ def test_dry_broker_wrapper_holds_like_live_on_missing_date():
     assert result["hold_reason"] == HOLD_EXIT_UNCONFIRMED
 
 
+def test_readonly_broker_wrapper_holds_like_live_on_missing_date():
+    """ReadOnlyBroker(PREVIEW/EXECUTE)도 날짜 누락 시 현재가 폴백 없이 보류합니다."""
+    from broker.base import ReadOnlyBroker
+
+    real = MagicMock()
+    real.provides_daily_candle_dates = True
+    real.get_daily_candles.return_value = [{"date": None, "close": ABOVE}]
+    result, _ = _run(None, ABOVE, broker=ReadOnlyBroker(real))
+    assert result["exit"] is False
+    assert result["orders"] == []
+    assert result["hold_reason"] == HOLD_EXIT_UNCONFIRMED
+
+
 # ── 8. 당일 미확정 봉이 포함된 응답 ────────────────────────────────────────────
 def test_today_unconfirmed_candle_is_ignored():
     candles = [
