@@ -206,6 +206,23 @@ def _verifier_meta_session(meta):
     """
     if not isinstance(meta, dict):
         return None
+    # 적용 주문 근거(_settlement_deltas)에는 ord_dt 가 담겨 있습니다.
+    # 등록 메타의 submitted_session 보다 주문 자신의 원본 날짜를 우선해
+    # 번호 재사용 시 인스턴스를 확정합니다 (구버전 메타는 submitted_session 사용).
+    ord_dt = str(meta.get("ord_dt") or "")
+    if len(ord_dt) == 8 and ord_dt.isdigit():
+        if meta.get("_ord_dt_is_kst_date"):
+            ord_tmd = str(meta.get("ord_tmd") or "")
+            if ord_tmd:
+                try:
+                    kst_dt = datetime.strptime(
+                        ord_dt + ord_tmd.zfill(6), "%Y%m%d%H%M%S"
+                    ).replace(tzinfo=KST)
+                    return kst_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+                except ValueError:
+                    pass
+            return None
+        return ord_dt
     session = str(meta.get("submitted_session") or "").replace("-", "")
     if len(session) == 8 and session.isdigit():
         return session
@@ -270,8 +287,33 @@ def _order_instance_matches(fill, meta):
     fill_session = _verifier_fill_session(fill)
     meta_session = _verifier_meta_session(meta)
     if fill_session and meta_session:
-        return fill_session == meta_session
+        if fill_session == meta_session:
+            return True
+        # 구버전 Evidence 는 `_ord_dt_is_kst_date` 가 없습니다. 메리츠/TOSS 처럼
+        # ord_dt 가 KST 날짜인 행은 메타의 KST 제출일과 ord_dt 가 같고, ord_tmd 로
+        # 환산한 ET 세션이 메타 세션과 일치하면 같은 인스턴스로 인정합니다.
+        ord_dt = str(fill.get("ord_dt") or "")
+        ord_tmd = str(fill.get("ord_tmd") or "")
+        meta_kst = str(meta.get("submitted_at") or "")[:8]
+        if len(ord_dt) == 8 and ord_dt.isdigit() and ord_tmd and ord_dt == meta_kst:
+            try:
+                kst_dt = datetime.strptime(
+                    ord_dt + ord_tmd.zfill(6), "%Y%m%d%H%M%S"
+                ).replace(tzinfo=KST)
+                if (
+                    kst_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+                    == meta_session
+                ):
+                    return True
+            except ValueError:
+                pass
+        return False
     return None
+
+
+def _instance_key(odno, side, session):
+    """주문 인스턴스 집계 키 — (주문번호, 방향, 미국 세션)."""
+    return (str(odno), _verifier_side(side), str(session or ""))
 
 
 def _fill_index_by_odno(fills):
@@ -294,8 +336,6 @@ def _match_fill_for_meta(odno, meta, fill_index):
     candidates = (fill_index or {}).get(str(odno)) or []
     if not candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
     results = [_order_instance_matches(fill, meta) for fill in candidates]
     matched = [fill for fill, result in zip(candidates, results) if result is True]
     if matched:
@@ -303,23 +343,36 @@ def _match_fill_for_meta(odno, meta, fill_index):
             matched,
             key=lambda fill: (_as_int(fill.get("qty")), _as_float(fill.get("amount"))),
         )
-    if all(result is None for result in results):
-        return candidates[-1]
+    # 단일 후보이고 식별 근거가 없으면 다른 인스턴스와 혼동될 여지가 없으므로
+    # 레거시 Evidence 호환을 위해 그 행을 씁니다. 그 외(명시적 불일치 또는
+    # 복수 후보의 식별 불가)는 모호하므로 fail-closed 합니다.
+    if len(candidates) == 1 and results[0] is None:
+        return candidates[0]
     return None
 
 
-def _meta_for_fill(odno, fill, pre_meta, order_by_odno=None):
+def _meta_for_fill(odno, fill, pre_meta, order_by_odno=None, fill_index=None):
     """이력 행에 **대응하는 주문 인스턴스**의 메타만 합칩니다.
 
     다른 인스턴스(다른 날짜·다른 방향)의 마커는 절대 차용하지 않습니다.
-    식별 불가(None)는 기존 동작을 유지해 레거시 Evidence 와 호환합니다.
+    식별 근거가 없고 같은 번호의 후보가 여럿이면 모호하므로 차용하지 않습니다.
+    단일 후보의 레거시 근거만 혼동 가능성이 없어 호환됩니다.
     """
+    def _usable(candidate):
+        result = _order_instance_matches(fill, candidate)
+        if result is True:
+            return True
+        if result is None:
+            others = (fill_index or {}).get(str(odno)) or []
+            return len(others) <= 1
+        return False
+
     meta = {}
     order = (order_by_odno or {}).get(str(odno))
-    if isinstance(order, dict) and _order_instance_matches(fill, order) is not False:
+    if isinstance(order, dict) and _usable(order):
         meta.update(order)
     base = (pre_meta or {}).get(str(odno))
-    if isinstance(base, dict) and _order_instance_matches(fill, base) is not False:
+    if isinstance(base, dict) and _usable(base):
         meta.update(base)
     return meta
 
@@ -533,7 +586,7 @@ def _verify_skipped_unverified(evidence):
 
     for odno, candidates in fill_index.items():
         for fill in candidates:
-            meta = _meta_for_fill(odno, fill, pre_meta)
+            meta = _meta_for_fill(odno, fill, pre_meta, fill_index=fill_index)
             if odno in listed or not isinstance(meta, dict) or not meta:
                 continue
             if _fill_after_watermark(fill, evidence):
@@ -722,7 +775,7 @@ def _required_settlement_fills(evidence):
         raw_amount = _as_float(fill.get("amount"))
         # 같은 번호가 다른 날짜·방향으로 재사용되면 다른 주문의 마커를 차용하지 않습니다.
         # 인스턴스가 확정되지 않으면 워터마크·원장 등 독립 근거로 판단합니다.
-        meta = _meta_for_fill(odno, fill, pre_meta, order_by_odno)
+        meta = _meta_for_fill(odno, fill, pre_meta, order_by_odno, fill_index)
         side = str(fill.get("side") or meta.get("side") or "")
         if side in ("BUY", "SELL"):
             side = "매수" if side == "BUY" else "매도"
@@ -834,6 +887,7 @@ def _required_settlement_fills(evidence):
         item = {
             "odno": odno,
             "side": side,
+            "instance_key": _instance_key(odno, side, _verifier_fill_session(fill)),
             "req_qty": req_qty,
             "req_amount": req_amount,
             "kind": kind,
@@ -941,26 +995,51 @@ def _required_settlement_fills(evidence):
             position = position_after
 
     # ── 필수 체결 vs 주장된 적용 내역 (수량·금액 전부) ──
-    req_qty_by_odno = {}
-    req_amt_by_odno = {}
+    # 번호만으로 합치면 재사용된 주문끼리 누락·과다가 상쇄됩니다.
+    # (번호, 방향, 세션) 단위로 집계해 인스턴스별로 대조합니다.
+    req_qty_by_key = {}
+    req_amt_by_key = {}
     for item in required:
-        odno = item["odno"]
-        req_qty_by_odno[odno] = req_qty_by_odno.get(odno, 0) + item["req_qty"]
-        req_amt_by_odno[odno] = req_amt_by_odno.get(odno, 0.0) + item["req_amount"]
-    act_qty_by_odno = {}
-    act_amt_by_odno = {}
-    for order in orders:
+        key = item.get("instance_key") or _instance_key(
+            item["odno"], item["side"], item.get("ts")
+        )
+        req_qty_by_key[key] = req_qty_by_key.get(key, 0) + item["req_qty"]
+        req_amt_by_key[key] = req_amt_by_key.get(key, 0.0) + item["req_amount"]
+    act_qty_by_key = {}
+    act_amt_by_key = {}
+    for index, order in enumerate(orders):
         odno = str(order.get("odno"))
-        act_qty_by_odno[odno] = act_qty_by_odno.get(odno, 0) + _as_int(order.get("qty_delta"))
-        act_amt_by_odno[odno] = act_amt_by_odno.get(odno, 0.0) + _as_float(order.get("amount_delta"))
-    for odno in sorted(set(req_qty_by_odno) | set(act_qty_by_odno)):
-        req_qty = req_qty_by_odno.get(odno, 0)
-        req_amount = req_amt_by_odno.get(odno, 0.0)
-        act_qty = act_qty_by_odno.get(odno, 0)
-        act_amount = act_amt_by_odno.get(odno, 0.0)
+        side = _verifier_side(order.get("side"))
+        session = _verifier_fill_session(order) or _verifier_meta_session(order)
+        if not session:
+            matched = _match_fill_for_meta(odno, order, fill_index)
+            if matched is not None:
+                session = _verifier_fill_session(matched)
+            else:
+                # 구버전 근거에는 적용 주문에 ord_dt 가 없습니다. 같은 번호의
+                # 후보 중 방향이 일치하는 행이 하나뿐이면 그 세션을 씁니다
+                # (다른 인스턴스와 혼동될 여지가 없을 때만 레거시 호환).
+                same_side = [
+                    row for row in (fill_index or {}).get(odno) or []
+                    if _verifier_side(row.get("side")) == side
+                ]
+                if len(same_side) == 1:
+                    session = _verifier_fill_session(same_side[0])
+        key = _instance_key(odno, side, session)
+        if session is None and len((fill_index or {}).get(odno) or []) > 1:
+            # 후보가 여럿인데 식별 불가 — 다른 인스턴스와 상쇄되지 않도록
+            # 항목별로 고유화합니다 (단일 후보 레거시는 기존 키 유지).
+            key = key + (str(order.get("ledger_seq") or index),)
+        act_qty_by_key[key] = act_qty_by_key.get(key, 0) + _as_int(order.get("qty_delta"))
+        act_amt_by_key[key] = act_amt_by_key.get(key, 0.0) + _as_float(order.get("amount_delta"))
+    for key in sorted(set(req_qty_by_key) | set(act_qty_by_key), key=str):
+        req_qty = req_qty_by_key.get(key, 0)
+        req_amount = req_amt_by_key.get(key, 0.0)
+        act_qty = act_qty_by_key.get(key, 0)
+        act_amount = act_amt_by_key.get(key, 0.0)
         if act_qty != req_qty or abs(act_amount - req_amount) > 0.02:
             problems.append(
-                f"{odno} 필수 체결 불일치: 반드시 처리 {req_qty}주/${req_amount:.2f} "
+                f"{key[0]} 필수 체결 불일치: 반드시 처리 {req_qty}주/${req_amount:.2f} "
                 f"vs 적용 {act_qty}주/${act_amount:.2f} (누락/부분반영/과다)"
             )
 
@@ -1221,10 +1300,14 @@ def _independent_expected_ordered(evidence):
             continue
         odno = str(order.get("odno"))
         side = order.get("side")
-        raw = _match_fill_for_meta(
+        matched_fill = _match_fill_for_meta(
             odno, {**(pre_meta.get(odno) or {}), **order}, fill_index
-        ) or {}
-        meta = pre_meta.get(odno) or {}
+        )
+        raw = matched_fill or {}
+        meta = (
+            _meta_for_fill(odno, matched_fill, pre_meta, fill_index=fill_index)
+            if matched_fill else {}
+        )
         if side == "매도" and not order.get("reverse"):
             cumulative = _as_int(raw.get("qty"))
             marker = (
@@ -1232,6 +1315,12 @@ def _independent_expected_ordered(evidence):
                 if mode == "full_reinference"
                 else (evidence.get("sell_t_effects_before") or {}).get(odno) or {}
             )
+            if (
+                marker
+                and matched_fill is not None
+                and _order_instance_matches(matched_fill, pre_meta.get(odno) or {}) is False
+            ):
+                marker = {}  # 다른 인스턴스의 매도 기준선 마커는 차용하지 않습니다.
             basis = _as_int(marker.get("basis"))
             if basis <= 0 and mode == "full_reinference":
                 # 전체 재추정은 추가매수까지 반영한 필수 체결 궤적의 기준선을 씁니다.
@@ -1268,7 +1357,7 @@ def _independent_expected_ordered(evidence):
             if position is not None:
                 position += qty
             continue
-        key = ("reverse", odno)
+        key = ("reverse", odno, _verifier_fill_session(raw))
         if key in reverse_expected_seen:
             # 한 주문의 증가분은 한 항목에만 계산합니다(추가 항목은 0).
             expected_entries[seq] = dict(expected_entries.get(seq) or actual)

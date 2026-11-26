@@ -180,15 +180,15 @@ def test_indeterminate_instance_fail_closed():
     assert any("주문 인스턴스를 확정할 수 없어" in p for p in problems)
 
 
-def test_legacy_evidence_without_session_keeps_last_wins():
-    """제출일 정보가 없는 레거시 근거는 기존 last-wins 동작을 유지합니다."""
+def test_legacy_evidence_without_session_fails_closed_when_ambiguous():
+    """제출일 정보가 없는 레거시 근거도 후보가 여럿이면 모호하므로 fail-closed 합니다."""
     fills = [
         _fill("7400", "매수", 1, 10.0, "2026-11-12T19:10:00+00:00"),
         _fill("7400", "매수", 2, 20.0, "2026-11-24T19:10:00+00:00"),
     ]
     legacy_meta = {"side": "BUY", "processed_filled_qty": 2, "processed_filled_amount": 20.0}
     idx = verify_run._fill_index_by_odno(fills)
-    assert verify_run._match_fill_for_meta("7400", legacy_meta, idx) is fills[-1]
+    assert verify_run._match_fill_for_meta("7400", legacy_meta, idx) is None
 
 
 def test_kst_and_us_session_conventions():
@@ -343,3 +343,123 @@ def test_e2e_reconstructed_failed_dry():
     _p2, req2, money2 = verify_run._required_settlement_fills(replay)
     assert all(r["req_qty"] == 0 for r in req2 if r["odno"] == "4822")
     assert abs(money2 - 5249.61) < 0.05
+
+
+# ───────────────────────────────────────────────────────────────────
+# P1 보완 — 결함 재현 테스트 (수정 전 실패 확인용)
+# ───────────────────────────────────────────────────────────────────
+def test_p11_single_candidate_explicit_mismatch_fails_closed():
+    """단일 후보라도 날짜·방향이 명시적으로 다르면 매칭하지 않습니다."""
+    fill = _fill("8100", "매도", 4, 260.76, "2026-11-12T19:10:00+00:00")
+    meta = _meta("2026-11-24", qty=1, amount=32.53, side="BUY")
+    idx = verify_run._fill_index_by_odno([fill])
+    assert verify_run._match_fill_for_meta("8100", meta, idx) is None
+
+
+def test_p11_multiple_candidates_indeterminate_fails_closed():
+    """복수 후보에 식별 근거가 없으면 last-wins 대신 fail-closed 합니다."""
+    fills = [
+        {"odno": "8101", "side": "매수", "qty": 1, "amount": 10.0},
+        {"odno": "8101", "side": "매수", "qty": 1, "amount": 10.0},
+    ]
+    meta = {"side": "BUY", "processed_filled_qty": 1, "processed_filled_amount": 10.0}
+    idx = verify_run._fill_index_by_odno(fills)
+    assert verify_run._match_fill_for_meta("8101", meta, idx) is None
+
+
+def test_p11_legacy_single_candidate_without_info_still_allowed():
+    """단일 후보에 식별 근거가 없으면 혼동 가능성이 없으므로 레거시 호환을 유지합니다."""
+    fill = {"odno": "8102", "side": "매수", "qty": 1, "amount": 10.0}
+    meta = {"side": "BUY", "processed_filled_qty": 1, "processed_filled_amount": 10.0}
+    idx = verify_run._fill_index_by_odno([fill])
+    assert verify_run._match_fill_for_meta("8102", meta, idx) is fill
+
+
+def test_p11_meta_for_fill_ambiguous_does_not_borrow():
+    """복수 후보·식별 불가 상황에서는 orders_meta 마커를 차용하지 않습니다."""
+    fills = [
+        {"odno": "8103", "side": "매수", "qty": 1, "amount": 10.0},
+        {"odno": "8103", "side": "매수", "qty": 1, "amount": 10.0},
+    ]
+    meta = {"side": "BUY", "processed_filled_qty": 1, "processed_filled_amount": 10.0}
+    idx = verify_run._fill_index_by_odno(fills)
+    assert verify_run._meta_for_fill("8103", fills[0], {"8103": meta}, None, idx) == {}
+
+
+def test_p12_evidence_carries_kst_date_flag(monkeypatch):
+    """실제 Evidence 생성 함수가 _ord_dt_is_kst_date 를 보존하는지 확인합니다."""
+    import trading_bot
+
+    monkeypatch.setenv("BROKER", "meritz")
+    monkeypatch.setenv("BROKER_MODE", "real")
+    rows = [
+        {
+            "odno": "20261124:1", "sll_buy_dvsn_cd_name": "매수",
+            "ft_ccld_qty": "1", "ft_ccld_unpr3": "10.0", "ft_ccld_amt3": "10.0",
+            "ord_dt": "20261125", "ord_tmd": "041000",
+            "ord_datetime_utc": "2026-11-24T19:10:00+00:00",
+            "_ord_dt_is_kst_date": True,
+        }
+    ]
+    ev = trading_bot.build_settlement_evidence(
+        "SOXL", {}, rows, mode="DRY", run_id="p12", balance_qty=1,
+        before={"last_updated": "2026-11-24T19:10:00+00:00"},
+    )
+    fill = ev["fills"][0]
+    assert fill.get("_ord_dt_is_kst_date") is True
+    assert verify_run._verifier_fill_session(fill) == "20261124"
+
+
+def test_p13_same_odno_same_side_same_amount_different_dates():
+    """동일 번호·방향·금액의 서로 다른 날짜 주문이 집계에서 상쇄되면 안 됩니다."""
+    ev = _ev(
+        watermark_before="2026-11-23T19:10:00+00:00",
+        fills=[
+            _fill("8200", "매수", 1, 10.0, "2026-11-24T19:10:00+00:00", ord_dt="20261124"),
+            _fill("8200", "매수", 1, 10.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125"),
+        ],
+        orders_meta_before={},
+        # 한 인스턴스에 2주를 몰아 적용하고 다른 인스턴스는 누락 → odno 합계는 같음
+        orders=[{"odno": "8200", "side": "매수", "qty_delta": 2, "amount_delta": 20.0,
+                 "ord_dt": "20261124"}],
+    )
+    problems, _required, _money = verify_run._required_settlement_fills(ev)
+    assert any("8200" in p and "필수 체결 불일치" in p for p in problems), problems
+
+
+def test_p13_reverse_expected_seen_distinct_instances():
+    """같은 번호의 서로 다른 리버스 인스턴스는 reverse_expected_seen이 상쇄하지 않습니다."""
+    ev = _ev(
+        watermark_before="2026-11-23T19:10:00+00:00",
+        fills=[
+            _fill("8300", "매수", 1, 10.0, "2026-11-24T19:10:00+00:00", ord_dt="20261124",
+                  reverse_action="buy", reverse_t_target=1.0, reverse_t_rule=1, total_qty=1),
+            _fill("8300", "매수", 1, 10.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125",
+                  reverse_action="buy", reverse_t_target=1.0, reverse_t_rule=1, total_qty=1),
+        ],
+        orders_meta_before={
+            "8300": _meta("2026-11-24", reverse_action="buy", reverse_t_target=1.0,
+                          reverse_t_rule=1, total_qty=1, applied_fill_fraction=0.0),
+        },
+        orders=[
+            {"odno": "8300", "side": "매수", "qty_delta": 1, "amount_delta": 10.0,
+             "reverse": True, "ord_dt": "20261124", "ledger_seq": 19, "t_delta": 1.0},
+            {"odno": "8300", "side": "매수", "qty_delta": 1, "amount_delta": 10.0,
+             "reverse": True, "ord_dt": "20261125", "ledger_seq": 20, "t_delta": 1.0,
+             "total_qty": 1, "reverse_t_target": 1.0, "reverse_t_rule": 1,
+             "applied_fill_fraction": 0.0},
+        ],
+        ledger_after={
+            "start_T": 19.6562, "next_seq": 21,
+            "entries": [
+                {"seq": 19, "kind": "reverse_buy", "odno": "8300", "delta": 1.0, "target": 1.0},
+                {"seq": 20, "kind": "reverse_buy", "odno": "8300", "delta": 0.5, "target": 0.5},
+            ],
+        },
+    )
+    problems, ledger, _money = verify_run._independent_expected_ordered(ev)
+    entries = {str(e["seq"]): e for e in (ledger or {}).get("entries", [])}
+    # 두 인스턴스가 각각 +1.0 이어야 하며, 두 번째가 실제 기록(0.5)을
+    # 그대로 신뢰해 복사되지 않아야 합니다.
+    assert abs(entries["19"]["delta"] - 1.0) < 1e-6, entries
+    assert abs(entries["20"]["delta"] - 1.0) < 1e-6, entries
