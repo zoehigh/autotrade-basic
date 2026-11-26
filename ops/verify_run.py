@@ -188,6 +188,137 @@ def _fill_after_watermark(fill, evidence):
         return odno > last_ordno
 
 
+def _verifier_side(value):
+    """브로커 표기(BUY/SELL/매수/매도)를 검증기 내부 표기로 정규화합니다."""
+    text = str(value or "").strip().upper()
+    if text in ("BUY", "매수", "B"):
+        return "매수"
+    if text in ("SELL", "매도", "S"):
+        return "매도"
+    return ""
+
+
+def _verifier_meta_session(meta):
+    """등록 메타의 제출 미국 세션(YYYYMMDD)을 독립 계산합니다 (state.py 와 별도 구현).
+
+    `submitted_session`(미국 영업일)을 우선하고, 없으면 KST `submitted_at`
+    (YYYYMMDDHHMMSS)을 ET로 환산합니다. 둘 다 없으면 None.
+    """
+    if not isinstance(meta, dict):
+        return None
+    session = str(meta.get("submitted_session") or "").replace("-", "")
+    if len(session) == 8 and session.isdigit():
+        return session
+    text = str(meta.get("submitted_at") or "")
+    if len(text) >= 14 and text[:14].isdigit():
+        try:
+            kst_dt = datetime.strptime(text[:14], "%Y%m%d%H%M%S").replace(tzinfo=KST)
+            return kst_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _verifier_fill_session(fill):
+    """이력 행의 미국 세션(YYYYMMDD)을 독립 계산합니다.
+
+    - evidence 의 `ts` 는 세션 기준 시각(19:10Z)이므로 날짜가 곧 미국 세션입니다.
+    - NHPlug 처럼 시각 없는 미국 영업일 행은 `ord_dt` 를 그대로 씁니다.
+    - 메리츠/TOSS(`_ord_dt_is_kst_date`)는 KST 날짜이므로 시각이 있으면 ET로 환산하고,
+      시각이 없으면 세션 확정 불가(None)로 둡니다 (하위 호환은 호출부가 처리).
+    """
+    if not isinstance(fill, dict):
+        return None
+    ts = str(fill.get("ts") or "")
+    if len(ts) >= 10 and ts[4:5] == "-" and ts[7:8] == "-":
+        return ts[:10].replace("-", "")
+    ord_dt = str(fill.get("ord_dt") or "")
+    if len(ord_dt) == 8 and ord_dt.isdigit():
+        if fill.get("_ord_dt_is_kst_date"):
+            ord_tmd = str(fill.get("ord_tmd") or "")
+            if ord_tmd:
+                try:
+                    kst_dt = datetime.strptime(
+                        ord_dt + ord_tmd.zfill(6), "%Y%m%d%H%M%S"
+                    ).replace(tzinfo=KST)
+                    return kst_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+                except ValueError:
+                    pass
+            return None
+        return ord_dt
+    return None
+
+
+def _order_instance_matches(fill, meta):
+    """같은 주문번호의 이력 행과 메타가 **같은 주문 인스턴스**인지 판정합니다.
+
+    Returns:
+        True: 같은 인스턴스 / False: 다른 인스턴스(마커 차용 금지) /
+        None: 식별 근거 부족(기존 동작 유지)
+    """
+    if not isinstance(fill, dict) or not isinstance(meta, dict):
+        return None
+    fill_side = _verifier_side(fill.get("side") or meta.get("side"))
+    meta_side = _verifier_side(meta.get("side"))
+    if fill_side and meta_side and fill_side != meta_side:
+        return False
+    fill_session = _verifier_fill_session(fill)
+    meta_session = _verifier_meta_session(meta)
+    if fill_session and meta_session:
+        return fill_session == meta_session
+    return None
+
+
+def _fill_index_by_odno(fills):
+    """주문번호 → 이력 행 목록 (같은 번호 재사용을 보존합니다)."""
+    index = {}
+    for fill in fills or []:
+        if not isinstance(fill, dict):
+            continue
+        index.setdefault(str(fill.get("odno") or ""), []).append(fill)
+    return index
+
+
+def _match_fill_for_meta(odno, meta, fill_index):
+    """메타가 가리키는 주문 인스턴스의 이력 행을 찾습니다.
+
+    같은 인스턴스의 부분체결이 여러 행이면 누적 체결이 가장 큰 행을 씁니다.
+    식별 근거가 없으면(None) 기존 last-wins 로 되돌려 하위 호환을 유지하고,
+    명시적으로 다른 인스턴스만 있으면 None 을 반환해 마커 차용을 막습니다.
+    """
+    candidates = (fill_index or {}).get(str(odno)) or []
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    results = [_order_instance_matches(fill, meta) for fill in candidates]
+    matched = [fill for fill, result in zip(candidates, results) if result is True]
+    if matched:
+        return max(
+            matched,
+            key=lambda fill: (_as_int(fill.get("qty")), _as_float(fill.get("amount"))),
+        )
+    if all(result is None for result in results):
+        return candidates[-1]
+    return None
+
+
+def _meta_for_fill(odno, fill, pre_meta, order_by_odno=None):
+    """이력 행에 **대응하는 주문 인스턴스**의 메타만 합칩니다.
+
+    다른 인스턴스(다른 날짜·다른 방향)의 마커는 절대 차용하지 않습니다.
+    식별 불가(None)는 기존 동작을 유지해 레거시 Evidence 와 호환합니다.
+    """
+    meta = {}
+    order = (order_by_odno or {}).get(str(odno))
+    if isinstance(order, dict) and _order_instance_matches(fill, order) is not False:
+        meta.update(order)
+    base = (pre_meta or {}).get(str(odno))
+    if isinstance(base, dict) and _order_instance_matches(fill, base) is not False:
+        meta.update(base)
+    return meta
+
+
 def _unregistered_expected_shares(orders, fills):
     """미등록 매수의 T 기여분을 **건수 폴백**으로 독립 배분합니다.
 
@@ -196,7 +327,7 @@ def _unregistered_expected_shares(orders, fills):
     검증기는 정산이 기록한 t_target/t_delta 를 신뢰하지 않고 이 규칙을
     다시 계산해 배분 오류를 검출합니다.
     """
-    fill_by_odno = {str(f.get("odno")): f for f in (fills or [])}
+    fill_index = _fill_index_by_odno(fills)
     groups = {}
     for order in orders or []:
         if not order.get("unregistered") or order.get("reverse"):
@@ -204,7 +335,8 @@ def _unregistered_expected_shares(orders, fills):
         odno = str(order.get("odno") or "")
         day = str(order.get("ord_dt") or "")
         if not day:
-            ts = str((fill_by_odno.get(odno) or {}).get("ts") or "")
+            fill = _match_fill_for_meta(odno, order, fill_index) or {}
+            ts = str(fill.get("ts") or "")
             day = ts[:10]
         groups.setdefault(day, []).append(order)
 
@@ -342,7 +474,7 @@ def _verify_skipped_unverified(evidence):
         if skipped:
             return ["log_salt 가 없거나 형식 오류입니다 (건너뜀 감사 해시 대조 불가 — 검증 불가)"]
         salt = os.urandom(16).hex()  # 건너뜀 항목이 없으면 메시지 라벨용 임시 salt 만 필요
-    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    fill_index = _fill_index_by_odno(evidence.get("fills") or [])
     applied = {
         str(o.get("odno")) for o in (evidence.get("orders") or []) if o.get("odno") is not None
     }
@@ -358,9 +490,28 @@ def _verify_skipped_unverified(evidence):
             problems.append(f"{label} 건너뜀 항목의 odno_hash 가 주문번호와 일치하지 않습니다")
         if entry.get("reason") != "legacy_zero_marker_unproven":
             problems.append(f"{label} 건너뜀 사유가 알 수 없는 값입니다: {entry.get('reason')!r}")
-        fill = fills.get(odno)
+        candidates = fill_index.get(odno) or []
+        fill = None
+        if len(candidates) == 1:
+            fill = candidates[0]
+        elif candidates:
+            # 번호 재사용: 건너뜀 항목의 시각·체결수량으로 인스턴스를 확정합니다.
+            entry_ts = str(entry.get("ts") or "")
+            matched = [row for row in candidates if str(row.get("ts") or "") == entry_ts]
+            if not matched:
+                matched = [
+                    row for row in candidates
+                    if _as_int(row.get("qty")) == _as_int(entry.get("filled_qty"))
+                ]
+            if len(matched) == 1:
+                fill = matched[0]
         if fill is None:
-            problems.append(f"{label} 건너뜀 주문이 이력(fills)에 없습니다")
+            if candidates:
+                problems.append(
+                    f"{label} 건너뜀 주문의 인스턴스를 확정할 수 없습니다 (주문번호 재사용 — 검증 불가)"
+                )
+            else:
+                problems.append(f"{label} 건너뜀 주문이 이력(fills)에 없습니다")
             continue
         if _fill_after_watermark(fill, evidence):
             problems.append(f"{label} 건너뜀 주문이 워터마크 이후 신규 체결입니다 (잘못된 건너뛰기)")
@@ -375,28 +526,29 @@ def _verify_skipped_unverified(evidence):
         if isinstance(post_meta, dict) and post_meta.get(odno) != pre_meta.get(odno):
             problems.append(f"{label} 건너뛴 주문의 마커가 변경됐습니다")
 
-    for odno, fill in fills.items():
-        meta = pre_meta.get(odno)
-        if odno in listed or not isinstance(meta, dict):
-            continue
-        if _fill_after_watermark(fill, evidence):
-            continue
-        if not _legacy_zero_marker_unproven(meta) or _as_int(fill.get("qty")) <= 0:
-            continue
-        # 리버스 주문·금액 미확정은 다른 경로(reconcile / 금액 확정 대기)가 담당합니다.
-        if fill.get("reverse_action") or meta.get("reverse_action"):
-            continue
-        if not fill.get("amount_confirmed", True):
-            continue
-        label = _independent_odno_hash(odno, salt)
-        if odno in applied:
-            problems.append(
-                f"{label} 증명 불가 과거 주문(레거시 0 마커)이 재반영됐습니다 (이중 가산 의심)"
-            )
-        else:
-            problems.append(
-                f"{label} 증명 불가 과거 주문이 건너뜀 목록에도 반영 내역에도 없습니다 (감사 누락)"
-            )
+    for odno, candidates in fill_index.items():
+        for fill in candidates:
+            meta = _meta_for_fill(odno, fill, pre_meta)
+            if odno in listed or not isinstance(meta, dict) or not meta:
+                continue
+            if _fill_after_watermark(fill, evidence):
+                continue
+            if not _legacy_zero_marker_unproven(meta) or _as_int(fill.get("qty")) <= 0:
+                continue
+            # 리버스 주문·금액 미확정은 다른 경로(reconcile / 금액 확정 대기)가 담당합니다.
+            if fill.get("reverse_action") or meta.get("reverse_action"):
+                continue
+            if not fill.get("amount_confirmed", True):
+                continue
+            label = _independent_odno_hash(odno, salt)
+            if odno in applied:
+                problems.append(
+                    f"{label} 증명 불가 과거 주문(레거시 0 마커)이 재반영됐습니다 (이중 가산 의심)"
+                )
+            else:
+                problems.append(
+                    f"{label} 증명 불가 과거 주문이 건너뜀 목록에도 반영 내역에도 없습니다 (감사 누락)"
+                )
     return problems
 
 
@@ -427,7 +579,7 @@ def _verify_fill_markers(evidence):
     pre_meta = evidence.get("orders_meta_before")
     if not isinstance(pre_meta, dict):
         pre_meta = {}
-    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    fill_index = _fill_index_by_odno(evidence.get("fills") or [])
     applied = {
         str(order.get("odno"))
         for order in (evidence.get("orders") or [])
@@ -466,7 +618,16 @@ def _verify_fill_markers(evidence):
             )
             continue
 
-        fill = fills.get(odno)
+        fill = _match_fill_for_meta(odno, after_meta, fill_index)
+        if fill is None and (fill_index.get(odno) or []):
+            # 같은 번호가 다른 날짜·방향으로 재사용됐지만 이 메타의 인스턴스가
+            # 이력에 없습니다. 다른 주문의 체결로 마커를 대조하지 않습니다.
+            if after_qty != before_qty or abs(after_amount - before_amount) > 0.005:
+                problems.append(
+                    f"{odno} 주문 인스턴스를 확정할 수 없어 체결 마커를 대조할 수 없습니다 "
+                    f"(주문번호 재사용 — 검증 불가)"
+                )
+            continue
         if fill is None:
             if after_qty != before_qty or abs(after_amount - before_amount) > 0.005:
                 problems.append(
@@ -544,11 +705,7 @@ def _required_settlement_fills(evidence):
     unreg_shares = _unregistered_expected_shares(orders, fills)
     pending_marker = _pending_marker_odnos(evidence)
     pending_marker_set = set(pending_marker)
-
-    def _meta_for(odno):
-        meta = dict(order_by_odno.get(odno) or {})
-        meta.update(pre_meta.get(odno) or {})
-        return meta
+    fill_index = _fill_index_by_odno(fills)
 
     def _sort_key(fill):
         return (str(fill.get("ts") or ""), str(fill.get("odno") or ""))
@@ -558,7 +715,9 @@ def _required_settlement_fills(evidence):
         odno = str(fill.get("odno") or "")
         raw_qty = _as_int(fill.get("qty"))
         raw_amount = _as_float(fill.get("amount"))
-        meta = _meta_for(odno)
+        # 같은 번호가 다른 날짜·방향으로 재사용되면 다른 주문의 마커를 차용하지 않습니다.
+        # 인스턴스가 확정되지 않으면 워터마크·원장 등 독립 근거로 판단합니다.
+        meta = _meta_for_fill(odno, fill, pre_meta, order_by_odno)
         side = str(fill.get("side") or meta.get("side") or "")
         if side in ("BUY", "SELL"):
             side = "매수" if side == "BUY" else "매도"
@@ -995,7 +1154,7 @@ def _independent_expected_ordered(evidence):
         str(e.get("seq")): e for e in (ledger_after.get("entries") or [])
     }
     orders = evidence.get("orders") or []
-    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    fill_index = _fill_index_by_odno(evidence.get("fills") or [])
     pre_meta = evidence.get("orders_meta_before") or {}
     unreg_shares = _unregistered_expected_shares(
         orders, evidence.get("fills") or []
@@ -1057,7 +1216,9 @@ def _independent_expected_ordered(evidence):
             continue
         odno = str(order.get("odno"))
         side = order.get("side")
-        raw = fills.get(odno) or {}
+        raw = _match_fill_for_meta(
+            odno, {**(pre_meta.get(odno) or {}), **order}, fill_index
+        ) or {}
         meta = pre_meta.get(odno) or {}
         if side == "매도" and not order.get("reverse"):
             cumulative = _as_int(raw.get("qty"))
@@ -1217,6 +1378,7 @@ def _recompute_expected_ordered(evidence):
         problems.append("보유수량 기준 미확보로 정산이 보류됐습니다 (검증 불가)")
     problems.extend(_verify_fill_markers(evidence))
     problems.extend(_verify_skipped_unverified(evidence))
+    pre_meta = evidence.get("orders_meta_before") or {}
     t_before = evidence.get("T_before")
     money_before = evidence.get("net_invested_before")
     if t_before is None or money_before is None:
@@ -1325,7 +1487,7 @@ def _recompute_expected_ordered(evidence):
             problems.append(f"매도/매수 원장({seq}) delta 필드 변조")
 
     orders = evidence.get("orders") or []
-    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    fill_index = _fill_index_by_odno(evidence.get("fills") or [])
     seen_seq: dict[str, dict] = {}
     applied_seq = []
     previous_new_seq = -1
@@ -1359,7 +1521,9 @@ def _recompute_expected_ordered(evidence):
                 problems.append(f"주문 {odno} 적용 순서가 원장 순서와 다릅니다")
             previous_new_seq = max(previous_new_seq, seq_int)
 
-        raw = fills.get(odno) or {}
+        raw = _match_fill_for_meta(
+            odno, {**(pre_meta.get(odno) or {}), **order}, fill_index
+        ) or {}
         raw_qty = int(raw.get("qty") or 0)
         raw_amount = float(raw.get("amount") or 0.0)
         qty_delta = int(order.get("qty_delta") or 0)
@@ -1494,7 +1658,7 @@ def _recompute_expected(evidence):
     t_value = float(t_before)
     money = float(money_before)
     orders = evidence.get("orders") or []
-    fills = {str(f.get("odno")): f for f in (evidence.get("fills") or [])}
+    fill_index = _fill_index_by_odno(evidence.get("fills") or [])
     unreg_shares = _unregistered_expected_shares(
         orders, evidence.get("fills") or []
     )
@@ -1518,7 +1682,7 @@ def _recompute_expected(evidence):
         side = o.get("side")
         qty_delta = int(o.get("qty_delta") or 0)
         amount_delta = float(o.get("amount_delta") or 0)
-        raw = fills.get(odno) or {}
+        raw = _match_fill_for_meta(odno, o, fill_index) or {}
         raw_qty = int(raw.get("qty") or 0)
         raw_amount = float(raw.get("amount") or 0)
 
@@ -1712,6 +1876,15 @@ def _verify_evidence(evidence):
             f"vs 근거 재계산 ${expected_money:.2f}"
         )
     return problems
+
+
+def verify_evidence_masked(evidence):
+    """메모리 근거를 검증하고 **원문 주문번호를 마스킹한** 문제 목록을 반환합니다.
+
+    파일 경로(`verify_evidence_file`)와 파이프라인 저장 전 게이트가 같은 마스킹을
+    쓰도록 합니다. Evidence 자체(암호화 artifact)는 원문을 유지합니다.
+    """
+    return _mask_problem_messages(_verify_evidence(evidence), evidence)
 
 
 def _symbol_executed_count(text, symbol):
