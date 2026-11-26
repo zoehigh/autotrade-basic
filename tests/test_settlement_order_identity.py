@@ -214,6 +214,20 @@ def test_kst_and_us_session_conventions():
 # ───────────────────────────────────────────────────────────────────
 # B. 기존 탐지 정책 유지
 # ───────────────────────────────────────────────────────────────────
+def test_kis_compat_timestamp_does_not_break_matching():
+    """KIS 새벽 주문의 호환용 ts가 세션보다 하루 앞서도 ord_dt로 확정합니다."""
+    fill = _fill(
+        "8000", "매수", 1, 10.0, "2026-11-23T19:10:00+00:00",
+        ord_dt="20261124", ord_tmd="041000",
+    )
+    meta = _meta("2026-11-24", qty=1, amount=10.0)
+    assert verify_run._verifier_fill_session(fill) == "20261124"
+    assert verify_run._order_instance_matches(fill, meta) is True
+    ev = _ev(fills=[fill], orders_meta_before={"8000": meta})
+    _problems, required, _money = verify_run._required_settlement_fills(ev)
+    assert required[0]["req_qty"] == 0  # 정상 마커가 차용되지 않고 유지됨
+
+
 def test_tampering_and_duplicate_still_detected():
     """마커 변조·과다 적용은 여전히 실패합니다."""
     ev = _ev(

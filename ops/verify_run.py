@@ -222,16 +222,18 @@ def _verifier_meta_session(meta):
 def _verifier_fill_session(fill):
     """이력 행의 미국 세션(YYYYMMDD)을 독립 계산합니다.
 
-    - evidence 의 `ts` 는 세션 기준 시각(19:10Z)이므로 날짜가 곧 미국 세션입니다.
-    - NHPlug 처럼 시각 없는 미국 영업일 행은 `ord_dt` 를 그대로 씁니다.
-    - 메리츠/TOSS(`_ord_dt_is_kst_date`)는 KST 날짜이므로 시각이 있으면 ET로 환산하고,
-      시각이 없으면 세션 확정 불가(None)로 둡니다 (하위 호환은 호출부가 처리).
+    - `ord_dt`(브로커 원본)가 있으면 이를 우선합니다. KIS/LS/키움/NHPlug 는
+      미국 영업일이고, 메리츠/TOSS(`_ord_dt_is_kst_date`)는 KST 날짜이므로
+      `ord_tmd` 로 ET 세션을 환산합니다 (시각 없으면 확정 불가 None).
+    - 구버전 Evidence 처럼 `ord_dt` 가 없으면 `ts` 날짜로 폴백합니다
+      (호환용 `ord_datetime_utc` 는 세션보다 하루 앞설 수 있어 마지막 수단).
     """
     if not isinstance(fill, dict):
         return None
-    ts = str(fill.get("ts") or "")
-    if len(ts) >= 10 and ts[4:5] == "-" and ts[7:8] == "-":
-        return ts[:10].replace("-", "")
+    # 브로커 원본 날짜를 우선합니다. `ts`(= ord_datetime_utc)는 상태 호환상
+    # ord_dt 를 KST 로 해석한 값이라 KIS/LS/키움 새벽 주문에서는 미국 세션보다
+    # 하루 앞설 수 있습니다 (docs/agents/brokers.md). ord_dt 가 있는 근거에서는
+    # 절대 ts 날짜로 세션을 추정하지 않습니다.
     ord_dt = str(fill.get("ord_dt") or "")
     if len(ord_dt) == 8 and ord_dt.isdigit():
         if fill.get("_ord_dt_is_kst_date"):
@@ -246,6 +248,9 @@ def _verifier_fill_session(fill):
                     pass
             return None
         return ord_dt
+    ts = str(fill.get("ts") or "")
+    if len(ts) >= 10 and ts[4:5] == "-" and ts[7:8] == "-":
+        return ts[:10].replace("-", "")
     return None
 
 
