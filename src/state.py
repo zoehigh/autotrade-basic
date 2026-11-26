@@ -3269,7 +3269,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         _mark_settlement_hold(
             state,
             f"KIS 모의 주문번호 재사용으로 체결을 주문별로 구분할 수 없는 주문 {len(ambiguous_odnos)}건 "
-            f"({mask_odno(list(ambiguous_odnos)[:5])[1:-1]}) — 브로커 앱 체결 대조 후 보정 필요",
+            f"({mask_odno(list(ambiguous_odnos)[:5])[1:-1]}) — 브로커 앱 체결 대조 후 보정 필요 "
+            f"(구분 불가 사유는 위 로그, 복구는 docs/agents/state-repair.md 의 REPAIR 절차: 같은 번호의 과거 주문 기록 "
+            f"(sell_t_effects)·정산 기준 시각 정리)",
         )
         return state, list(ambiguous_odnos)
 

@@ -175,3 +175,52 @@ def test_KIS_모의가_아니면_구분_불가_보류를_만들지_않는다(mon
     candidates = [(None, N, _old_row(10, 50.0)), (None, N, _sell_row(5))]
     assert state_module._ambiguous_reused_odnos(st, candidates) == {}
     assert state_module._row_date_relation(_old_row(), _meta()) == "match"
+
+
+# ───────── 보류 해소·오탐 경계 (리뷰 반영) ─────────
+
+def test_사이클_종료로_매도_효과가_비워진_뒤_번호가_재사용돼도_보류하지_않는다():
+    st = _state(_sell_meta(0), last_updated=MID_WM)
+    st["sell_t_effects"] = {}                                 # 전량매도 사이클 종료 시 비워짐
+    assert state_module._ambiguous_reused_odnos(st, [(None, N, _sell_row(5))]) == {}
+
+
+def test_매도_효과_기록을_정리하면_같은_행이_정상_정산으로_복귀한다():
+    """보류는 매 실행 같은 조건으로 반복되므로 해소 경로(기록 정리 = REPAIR 절차)가 필요합니다."""
+    st = _state(_sell_meta(0), last_updated=MID_WM)
+    st["sell_t_effects"] = {N: {"basis": 20, "factor": 0.75}}
+    for _ in range(2):                                        # 같은 입력은 매 실행 같은 보류 (워터마크가 전진하지 않음)
+        held = _settle(deepcopy(st), [_sell_row(5)])
+        assert held.get("_settlement_hold") is True
+        assert held["_pending_amount_odnos"] == [N]
+
+    st["sell_t_effects"] = {}                                 # 같은 번호의 과거 주문 기록 정리 후
+    recovered = _settle(deepcopy(st), [_sell_row(5)])
+    assert not recovered.get("_settlement_hold")
+    assert recovered["orders_meta"][N]["processed_filled_qty"] == 5
+
+
+def test_두_행_중_하나만_메타와_날짜가_맞아도_번호_키_충돌이므로_보류하고_해당_번호를_알린다():
+    st = _state(_meta(0, 0.0), last_updated=EARLY_WM)
+    result = _settle(st, [_old_row(10, 50.0), _new_row(5, 10.0)])
+    assert result["_pending_amount_odnos"] == [N]
+    assert "REPAIR" in result["_settlement_hold_reason"]
+
+
+def test_메타가_없는_매도_행은_효과_기록이_있어도_기존_동작이다():
+    """미등록 매도 행의 번호가 sell_t_effects 에 있는 경우는 이 가드의 대상이 아님 (기존 동작, 잔여 위험으로 문서화)."""
+    st = _state(None, last_updated=MID_WM)
+    st["orders_meta"] = {}
+    st["sell_t_effects"] = {N: {"basis": 20, "factor": 0.75}}
+    assert state_module._ambiguous_reused_odnos(st, [(None, N, _sell_row(5))]) == {}
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "알려진 한계(후속 과제): additional_loc_odno 는 번호만으로 추가매수를 판정하고 정리되지 않음 — "
+    "같은 번호가 재사용된 신규 일반 매수가 날짜 확인 없이 추가매수(T 효과 없음)로 분류될 수 있음. 상태 스키마 변경이 필요해 이번 범위 밖"))
+def test_additional_loc_odno_에_남은_번호가_재사용된_신규_일반_매수는_추가매수로_분류되지_않는다():
+    meta = _meta(0, 0.0)                                       # 새 일반 매수 (is_additional=False)
+    st = _state(meta, last_updated=MID_WM)
+    st["additional_loc_odno"] = [N]                            # 과거 미등록 추가매수가 같은 번호
+    result = _settle(st, [_new_row(5, 10.0)])
+    assert result["T"] == pytest.approx(5.5, abs=1e-3)         # 일반 매수이므로 T 가 올라야 함
