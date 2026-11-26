@@ -429,6 +429,39 @@ class TestPreviewAndReadOnly:
         assert io["saved"] == []
         assert broker.place_order.call_count == 0
 
+    def test_preview_exit_unconfirmed_holds_with_readonly_dated_broker(self, io, monkeypatch):
+        """PREVIEW: 날짜 제공 브로커가 날짜를 못 주면 EXIT_UNCONFIRMED 보류, 주문 0건."""
+        from strategy import 무한매수법_V4 as real_strategy
+
+        monkeypatch.setattr(trading_bot, "무한매수법_V4", real_strategy)
+        monkeypatch.setattr("strategy.get_finnhub_ma5", lambda symbol: None)
+        monkeypatch.setattr("strategy.us_session_last_closed_date", lambda *a, **k: "2026-10-23")
+
+        state = _base_state(
+            T=19.5,
+            close_prices=[50.0],
+            reverse_mode={"active": True, "day_count": 1},
+            net_invested=8000.0,
+            net_invested_status="valid",
+        )
+        io["load"]("TQQQ", state)
+        _write_evidence(Path("."))
+
+        real = _make_broker(balance_qty=130)
+        real.provides_daily_candle_dates = True
+        real.get_daily_candles.return_value = [{"date": None, "close": 59.26}]
+        real.get_stock_quotation.return_value = SimpleNamespace(tradable=True)
+        real.get_stock_price.return_value = SimpleNamespace(open=59.26, last=59.26)
+        real.get_balance.return_value = Balance(quantity=130, avg_price=65.5732)
+        real.get_purchase_amount.return_value = PurchaseAmount(orderable_cash=2000.0)
+
+        settled = trading_bot._settled_from_state(_symbol_config())
+        plan = pipeline.build_order_plan(settled, ReadOnlyBroker(real))
+
+        assert plan.orders == []
+        assert plan.strategy_result.get("reverse_hold") == "EXIT_UNCONFIRMED"
+        assert real.place_order.call_count == 0
+
     def test_preview_uses_reinvested_effective_seed(self, io, monkeypatch):
         seen = {}
 
@@ -878,6 +911,25 @@ class TestExecute:
         _state, _plan, path = _approve(tmp_path, state=state)
         broker = _make_broker()
         with pytest.raises(RuntimeError, match="미해결 주문/정산"):
+            pipeline_execute.execute_approved_plan(
+                broker, str(path), now=_fixed_now(), state_override=state
+            )
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(path))["consumed"] is False
+
+    def test_execute_recompute_exit_unconfirmed_blocks_orders(self, io, tmp_path, monkeypatch):
+        """EXECUTE 재계산에서 EXIT_UNCONFIRMED 보류가 나오면 승인 주문도 실행하지 않습니다."""
+        state, _plan, path = _approve(tmp_path)
+        held = SimpleNamespace(
+            orders=[],
+            strategy_result={"reverse_hold": "EXIT_UNCONFIRMED"},
+            state_patch={},
+            plan_id="held-plan",
+            symbol="TQQQ",
+        )
+        monkeypatch.setattr(pipeline_execute, "build_order_plan", lambda *a, **k: held)
+        broker = _make_broker()
+        with pytest.raises(RuntimeError, match=r"리버스 보류\(EXIT_UNCONFIRMED\)"):
             pipeline_execute.execute_approved_plan(
                 broker, str(path), now=_fixed_now(), state_override=state
             )

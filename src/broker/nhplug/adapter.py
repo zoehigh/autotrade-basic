@@ -41,6 +41,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     resolve_real_kst_from_ord,
+    normalize_daily_candle_date,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -85,6 +86,8 @@ class NHPlugBroker(Broker):
     config.py의 BROKER_CONFIG["nhplug"]에서 설정을 읽습니다.
     BROKER_MODE에 따라 실전(real) / 모의(demo) 도메인이 결정됩니다.
     """
+
+    provides_daily_candle_dates = True   # 일봉 응답의 trade_date(YYYYMMDD)를 세션 날짜로 제공
 
     def __init__(self):
         from config import BROKER_CONFIG, BROKER_MODE, HTTP_TIMEOUT
@@ -997,17 +1000,10 @@ class NHPlugBroker(Broker):
     # 일봉 종가
     # ═══════════════════════════════════════════════════════════════════
 
-    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """
-        해외주식 기간별시세(일봉)를 조회합니다 → list[float] (오래된 순).
+    def _fetch_daily_rows(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉 원본 행을 {"date", "close"}로 정규화해 조회합니다 (응답 순서 = 최신순).
 
-        TR: GSC10060 (기간별시세)
-        Input_0: iem_cd, end_dt(YYYYMMDD), count(조회건수), maxavg("0"),
-                 gubun("3"=일), xtick("0001"), today_cls("0"=종료일조회),
-                 market_cls("0"=전체)
-        응답: Output_0 = 배열(date, trdprc, open_prc, high, low, hst_trdprc 등),
-             Output_1 = 배열(trade_date, close_prc 등)
-
+        TR: GSC10060 (기간별시세). 응답 Output_1 의 trade_date / close_prc 를 읽습니다.
         ⚠️ 시세 API는 모의투자 서버(moapi)가 지원하지 않으므로(IGW40019)
         항상 운영 도메인(self._live_domain)으로 라우팅합니다.
         """
@@ -1036,18 +1032,35 @@ class NHPlugBroker(Broker):
             if isinstance(output, dict):
                 output = [output]
 
-            closes = []
+            rows = []
             for item in output:
                 close = self._to_float(item.get("close_prc"))
-                if close > 0:
-                    closes.append(close)
-
-            # 최신순 반환 가정 → 역순 (오래된 순)
-            closes.reverse()
-            return closes[-days:]
+                if close <= 0:
+                    continue
+                rows.append({
+                    "date": normalize_daily_candle_date(item.get("trade_date")),
+                    "close": close,
+                })
+            return rows
 
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"일자별종가 조회 실패: {str(e)}")
+
+    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+        """해외주식 기간별시세(일봉) 종가를 조회합니다 → list[float] (오래된 순). TR: GSC10060."""
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [row["close"] for row in reversed(rows)][-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉을 날짜 포함으로 조회합니다 → [{"date", "close"}] (오래된 순).
+
+        trade_date(YYYYMMDD)를 'YYYY-MM-DD'로 정규화합니다. 날짜를 못 읽은 행은 date=None 으로 남깁니다.
+        """
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [
+            {"date": row["date"], "close": row["close"]}
+            for row in reversed(rows)
+        ][-days:]
 
     # ═══════════════════════════════════════════════════════════════════
     # 주문 API

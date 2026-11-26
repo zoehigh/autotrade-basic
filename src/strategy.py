@@ -212,27 +212,39 @@ HOLD_RECONCILIATION_PENDING = "RECONCILIATION_PENDING"          # 체결 반영�
 HOLD_UNRESOLVED_REVERSE_ORDERS = "UNRESOLVED_REVERSE_ORDERS"    # terminal 미확정 리버스 주문 → 신규 주문·종료 판정 보류
 
 
-def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
-    """확정된 직전 정규장 종가를 (종가, 거래일 YYYY-MM-DD) 로 반환합니다. 확보하지 못하면 None.
+_UNFETCHED = object()   # 일봉 조회 여부 구분용 표식 — 같은 판정에서 API를 두 번 호출하지 않기 위해 사용
 
-    리버스 종료 판정은 '종가' 기준이므로 프리마켓·실시간 시세(last_price)를 쓰지 않습니다.
-    확정 종가의 조건: XNYS 캘린더상 이미 마감된 가장 최근 세션(조기마감·휴장 반영)의 일봉이
-    브로커 일봉에 같은 날짜로 존재하고 종가가 양수일 것. 브로커가 날짜를 주지 않거나(date=None)
-    최신 일봉이 그 세션보다 오래됐거나 조회가 실패하면 '미확보'입니다.
-    """
+
+def _fetch_daily_candles(broker, symbol, exchange_code):
+    """일봉을 1회 조회합니다. 브로커 미지원·조회 실패·형식 이상이면 None (종료 판정 보류)."""
     if broker is None or not hasattr(broker, "get_daily_candles"):
-        return None
-    if now_utc is None:
-        now_utc = datetime.now(ZoneInfo("UTC"))   # 전략의 시계를 그대로 사용 (섀도 원장 등 세션 시뮬레이션과 일치)
-    expected = us_session_last_closed_date(now_utc)
-    if not expected:
         return None
     try:
         candles = broker.get_daily_candles(symbol, exchange_code, days=5)
     except Exception as error:  # 조회 실패는 '미확보'로 처리 (종료 판정을 하지 않음)
         print(f"[경고] {symbol} 일봉 조회 실패 — 확정 종가 미확보: {error}")
         return None
-    if not isinstance(candles, list):
+    return candles if isinstance(candles, list) else None
+
+
+def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None, candles=_UNFETCHED):
+    """확정된 직전 정규장 종가를 (종가, 거래일 YYYY-MM-DD) 로 반환합니다. 확보하지 못하면 None.
+
+    리버스 종료 판정은 '종가' 기준이므로 프리마켓·실시간 시세(last_price)를 쓰지 않습니다.
+    확정 종가의 조건: XNYS 캘린더상 이미 마감된 가장 최근 세션(조기마감·휴장 반영)의 일봉이
+    브로커 일봉에 같은 날짜로 존재하고 종가가 양수일 것. 브로커가 날짜를 주지 않거나(date=None)
+    최신 일봉이 그 세션보다 오래됐거나 조회가 실패하면 '미확보'입니다.
+
+    candles: 이미 조회한 일봉을 넘기면 재조회하지 않습니다 (같은 판정의 중복 API 호출 방지).
+    """
+    if candles is _UNFETCHED:
+        candles = _fetch_daily_candles(broker, symbol, exchange_code)
+    if candles is None:
+        return None
+    if now_utc is None:
+        now_utc = datetime.now(ZoneInfo("UTC"))   # 전략의 시계를 그대로 사용 (섀도 원장 등 세션 시뮬레이션과 일치)
+    expected = us_session_last_closed_date(now_utc)
+    if not expected:
         return None
     for candle in reversed(candles):
         if not isinstance(candle, dict) or candle.get("date") != expected:
@@ -246,12 +258,8 @@ def _confirmed_prev_close(broker, symbol, exchange_code, now_utc=None):
     return None
 
 
-def _candles_lack_dates(broker, symbol, exchange_code):
-    """브로커가 일봉 날짜를 제공하지 않는지(모든 봉의 date 가 None) 확인합니다. 조회 실패·형식 이상이면 False."""
-    try:
-        candles = broker.get_daily_candles(symbol, exchange_code, days=5)
-    except Exception:
-        return False
+def _candles_lack_dates(candles):
+    """이미 조회한 일봉이 전부 날짜 없는 봉인지 확인합니다 (날짜 미제공 브로커만 현재가 폴백)."""
     return (
         isinstance(candles, list) and len(candles) > 0
         and all(isinstance(c, dict) and c.get("date") is None for c in candles)
@@ -261,16 +269,18 @@ def _candles_lack_dates(broker, symbol, exchange_code):
 def _resolve_exit_close(broker, symbol, exchange_code, last_price):
     """리버스 종료 판정에 쓸 (가격, 근거 설명)을 반환합니다. 판정을 보류해야 하면 None.
 
-    - 일봉 날짜를 제공하는 브로커(메리츠): 확정된 직전 정규장 종가만 인정. 못 얻으면 None(보류).
-    - 일봉 날짜를 제공하지 않는 브로커(KIS·KIWOOM·LS·NHPLUG 등 기본 구현): 확정 종가를 검증할 수 없으므로
-      기존 방식(현재가)을 유지하고 경고를 남깁니다 — 그렇지 않으면 이 브로커들은 리버스 1일차 이후 영구 보류됩니다.
-      (이 브로커들의 날짜 포함 일봉 구현은 실응답 검증 후 별도 작업)
+    일봉은 이 함수에서 한 번만 조회하고, 그 결과로 확정 종가와 날짜 제공 여부를 함께 판단합니다.
+    - 날짜를 제공하는 브로커(메리츠·토스·KIS·KIWOOM·NHPLUG·LS): 확정된 직전 정규장 종가만 인정.
+      못 얻으면 None(보류) — 현재가로 종료하지 않습니다.
+    - 날짜를 제공하지 않는 브로커(기본 구현, date=None): 확정 종가를 검증할 수 없으므로
+      기존 방식(현재가)을 유지하고 경고를 남깁니다 (다른 브로커를 정지시키지 않기 위한 폴백).
     """
-    confirmed = _confirmed_prev_close(broker, symbol, exchange_code)
+    candles = _fetch_daily_candles(broker, symbol, exchange_code)
+    confirmed = _confirmed_prev_close(broker, symbol, exchange_code, candles=candles)
     if confirmed is not None:
         close_price, close_date = confirmed
         return close_price, f"확정 종가[{close_date}]"
-    if _candles_lack_dates(broker, symbol, exchange_code):
+    if _candles_lack_dates(candles) and not getattr(broker, "provides_daily_candle_dates", False):
         print(
             f"[경고] {symbol} 이 브로커는 일봉 날짜를 제공하지 않아 확정 종가를 검증할 수 없습니다 "
             f"→ 기존 방식(현재가 ${last_price:.2f})으로 종료를 판정합니다 (프리마켓 가격 영향 가능)."
@@ -365,9 +375,10 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
 
     [원문에 없어 구현이 정한 정책 — 변경 시 별도 검토]
     - 종료 판정 시작 시점: 진입 첫날은 종료 판정을 하지 않고 2일차부터(보수적 해석).
-    - 종료 판정 가격: 일봉 날짜를 제공하는 브로커(메리츠)는 확정된 직전 정규장 종가(+ XNYS 직전 마감 세션 날짜 대조)만 인정,
-      현재가(프리마켓)로는 종료하지 않고 확정 종가를 얻지 못하면 종료도 계속도 판단하지 않고 그 실행은 주문 없이 보류.
-      일봉 날짜를 제공하지 않는 브로커(KIS·KIWOOM·LS·NHPLUG)는 검증 불가이므로 기존 방식(현재가) 유지 + 경고.
+    - 종료 판정 가격: 일봉 날짜를 제공하는 브로커(메리츠·토스·KIS·KIWOOM·NHPLUG·LS)는 확정된 직전 정규장 종가
+      (+ XNYS 직전 마감 세션 날짜 대조)만 인정, 현재가(프리마켓)로는 종료하지 않고 확정 종가를 얻지 못하면
+      종료도 계속도 판단하지 않고 그 실행은 주문 없이 보류.
+      날짜를 제공하지 않는 브로커(기본 구현)만 기존 방식(현재가) 유지 + 경고.
     - 미체결·부분체결: terminal 확정 전에는 신규 주문·종료 판정을 모두 보류(중복 매도 방지).
       체결>0 + 종결(취소·만료, 거부 제외)이면 그날을 리버스 1일차 완료로 보는 것은 이 PR 이전부터의 동작(state.py).
     - 종료일 같은 날 일반모드 복귀(원문은 '확인한 다음 날부터'로 읽힐 수 있음 — 이 구현은 종료 판정을 한 그 실행에서 이어서 주문).

@@ -217,6 +217,7 @@ def _run_live(broker, symbol_config, monkeypatch=None, tmp_path=None):
 def _broker(history, last=59.26, qty=144, avg=65.5732, cash=177.5, close=59.26, candle_date="auto"):
     broker = MagicMock()
     broker.name = "mock"
+    broker.provides_daily_candle_dates = False   # 기본은 날짜 미제공 브로커 (필요한 테스트에서 True로 설정)
     broker.is_trading_day.return_value = True
     broker.get_order_history.return_value = history
     broker.exchange_code.return_value = "NASD"

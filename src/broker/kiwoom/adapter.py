@@ -40,6 +40,7 @@ from broker.market_utils import (
     is_us_trading_day,
     normalize_order_price,
     resolve_real_kst_from_ord,
+    normalize_daily_candle_date,
 )
 # 공개 로그용 주문번호 마스킹 (표시 전용 — 주문번호 값 자체는 절대 바꾸지 않습니다)
 from log_mask import mask_odno
@@ -122,6 +123,8 @@ class KiwoomBroker(Broker):
     config.py의 BROKER_CONFIG["kiwoom"]에서 설정을 읽습니다.
     BROKER_MODE에 따라 실전(real) / 모의(demo) 도메인이 결정됩니다.
     """
+
+    provides_daily_candle_dates = True   # 일봉 응답의 dt(YYYYMMDD)를 세션 날짜로 제공
 
     def __init__(self):
         from config import BROKER_CONFIG, BROKER_MODE, HTTP_TIMEOUT
@@ -478,12 +481,8 @@ class KiwoomBroker(Broker):
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"호가 조회 실패: {str(e)}")
 
-    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
-        """
-        해외주식 일봉 종가를 조회합니다 → list[float] (오래된 순).
-
-        TR: usa06012 (일 차트)
-        """
+    def _fetch_daily_rows(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉 원본 행을 {"date", "close"}로 정규화해 조회합니다 (응답 순서 = 최신순)."""
         token = self._get_token()
         api_exch = get_api_exchange_code(exchange)
 
@@ -497,17 +496,35 @@ class KiwoomBroker(Broker):
             data = self._request_with_rate_retry(TR_CHART_DAILY, body, token)
             items = data.get("result_list", data.get("output", []))
 
-            closes = []
+            rows = []
             for item in items:
                 price = _parse_price(item.get("cur_prc"))
-                if price > 0:
-                    closes.append(price)
-
-            closes.reverse()
-            return closes[-days:]
+                if price <= 0:
+                    continue
+                rows.append({
+                    "date": normalize_daily_candle_date(item.get("dt")),
+                    "close": price,
+                })
+            return rows
 
         except requests.exceptions.RequestException as e:
             raise BrokerError(f"일봉 종가 조회 실패: {str(e)}")
+
+    def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
+        """해외주식 일봉 종가를 조회합니다 → list[float] (오래된 순). TR: usa06012."""
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [row["close"] for row in reversed(rows)][-days:]
+
+    def get_daily_candles(self, symbol: str, exchange: str, days: int = 5) -> list[dict]:
+        """일봉을 날짜 포함으로 조회합니다 → [{"date", "close"}] (오래된 순).
+
+        dt(YYYYMMDD)를 'YYYY-MM-DD'로 정규화합니다. 날짜를 못 읽은 행은 date=None 으로 남깁니다.
+        """
+        rows = self._fetch_daily_rows(symbol, exchange, days)
+        return [
+            {"date": row["date"], "close": row["close"]}
+            for row in reversed(rows)
+        ][-days:]
 
     def get_balance(self, symbol: str, exchange: str) -> Optional[Balance]:
         """

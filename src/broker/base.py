@@ -95,6 +95,10 @@ class Broker(ABC):
     즉시 TypeError가 발생합니다.
     """
 
+    # 일봉 날짜 제공 여부. True 인 브로커는 날짜를 못 얻으면 현재가 폴백 없이 종료 판정을 보류합니다.
+    # 기본 구현(get_daily_closes 기반, date=None)을 쓰는 브로커는 False 로 두어 기존 동작을 유지합니다.
+    provides_daily_candle_dates = False
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -281,6 +285,11 @@ class DryBroker(Broker):
     def name(self) -> str:
         return self._real.name
 
+    @property
+    def provides_daily_candle_dates(self) -> bool:
+        """일봉 날짜 제공 여부도 실제 브로커에 위임 (DRY/LIVE 종료 판정 일관성)."""
+        return getattr(self._real, "provides_daily_candle_dates", False)
+
     # ── 시장 정보: 실제 브로커에 위임 ──
     def is_trading_day(self) -> bool:
         return self._real.is_trading_day()
@@ -379,6 +388,11 @@ class ReadOnlyBroker(Broker):
     @property
     def supports_open_orders_query(self) -> bool:
         return getattr(self.__real, "supports_open_orders_query", False)
+
+    @property
+    def provides_daily_candle_dates(self) -> bool:
+        """일봉 날짜 제공 여부도 실제 브로커에 위임 (PREVIEW/EXECUTE 종료 판정 일관성)."""
+        return getattr(self.__real, "provides_daily_candle_dates", False)
 
     def is_trading_day(self) -> bool:
         return self.__real.is_trading_day()
