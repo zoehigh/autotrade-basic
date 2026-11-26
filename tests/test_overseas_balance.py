@@ -69,7 +69,7 @@ def test_overseas_balance():
         print(f"❌ 테스트 실패: {str(e)}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"해외주식 잔고 조회 실패 ({TEST_SYMBOL}/{TEST_EXCHANGE}): {e}")
 
 
 if __name__ == "__main__":

@@ -54,11 +54,11 @@ from broker.ls.order_types import (
     DEMO_UNSUPPORTED_ORDER_TYPES,
     TR_ID_PRICE,
     TR_ID_BALANCE,
-    TR_ID_CASH_BALANCE,
     TR_ID_ORDER_HISTORY,
     TR_ID_ORDER,
     TR_ID_DAILY_CLOSE,
     LS_SUCCESS_RSP_CDS,
+    TR_ID_CASH_BALANCE,
 )
 from config import BROKER_MODE, BROKER_CONFIG, HTTP_TIMEOUT, FINNHUB_API_KEY, LS_DEMO_BYPASS_BUGS
 
@@ -183,7 +183,7 @@ class LSBroker(Broker):
 
     def get_daily_closes(self, symbol: str, exchange: str, days: int = 5) -> list[float]:
         """
-        해외주식 일별주가를 조회합니다 -> list[float] (오래된 순).
+        해외주식 일별주가를 조회합니다 → list[float] (오래된 순).
 
         1차: LS g3204 TR
         2차: Finnhub candle API fallback
@@ -241,7 +241,7 @@ class LSBroker(Broker):
                 except (ValueError, TypeError):
                     continue
 
-            # g3204은 오래된순(ascending) 반환 -> 마지막 days개가 최근
+            # g3204은 오래된순(ascending) 반환 → 마지막 days개가 최근
             return closes[-days:]
 
         except requests.exceptions.RequestException as e:
@@ -284,10 +284,10 @@ class LSBroker(Broker):
 
     def get_stock_price(self, symbol: str, exchange: str) -> StockPrice:
         """
-        해외주식 현재가를 조회합니다 -> StockPrice(open, last).
+        해외주식 현재가를 조회합니다 → StockPrice(open, last).
 
         1차: LS g3101 TR (실전/모의 모두 시도)
-        2차: LS 실패 + 모의투자 환경 -> Finnhub fallback (설정된 경우)
+        2차: LS 실패 + 모의투자 환경 → Finnhub fallback (설정된 경우)
 
         LS 모의투자 환경에서는 g3101이 해외주식 현재가를 지원하지 않습니다
         (rsp_cd="" 반환). 이 경우 Finnhub 무료 API로 fallback합니다.
@@ -301,13 +301,13 @@ class LSBroker(Broker):
         except BrokerError:
             pass
 
-        # 2. LS 실패 (rsp_cd="") -> Finnhub fallback (실전/모의 공통)
+        # 2. LS 실패 (rsp_cd="") → Finnhub fallback (실전/모의 공통)
         if FINNHUB_API_KEY:
             try:
                 symbol_upper = symbol.upper()
                 price = self._get_stock_price_finnhub(symbol_upper)
                 if price.last > 0:
-                    print(f"[Finnhub Fallback] {symbol}: LS API 실패, Finnhub 사용 -> ${price.last:.2f}")
+                    print(f"[Finnhub Fallback] {symbol}: LS API 실패, Finnhub 사용 → ${price.last:.2f}")
                     return price
             except BrokerError:
                 pass
@@ -320,7 +320,7 @@ class LSBroker(Broker):
                 f".env 파일에 FINNHUB_API_KEY를 추가하세요."
             )
 
-        # 4. 실전/모의 모두 유효 가격 없음 -> 진단 메시지 출력 후 0.0 반환
+        # 4. 실전/모의 모두 유효 가격 없음 → 진단 메시지 출력 후 0.0 반환
         mode_label = "실전" if self._mode == "real" else "모의"
         print(f"[경고] {symbol}({exchange}) 현재가 조회 실패: "
               f"LS {mode_label} g3101이 유효한 가격을 반환하지 않았습니다.")
@@ -381,7 +381,7 @@ class LSBroker(Broker):
             cached_time, cached_price = self._finnhub_cache[symbol]
             if now - cached_time < self._finnhub_ttl:
                 age = now - cached_time
-                print(f"[Finnhub Cache] {symbol}: 캐시 사용 (age={age:.1f}s) -> ${cached_price.last:.2f}")
+                print(f"[Finnhub Cache] {symbol}: 캐시 사용 (age={age:.1f}s) → ${cached_price.last:.2f}")
                 return cached_price
 
         url = "https://finnhub.io/api/v1/quote"
@@ -409,13 +409,13 @@ class LSBroker(Broker):
 
     def get_stock_quotation(self, symbol: str, exchange: str) -> StockQuotation:
         """
-        해외주식 현재체결가를 조회합니다 -> StockQuotation(tradable, last).
+        해외주식 현재체결가를 조회합니다 → StockQuotation(tradable, last).
 
         LS TR: g3101 (현재가 조회와 동일 TR)
         g3101은 주문가능 여부 플래그를 제공하지 않으므로 tradable은 항상 True입니다.
 
         1차: LS g3101 TR (실전/모의 모두 시도)
-        2차: LS 실패 + 모의투자 환경 -> Finnhub fallback (설정된 경우)
+        2차: LS 실패 + 모의투자 환경 → Finnhub fallback (설정된 경우)
         """
         # 1. LS g3101 TR 조회
         try:
@@ -448,13 +448,13 @@ class LSBroker(Broker):
         except (BrokerError, requests.exceptions.RequestException):
             pass
 
-        # 2. LS 실패 (rsp_cd="") -> Finnhub fallback (실전/모의 공통)
+        # 2. LS 실패 (rsp_cd="") → Finnhub fallback (실전/모의 공통)
         if FINNHUB_API_KEY:
             try:
                 symbol_upper = symbol.upper()
                 price = self._get_stock_price_finnhub(symbol_upper)
                 if price.last > 0:
-                    print(f"[Finnhub Fallback] {symbol}: LS g3101 실패, Finnhub 사용 -> ${price.last:.2f}")
+                    print(f"[Finnhub Fallback] {symbol}: LS g3101 실패, Finnhub 사용 → ${price.last:.2f}")
                     return StockQuotation(tradable=True, last=price.last)
             except BrokerError:
                 pass
@@ -708,7 +708,6 @@ class LSBroker(Broker):
             f"매수가능금액 조회 실패: {symbol}@{exchange} "
             f"(COSOQ02701+COSOQ00201 모두 실패)"
         )
-
     def get_order_history(
         self,
         symbol: str,
@@ -718,7 +717,7 @@ class LSBroker(Broker):
         limit: int = 100,
     ) -> list[dict]:
         """
-        해외주식 주문체결내역을 조회합니다 -> list[dict].
+        해외주식 주문체결내역을 조회합니다 → list[dict].
 
         LS TR: COSAQ00103 (해외주식 체결내역조회)
         연속조회(tr_cont/tr_cont_key 헤더)를 통해 전체 체결 이력을 수집합니다.
@@ -786,9 +785,9 @@ class LSBroker(Broker):
                 if rsp_cd != "00000":
                     msg = data.get("rsp_msg", "알 수 없는 에러")
                     print(f"[주문이력] {symbol} API 오류: rsp_cd={rsp_cd} rsp_msg={msg}")
-                    # 정상 케이스 -> 빈 목록 반환
+                    # 정상 케이스 → 빈 목록 반환
                     # 01900: 모의투자 미지원 TR
-                    # "02679": 체결내역 없음 (실전 정상 응답)
+                    # 02679: 체결내역 없음 (실전 정상 응답)
                     if rsp_cd in ("01900", "02679"):
                         reason = "모의투자 미지원" if rsp_cd == "01900" else "체결내역 없음"
                         print(f"[주문이력] {symbol} {reason}({rsp_cd}), 빈 목록 반환")
@@ -809,7 +808,7 @@ class LSBroker(Broker):
                         try:
                             # LS quirk: 해외주식 체결내역(ord_dt)은 미국(ET) 영업일.
                             # 상태 체인(last_updated)은 이 규칙을 유지해야 하므로
-                            # 표시용 보정만 별도 수행 -> ord_datetime_utc 미변경.
+                            # 표시용 보정만 별도 수행 → ord_datetime_utc 미변경.
                             kst_dt = datetime.strptime(
                                 ord_dt + ord_tmd, "%Y%m%d%H%M%S"
                             )
@@ -824,8 +823,8 @@ class LSBroker(Broker):
                                 f"ord_dt={ord_dt} ord_tmd={ord_tmd_raw} ({e})"
                             )
 
-                    # LS 응답 필드명 -> 표준 필드명 매핑
-                    order_history.append({
+                    # LS 응답 필드명 → 표준 필드명 매핑
+                    row = {
                         "ord_dt": ord_dt,
                         "ord_tmd": ord_tmd_raw,
                         "ord_datetime_kst": ord_datetime_kst_iso,
@@ -836,7 +835,6 @@ class LSBroker(Broker):
                             else "매도" if item.get("sll_buy_dvsn_cd_name") == "01"
                             else item.get("sll_buy_dvsn_cd_name", "")
                         ),
-                        "ft_ord_qty": item.get("ft_ord_qty", "0"),
                         "ft_ccld_qty": item.get("ft_ccld_qty", "0"),
                         "ft_ccld_unpr3": item.get("ft_ccld_unpr3", "0"),
                         "ft_ccld_amt3": item.get("ft_ccld_amt3", "0"),
@@ -846,7 +844,11 @@ class LSBroker(Broker):
                         "tr_crcy_cd": item.get("tr_crcy_cd", ""),
                         "odno": item.get("odno", ""),
                         "ovrs_excg_cd": item.get("ovrs_excg_cd", ""),
-                    })
+                    }
+                    # 원주문 수량 필드가 없으면 "0"을 합성하지 않고 키를 생략합니다.
+                    if "ft_ord_qty" in item:
+                        row["ft_ord_qty"] = item["ft_ord_qty"]
+                    order_history.append(row)
 
                 # 연속조회 여부 확인 (헤더)
                 tr_cont = resp.headers.get("tr_cont", "N")
@@ -878,7 +880,7 @@ class LSBroker(Broker):
                     else:
                         us_dt_str = "(날짜없음)"
 
-                    # 실제 한국 시각 (ord_dt=미국영업일 + ord_tmd=KST -> 복원)
+                    # 실제 한국 시각 (ord_dt=미국영업일 + ord_tmd=KST → 복원)
                     real_kst = None
                     if ord_dt and ord_tmd:
                         real_kst = resolve_real_kst_from_ord(ord_dt, ord_tmd)
@@ -940,7 +942,7 @@ class LSBroker(Broker):
         if self._mode != "real" and order_type in DEMO_UNSUPPORTED_ORDER_TYPES:
             print(
                 f"⚠️  모의투자 미지원 주문 유형: {order_type}"
-                f" -> LIMIT(지정가)으로 자동 변환합니다."
+                f" → LIMIT(지정가)으로 자동 변환합니다."
             )
             order_type = "LIMIT"
 
@@ -952,7 +954,7 @@ class LSBroker(Broker):
         # OrdPtnCode: 01=매도, 02=매수
         ord_ptn_code = "02" if side == "BUY" else "01"
 
-        # 브로커 호가 단위 규칙에 맞춰 주문가를 정규화 ($1+ -> 소수점 2자리 등)
+        # 브로커 호가 단위 규칙에 맞춰 주문가를 정규화 ($1+ → 소수점 2자리 등)
         price = normalize_order_price(price)
 
         body = {
@@ -1095,7 +1097,7 @@ class LSBroker(Broker):
     # ══════════════════════════════════════════════════════════════════
 
     def exchange_code(self, user_code: str) -> str:
-        """사용자 거래소 코드 -> API 거래소 코드 변환 (예: 'NAS' -> '82')."""
+        """사용자 거래소 코드 → API 거래소 코드 변환 (예: 'NAS' → '82')."""
         return get_api_exchange_code(user_code)
 
     def close(self):

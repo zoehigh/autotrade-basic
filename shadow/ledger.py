@@ -646,6 +646,11 @@ def generate_symbol(broker, symbol_config, snapshot_dir=".shadow"):
         T=float(snapshot["T"]),
         additional_loc_levels=additional_loc_levels,
         state=virtual_state,
+        # 리버스 중복방지 기준은 **이번 generate 의 대상 세션**입니다. 넘기지 않으면
+        # 전략이 ET 벽시계 오늘로 폴백하는데, 섀도우 GENERATE 는 KST 아침(ET 전일 밤)에
+        # 돌기 때문에 벽시계 날짜가 세션보다 하루 앞서 리버스 주문이 "이미 실행됨"으로
+        # 오판되어 0건이 됩니다 (실운영 pipeline.py 와 동일하게 세션을 명시 전달).
+        session_date=session_date,
     )
 
     orders = result.get("orders", []) or []

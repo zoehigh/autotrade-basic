@@ -26,7 +26,7 @@ from state import reconcile_reverse_fills, update_T_from_history
 
 # 실제 파이프라인 하네스(고정 시계·모의 브로커)를 재사용합니다.
 from test_reverse_exit_pipeline import (  # noqa: F401  (env 는 pytest fixture)
-    _CLOCK, _DAY3_NOW_UTC, _broker, _config, _day1, _next_session, _placed, _same_session_later, env,
+    _CLOCK, _DAY3_NOW_UTC, _broker, _config, _day1, _next_session, _pipeline_env, _placed, _run_live, _same_session_later, env,
 )
 
 CYCLE = "C1"
@@ -247,7 +247,7 @@ def test_파이프라인_이전_세션_미체결_리버스_매도는_만료_가�
     holder["state"] = _next_session(state)
     broker = _broker(_kis_day2_history(odno, 0), qty=144, close=59.26, cash=2000.0)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     final = saved[-1]
     meta = final["orders_meta"][odno]
@@ -267,7 +267,7 @@ def test_파이프라인_같은_세션의_미체결_주문은_자동_종결하�
     _same_session_later()
     broker = _broker(_kis_day2_history(odno, 0), qty=144, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     final = saved[-1] if saved else holder["state"]
     meta = final["orders_meta"][odno]
@@ -285,7 +285,7 @@ def test_파이프라인_해소_후_반복_실행해도_T와_마커가_변하지
     state, odno = _day1(env)
     holder["state"] = _next_session(state)
     broker = _broker(_kis_day2_history(odno, 0), qty=144, close=59.26, cash=2000.0)
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
     first = deepcopy(saved[-1])
 
     evid = sorted(glob.glob(str(tmp_path / "settlement-TQQQ-*.json")))
@@ -300,7 +300,7 @@ def test_파이프라인_해소_후_반복_실행해도_T와_마커가_변하지
     holder["state"] = deepcopy(first)
     placed_before = broker.place_order.call_count
     broker2 = _broker(_kis_day2_history(odno, 0), qty=144, close=59.26, cash=2000.0)
-    trading_bot.run_one_symbol(broker2, _config())
+    _run_live(broker2, _config())
     second = saved[-1]
     assert second["T"] == first["T"]
     assert second["orders_meta"][odno]["processed_filled_qty"] == 0
@@ -400,3 +400,19 @@ def test_다른_브로커나_실전의_정산_기준_시각_동작은_그대로�
         state = _reconcile(_incident_state(), _history_00(), broker=broker, mode=mode)
         # 이전 동작: 0체결 행도 이벤트로 기준 시각을 옮김 (이 PR 은 KIS 모의만 바꿈)
         assert state["last_updated"] > "2026-11-19T19:10:00+00:00", (broker, mode)
+
+
+def test_승인_대조의_새_체결_목록도_같은_번호의_체결_행을_우선한다():
+    """KIS 모의: 지연 체결 행 뒤에 같은 번호의 0체결 행이 와도 새 체결로 잡혀야 합니다 (정산 조회표와 일치)."""
+    import pipeline
+    state = {"last_updated": "2026-11-21T00:00:00+00:00",
+             "orders_meta": {"100": {"processed_filled_qty": 1}, "200": {"processed_filled_qty": 0}}}
+    history = [
+        {"odno": "100", "ft_ccld_qty": "2", "ord_datetime_utc": "2026-11-19T00:00:00+00:00"},
+        {"odno": "100", "ft_ccld_qty": "0", "ord_datetime_utc": "2026-11-20T00:00:00+00:00"},
+        {"odno": "200", "ft_ccld_qty": "1", "ord_datetime_utc": "2026-11-22T00:00:00+00:00"},
+    ]
+    with patch("config.BROKER", "kis"), patch("config.BROKER_MODE", "demo"):
+        assert pipeline._history_new_fill_odnos(state, history) == {"100", "200"}
+    with patch("config.BROKER", "kis"), patch("config.BROKER_MODE", "real"):
+        assert pipeline._history_new_fill_odnos(state, history) == {"200"}   # 실전은 기존 last-wins 유지

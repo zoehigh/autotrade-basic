@@ -181,6 +181,20 @@ def _get_reverse_star_point(symbol, last_price, close_prices):
     return last_price
 
 
+def _reverse_guard_session(session_date=None):
+    """리버스 중복방지 기준 세션(미국 영업일)을 결정합니다.
+
+    파이프라인은 **실행 대상 세션**(`SettledState.session`)을 넘깁니다. KST 아침
+    PREVIEW 시점에는 ET 벽시계가 아직 전일이라, 벽시계로 비교하면 진행 중인
+    리버스를 "이미 이 세션 실행됨"으로 오판해 0건으로 건너뜁니다.
+    `session_date` 를 못 받으면(구 호출부) 기존처럼 ET 오늘로 폴백합니다.
+    """
+    text = str(session_date or "").strip()
+    if text:
+        return text
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
 def _has_unresolved_reverse_orders(state):
     """현재 리버스 cycle 에 아직 terminal 확정되지 않은 주문이 있는지 (trading_bot 의 같은 이름 함수와 동일 규칙)."""
     cycle_id = state.get("reverse_mode", {}).get("cycle_id", "")
@@ -336,7 +350,7 @@ def _build_reverse_additional_buys(quarter_amount, quarter_qty, quarter_price, t
 
 def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
                          position_qty, avg_price, orderable_cash, last_price,
-                         state, additional_loc_levels=8):
+                         state, additional_loc_levels=8, session_date=None):
     """리버스모드 1회 실행의 주문을 계산합니다 (상태는 읽기만 합니다 — T·day_count 는 체결 반영으로만 바뀝니다).
 
     [원문(라오어 V4 두 문서)에서 확인된 규칙]
@@ -367,7 +381,7 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
         # 정상 무주문이 아니라 보류이므로 사유를 상위로 전달합니다 (알림·실행 요약 대상).
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False,
                 "hold_reason": HOLD_RECONCILIATION_PENDING}
-    session_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    session_date = _reverse_guard_session(session_date)
     if rev.get("last_planned_session") == session_date:
         print(f"[리버스모드] {symbol} 이미 {session_date} 실행됨 → 중복 주문을 생성하지 않습니다.")
         return {"orders": [], "new_T": float(state.get("T", 0.0)), "exit": False}
@@ -529,7 +543,7 @@ def execute_reverse_mode(broker, symbol, exchange_code, splits, symbol_type,
     return {"orders": orders, "new_T": new_T, "exit": False, "reverse_day": day_count}
 
 
-def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=8, state=None):
+def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_type, seed=0, T=0.0, additional_loc_levels=8, state=None, session_date=None):
     """
     무한매수법 V4.0 전략을 실행합니다.
 
@@ -704,6 +718,7 @@ def 무한매수법_V4(broker: Broker, symbol, exchange_code, splits, symbol_typ
                 broker, symbol, exchange_code, splits, symbol_type,
                 position_qty, avg_price, orderable_cash, last_price,
                 state, additional_loc_levels=additional_loc_levels,
+                session_date=session_date,
             )
             new_T = rev_result["new_T"]
             rev_orders = rev_result["orders"]

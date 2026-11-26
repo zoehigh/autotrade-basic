@@ -17,9 +17,23 @@ for _p in (_repo_root, _src_path):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pipeline
+import pipeline_execute
 import trading_bot
-from broker.base import Balance, OrderResult, PurchaseAmount, StockPrice, StockQuotation
+from broker.base import Balance, OrderResult, PurchaseAmount, ReadOnlyBroker, StockPrice, StockQuotation
 from broker.market_utils import us_session_last_closed_date
+
+
+# 테스트 공용 컨텍스트: autouse fixture(`_pipeline_env`)가 채웁니다.
+# `_run_live()` 는 이 값을 써서 실제 approval 디렉터리/임시 cwd 를 공유합니다.
+_CTX = {}
+
+# 리버스 보류 사유 → 사람이 읽을 문구 (운영 run_one_symbol 과 같은 문구).
+_REVERSE_HOLD_MESSAGES = {
+    "EXIT_UNCONFIRMED": "확정된 직전 정규장 종가를 확인하지 못해 리버스 종료 판정을 보류했습니다 (일봉 조회·날짜 확인 필요).",
+    "RECONCILIATION_PENDING": "리버스 체결 반영·주문이력 확인(reconcile)이 끝나지 않아 신규 주문을 보류했습니다 (전일 리버스 주문 미종결·이력 누락 등 — 체결·이력 확인 필요).",
+    "UNRESOLVED_REVERSE_ORDERS": "terminal 확정되지 않은 리버스 주문이 있어 신규 주문과 종료 판정을 보류했습니다 (체결 반영·이력 확인 필요).",
+}
 
 
 # 실제 시계에 의존하면 주말·장 마감 이후 실행 시 결과가 달라지므로 시각을 고정합니다.
@@ -102,6 +116,104 @@ def env(monkeypatch):
     return holder, saved
 
 
+@pytest.fixture(autouse=True)
+def _pipeline_env(monkeypatch, tmp_path):
+    """SETTLE → PREVIEW → APPROVE → EXECUTE 산출물을 테스트별 임시 폴더로 격리합니다.
+
+    승인 파일은 **실제 파이프라인**이 만듭니다 (자동 승인 mock 금지). 테스트는
+    이 폴더에 남은 계획/승인/정산 근거를 쓰고, 실행 후 정리합니다.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RUN_ID", "run-test")
+    # RUN_PHASE 는 EXECUTE 호출 동안에만 세웁니다 (`_run_live`).
+    # 여기서 전역으로 세우면 main() 이 레거시 통합 경로 대신 phase 로 분기합니다.
+    monkeypatch.delenv("RUN_PHASE", raising=False)
+    monkeypatch.setenv("APPROVALS_DIR", str(tmp_path / "approvals"))
+    monkeypatch.setenv("PLAN_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("RUN_LOCK_PATH", str(tmp_path / ".run.lock"))
+    monkeypatch.delenv("RUN_LOCK_HELD", raising=False)
+    monkeypatch.delenv("RUN_LOCK_FD", raising=False)
+    monkeypatch.delenv("APPROVAL_PLAN_ID", raising=False)
+    monkeypatch.delenv("APPROVAL_FILE", raising=False)
+    _CTX.clear()
+    _CTX.update(monkeypatch=monkeypatch, tmp_path=tmp_path)
+    yield
+    for pattern in ("settlement-*.json", "plans/*.json", "approvals/*.json"):
+        for path in tmp_path.glob(pattern):
+            path.unlink()
+
+
+def _run_live(broker, symbol_config, monkeypatch=None, tmp_path=None):
+    """`trading_bot.run_one_symbol` 의 LIVE 경로를 **실제 파이프라인**으로 실행합니다.
+
+    main 버전의 run_one_symbol 처럼 SETTLE → 전략 → 주문 순서를 유지하되,
+    이 브랜치에서 LIVE 주문은 승인 파일이 있어야만 실행되므로 테스트가
+    PREVIEW 계획 파일 대신 **실제 승인 파일**을 만들어 EXECUTE 합니다.
+    (승인 검증·세션·TTL·재계산·가격 허용오차 게이트는 모두 실제 코드가 수행)
+    """
+    monkeypatch = monkeypatch or _CTX["monkeypatch"]
+    tmp_path = tmp_path or _CTX["tmp_path"]
+    # 실행 직전 재계산(EXECUTE)은 trading_bot.SYMBOLS 설정을 쓰므로 같은 설정으로 맞춥니다.
+    monkeypatch.setattr(trading_bot, "SYMBOLS", [symbol_config])
+
+    symbol = symbol_config["symbol"]
+    read_only_broker = ReadOnlyBroker(broker)
+    settled = trading_bot.settle_positions(read_only_broker, symbol_config)
+    if settled.halt_reason:
+        if settled.halt_reason == "non_trading_day":
+            return None
+        print(f"  [{symbol}] 정산 보류: {settled.halt_reason}")
+        return None
+
+    plan = pipeline.build_order_plan(settled, read_only_broker)
+    strategy_result = plan.strategy_result or {}
+    hold_reason = strategy_result.get("reverse_hold")
+
+    if not plan.orders:
+        if hold_reason:
+            hold_text = _REVERSE_HOLD_MESSAGES.get(hold_reason, hold_reason)
+            print(f"[보류] {symbol}: {hold_text}")
+            if trading_bot.TRADE_MODE == "LIVE":
+                trading_bot.notify(
+                    f"⚠️ 리버스 보류 {symbol}\n{hold_text}\n"
+                    "이번 실행은 신규 주문이 없습니다. 확인 후 조치가 필요합니다.",
+                    urgent=True,
+                )
+            return {"symbol": symbol, "executed": 0, "reserved": 0, "failed": 0,
+                    "errors": [], "held": hold_reason}
+        # 주문이 없어도 리버스 종료 상태 변경은 기존처럼 저장합니다.
+        if trading_bot.TRADE_MODE == "LIVE" and strategy_result.get("reverse_exit"):
+            trading_bot.save_state(symbol, settled.state)
+        return None
+
+    approvals_dir = str(tmp_path / "approvals")
+    approval_path = pipeline.approve_order_plan(plan, approvals_dir=approvals_dir)
+    # EXECUTE 는 승인 계획을 실행 직전에 **다시 계산**합니다 (stale 주문 금지).
+    # 이 테스트의 `get_stock_price` 호출 수 단언은 "전략 1회 실행 안에서 재귀 조회가
+    # 없는지"를 보는 것이므로, PREVIEW 단계의 조회 수는 여기서 초기화합니다.
+    try:
+        broker.get_stock_price.reset_mock()
+    except AttributeError:
+        pass
+    # `now` 를 고정해 프리장 대기(최대 ~7.5시간)를 건너뜁니다.
+    # EXECUTE 경계 게이트(LIVE+RUN_PHASE)는 호출 동안에만 충족시킵니다.
+    previous_phase = os.environ.get("RUN_PHASE")
+    os.environ["RUN_PHASE"] = "EXECUTE"
+    try:
+        return pipeline_execute.execute_approved_plan(
+            broker,
+            approval_path,
+            approvals_dir=approvals_dir,
+            now=_CLOCK["now"],
+            state_override=settled.state,
+        )
+    finally:
+        if previous_phase is None:
+            os.environ.pop("RUN_PHASE", None)
+        else:
+            os.environ["RUN_PHASE"] = previous_phase
+
+
 def _broker(history, last=59.26, qty=144, avg=65.5732, cash=177.5, close=59.26, candle_date="auto"):
     broker = MagicMock()
     broker.name = "mock"
@@ -140,7 +252,7 @@ def _day1(env):
     holder, saved = env
     holder["state"] = _initial_state()
     broker = _broker(_buy_history(144), close=None)      # 첫날은 확정 종가를 조회하지 않는다 (조회 실패여도 무관)
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
     assert _placed(broker) == [("SELL", 14, "MOC")]
     state = deepcopy(saved[-1])
     odno = next(iter(state["orders_meta"]))
@@ -200,7 +312,7 @@ def test_full_pipeline_fill_then_exit_day_places_normal_orders(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     placed = _placed(broker)
     assert placed and all(t in ("LOC", "LIMIT") for _, _, t in placed), placed
@@ -223,7 +335,7 @@ def test_one_share_fill_then_exit_opens_new_cycle_day1(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 1, "취소", 143), qty=143, cash=177.5, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert _placed(broker) == [("SELL", 14, "MOC")]
     final = saved[-1]
@@ -245,13 +357,13 @@ def test_same_session_rerun_after_reentry_places_nothing(env):
     holder, saved = env
     state, odno = _day1(env)
     holder["state"] = _next_session(state)
-    trading_bot.run_one_symbol(_broker(_day2_history(odno, 1, "취소", 143), qty=143, close=59.26), _config())
+    _run_live(_broker(_day2_history(odno, 1, "취소", 143), qty=143, close=59.26), _config())
     holder["state"] = deepcopy(saved[-1])
     _same_session_later()
     new_odno = [k for k in saved[-1]["orders_meta"] if k != odno][0]
     hist = _day2_history(odno, 1, "취소", 143)    # 새 MOC 는 아직 이력에 미체결로 보이지 않을 수도 있음(조회 지연)
     broker2 = _broker(hist, qty=143, close=59.26)
-    trading_bot.run_one_symbol(broker2, _config())
+    _run_live(broker2, _config())
     assert broker2.place_order.call_count == 0, new_odno
 
 
@@ -262,7 +374,7 @@ def test_unfilled_open_day1_blocks_day2_orders(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 0, "미체결", 144), qty=144, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert broker.place_order.call_count == 0
     final = saved[-1] if saved else holder["state"]
@@ -276,7 +388,7 @@ def test_rejected_day1_is_retried_as_day1(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 0, "거부", 144), qty=144, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert _placed(broker) == [("SELL", 14, "MOC")]
     assert saved[-1]["T"] == 19.7734
@@ -289,7 +401,7 @@ def test_unconfirmed_close_on_day2_places_nothing_and_keeps_state(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=None)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert broker.place_order.call_count == 0
     final = saved[-1] if saved else holder["state"]
@@ -305,7 +417,7 @@ def test_undated_broker_day2_is_not_stalled_in_pipeline(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=59.26, candle_date=None)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert broker.place_order.call_count > 0, "날짜 미제공 브로커는 보류가 아니라 기존 방식으로 진행해야 합니다"
     assert saved[-1]["reverse_mode"] == {}
@@ -321,13 +433,39 @@ def test_unconfirmed_close_hold_is_reported_and_notified(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=None)
 
-    result = trading_bot.run_one_symbol(broker, _config())
+    result = _run_live(broker, _config())
 
     assert result is not None and result["held"] == "EXIT_UNCONFIRMED"
     assert result["executed"] == 0 and result["failed"] == 0
     hold_alerts = [(m, u) for m, u in holder["notified"] if "리버스 보류" in m]
     assert len(hold_alerts) == 1 and hold_alerts[0][1] is True
     assert "종가" in hold_alerts[0][0] and "신규 주문이 없습니다" in hold_alerts[0][0]
+
+
+def test_hold_via_run_one_symbol_needs_no_approval_and_writes_no_plan(env, tmp_path):
+    """prod 경로 회귀: `run_one_symbol` 자체가 보류를 보고합니다 (승인 불필요·계획 파일 없음·주문 없음).
+
+    `_run_live` 헬퍼가 아니라 실제 `run_one_symbol` 을 호출하므로, 보류 처리가
+    테스트 scaffolding 이 아니라 프로덕션 호출자에 있음을 보장합니다.
+    """
+    holder, saved = env
+    state, odno = _day1(env)
+    holder["notified"].clear()
+    saved_before = len(saved)
+    holder["state"] = _next_session(state)
+    broker = _broker(_day2_history(odno, 14, "체결", 130), qty=130, cash=2000.0, close=None)
+    approvals_before = set(tmp_path.glob("approvals/*.json"))
+
+    result = trading_bot.run_one_symbol(broker, _config())
+
+    assert result is not None and result["held"] == "EXIT_UNCONFIRMED"
+    assert result["executed"] == 0 and result["failed"] == 0
+    assert broker.place_order.call_count == 0
+    hold_alerts = [(m, u) for m, u in holder["notified"] if "리버스 보류" in m]
+    assert len(hold_alerts) == 1 and hold_alerts[0][1] is True
+    assert list(tmp_path.glob("plans/*.json")) == [], "보류 시 PREVIEW 계획 파일을 남기지 않습니다"
+    assert set(tmp_path.glob("approvals/*.json")) == approvals_before, "보류 시 승인 파일을 만들지 않습니다"
+    assert len(saved) == saved_before + 1, "SETTLE 저장 1회 외에 보류로 추가 저장하지 않습니다"
 
 
 def test_unresolved_prior_day_order_blocks_orders_via_reconciliation(env):
@@ -340,7 +478,7 @@ def test_unresolved_prior_day_order_blocks_orders_via_reconciliation(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 0, "미체결", 144), qty=144, close=59.26)
 
-    trading_bot.run_one_symbol(broker, _config())
+    _run_live(broker, _config())
 
     assert broker.place_order.call_count == 0
     final = saved[-1] if saved else holder["state"]
@@ -357,7 +495,7 @@ def test_unresolved_prior_day_order_hold_is_reported_and_notified(env):
     holder["state"] = _next_session(state)
     broker = _broker(_day2_history(odno, 0, "미체결", 144), qty=144, close=59.26)
 
-    result = trading_bot.run_one_symbol(broker, _config())
+    result = _run_live(broker, _config())
 
     assert result is not None and result["held"] == "RECONCILIATION_PENDING"
     assert any("리버스 보류" in m and "reconcile" in m and urgent for m, urgent in holder["notified"])
@@ -371,7 +509,7 @@ def test_normal_no_order_day_is_not_reported_as_hold(env):
     holder["notified"].clear()
     holder["state"] = deepcopy(state)          # 같은 세션 그대로 재실행
     _same_session_later()
-    result = trading_bot.run_one_symbol(_broker(_buy_history(144), qty=144, close=None), _config())
+    result = _run_live(_broker(_buy_history(144), qty=144, close=None), _config())
 
     assert not result
     assert not any("리버스 보류" in m for m, _ in holder["notified"])
@@ -380,6 +518,10 @@ def test_normal_no_order_day_is_not_reported_as_hold(env):
 def test_main_summary_lists_hold_separately(env, monkeypatch, capsys):
     """main() 실행 요약: 보류는 성공 집계와 별도 [보류] 줄로 표시되고 보류 사유가 남는다 (단순 성공으로만 보고하지 않음)."""
     holder, saved = env
+    # 이 테스트는 main() 의 **레거시 통합 경로**(RUN_PHASE 없음) 요약만 검증합니다.
+    # 이 브랜치에서는 RUN_PHASE 없는 LIVE 가 게이트로 차단되므로, 요약 로직까지
+    # 도달하게 위상 검증만 통과시킵니다 (주문/승인 경로는 사용하지 않음).
+    monkeypatch.setattr(trading_bot, "validate_run_phase", lambda *a, **k: "")
     monkeypatch.setattr(trading_bot, "run_one_symbol",
                         lambda broker, cfg: {"symbol": cfg["symbol"], "executed": 0, "reserved": 0, "failed": 0,
                                              "errors": [], "held": "EXIT_UNCONFIRMED"})
@@ -421,7 +563,7 @@ def _day2_orders(env, monkeypatch, tmp_path):
         return OrderResult(order_id=odno, order_time="20261113183020", is_reservation=False)
 
     broker.place_order.side_effect = _place
-    trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+    _run_live(broker, {**_config(), "additional_loc_levels": 8})
     return deepcopy(saved[-1]), placed, history
 
 
@@ -477,7 +619,7 @@ def test_reverse_day3_additional_fill_keeps_t_adds_net_invested_and_passes_verif
         holder["state"] = deepcopy(day2_state)
         balance = 144 - 14 - 13 + placed[1][2] + (1 if with_fill else 0)   # 이력과 같은 순보유수량
         broker = _broker(_rows(with_fill), last=50.0, qty=balance, avg=65.5732, cash=3000.0, close=50.0)
-        trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+        _run_live(broker, {**_config(), "additional_loc_levels": 8})
         final = deepcopy(saved[-1])
         evid = sorted(glob.glob(str(tmp_path / "settlement-TQQQ-*.json")))
         assert evid, "정산 근거 파일이 기록돼야 합니다"
@@ -517,7 +659,7 @@ def test_reverse_day3_sell_unfilled_quarter_buy_filled_uses_prior_t_and_passes_v
     _CLOCK["now"] = _DAY3_NOW_UTC
     holder["state"] = deepcopy(day2_state)
     broker = _broker(rows, last=50.0, qty=144 - 14 + placed[1][2], avg=65.5732, cash=3000.0, close=50.0)
-    trading_bot.run_one_symbol(broker, {**_config(), "additional_loc_levels": 8})
+    _run_live(broker, {**_config(), "additional_loc_levels": 8})
     final = saved[-1]
 
     expected = round(t_before + (20 - t_before) * 0.25, 4)
