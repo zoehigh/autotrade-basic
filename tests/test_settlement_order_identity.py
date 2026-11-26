@@ -465,8 +465,8 @@ def test_p13_reverse_expected_seen_distinct_instances():
     assert abs(entries["20"]["delta"] - 1.0) < 1e-6, entries
 
 
-def test_oracle_same_side_reuse_delta_without_session_is_not_false_positive():
-    """정상 same-side 재사용 정산이 delta에 세션이 없어 오탐되지 않아야 합니다."""
+def test_legacy_ambiguous_delta_fails_closed():
+    """구버전 delta에 식별 정보가 없고 후보가 여럿이면 모호하므로 fail-closed 합니다."""
     ev = _ev(
         watermark_before="2026-11-24T19:10:00+00:00",
         fills=[
@@ -474,9 +474,118 @@ def test_oracle_same_side_reuse_delta_without_session_is_not_false_positive():
             _fill("7000", "매수", 1, 12.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125"),
         ],
         orders_meta_before={"7000": _meta("2026-11-24", qty=1, amount=10.0)},
-        # 실제 settlement delta 형식: ord_dt/ord_tmd/submitted_session 없음
         orders=[{"odno": "7000", "side": "매수", "qty_delta": 1, "amount_delta": 12.0,
                  "ledger_seq": 19}],
     )
     problems, _required, _money = verify_run._required_settlement_fills(ev)
+    assert any("7000" in p and "필수 체결 불일치" in p for p in problems), problems
+
+
+def test_explicit_delta_identity_allows_legitimate_reuse():
+    """delta에 명시적 식별 정보가 있으면 정상 same-side 재사용이 PASS 합니다."""
+    ev = _ev(
+        watermark_before="2026-11-24T19:10:00+00:00",
+        fills=[
+            _fill("7000", "매수", 1, 10.0, "2026-11-24T19:10:00+00:00", ord_dt="20261124"),
+            _fill("7000", "매수", 1, 12.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125"),
+        ],
+        orders_meta_before={"7000": _meta("2026-11-24", qty=1, amount=10.0)},
+        orders=[{"odno": "7000", "side": "매수", "qty_delta": 1, "amount_delta": 12.0,
+                 "ord_dt": "20261125", "ord_tmd": "041000",
+                 "ord_datetime_utc": "2026-11-25T19:10:00+00:00",
+                 "_ord_dt_is_kst_date": False, "ledger_seq": 19}],
+    )
+    problems, _required, _money = verify_run._required_settlement_fills(ev)
     assert not any("7000" in p and "필수 체결 불일치" in p for p in problems), problems
+
+
+def test_past_order_applied_instead_of_new_is_detected():
+    """동일 번호·방향·금액의 과거 주문을 신규 대신 중복 적용하면 검출됩니다."""
+    ev = _ev(
+        watermark_before="2026-11-24T19:10:00+00:00",
+        fills=[
+            _fill("7001", "매수", 1, 10.0, "2026-11-24T19:10:00+00:00", ord_dt="20261124"),
+            _fill("7001", "매수", 1, 10.0, "2026-11-25T19:10:00+00:00", ord_dt="20261125"),
+        ],
+        orders_meta_before={"7001": _meta("2026-11-24", qty=1, amount=10.0)},
+        # 과거(11-24) 행의 식별 정보를 달아 신규(11-25) 체결에 적용했다고 주장
+        orders=[{"odno": "7001", "side": "매수", "qty_delta": 1, "amount_delta": 10.0,
+                 "ord_dt": "20261124", "ord_tmd": "041000",
+                 "ord_datetime_utc": "2026-11-24T19:10:00+00:00",
+                 "_ord_dt_is_kst_date": False, "ledger_seq": 19}],
+    )
+    problems, _required, _money = verify_run._required_settlement_fills(ev)
+    assert any("필수 체결 불일치" in p or "원시 체결과 다릅니다" in p for p in problems), problems
+
+
+def test_meritz_toss_identity_convention_in_evidence(monkeypatch):
+    """Meritz/Toss KST 날짜 컨벤션이 delta→Evidence→검증 경로에서 유지됩니다."""
+    monkeypatch.setenv("TQQQ_SEED", "10000")
+    monkeypatch.setenv("SOXL_SEED", "5000")
+    import trading_bot
+
+    row = {
+        "odno": "20261125:1", "sll_buy_dvsn_cd_name": "매수",
+        "ft_ccld_qty": "1", "ft_ccld_unpr3": "10.0", "ft_ccld_amt3": "10.0",
+        "ord_dt": "20261126", "ord_tmd": "041000",
+        "ord_datetime_utc": "2026-11-25T19:10:00+00:00",
+        "_ord_dt_is_kst_date": True,
+    }
+    ev = trading_bot.build_settlement_evidence(
+        "SOXL", {}, [row], mode="DRY", run_id="mt", balance_qty=1,
+        before={"last_updated": "2026-11-25T19:10:00+00:00"},
+    )
+    fill = ev["fills"][0]
+    delta = {"odno": "20261125:1", "side": "매수", "qty_delta": 1, "amount_delta": 10.0,
+             "ord_dt": fill["ord_dt"], "ord_tmd": fill["ord_tmd"],
+             "ord_datetime_utc": row["ord_datetime_utc"],
+             "_ord_dt_is_kst_date": fill["_ord_dt_is_kst_date"]}
+    assert verify_run._verifier_fill_session(fill) == "20261125"
+    assert verify_run._verifier_meta_session(delta) == "20261125"
+    assert verify_run._delta_identity_problems(delta, fill) == []
+
+
+def test_full_path_settlement_to_evidence_to_verifier(monkeypatch):
+    """실제 정산 처리기 → Evidence 생성 → 독립 검증 경로가 재사용에서 PASS 합니다."""
+    import copy
+
+    monkeypatch.setenv("TQQQ_SEED", "10000")
+    monkeypatch.setenv("SOXL_SEED", "5000")
+    import trading_bot
+    from state import reconcile_reverse_fills
+
+    rows = [
+        {"odno": "3357", "sll_buy_dvsn_cd_name": "매도", "ft_ccld_qty": "4",
+         "ft_ccld_unpr3": "65.19", "ft_ccld_amt3": "260.76", "ord_dt": "20261112",
+         "ord_tmd": "041000", "ord_datetime_utc": "2026-11-12T19:10:00+00:00"},
+        {"odno": "3357", "sll_buy_dvsn_cd_name": "매수", "ft_ccld_qty": "1",
+         "ft_ccld_unpr3": "32.53", "ft_ccld_amt3": "32.53", "ord_dt": "20261124",
+         "ord_tmd": "041000", "ord_datetime_utc": "2026-11-24T19:10:00+00:00"},
+    ]
+    meta = {"3357": {
+        "side": "BUY", "total_qty": 1, "processed_filled_qty": 0,
+        "processed_filled_amount": 0.0, "fill_marker_version": 1,
+        "reverse_action": "buy", "submitted_session": "2026-11-24",
+        "submitted_at": "20261125052359", "reverse_base_t": 19.5416,
+        "reverse_t_target": 0.1146, "reverse_t_rule": 2, "reverse_splits": 20,
+        "cycle_id": "c1",
+    }}
+    ledger = {"start_T": 19.5416, "entries": []}
+    before = {
+        "T": 19.5416, "net_invested": 5249.61,
+        "last_updated": "2026-11-24T19:10:00+00:00",
+        "orders_meta": copy.deepcopy(meta), "settlement_ledger": copy.deepcopy(ledger),
+    }
+    state = copy.deepcopy(before)
+    state["reverse_mode"] = {"active": True, "cycle_id": "c1"}
+    state["sell_t_effects"] = {}
+    reconcile_reverse_fills(state, rows)
+    state["_settlement_deltas"] = state.pop("_reverse_settlement_deltas", [])
+    assert state["_settlement_deltas"] and all(
+        "ord_dt" in d for d in state["_settlement_deltas"]
+    )
+    ev = trading_bot.build_settlement_evidence(
+        "SOXL", state, rows, mode="DRY", run_id="fullpath", balance_qty=49, before=before
+    )
+    assert all("ord_dt" in o for o in ev["orders"])
+    assert verify_run._verify_evidence(ev) == []

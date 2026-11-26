@@ -311,6 +311,44 @@ def _order_instance_matches(fill, meta):
     return None
 
 
+def _delta_identity_problems(order, fill):
+    """적용 delta의 명시적 식별 정보를 원시 체결과 독립 대조합니다.
+
+    정산 처리기가 기록한 주문 행의 세션·원본 날짜·시각·날짜 컨벤션이
+    검증기가 보는 원시 체결과 다르면 다른 주문을 적용한 것입니다.
+    식별 정보가 없는 구버전 delta는 여기서 판정하지 않습니다.
+    """
+    if not isinstance(order, dict) or not isinstance(fill, dict):
+        return []
+    problems = []
+    for key in ("ord_dt", "ord_tmd", "ord_datetime_utc"):
+        expected = str(order.get(key) or "")
+        if not expected:
+            continue
+        actual = str(fill.get(key) or "")
+        if key == "ord_datetime_utc" and not actual:
+            actual = str(fill.get("ts") or "")
+        if not actual:
+            # 구버전 Evidence 의 fills 에는 원본 날짜가 없습니다. 대조 근거가
+            # 없으면 여기서 판정하지 않고 인스턴스 확정 경로에 맡깁니다.
+            continue
+        if key == "ord_dt":
+            expected = expected.replace("-", "")[:8]
+            actual = actual.replace("-", "")[:8]
+        if expected != actual:
+            problems.append(
+                f"적용 주문의 {key} 가 원시 체결과 다릅니다 "
+                f"(기록 {expected!r} vs 이력 {actual!r})"
+            )
+    if (
+        "_ord_dt_is_kst_date" in order
+        and bool(order.get("_ord_dt_is_kst_date"))
+        != bool(fill.get("_ord_dt_is_kst_date"))
+    ):
+        problems.append("적용 주문의 날짜 컨벤션(_ord_dt_is_kst_date)이 원시 체결과 다릅니다")
+    return problems
+
+
 def _instance_key(odno, side, session):
     """주문 인스턴스 집계 키 — (주문번호, 방향, 미국 세션)."""
     return (str(odno), _verifier_side(side), str(session or ""))
@@ -1011,8 +1049,11 @@ def _required_settlement_fills(evidence):
         odno = str(order.get("odno"))
         side = _verifier_side(order.get("side"))
         session = _verifier_fill_session(order) or _verifier_meta_session(order)
+        matched = _match_fill_for_meta(odno, order, fill_index)
+        if matched is not None:
+            # delta에 명시적으로 기록된 인스턴스 식별 정보를 원시 체결과 독립 대조합니다.
+            problems.extend(_delta_identity_problems(order, matched))
         if not session:
-            matched = _match_fill_for_meta(odno, order, fill_index)
             if matched is not None:
                 session = _verifier_fill_session(matched)
             else:
@@ -1025,26 +1066,17 @@ def _required_settlement_fills(evidence):
                 ]
                 if len(same_side) == 1:
                     session = _verifier_fill_session(same_side[0])
-                if session is None:
-                    # 실제 settlement delta 에는 세션 식별자가 없습니다.
-                    # 같은 번호·방향의 필수 체결 중 수량·금액이 일치하는 항목이
-                    # 하나뿐이면 그 인스턴스로 확정합니다. 후보가 여럿이면 모호하므로
-                    # 확정하지 않고 아래 고유 키 경로로 fail-closed 합니다.
-                    qty = _as_int(order.get("qty_delta"))
-                    amount = _as_float(order.get("amount_delta"))
-                    keys = {
-                        item["instance_key"]
-                        for item in required
-                        if item.get("instance_key")
-                        and item["instance_key"][0] == odno
-                        and item["instance_key"][1] == side
-                        and item["req_qty"] == qty
-                        and abs(item["req_amount"] - amount) <= 0.02
-                    }
-                    if len(keys) == 1:
-                        session = next(iter(keys))[2]
+        candidates = (fill_index or {}).get(odno) or []
+        if (
+            session
+            and len(candidates) == 1
+            and not _verifier_fill_session(candidates[0])
+        ):
+            # 구버전 fill 에 날짜가 없고 후보가 하나뿐이면 인스턴스가 유일하므로
+            # 레거시 키("")로 맞춰 호환합니다 (후보가 여럿이면 fail-closed 유지).
+            session = ""
         key = _instance_key(odno, side, session)
-        if session is None and len((fill_index or {}).get(odno) or []) > 1:
+        if session is None and len(candidates) > 1:
             # 후보가 여럿인데 식별 불가 — 다른 인스턴스와 상쇄되지 않도록
             # 항목별로 고유화합니다 (단일 후보 레거시는 기존 키 유지).
             key = key + (str(order.get("ledger_seq") or index),)
