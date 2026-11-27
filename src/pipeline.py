@@ -2481,12 +2481,33 @@ def _load_verify_run_module():
             pass
 
 
+def _write_verification_failed_evidence(symbol, evidence, problems):
+    """검증 실패 진단용 상세 근거를 committed=false 로 남깁니다.
+
+    암호화 Artifact 로 보존되지만 `committed=false` + `scope=settlement_detail`
+    이므로 PREVIEW/EXECUTE/VERIFY 는 확정 근거로 쓰지 않습니다.
+    """
+    try:
+        return _write_settlement_evidence(
+            symbol,
+            evidence,
+            committed=False,
+            failure_reason="verification_failed: " + " / ".join(problems[:3]),
+        )
+    except OSError as evidence_error:
+        print(
+            f"[경고] {symbol} 검증 실패 근거 기록 실패 — 감사 근거 없이 보류합니다: "
+            f"{evidence_error}"
+        )
+        return None
+
+
 def _verify_settlement_evidence(evidence):
     """ops/verify_run.py 의 독립 재계산으로 정산 근거를 검증합니다."""
     if evidence is None:
         return ["정산 근거가 없습니다."]
     try:
-        return list(_load_verify_run_module()._verify_evidence(evidence) or [])
+        return list(_load_verify_run_module().verify_evidence_masked(evidence) or [])
     except Exception as error:
         return [f"독립 검증기 실행 실패: {error}"]
 
@@ -3114,6 +3135,9 @@ def _settle_positions(
     # 원인을 해소한 뒤 재실행하세요.
     evidence_problems = [] if hold else _verify_settlement_evidence(settlement_evidence)
     if evidence_problems:
+        # 진단용 상세 근거를 committed=false 로 남겨 암호화 Artifact 에 보존합니다.
+        # state 저장·주문 차단 정책은 그대로 유지합니다.
+        _write_verification_failed_evidence(symbol, settlement_evidence, evidence_problems)
         raise tb.SymbolScopedError(
             f"{symbol} 정산 근거 독립 검증 실패 — 저장/주문을 보류합니다: "
             + " / ".join(evidence_problems[:3])

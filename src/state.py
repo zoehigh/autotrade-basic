@@ -445,6 +445,22 @@ def _order_matches_submitted_date(order, submitted_at, submitted_session=""):
     return _order_real_kst_date(order) == str(submitted_at)[:8]
 
 
+def _order_identity_fields(order):
+    """정산 delta 에 담을 주문 인스턴스 식별 정보 (영속 state 스키마에는 포함되지 않음).
+
+    검증기가 원시 체결 이력과 독립 대조할 수 있도록 브로커 원본 날짜·시각과
+    날짜 컨벤션 플래그를 함께 기록합니다. T·순투입 계산에는 사용하지 않습니다.
+    """
+    if not isinstance(order, dict):
+        return {}
+    return {
+        "ord_dt": str(order.get("ord_dt", "") or "").replace("-", "")[:8],
+        "ord_tmd": str(order.get("ord_tmd", "") or ""),
+        "ord_datetime_utc": str(order.get("ord_datetime_utc", "") or ""),
+        "_ord_dt_is_kst_date": bool(order.get("_ord_dt_is_kst_date", False)),
+    }
+
+
 def _order_us_session_date(order):
     """주문이 속한 미국(ET) 세션 날짜(YYYYMMDD)를 반환합니다.
 
@@ -1073,7 +1089,8 @@ def reconcile_reverse_fills(state, order_history):
             net_invested -= delta_amount
             if filled_qty > processed_qty or delta_amount > 0:
                 state.setdefault("_reverse_settlement_deltas", []).append({
-                    "odno": str(odno),
+                    **_order_identity_fields(order),
+"odno": str(odno),
                     "side": "매도",
                     "qty_delta": max(0, filled_qty - processed_qty),
                     "amount_delta": delta_amount,
@@ -1179,7 +1196,8 @@ def reconcile_reverse_fills(state, order_history):
             net_invested += delta_amount
             if filled_qty > processed_qty or delta_amount > 0:
                 state.setdefault("_reverse_settlement_deltas", []).append({
-                    "odno": str(odno),
+                    **_order_identity_fields(order),
+"odno": str(odno),
                     "side": "매수",
                     "qty_delta": max(0, filled_qty - processed_qty),
                     "amount_delta": delta_amount,
@@ -1966,7 +1984,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
                 factor = 0.75
             ledger_entry = _find_settlement_entry(state, kind="sell", odno=odno)
             state["_settlement_deltas"].append({
-                "odno": odno,
+                **_order_identity_fields(order),
+"odno": odno,
                 "side": "매도",
                 "qty_delta": sell_qty,
                 "amount_delta": _inference_amount(order),
@@ -2034,7 +2053,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
             net_qty += qty
             # T 효과는 없지만 금액·수량 검산 대상입니다. (검증기가 필수 체결로 확인)
             state["_settlement_deltas"].append({
-                "odno": str(o.get("odno", "")),
+                **_order_identity_fields(o),
+"odno": str(o.get("odno", "")),
                 "side": "매수",
                 "qty_delta": qty,
                 "amount_delta": _inference_amount(o),
@@ -2076,7 +2096,8 @@ def _infer_T_from_full_history(symbol, state, order_history):
                     _inference_amount(o),
                 )
                 state["_settlement_deltas"].append({
-                    "odno": odno,
+                    **_order_identity_fields(o),
+"odno": odno,
                     "side": "매수",
                     "qty_delta": qty,
                     "amount_delta": _inference_amount(o),
@@ -2116,6 +2137,7 @@ def _infer_T_from_full_history(symbol, state, order_history):
                     odno = str(o.get("odno", ""))
                     T, ledger_entry = _apply_buy_t_effect(state, T, share, odno, allow_adjust=False)
                     state["_settlement_deltas"].append({
+                        **_order_identity_fields(o),
                         "odno": odno,
                         "side": "매수",
                         "qty_delta": qty,
@@ -3568,7 +3590,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             )
             entry_now = (state.get("sell_t_effects") or {}).get(str(odno)) or {}
             state["_settlement_deltas"].append({
-                "odno": str(odno),
+                **_order_identity_fields(row),
+"odno": str(odno),
                 "side": "매도",
                 "qty_delta": dq,
                 "amount_delta": da,
@@ -3586,7 +3609,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             net_invested += da
             print(f"  → 지연 체결 반영: odno={mask_odno(odno)} 추가매수 {dq}주 → T 변경 없음")
             state["_settlement_deltas"].append({
-                "odno": str(odno),
+                **_order_identity_fields(row),
+"odno": str(odno),
                 "side": "매수",
                 "qty_delta": dq,
                 "amount_delta": da,
@@ -3611,7 +3635,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 )
             net_invested += da
             state["_settlement_deltas"].append({
-                "odno": str(odno),
+                **_order_identity_fields(row),
+"odno": str(odno),
                 "side": "매수",
                 "qty_delta": dq,
                 "amount_delta": da,
@@ -3851,7 +3876,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             entry_now = effects_now.get(str(odno)) or {}
             ledger_entry = _find_settlement_entry(state, kind="sell", odno=str(odno))
             state["_settlement_deltas"].append({
-                "odno": str(odno),
+                **_order_identity_fields(order),
+"odno": str(odno),
                 "side": "매도",
                 "qty_delta": sell_qty,
                 "amount_delta": sell_amt,
@@ -3895,7 +3921,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
             if meta is not None:
                 _commit_fill_markers(meta, order, buy_qty, buy_amt)
             state["_settlement_deltas"].append({
-                "odno": str(odno),
+                **_order_identity_fields(order),
+"odno": str(odno),
                 "side": "매수",
                 "qty_delta": buy_qty,
                 "amount_delta": buy_amt,
@@ -3953,7 +3980,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                 net_qty += buy_qty
                 net_invested += buy_amt
                 state["_settlement_deltas"].append({
-                    "odno": str(odno),
+                    **_order_identity_fields(order),
+"odno": str(odno),
                     "side": "매수",
                     "qty_delta": buy_qty,
                     "amount_delta": buy_amt,
@@ -3997,7 +4025,8 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
                         remaining_delta = round(remaining_delta - _share, 4)
                     T, ledger_entry = _apply_buy_t_effect(state, T, _share, odno, allow_adjust=False)
                     state["_settlement_deltas"].append({
-                        "odno": str(odno),
+                        **_order_identity_fields(order),
+"odno": str(odno),
                         "side": "매수",
                         "qty_delta": buy_qty,
                         "amount_delta": buy_amt,
