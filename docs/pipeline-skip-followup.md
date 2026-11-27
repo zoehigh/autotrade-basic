@@ -63,8 +63,7 @@
   실패로 드러납니다.
 - 영향: self-hosted(Kiwoom·Toss real) 의 아침 LIFECYCLE/EXECUTE. hosted 기본 설정에서는 같은 시각의 대기가
   4시간을 넘어 게이트에서 먼저 실패합니다. 로컬 cron 의 18:30 EXECUTE 는 영향이 없습니다.
-- **이 PR 에는 수정을 포함하지 않습니다** (후속 과제). 검토할 방향: 브로커의 휴장 판정을 대상 세션이
-  ET 오늘일 때만 실패로 처리.
+- **이 PR 에는 수정을 포함하지 않습니다** (후속 과제).
 
 ## 3. 정상 SKIP 과 실패의 구분
 
@@ -80,7 +79,21 @@
 3. 정기 슬롯이 마감 후 시각이 되면 매일 SKIP(성공)이며 요약·텔레그램의 사유로만 드러납니다 (연속 SKIP 감시).
 4. 주문 창이 닫힌 날의 LIFECYCLE 은 PREVIEW 를 생략하므로 PREVIEW 에서만 판정되는 보류는 다음 거래일에 드러납니다.
 5. hosted 러너에서 프리장 대기가 상한을 넘으면 기존대로 실패합니다.
-6. step timeout·취소 시 step output 보존은 `ops/mock_actions/` 로 GitHub 에서 확인해야 합니다 (미실행).
+
+### GitHub Actions Mock 검증 결과 (2026-11-27, 검증 대상 코드 `cb7f9f0`)
+
+| run ID | 내용 | 결과 |
+|---|---|---|
+| 45927934430 | 자동 14개 시나리오 | `assert` 14/14 성공 (run 전체는 의도된 실패 재현으로 failure) |
+| 45928515419 | 수동 취소 (EXECUTE 대기 중 `gh run cancel`) | `assert` 성공 |
+
+- 정상 SKIP(`skip`)·DRY 휴장(`dry-holiday`): 새 state 캐시 없음, 정산 검증 job `skipped`.
+- 근거 누락(`evidence-missing` 등): 거래 job 이 성공해도 정산 검증 실패("정산 근거 파일이 없습니다").
+- 강제 종료(exit 137)·1분 step timeout·run 취소: step output(`PARTIAL_FAILURE`/`ATTEMPTED`)이 **보존**됐고,
+  state 캐시 저장과 정산 검증이 실행됐습니다.
+- 새 캐시는 `mock-skip-*` 8개(모두 `mock-verify/pr31` 범위)뿐이고 기존 운영 캐시 19개는 유지됐습니다.
+- 덮지 않은 것: 유효한 근거의 정산 검증 **성공** 경로, self-hosted·단독 EXECUTE, 실제 봇·브로커·텔레그램.
+- 관측: 사용 중인 `actions/*@v4` 등에 Node.js 20 지원 중단 경고가 있습니다 (이 PR 이전부터의 버전).
 
 ### 메리츠 pipeline 운영 전환 때 함께 처리할 과제
 
