@@ -1509,12 +1509,14 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
     state.pop("_settlement_hold", None)
     state.pop("_settlement_hold_reason", None)
     state.pop("_pending_marker_odnos", None)
+    state.pop("_odno_reuse_ambiguous", None)
     snapshot = deepcopy(state)
     result = _update_T_from_history_impl(symbol, state, order_history, balance_qty=balance_qty)
     if isinstance(result, dict) and result.get("_settlement_hold"):
         reason = result.get("_settlement_hold_reason", "정산 근거 부족")
         pending = list(result.get("_pending_amount_odnos") or [])
         marker_pending = list(result.get("_pending_marker_odnos") or [])
+        reuse_ambiguous = list(result.get("_odno_reuse_ambiguous") or [])
         result.clear()
         result.update(snapshot)
         _mark_settlement_hold(result, reason)
@@ -1522,6 +1524,8 @@ def update_T_from_history(symbol, state, order_history, balance_qty=None):
             result["_pending_amount_odnos"] = pending
         if marker_pending:
             result["_pending_marker_odnos"] = marker_pending
+        if reuse_ambiguous:
+            result["_odno_reuse_ambiguous"] = reuse_ambiguous
     return result
 
 
@@ -3289,6 +3293,9 @@ def _apply_recent_history_dt(symbol, state, order_history, last_updated_dt, last
         state.clear()
         state.update(apply_snapshot)
         state["_pending_amount_odnos"] = list(ambiguous_odnos)
+        # 호출부가 "금액 확정 후 재실행" 같은 일시적 보류 안내 대신 번호 재사용 구분 불가 사유를 알리도록 표시합니다
+        # (밑줄 키는 저장되지 않는 일회성 표식).
+        state["_odno_reuse_ambiguous"] = list(ambiguous_odnos)
         for odno_ambiguous, reason in ambiguous_odnos.items():
             print(f"  [경고] 주문번호 재사용 구분 불가: odno={mask_odno(odno_ambiguous)} — {reason}")
         _mark_settlement_hold(
