@@ -221,7 +221,7 @@ def _simulate(name, tmp_path):
         if "=" in line
     )
     bot = "success" if result.returncode == 0 else "failure"
-    trade = "failure" if inputs["fail_after"] == "true" else bot
+    trade = "failure" if inputs["fail_after"] == "yes" else bot
     ctx = {
         "steps.resolve.outputs.trade_mode": inputs["trade_mode"],
         "steps.bot.outcome": bot,

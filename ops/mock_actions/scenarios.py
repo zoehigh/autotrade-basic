@@ -58,7 +58,7 @@ SCENARIOS = {
     "skip-late-failure": _case(
         {"gate": _gate("closed", due=False)},
         "failure", ["SKIPPED"], ["SKIPPED"], False, FAILED,
-        fail_after="true",
+        fail_after="yes",
     ),
     "dry-holiday": _case(
         {"gate": _gate(), "skip_marker": "mock holiday"},

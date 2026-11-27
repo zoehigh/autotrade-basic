@@ -66,7 +66,8 @@ INPUT_DEFAULTS = {
     "trade_mode": "LIVE",
     "run_phase": "LIFECYCLE",
     "bot_timeout": "",
-    "fail_after": "false",
+    # 'true'/'false' 는 bool 로 해석될 수 있어(actionlint 타입 검사) 쓰지 않습니다.
+    "fail_after": "no",
 }
 
 
@@ -117,7 +118,7 @@ def build_run_workflow(base):
         summary_index,
         {
             "name": "Mock 사후 단계 실패 주입",
-            "if": "${{ inputs.fail_after == 'true' }}",
+            "if": "${{ inputs.fail_after == 'yes' }}",
             "run": "echo 'mock: later step failure'; exit 1",
         },
     )
