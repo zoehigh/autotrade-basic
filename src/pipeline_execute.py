@@ -454,7 +454,9 @@ def execute_approved_plan(
         effective_now = _wait_until_pre_market(_tb(), now)
     except OrderWindowClosed as closed:
         with global_lock():
-            return _skip_approved_plan(approval_or_id, approvals_dir, closed.window)
+            return _skip_approved_plan(
+                approval_or_id, approvals_dir, closed.window, state_override
+            )
     with global_lock():
         return _execute_approved_plan(
             broker,
@@ -467,8 +469,12 @@ def execute_approved_plan(
         )
 
 
-def _skip_approved_plan(approval_or_id, approvals_dir, window):
+def _skip_approved_plan(approval_or_id, approvals_dir, window, state_override=None):
     """주문 창이 닫혀 승인을 실행하지 않습니다 (승인 미소비, 주문/state 변경 없음).
+
+    **유효한 승인만** 정상 SKIP 입니다. 변조·바인딩 불일치·state 변경·미해결 보류·
+    정산 근거 누락은 실행할 때와 같이 예외로 실패합니다 (브로커 조회/주문 없음).
+    시각 조건(세션 도래·TTL)만 검사하지 않습니다.
 
     결과 파일에는 `approval-skipped` 를 남깁니다 — VERIFY 는 이 승인을 "실행 안 됨"
     으로 계속 구분합니다 (실행 성공으로 보이지 않게 함).
@@ -480,6 +486,23 @@ def _skip_approved_plan(approval_or_id, approvals_dir, window):
     )
     reason = window.reason
     symbol = approval.get("symbol", "")
+    state = (
+        state_override if state_override is not None else _tb().load_state(symbol)
+    )
+    problems = verify_approval(approval, state, check_time=False)
+    if problems:
+        raise RuntimeError(
+            "승인 검증 실패 — 정상 SKIP 이 아닙니다: " + " / ".join(problems)
+        )
+    assert_no_pending_fence(state, symbol)
+    evidence_id = str(
+        approval.get("evidence_id") or approval.get("settlement_run_id") or ""
+    )
+    if not evidence_file_for_run(symbol, evidence_id):
+        raise RuntimeError(
+            f"{symbol} 커밋된 SETTLE 근거를 찾을 수 없습니다 (evidence_id={evidence_id}) "
+            "— 정상 SKIP 이 아닙니다."
+        )
     print(f"⏭ [EXECUTE] {symbol} 주문 SKIP: {reason}")
     _write_outcome_record(approval, "approval-skipped", f"order-window: {reason}")
     _tb()._write_run_skip_marker(f"{symbol} {reason}")

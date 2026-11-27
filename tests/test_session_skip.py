@@ -353,6 +353,67 @@ def test_used_approval_is_rejected_even_on_holiday(
     assert not marker.exists()
 
 
+def _tamper(path, change):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    change(data)
+    Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("orders", "plan_hash 불일치"),
+        ("broker", "broker 불일치"),
+        ("state_hash", "상태 해시 불일치"),
+        ("pending_fence", "미해결 주문"),
+        ("balance_mismatch", "이력-잔고 불일치"),
+        ("evidence", "SETTLE 근거"),
+    ],
+)
+def test_invalid_approval_or_hold_is_not_skipped_on_holiday(
+    io, holiday_clock, monkeypatch, tmp_path, case, expected
+):
+    marker = tmp_path / "skip-marker"
+    monkeypatch.setenv("RUN_SKIP_MARKER", str(marker))
+    # 보류 사례는 승인 지문과 일치하는 state 로 만들어, 해시가 아니라 보류 검사가
+    # 막는지 확인합니다.
+    holds = {
+        "pending_fence": {"pending_order_intent": {"side": "BUY"}},
+        "balance_mismatch": {"balance_mismatch": {"note": "requires-attention"}},
+    }
+    state, _plan, path = _approve(tmp_path, state=_base_state(**holds.get(case, {})))
+    state = deepcopy(state)
+    if case == "orders":
+        _tamper(path, lambda data: data["orders"][0].update(quantity=999))
+    elif case == "broker":
+        monkeypatch.setattr(trading_bot, "BROKER", "otherbroker")
+        monkeypatch.setenv("BROKER", "otherbroker")
+    elif case == "state_hash":
+        state["T"] = 7.0
+    elif case == "evidence":
+        for evidence in tmp_path.glob("settlement-*.json"):
+            evidence.unlink()
+    io["load"]("TQQQ", state)
+    broker = _e2e_broker()
+
+    with pytest.raises(RuntimeError, match=expected):
+        pipeline_execute.execute_approved_plan(broker, str(path))
+
+    assert broker.place_order.call_count == 0
+    assert not marker.exists()
+    assert pipeline.read_approval_outcome(str(path)).get("outcome") is None
+    assert pipeline.load_approval(str(path))["consumed"] is False
+    assert io["saved"] == []
+
+
+def test_time_checks_are_the_only_ones_relaxed(io, tmp_path):
+    state, _plan, path = _approve(tmp_path)
+    approval = pipeline.load_approval(str(path))
+    late = _utc("2026-11-27 04:10")
+    assert pipeline.verify_approval(approval, state, now=late)
+    assert pipeline.verify_approval(approval, state, now=late, check_time=False) == []
+
+
 def test_calendar_error_during_execute_is_not_a_skip(io, monkeypatch, tmp_path):
     _state, _plan, path = _approve(tmp_path)
     monkeypatch.setattr(trading_bot, "get_kst_now", lambda: _kst("2026-11-27 04:10"))
