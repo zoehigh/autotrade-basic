@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""가짜 `uv` — 워크플로 Mock 검증 전용 (브로커·네트워크 호출 없음).
+
+`uv run python <대상>` 만 받습니다. 세션 게이트 출력과 봇 단계별 종료코드·산출물을
+`STUB_CONFIG`(JSON) 대로 흉내 냅니다. 그 밖의 파이썬 스크립트(계획 ID 읽기 등)는
+그대로 실행합니다. `tests/` 와 Actions Mock 워크플로가 같은 파일을 씁니다.
+"""
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+args = sys.argv[1:]
+assert args[:2] == ["run", "python"], args
+args = args[2:]
+config = json.loads(os.environ["STUB_CONFIG"])
+log = Path(os.environ["STUB_LOG"])
+
+
+def record(entry):
+    with log.open("a") as fh:
+        fh.write(entry + "\n")
+    print(f"[mock-uv] {entry}", file=sys.stderr, flush=True)
+
+
+if args and args[0] == "ops/session_gate.py":
+    record("GATE")
+    if config.get("gate_rc", 0):
+        sys.exit(config["gate_rc"])
+    for key, value in config["gate"].items():
+        print(f"{key}={value}")
+    sys.exit(0)
+if args and args[0] == "-c":
+    record("SUMMARY")
+    Path(os.environ["STUB_SENT"]).write_text(os.environ["RUN_SUMMARY_MESSAGE"])
+    sys.exit(config.get("send_rc", 0))
+if args[0] != "trading_bot.py":
+    os.execv(sys.executable, [sys.executable, *args])
+
+phase = os.environ.get("RUN_PHASE", "") or "LEGACY"
+target = os.environ.get("PLAN_ID", "") if phase == "APPROVE" else ""
+if phase in ("EXECUTE", "VERIFY"):
+    target = os.environ.get("APPROVAL_PLAN_ID", "")
+key = f"{phase}:{target}" if f"{phase}:{target}" in config.get("rc", {}) else phase
+record(f"{phase} {target}".strip())
+# 상태를 바꾼 뒤 중단되는 상황을 만들기 위해 먼저 state 를 씁니다.
+if phase in ("SETTLE", "EXECUTE"):
+    Path(".state.json").write_text(json.dumps({"MOCK": {"last_phase": phase}}))
+if config.get("kill") == phase:
+    os.kill(os.getppid(), signal.SIGKILL)
+    sys.exit(1)
+if config.get("sleep") == phase:
+    time.sleep(config.get("sleep_seconds", 300))
+rc = config.get("rc", {}).get(key, 0)
+if rc == 0 and phase == "SETTLE" and not config.get("no_evidence"):
+    Path("settlement-TQQQ-x.json").write_text("{}")
+if rc == 0 and phase == "PREVIEW":
+    Path("plans").mkdir(exist_ok=True)
+    for plan_id in config.get("plans", ["P1"]):
+        Path("plans", f"{plan_id}.json").write_text(json.dumps({"plan_id": plan_id}))
+if rc == 0 and phase == "APPROVE":
+    Path("approvals").mkdir(exist_ok=True)
+    Path("approvals", f"{target}.json").write_text("{}")
+marker = os.environ.get("RUN_SKIP_MARKER", "")
+if phase == "LEGACY" and config.get("skip_marker"):
+    Path(marker).write_text(config["skip_marker"] + "\n")
+# 봇의 EXECUTE SKIP: 창이 닫혀 있고 승인 검증을 통과(exit 0)한 대상만 표식을 남깁니다.
+if phase == "EXECUTE" and marker and rc == 0 and target not in config.get("no_skip", []):
+    with open(marker, "a") as fh:
+        fh.write(f"{target} skip\n")
+sys.exit(rc)

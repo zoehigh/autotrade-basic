@@ -22,7 +22,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "trade_base.yml"
 CONTEXT_KEY = "steps.resolve.outputs.trade_mode"
 
 _TOKEN = re.compile(
-    r"\s*(?:(?P<str>'[^']*')|(?P<op>&&|\|\||==|!=|!|\(|\))|(?P<id>[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?))"
+    r"\s*(?:(?P<str>'[^']*')|(?P<op>&&|\|\||==|!=|!|\(|\))|(?P<id>[A-Za-z_][A-Za-z0-9_.\-]*(?:\(\))?))"
 )
 
 

@@ -1744,9 +1744,14 @@ def load_approval(plan_id=None, approvals_dir=None):
 
 
 def verify_approval(
-    approval, state, now=None, require_unconsumed=True, check_state_hash=True
+    approval, state, now=None, require_unconsumed=True, check_state_hash=True,
+    check_time=True,
 ):
-    """승인 파일과 현재 상태를 대조해 문제 목록을 반환합니다 (읽기 전용)."""
+    """승인 파일과 현재 상태를 대조해 문제 목록을 반환합니다 (읽기 전용).
+
+    `check_time=False` 는 **주문을 내지 않는** 휴장·마감 SKIP 전용입니다: "지금 실행할
+    시각인가"(세션 도래·경과, TTL 만료)만 제외하고 무결성·바인딩 검사는 모두 합니다.
+    """
     problems = []
     if not isinstance(approval, dict):
         return ["승인 파일 형식이 올바르지 않습니다."]
@@ -1800,7 +1805,7 @@ def verify_approval(
                 f"{approval.get('session')} != 실행 대상 세션 {expected_session}"
             )
         # 승인 TTL(기본 9h)을 넘겨 다음 세션까지 살아남은 승인은 실행하지 않습니다.
-        current_et = _et_today(now)
+        current_et = _et_today(now) if check_time else expected_session
         if current_et > expected_session:
             problems.append(
                 f"승인 세션이 지났습니다: 승인 {expected_session}, 오늘(ET) {current_et} "
@@ -1821,7 +1826,7 @@ def verify_approval(
     expires = _parse_iso(approval.get("expires_at_utc"))
     if expires is None:
         problems.append("expires_at_utc 를 해석할 수 없습니다.")
-    elif current_now.astimezone(timezone.utc) >= expires:
+    elif check_time and current_now.astimezone(timezone.utc) >= expires:
         problems.append(f"승인이 만료되었습니다: {approval.get('expires_at_utc')}")
 
     if state is not None:

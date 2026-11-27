@@ -12,7 +12,10 @@ T·net_invested·evidence·plan_hash 가 일관적인지, 그리고 실패 경�
 """
 import sys
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -325,3 +328,65 @@ class TestE2EStateDrift:
 
         assert broker.place_order.call_count == 0
         assert pipeline.load_approval(str(path))["consumed"] is False
+
+
+# ── 시나리오 F: 휴장일 — 정산은 실행, 주문은 정상 SKIP, 다음 세션에 실행 ──
+
+
+class TestE2EHolidaySkipThenNextSession:
+    def test_holiday_settles_skips_orders_and_executes_next_session(
+        self, io, monkeypatch, tmp_path
+    ):
+        """11-26(휴장) SETTLE → PREVIEW(11-27 계획) → EXECUTE SKIP → 11-27 EXECUTE → VERIFY."""
+        kst = ZoneInfo("Asia/Seoul")
+        holiday = datetime(2026, 11, 26, 19, 10, tzinfo=timezone.utc)  # ET 11-26 14:10
+        next_session = datetime(2026, 11, 27, 9, 30, tzinfo=timezone.utc)  # ET 04:30
+        clock = [holiday]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0].astimezone(tz) if tz else clock[0]
+
+        sleep = MagicMock()
+        monkeypatch.setattr(trading_bot, "datetime", Clock)
+        monkeypatch.setattr(trading_bot, "get_kst_now", lambda: clock[0].astimezone(kst))
+        monkeypatch.setattr(trading_bot, "is_us_dst", lambda: False)
+        monkeypatch.setattr(trading_bot.time, "sleep", sleep)
+        io["load"]("TQQQ", deepcopy(_base_state()))
+        broker = _e2e_broker()
+        broker.is_trading_day.return_value = False
+        read_only = ReadOnlyBroker(broker)
+
+        settled = pipeline.settle_positions(read_only, _symbol_config())
+        assert settled.halt_reason is None
+        assert (settled.settled_session, settled.session) == ("2026-11-25", "2026-11-27")
+        assert len(io["saved"]) == 1
+        io["load"]("TQQQ", deepcopy(settled.state))
+
+        plan = pipeline.build_order_plan(settled, read_only)
+        assert plan.session == "2026-11-27"
+        approval_path = pipeline.approve_order_plan(plan, approvals_dir=str(tmp_path))
+
+        skipped = pipeline_execute.execute_approved_plan(broker, str(approval_path))
+        assert skipped["skipped"] and skipped["failed"] == 0
+        assert broker.place_order.call_count == 0
+        assert pipeline.load_approval(str(approval_path))["consumed"] is False
+        assert len(io["saved"]) == 1, "SKIP 은 state 를 저장하지 않습니다"
+        sleep.assert_not_called()
+
+        # 다음 세션: 휴장일 승인은 TTL 이 지났을 수 있으므로 새 계획으로 실행합니다.
+        clock[0] = next_session
+        broker.is_trading_day.return_value = True
+        new_plan = pipeline.build_order_plan(
+            pipeline.settled_from_state(_symbol_config(), state=settled.state), read_only
+        )
+        new_path = pipeline.approve_order_plan(new_plan, approvals_dir=str(tmp_path))
+        result = pipeline_execute.execute_approved_plan(broker, str(new_path))
+        assert result["outcome"] == "executed"
+        assert broker.place_order.call_count == len(new_plan.orders)
+        sleep.assert_not_called()
+
+        io["load"]("TQQQ", deepcopy(io["saved"][-1]))
+        monkeypatch.setenv("APPROVAL_FILE", str(new_path))
+        assert trading_bot._run_verify_phase() == 0

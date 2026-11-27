@@ -43,8 +43,8 @@
   10:05 KST 는 동절기(ET 20:05) 기준 여유 시각이며 `AFTER_HOURS_END_ET_HOUR` 로 조정합니다.
 - `SETTLE` 대상은 **직전 마감 세션**, 주문 대상은 그 **다음 세션**입니다. 그래서 KST 아침
   PREVIEW 와 KST 18:30 EXECUTE 의 세션이 일치합니다.
-- `PREVIEW`/`EXECUTE` 는 프리장 개장(KST 17:00 DST / 18:00 비DST) 전이면 **자동 대기**합니다
-  (real/demo 공통). 대기 중에는 전역 잠금을 잡지 않습니다 — §5 참고.
+- `PREVIEW`(AUTO_EXECUTE)/`EXECUTE` 는 프리장 개장(KST 17:00 DST / 18:00 비DST) 전이면 **자동 대기**합니다
+  (real/demo 공통). 대상 거래일이 휴장이거나 이미 마감됐으면 대기 없이 주문을 SKIP 합니다. 대기 중에는 전역 잠금을 잡지 않습니다 — §5 참고.
 - `VERIFY` 는 `ops/verify_run.py` 를 직접 부르지 않습니다. `run_daily.sh` 가
   `RUN_PHASE=VERIFY` 로 `trading_bot.py` 를 실행해 승인 파일 + 커밋된 SETTLE evidence 독립
   재계산 + 브로커 read-only 대조를 한 번에 수행합니다 (`ops/verify_run.sh` 는 레거시).
@@ -111,11 +111,33 @@
 | 권장 시각 (KST) | **10:10 이후 ~ 17:00 이전** |
 | 이유 | ① `SETTLE` 은 애프터아워 종료(20:00 ET = KST 09:00 DST / 10:00 비DST) **이후**에만 정산합니다 — 그 전에 dispatch 하면 SETTLE 이 보류로 끝나 체인이 중단됩니다(fail-closed). ② PREVIEW 는 직전 마감 세션의 **다음 세션**을 대상으로 계획을 만들고, EXECUTE 는 프리장 개장(KST 17:00 DST / 18:00 비DST)까지 스스로 대기합니다 |
 | 프리장 직후 dispatch | 프리장 개장 무렵(KST 17:00/18:00)에 dispatch 해도 동작합니다(대기 없이 바로 실행). 다만 그 시각엔 이미 대기 구간이 끝나 있으므로 위 여유 시간대가 안전합니다 |
-| DST | 미국 DST 전환(3월 둘째 일요일 / 11월 첫째 일요일)에도 cron 은 UTC 고정, KST 기준 시각은 자동 조정됩니다 |
+| DST | 미국 DST 전환(3월 둘째 일요일 / 11월 첫째 일요일)에 dispatch 시각이 자동으로 따라가는지는 **외부 스케줄러 설정에 달려 있으며 미확인**입니다. UTC 고정 cron 이면 ET 기준 실행 시각이 1시간 달라집니다. 전환 전후에 실제 실행 시각을 확인하세요 (`docs/pipeline-skip-followup.md` §1) |
 
-- `SETTLE` 이 보류(애프터아워 미종료·정산 미확정·휴장일 등)를 반환하면 SETTLE 단계가
+- `SETTLE` 이 보류(애프터아워 미종료·정산 미확정 등)를 반환하면 SETTLE 단계가
   실패로 끝나 **체인이 중단**됩니다. 이는 정상적인 fail-closed 동작이며, 시각을 늦춰
   다시 dispatch 하면 됩니다.
+
+### 휴장일·마감 후 실행과 실행 결과 표식
+
+LIVE 의 `LIFECYCLE`/`EXECUTE` 는 봇 실행 전에 `ops/session_gate.py` 가 **주문 대상 거래일**을
+판정합니다 (ET 오늘, 애프터아워 종료 20:00 ET 이후에는 다음 날).
+
+| 상황 | 동작 | `run_outcome` | state 캐시 | 정산 검증 |
+|------|------|---------------|------------|-----------|
+| 거래일 마감 전 | 기존 체인 (필요 시 프리장 대기) | `ORDERS_EXECUTED` / `SETTLE_ONLY` | 저장 | 실행 |
+| 휴장·주말, 직전 세션 정산 가능 | `SETTLE` 만, 주문 SKIP | `SETTLE_ONLY` | 저장 | 실행 |
+| 마감 후 애프터아워 종료 전 (조기폐장 포함) | 봇 미실행 | `SKIPPED` | 저장 안 함 | 제외 |
+| 위 SKIP 인데 state 에 보류 표식 | 실패 | `NOT_STARTED` | 저장 안 함 | 실행(실패) |
+| `EXECUTE` 단독, 주문 창 닫힘 | 봇이 승인 확인 후 주문 SKIP (승인 미소비) | `SKIPPED` | 저장 안 함 | 제외 |
+| 위에서 승인 없음·재사용·변조·바인딩/해시 불일치·보류 | 실패 | `PARTIAL_FAILURE` | 저장 | 실행 |
+| 게이트 실패 (검토 표식·해시·대기 상한·캘린더/state 오류) | 실패 | `NOT_STARTED` | 저장 안 함 | 실행(실패) |
+| `SETTLE` 실패 | 실패 | `FAILED` | 저장 | 실행 |
+| `SETTLE` 이후 실패 (부분 접수 가능) | 실패 | `PARTIAL_FAILURE` | 저장 | 실행 |
+
+- DRY 의 휴장일 실행은 `SKIPPED`(캐시 저장 없음·정산 검증 제외), 그 외 단독 단계 성공은 `COMPLETED` 입니다.
+- 결과 표식이 비어 있으면(강제 종료 등) 보수적으로 캐시를 저장하고 정산 검증을 실행합니다.
+- 결과와 SKIP 사유는 Actions 요약과 텔레그램(조용한 시간에도 발송)에 표시됩니다.
+- cron 변경 검토와 남은 한계: `docs/pipeline-skip-followup.md`
 - Actions 캐시는 **브랜치별 격리**입니다. T 보정 등 state 변경은 운영 브랜치(`main`)에서만 반영됩니다.
 
 ---

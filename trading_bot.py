@@ -52,7 +52,7 @@ from pipeline import (
     verify_evidence_file_with_ops,
     write_order_plan,
 )
-from pipeline_execute import execute_approved_plan
+from pipeline_execute import closed_order_window, execute_approved_plan
 from settlement_report import build_symbol_report, send_settlement_report
 from broker.market_utils import get_kst_now, is_us_dst, is_us_trading_day
 from strategy import 무한매수법_V4, adjust_price_to_tick
@@ -3625,7 +3625,11 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
                     failures += 1
                 else:
                     failed = int((result or {}).get("failed", 0))
-                    if failed:
+                    if (result or {}).get("skipped"):
+                        # 주문 창이 닫힌 정상 SKIP — "실행 완료"로 알리지 않습니다
+                        # (SKIP 알림은 execute_approved_plan 이 이미 발송).
+                        print(f"[AUTO_EXECUTE] {plan.symbol} 주문 SKIP: {result['skipped']}")
+                    elif failed:
                         notify(
                             f"⚠️ [AUTO_EXECUTE] {plan.symbol} 실행 실패 "
                             f"({failed}건)",
@@ -3674,7 +3678,9 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
         if not plan_ref:
             print("[EXECUTE] APPROVAL_PLAN_ID 또는 APPROVAL_FILE 이 필요합니다.")
             return 1
-        if not broker.is_trading_day():
+        # 주문 대상 세션이 휴장·마감이면 execute_approved_plan() 이 정상 SKIP 합니다.
+        # 주문 창은 열려 있는데 브로커가 휴장이라고 하면 기존대로 실패(fail-closed)입니다.
+        if not broker.is_trading_day() and closed_order_window(sys.modules[__name__]) is None:
             print("[EXECUTE] 미국 증시 휴장일입니다. 주문을 실행하지 않습니다.")
             return 1
         # 승인 파일도 같은 해시로 대조합니다 (사람이 검토한 계획 == 실제 실행 계획).
@@ -3694,6 +3700,20 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
         return int((result or {}).get("failed", 0))
 
     raise RuntimeError(f"알 수 없는 RUN_PHASE: {run_phase}")
+
+
+def _write_run_skip_marker(reason):
+    """state 를 바꾸지 않은 **정상 SKIP** 을 호출자(Actions 워크플로)에 알립니다.
+
+    `RUN_SKIP_MARKER` 가 지정된 경우에만 파일에 한 줄을 덧붙입니다 (대상이 여러 개면
+    SKIP 건수만큼). 워크플로는 이 표식이 있는 실행을 캐시 저장·정산 검증에서 제외할 수
+    있으므로, 오류 경로나 state 를 저장한 경로에서는 호출하면 안 됩니다.
+    """
+    path = os.getenv("RUN_SKIP_MARKER", "").strip()
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(" ".join(str(reason).split()) + "\n")
 
 
 def _phase_waits_outside_lock():
@@ -3913,6 +3933,7 @@ def _main_locked():
             today_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %A")
             print(f"\n📅 오늘({today_str})은 미국 증시 휴장일입니다. 프로그램을 종료합니다.")
             notify("📅 오늘은 미국 증시 휴장일입니다. 자동매매를 실행하지 않습니다.")
+            _write_run_skip_marker(f"{today_str} 미국 증시 휴장일 (정산·주문 미실행)")
             return
 
         # ========================================
