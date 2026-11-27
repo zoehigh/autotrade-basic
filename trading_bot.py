@@ -553,6 +553,14 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
             f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
             f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
         )
+    if state.get("_odno_reuse_ambiguous"):
+        # KIS 모의 주문번호 재사용으로 체결을 구분할 수 없는 보류 — "금액 확정 후 재실행"으로 해소되지 않으므로
+        # 일시적 보류와 다른 사유·안내(수동 확인, 전용 복구 도구 없음)를 그대로 알립니다.
+        reason = state.get("_settlement_hold_reason", "주문번호 재사용으로 체결을 구분할 수 없음")
+        msg = f"[보류] {symbol} {reason}"
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(msg)
     pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
     if pending_amount_odnos:
         pending_marker_odnos = [str(o) for o in (state.get("_pending_marker_odnos") or [])]
@@ -699,6 +707,9 @@ def build_settlement_evidence(
             # ord_datetime_utc 가 없는 행도 검증기가 (시각, 주문번호) 순서를
             # 복원할 수 있도록 원시 주문시각을 함께 남깁니다.
             "ord_tmd": str(row.get("ord_tmd", "") or ""),
+            # 메리츠/TOSS는 ord_dt가 KST 날짜입니다. 검증기가 미국 세션으로
+            # 오해하지 않도록 브로커 원본 컨벤션 플래그를 근거에 함께 남깁니다.
+            "_ord_dt_is_kst_date": bool(row.get("_ord_dt_is_kst_date", False)),
             "price": float(row.get("ft_ccld_unpr3", "0") or 0.0),
             "amount": fill_amount,
             "amount_confirmed": not bool(amount_estimated),
