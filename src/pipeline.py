@@ -33,6 +33,7 @@ import config
 from state import (
     _fill_amount,
     _has_unconfirmed_amount_fills,
+    _history_row_for_meta,
     _index_history_by_odno,
     _order_us_session_date,
     _parse_processed_qty_marker,
@@ -1115,7 +1116,7 @@ def _history_new_fill_odnos(state, order_history):
     # 정산과 같은 조회표를 써야 합니다 (KIS 모의: 같은 번호의 체결 행 우선, 그 외는 마지막 행).
     by_odno = _index_history_by_odno(order_history)
     for odno, meta in (state.get("orders_meta") or {}).items():
-        row = by_odno.get(str(odno))
+        row = _history_row_for_meta(by_odno, odno, meta)
         if row is None:
             continue
         try:

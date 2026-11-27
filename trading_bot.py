@@ -553,6 +553,14 @@ def _save_settlement_state(symbol: str, state: dict) -> bool:
             f"{symbol} 보유수량 기준 미확보로 정산 저장과 신규 주문을 보류합니다. "
             f"브로커 잔고 조회와 state.position_qty 를 확인하세요."
         )
+    if state.get("_odno_reuse_ambiguous"):
+        # KIS 모의 주문번호 재사용으로 체결을 구분할 수 없는 보류 — "금액 확정 후 재실행"으로 해소되지 않으므로
+        # 일시적 보류와 다른 사유·안내(수동 확인, 전용 복구 도구 없음)를 그대로 알립니다.
+        reason = state.get("_settlement_hold_reason", "주문번호 재사용으로 체결을 구분할 수 없음")
+        msg = f"[보류] {symbol} {reason}"
+        print(msg)
+        notify(msg, urgent=True)
+        raise SymbolScopedError(msg)
     pending_amount_odnos = list(state.get("_pending_amount_odnos") or [])
     if pending_amount_odnos:
         pending_marker_odnos = [str(o) for o in (state.get("_pending_marker_odnos") or [])]
