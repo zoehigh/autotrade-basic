@@ -129,7 +129,7 @@ LIVE 의 `LIFECYCLE`/`EXECUTE` 는 봇 실행 전에 `ops/session_gate.py` 가 *
 | 마감 후 애프터아워 종료 전 (조기폐장 포함) | 봇 미실행 | `SKIPPED` | 저장 안 함 | 제외 |
 | 위 SKIP 인데 state 에 보류 표식 | 실패 | `NOT_STARTED` | 저장 안 함 | 실행(실패) |
 | `EXECUTE` 단독, 주문 창 닫힘 | 봇이 승인 확인 후 주문 SKIP (승인 미소비) | `SKIPPED` | 저장 안 함 | 제외 |
-| 위에서 승인 없음·재사용·검토 해시 불일치 | 실패 | `PARTIAL_FAILURE` | 저장 | 실행(실패) |
+| 위에서 승인 없음·재사용·변조·바인딩/해시 불일치·보류 | 실패 | `PARTIAL_FAILURE` | 저장 | 실행 |
 | 게이트 실패 (검토 표식·해시·대기 상한·캘린더/state 오류) | 실패 | `NOT_STARTED` | 저장 안 함 | 실행(실패) |
 | `SETTLE` 실패 | 실패 | `FAILED` | 저장 | 실행 |
 | `SETTLE` 이후 실패 (부분 접수 가능) | 실패 | `PARTIAL_FAILURE` | 저장 | 실행 |
