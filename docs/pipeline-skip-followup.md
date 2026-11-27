@@ -111,14 +111,15 @@
 4. 메리츠 pipeline 전환 시 로컬 cron·VERIFY 개선 (위 항목).
 5. 공개 저장소의 민감한 운영 정보 제거와 보안 점검 (상세는 공개 문서에 적지 않음).
 
-## 5. #29·#30 병합 후 통합 재검증 계획
+## 5. #29·#30 병합 후 통합 재검증 — 완료 (2026-11-27)
 
-#29·#30 은 별도 세션에서 처리합니다. 둘이 main 에 병합된 뒤, #31 병합 전에:
+대상: `origin/main`(`7e03b8c`) 을 merge 한 `af9fb6f`. 충돌 없음, main 쪽 `.github/` 변경 없음.
 
-1. `origin/main` 을 #31 브랜치에 merge (rebase 하지 않음). 겹치는 파일: `src/pipeline.py`, `trading_bot.py`.
-2. 충돌이 없어도 확인: #29 의 정산 근거 보존·검증 변경과 #31 의 정산 검증 제외 조건·
-   `verify_approval(check_time=False)`, #30 의 새 정산 보류가 휴장일 SETTLE 에서 **실패로 드러나는지**.
-3. 전체 pytest 를 두 환경에서 실행: 저장소 `.env` / `.env` 없이 `BROKER=kis BROKER_MODE=demo`
-   (+ kiwoom·nhplug demo, nhplug 은 더미 `ACCOUNT_FINGERPRINT_SECRET`). meritz real 은 main 의 기존 실패 목록과 비교.
-4. `git diff --check`. 승인 후 `ops/mock_actions/` 를 병합 결과로 다시 생성해 Actions 에서 실행.
-5. 코드 충돌 해소가 있었을 때만 독립 리뷰 1회.
+- 전체 pytest: 저장소 `.env` 와 `.env` 없는 kis·kiwoom·nhplug demo/real 6개 조합 모두 2395 passed,
+  106 skipped, 1 xfailed. meritz real 의 실패 39건은 main 과 동일(기존 환경 의존). `git diff --check` 통과.
+- 정산 검증 **성공** 경로: 로컬에서 테스트 fixture 근거에 워크플로의 스냅샷·암호화·복호화·검산 스크립트를
+  실행해 통과 확인(변조·코드 버전 불일치·종목 누락은 실패). #30 의 번호 재사용 보류는 휴장일 SETTLE 에서 실패.
+  **GitHub Actions 에서의 성공 경로는 미확인**입니다.
+- Mock Actions 는 워크플로·하네스가 바뀌지 않아 다시 실행하지 않았습니다.
+- 독립 리뷰(Codex) P2 1건: 게이트 통과 후 EXECUTE 전에 장이 마감되면 `PARTIAL_FAILURE` — 접수되지 않은
+  실행을 드러내기 위해 **유지**합니다.
