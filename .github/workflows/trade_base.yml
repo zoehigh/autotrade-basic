@@ -434,7 +434,8 @@ jobs:
       # ═ 봇 실행 스크립트 설명 (run 블록 길이를 21,000자 아래로 유지하려고 YAML 주석에 둡니다) ═
       # ── 실행 결과 표식 ──
       # 같은 키를 여러 번 쓰면 마지막 값이 남습니다 → 중간에 죽어도 직전 표식이 남습니다.
-      # bot_started=false 는 "봇을 실행하지 않았다"는 **적극적인 증거**일 때만 남습니다.
+      # state_may_change=false 는 "state 를 바꾸지 않았다"는 **적극적인 증거**(봇 미실행, 또는 봇이
+      # 확인한 EXECUTE SKIP)일 때만 남습니다.
       # state 캐시 저장 가드는 이 값이 'false' 일 때만 저장을 생략합니다 (그 외는 보수적으로 저장).
       # ── 세션 게이트 ──
       # 주문 대상 세션 판정 + hosted 러너 대기 시간 예산.
@@ -484,6 +485,17 @@ jobs:
       #      파일의 plan_hash 와 대조합니다 (불일치 = 승인/실행 중단).
       #      완전 자동 경로(LIFECYCLE + reviewed=true)는 정책상 허용하되, 이 바인딩이
       #      없으므로 "사람 검토"가 아니라 "자동 진행"입니다 (ops/cron.example 참고).
+      # self-hosted runner 작업 디렉터리는 실행 간 재사용됩니다. 이전 실행이 남긴 주문번호 매핑
+      # 원장(odno-map-*.jsonl)은 아래 Evidence 단계의 `odno-map-*.jsonl` 글롭에 그대로 걸려
+      # **이번 실행의 암호화 Evidence 에 섞여** 업로드됩니다 (지난 실행 원문 주문번호가 이번
+      # 실행 근거로 둔갑). 봇을 실행하기 **전**에 지워 이번 실행이 만든 원장만 남깁니다.
+      # ⚠️ 봇 실행 **뒤**에는 절대 지우지 않습니다 — 그 시점의 원장이 이번 실행의 근거입니다.
+      # ── 5/5: 주문 실행 검증 (EXECUTE 실패와 무관하게 항상 실행) ──────────
+      # EXECUTE 가 실패해도 남은 승인 건의 "실제 접수·전송 여부"는 따로 확인해야 하므로
+      # 이 단계는 execute_failed 와 관계없이 돕니다 (실패 원인과 검증 결과를 구분).
+      # 단독 VERIFY — 봇이 실제로 수행한 검증 결과(PASS/FAIL/NOT_EXECUTED)를 그대로
+      # job output 에 남깁니다. (예전에는 검증을 하고도 여기서 SKIPPED 를 덮어써
+      # "검증 생략"으로 잘못 표시됐고, 실패 시에는 기록 전에 종료돼 빈 값이 됐습니다)
       - name: 자동매매 봇 실행
         # 주문 실행 검증(VERIFY) 결과를 job output 으로 넘기기 위한 id 입니다.
         # (정산 검증 결과와 구분해 보고하려고 verify-settlement job 으로도 전달합니다)
@@ -672,19 +684,15 @@ jobs:
           # ══ 실행 결과 표식 (설명은 이 스텝 위의 주석) ══
           set_out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
           set_outcome() { set_out run_outcome "$1"; set_out run_reason "$2"; }
-          set_out bot_started false
+          set_out state_may_change false
           set_outcome NOT_STARTED "봇 실행 전 중단 (게이트/설정 확인)"
-          # **봇을 처음 실행하기 직전에** 호출합니다.
-          mark_bot_started() {
-            set_out bot_started true
+          # state 를 바꿀 수 있는 **봇 실행 직전에** 호출합니다.
+          mark_state_may_change() {
+            set_out state_may_change true
             set_outcome FAILED "봇 실행 중 실패/중단"
           }
 
-          # self-hosted runner 작업 디렉터리는 실행 간 재사용됩니다. 이전 실행이 남긴 주문번호 매핑
-          # 원장(odno-map-*.jsonl)은 아래 Evidence 단계의 `odno-map-*.jsonl` 글롭에 그대로 걸려
-          # **이번 실행의 암호화 Evidence 에 섞여** 업로드됩니다 (지난 실행 원문 주문번호가 이번
-          # 실행 근거로 둔갑). 봇을 실행하기 **전**에 지워 이번 실행이 만든 원장만 남깁니다.
-          # ⚠️ 봇 실행 **뒤**에는 절대 지우지 않습니다 — 그 시점의 원장이 이번 실행의 근거입니다.
+          # 이전 실행의 주문번호 원장 제거 (설명은 이 스텝 위의 주석)
           rm -f odno-map-*.jsonl
 
           PLAN_DIR_DEFAULT=plans
@@ -892,9 +900,8 @@ jobs:
             fi
           fi
 
-          # 정산까지 실행하지 않는 **정상 SKIP** 으로 끝냅니다 (봇 미실행 → state 캐시 저장·정산 검증 없음).
           # 이전 실행의 보류 표식이 state 에 남아 있으면 정상 SKIP 으로 숨기지 않고 실패합니다.
-          skip_without_bot() { # $1 = 사유
+          require_no_state_hold() {
             local hold
             hold=$(gate_value state_hold)
             if [[ -n "$hold" ]]; then
@@ -902,7 +909,11 @@ jobs:
               set_outcome NOT_STARTED "보류 상태 잔존: $hold"
               exit 1
             fi
+          }
+          # state 를 바꾸지 않았고 정산도 실행하지 않은 **정상 SKIP** (캐시 저장·정산 검증 없음).
+          finish_normal_skip() { # $1 = 사유
             echo "::notice::정상 SKIP — $1"
+            set_out state_may_change false
             set_out settlement_status SKIPPED
             set_outcome SKIPPED "$1"
             mark_order_verify_skipped "$1"
@@ -949,18 +960,20 @@ jobs:
                 exit 1
               fi
             fi
-            # 주문 창이 닫힌 EXECUTE 는 봇을 실행하지 않고 정상 SKIP 합니다. 대상 지정이 없으면
-            # 설정 오류이므로 SKIP 하지 않고 봇이 실패하게 둡니다.
-            if [[ "$phase" == "EXECUTE" && "$window_state" == "closed" \
-                  && -n "$(printf '%s' "$refs" | tr -d '[:space:],')" ]]; then
-              skip_without_bot "$(gate_value reason) (RUN_PHASE=EXECUTE — 주문 미실행)"
+            # 주문 창이 닫힌 EXECUTE 도 봇을 실행합니다 — 승인 파일 존재·재사용·검토 해시는
+            # 봇이 확인해야 하며, 통과한 대상만 SKIP 표식을 남깁니다 (주문·state 저장 없음).
+            skip_marker=""
+            if [[ "$phase" == "EXECUTE" && "$window_state" == "closed" ]]; then
+              require_no_state_hold
+              skip_marker=$(mktemp)
+              export RUN_SKIP_MARKER="$skip_marker"
             fi
             if [[ -z "$phase" ]]; then
-              mark_bot_started
+              mark_state_may_change
               run_legacy_bot
               exit 0
             fi
-            mark_bot_started
+            mark_state_may_change
             case "$phase" in
               SETTLE) set_out settlement_status ATTEMPTED ;;
               EXECUTE) set_outcome PARTIAL_FAILURE "EXECUTE 단계 실패 (주문 접수 여부는 VERIFY·로그 확인)" ;;
@@ -1011,6 +1024,15 @@ jobs:
               exit 1
             fi
 
+            # 닫힌 창에서 **모든 대상**이 검증을 통과해 SKIP 했으면 정상 SKIP 입니다.
+            if [[ -n "$skip_marker" && "$failed" -eq 0 ]]; then
+              ref_total=$(printf '%s\n' "$refs" | tr ',' '\n' | grep -c '[^[:space:]]' || true)
+              skip_total=$(grep -c . "$skip_marker" || true)
+              if [[ "$ref_total" -gt 0 && "$skip_total" -eq "$ref_total" ]]; then
+                finish_normal_skip "$(gate_value reason) (RUN_PHASE=EXECUTE — 주문 미실행)"
+              fi
+            fi
+
             # EXECUTE 단독 실행도 끝나면 주문 실행 검증(RUN_PHASE=VERIFY)을 자동 수행합니다.
             # 같은 job·같은 작업 디렉터리라 승인 파일·정산 근거가 그대로 있습니다.
             if [[ "$phase" == "EXECUTE" ]]; then
@@ -1030,9 +1052,7 @@ jobs:
                 failed=$((failed + 1))
               fi
             elif [[ "$phase" == "VERIFY" ]]; then
-              # 단독 VERIFY — 봇이 실제로 수행한 검증 결과(PASS/FAIL/NOT_EXECUTED)를 그대로
-              # job output 에 남깁니다. (예전에는 검증을 하고도 여기서 SKIPPED 를 덮어써
-              # "검증 생략"으로 잘못 표시됐고, 실패 시에는 기록 전에 종료돼 빈 값이 됐습니다)
+              # 단독 VERIFY 결과 기록 (설명은 이 스텝 위의 주석)
               report_order_verify
               if [[ "$order_verify_exit" -ne 0 ]]; then
                 echo "::error::RUN_PHASE=VERIFY 실패 — 주문 실행 검증 결과 ${order_verify_status} (${order_verify_summary})"
@@ -1057,7 +1077,7 @@ jobs:
           # ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY (설명은 이 스텝 위의 주석) ──
           if [[ "${TRADE_MODE:-}" != "LIVE" ]]; then
             echo "::notice::RUN_PHASE=LIFECYCLE + TRADE_MODE=${TRADE_MODE:-} → DRY 미리보기만 실행합니다 (APPROVE/EXECUTE/VERIFY 는 LIVE 전용)"
-            mark_bot_started
+            mark_state_may_change
             run_legacy_bot
             exit 0
           fi
@@ -1067,9 +1087,10 @@ jobs:
             closed_reason=$(gate_value reason)
             settled_session=$(gate_value settled_session)
             if [[ "$(gate_value settlement_due)" != "true" ]]; then
-              skip_without_bot "$closed_reason; 직전 세션 ${settled_session} 은 애프터아워 종료 전이라 다음 실행에서 정산합니다"
+              require_no_state_hold
+              finish_normal_skip "$closed_reason; 직전 세션 ${settled_session} 은 애프터아워 종료 전이라 다음 실행에서 정산합니다"
             fi
-            mark_bot_started
+            mark_state_may_change
             set_out settlement_status ATTEMPTED
             echo "::group::[LIFECYCLE 1/5] SETTLE (주문 SKIP: $closed_reason)"
             RUN_PHASE=SETTLE uv run python trading_bot.py
@@ -1086,7 +1107,7 @@ jobs:
           plans_before=$(mktemp)
           ls -1 "$PLAN_DIR_DEFAULT" 2>/dev/null | sort > "$plans_before"
 
-          mark_bot_started
+          mark_state_may_change
           set_out settlement_status ATTEMPTED
           echo "::group::[LIFECYCLE 1/5] SETTLE"
           RUN_PHASE=SETTLE uv run python trading_bot.py
@@ -1163,9 +1184,7 @@ jobs:
           fi
           echo "::endgroup::"
 
-          # ── 5/5: 주문 실행 검증 (EXECUTE 실패와 무관하게 항상 실행) ──────────
-          # EXECUTE 가 실패해도 남은 승인 건의 "실제 접수·전송 여부"는 따로 확인해야 하므로
-          # 이 단계는 execute_failed 와 관계없이 돕니다 (실패 원인과 검증 결과를 구분).
+          # ── 5/5: 주문 실행 검증 (설명은 이 스텝 위의 주석)
           echo "::group::[LIFECYCLE 5/5] VERIFY (주문 실행 검증)"
           if [[ ! -s "$approved" ]]; then
             echo "::notice::승인된 계획이 없어 주문 실행 검증(VERIFY)을 생략합니다"
@@ -1226,27 +1245,27 @@ jobs:
       # state 캐시 저장 가드: 실제로 확정된 실행 모드(steps.resolve.outputs.trade_mode)가 LIVE 또는 REPAIR 이고
       # **봇이 시작됐을 가능성이 있을 때만** 새 캐시를 만듭니다. DRY·미확정·잘못된 값은 저장하지 않아
       # "운영 복원 후보"가 생기지 않습니다.
-      # - 봇 스텝이 실행되지 않았거나(skipped) bot_started=false(게이트 중단·정상 SKIP)면 state 가 바뀌지 않았으므로
+      # - 봇 스텝이 실행되지 않았거나(skipped) state_may_change=false(게이트 중단·정상 SKIP)면 state 를 바꾸지 않았으므로
       #   저장하지 않습니다. 표식이 비어 있으면(강제 종료 등) state 가 바뀌었을 수 있으므로 저장합니다.
       # - 복원(state 캐시 복원)은 모든 모드에서 허용합니다.
       # - always() 는 유지합니다: LIVE 실행이 일부 주문 처리 후 실패해도 state 를 보존해야 합니다 (success() 금지).
       # - 입력값/BROKER_MODE 로 판단하지 않습니다 (실제 실행 모드와 다를 수 있음).
       - name: state 캐시 저장
         uses: actions/cache/save@v4
-        if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.bot_started != 'false' }}
+        if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.state_may_change != 'false' }}
         with:
           path: .state.json
           key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
 
       - name: state 캐시 저장 생략 안내
-        if: ${{ always() && !((steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.bot_started != 'false') }}
+        if: ${{ always() && !((steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.state_may_change != 'false') }}
         # trade_mode 는 dispatch payload 에서 올 수 있는 외부 입력이므로 셸 스크립트에 직접 끼워 넣지 않고 env 로 전달합니다.
         env:
           RESOLVED_MODE: ${{ steps.resolve.outputs.trade_mode }}
-          BOT_STARTED: ${{ steps.bot.outputs.bot_started }}
+          STATE_MAY_CHANGE: ${{ steps.bot.outputs.state_may_change }}
         run: |
           if [[ "$RESOLVED_MODE" == "LIVE" || "$RESOLVED_MODE" == "REPAIR" ]]; then
-            echo "::notice::봇을 실행하지 않아(bot_started='${BOT_STARTED//[^a-z]/?}', 게이트 중단 또는 정상 SKIP) 새 state 캐시를 저장하지 않습니다."
+            echo "::notice::state 변경이 없어(state_may_change='${STATE_MAY_CHANGE//[^a-z]/?}', 게이트 중단 또는 정상 SKIP) 새 state 캐시를 저장하지 않습니다."
             exit 0
           fi
           echo "::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구는 로컬에서 TRADE_MODE=REPAIR 로 실행하세요 (Actions 의 REPAIR 는 현재 차단됩니다)."

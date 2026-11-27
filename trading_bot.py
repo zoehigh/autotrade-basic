@@ -3692,15 +3692,16 @@ def _dispatch_pipeline_phase_locked(run_phase, broker):
 
 
 def _write_run_skip_marker(reason):
-    """정산까지 건너뛴 **정상 SKIP** 을 호출자(Actions 워크플로)에 알립니다.
+    """state 를 바꾸지 않은 **정상 SKIP** 을 호출자(Actions 워크플로)에 알립니다.
 
-    `RUN_SKIP_MARKER` 가 지정된 경우에만 파일을 씁니다. 워크플로는 이 표식이 있는
-    실행만 정산 검증 대상에서 제외하므로, 오류 경로에서는 호출하면 안 됩니다.
+    `RUN_SKIP_MARKER` 가 지정된 경우에만 파일에 한 줄을 덧붙입니다 (대상이 여러 개면
+    SKIP 건수만큼). 워크플로는 이 표식이 있는 실행을 캐시 저장·정산 검증에서 제외할 수
+    있으므로, 오류 경로나 state 를 저장한 경로에서는 호출하면 안 됩니다.
     """
     path = os.getenv("RUN_SKIP_MARKER", "").strip()
     if not path:
         return
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, "a", encoding="utf-8") as fh:
         fh.write(" ".join(str(reason).split()) + "\n")
 
 

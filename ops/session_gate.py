@@ -62,7 +62,7 @@ def state_hold(state_path, symbols=""):
         if wanted and str(symbol).upper() not in wanted:
             continue
         if not isinstance(record, dict):
-            continue
+            raise ValueError(f"state 파일의 {symbol} 기록이 손상됐습니다 (객체가 아님)")
         holds.extend(f"{symbol}:{key}" for key in HOLD_KEYS if record.get(key))
         # 순투입금을 신뢰할 수 없으면 신규 주문이 보류되는 상태입니다.
         if record.get("net_invested_status") == "unresolved":

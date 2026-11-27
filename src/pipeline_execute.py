@@ -482,6 +482,7 @@ def _skip_approved_plan(approval_or_id, approvals_dir, window):
     symbol = approval.get("symbol", "")
     print(f"⏭ [EXECUTE] {symbol} 주문 SKIP: {reason}")
     _write_outcome_record(approval, "approval-skipped", f"order-window: {reason}")
+    _tb()._write_run_skip_marker(f"{symbol} {reason}")
     try:
         _tb().notify(f"⏭ {symbol} 주문 SKIP\n{reason}", urgent=True)
     except Exception as notify_error:

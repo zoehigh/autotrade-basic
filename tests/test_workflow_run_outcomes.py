@@ -84,8 +84,13 @@ if rc == 0 and phase == "PREVIEW":
 if rc == 0 and phase == "APPROVE":
     Path("approvals").mkdir(exist_ok=True)
     Path("approvals", f"{target}.json").write_text("{}")
+marker = os.environ.get("RUN_SKIP_MARKER", "")
 if phase == "LEGACY" and config.get("skip_marker"):
-    Path(os.environ["RUN_SKIP_MARKER"]).write_text(config["skip_marker"] + "\n")
+    Path(marker).write_text(config["skip_marker"] + "\n")
+# 봇의 EXECUTE SKIP: 창이 닫혀 있고 승인 검증을 통과(exit 0)한 대상만 표식을 남깁니다.
+if phase == "EXECUTE" and marker and rc == 0 and target not in config.get("no_skip", []):
+    with open(marker, "a") as fh:
+        fh.write(f"{target} skip\n")
 sys.exit(rc)
 '''
 
@@ -240,7 +245,7 @@ def test_closed_window_with_due_settlement_runs_settle_only(tmp_path, broker):
 def test_closed_window_without_due_settlement_is_normal_skip(tmp_path, broker):
     run = run_bot_step(tmp_path, broker=broker, gate=_gate("closed", due=False))
     _assert_run(run, rc=0, outcome="SKIPPED", cache=False, verify=False, phases=[])
-    assert run.outputs["bot_started"] == "false"
+    assert run.outputs["state_may_change"] == "false"
     assert run.outputs["settlement_status"] == "SKIPPED"
     assert run.outputs["order_verify_status"] == "SKIPPED"
     assert "애프터아워" in run.outputs["run_reason"]
@@ -259,22 +264,66 @@ def test_state_hold_is_not_hidden_by_skip(tmp_path):
     assert "pending_order_intent" in run.outputs["run_reason"]
 
 
-def test_standalone_execute_on_closed_window_is_skip(tmp_path):
-    run = run_bot_step(
+def _execute_closed(tmp_path, refs="P1", **config):
+    config.setdefault("gate", _gate("closed"))
+    return run_bot_step(
         tmp_path, phase="EXECUTE", runner="self-hosted",
-        gate=_gate("closed"), env={"APPROVAL_PLAN_ID": "P1"},
+        env={"APPROVAL_PLAN_ID": refs}, **config,
     )
-    _assert_run(run, rc=0, outcome="SKIPPED", cache=False, verify=False, phases=[])
+
+
+@pytest.mark.parametrize("refs,count", [("P1", 1), ("P1, P2,", 2)])
+def test_standalone_execute_on_closed_window_is_validated_then_skipped(
+    tmp_path, refs, count
+):
+    run = _execute_closed(tmp_path, refs)
+    _assert_run(
+        run, rc=0, outcome="SKIPPED", cache=False, verify=False,
+        phases=["EXECUTE"] * count,
+    )
+    assert run.outputs["order_verify_status"] == "SKIPPED"
+
+
+def test_invalid_approval_is_not_hidden_by_closed_window(tmp_path):
+    """없는·사용된 승인, 검토 해시 불일치는 봇이 exit 1 → SKIP 이 아닙니다."""
+    run = _execute_closed(tmp_path, rc={"EXECUTE": 1, "VERIFY": 1})
+    _assert_run(
+        run, rc=1, outcome="PARTIAL_FAILURE", cache=True, verify=True,
+        phases=["EXECUTE", "VERIFY"],
+    )
+
+
+def test_one_invalid_target_among_skips_is_a_failure(tmp_path):
+    run = _execute_closed(
+        tmp_path, "P1,P2", rc={"EXECUTE:P2": 1, "VERIFY": 2}
+    )
+    _assert_run(run, rc=1, outcome="PARTIAL_FAILURE", cache=True, verify=True)
+
+
+def test_execute_success_without_skip_marker_is_still_verified(tmp_path):
+    """봇이 SKIP 을 확인해 주지 않으면 기존대로 주문 VERIFY 를 수행합니다."""
+    run = _execute_closed(tmp_path, no_skip=["P1"])
+    _assert_run(
+        run, rc=0, outcome="ORDERS_EXECUTED", cache=True, verify=True,
+        phases=["EXECUTE", "VERIFY"],
+    )
+
+
+def test_open_window_execute_never_uses_skip_marker(tmp_path):
+    run = _execute_closed(tmp_path, gate=_gate(), rc={"VERIFY": 2})
+    _assert_run(run, rc=1, outcome="PARTIAL_FAILURE", cache=True, verify=True)
 
 
 def test_execute_without_target_is_config_error_even_when_closed(tmp_path):
-    run = run_bot_step(
-        tmp_path, phase="EXECUTE", runner="self-hosted",
-        gate=_gate("closed"), rc={"EXECUTE": 1, "VERIFY": 1},
-    )
+    run = _execute_closed(tmp_path, "", rc={"EXECUTE": 1, "VERIFY": 1})
     assert run.result.returncode == 1
     assert run.outcome == "PARTIAL_FAILURE"
     assert run.saves_cache() is True
+
+
+def test_state_hold_blocks_closed_execute(tmp_path):
+    run = _execute_closed(tmp_path, gate=_gate("closed", hold="TQQQ:balance_mismatch"))
+    _assert_run(run, rc=1, outcome="NOT_STARTED", cache=False, verify=True, phases=[])
 
 
 @pytest.mark.parametrize("broker", ["kis", "kiwoom", "nhplug", "meritz"])

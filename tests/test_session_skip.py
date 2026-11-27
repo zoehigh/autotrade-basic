@@ -157,7 +157,10 @@ def test_state_hold_clean_and_missing_file(tmp_path):
     assert session_gate.state_hold(path) == ""
 
 
-@pytest.mark.parametrize("content", ["{broken", "[]"])
+@pytest.mark.parametrize(
+    "content",
+    ["{broken", "[]", '{"TQQQ": null}', '{"TQQQ": [], "SOXL": {}}'],
+)
 def test_corrupt_state_is_an_error_not_a_skip(content, tmp_path):
     path = tmp_path / ".state.json"
     path.write_text(content, encoding="utf-8")
@@ -255,8 +258,10 @@ def holiday_clock(monkeypatch):
 
 
 def test_execute_skips_closed_window_without_consuming_approval(
-    io, holiday_clock, tmp_path
+    io, holiday_clock, monkeypatch, tmp_path
 ):
+    marker = tmp_path / "skip-marker"
+    monkeypatch.setenv("RUN_SKIP_MARKER", str(marker))
     state, _plan, path = _approve(tmp_path)
     io["load"]("TQQQ", deepcopy(state))
     broker = _e2e_broker()
@@ -272,6 +277,7 @@ def test_execute_skips_closed_window_without_consuming_approval(
     assert io["saved"] == [], "SKIP 은 state 를 저장하지 않습니다"
     assert pipeline.read_approval_outcome(str(path))["outcome"] == "approval-skipped"
     assert any("SKIP" in message for message in io["notifications"])
+    assert len(marker.read_text(encoding="utf-8").splitlines()) == 1
     holiday_clock.assert_not_called()
 
 
@@ -325,7 +331,11 @@ def test_dispatch_execute_broker_holiday_while_window_open_still_fails(
     assert broker.place_order.call_count == 0
 
 
-def test_used_approval_is_rejected_even_on_holiday(io, holiday_clock, tmp_path):
+def test_used_approval_is_rejected_even_on_holiday(
+    io, holiday_clock, monkeypatch, tmp_path
+):
+    marker = tmp_path / "skip-marker"
+    monkeypatch.setenv("RUN_SKIP_MARKER", str(marker))
     state, _plan, path = _approve(tmp_path)
     io["load"]("TQQQ", deepcopy(state))
     approval = pipeline.load_approval(str(path))
@@ -335,6 +345,12 @@ def test_used_approval_is_rejected_even_on_holiday(io, holiday_clock, tmp_path):
 
     with pytest.raises(RuntimeError, match="이미 사용"):
         pipeline_execute.execute_approved_plan(_e2e_broker(), str(path))
+    assert not marker.exists(), "거부된 승인은 SKIP 표식을 남기지 않습니다"
+    with pytest.raises(Exception):
+        pipeline_execute.execute_approved_plan(
+            _e2e_broker(), str(tmp_path / "missing.json")
+        )
+    assert not marker.exists()
 
 
 def test_calendar_error_during_execute_is_not_a_skip(io, monkeypatch, tmp_path):
@@ -377,7 +393,8 @@ def test_run_skip_marker_is_written_only_when_requested(monkeypatch, tmp_path):
     assert not marker.exists()
     monkeypatch.setenv("RUN_SKIP_MARKER", str(marker))
     trading_bot._write_run_skip_marker("휴장\n둘째 줄")
-    assert marker.read_text(encoding="utf-8") == "휴장 둘째 줄\n"
+    trading_bot._write_run_skip_marker("또 하나")
+    assert marker.read_text(encoding="utf-8") == "휴장 둘째 줄\n또 하나\n"
 
 
 @pytest.mark.parametrize("trading_day", [False, True])
