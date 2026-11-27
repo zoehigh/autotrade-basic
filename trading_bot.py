@@ -699,6 +699,9 @@ def build_settlement_evidence(
             # ord_datetime_utc 가 없는 행도 검증기가 (시각, 주문번호) 순서를
             # 복원할 수 있도록 원시 주문시각을 함께 남깁니다.
             "ord_tmd": str(row.get("ord_tmd", "") or ""),
+            # 메리츠/TOSS는 ord_dt가 KST 날짜입니다. 검증기가 미국 세션으로
+            # 오해하지 않도록 브로커 원본 컨벤션 플래그를 근거에 함께 남깁니다.
+            "_ord_dt_is_kst_date": bool(row.get("_ord_dt_is_kst_date", False)),
             "price": float(row.get("ft_ccld_unpr3", "0") or 0.0),
             "amount": fill_amount,
             "amount_confirmed": not bool(amount_estimated),
