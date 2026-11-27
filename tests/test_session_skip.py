@@ -126,9 +126,18 @@ def test_state_hold_reports_unresolved_markers_without_writing(tmp_path):
     path.write_text(
         json.dumps(
             {
-                "TQQQ": {"pending_order_intent": {"side": "BUY"}, "balance_mismatch": {}},
-                "SOXL": {"balance_mismatch": {"note": "x"}, "pending_order_batch": None},
-                "OLD": {"pending_order_batch": {"orders": []}},
+                symbol: {"net_invested_status": "valid", **record}
+                for symbol, record in {
+                    "TQQQ": {
+                        "pending_order_intent": {"side": "BUY"},
+                        "balance_mismatch": {},
+                    },
+                    "SOXL": {
+                        "balance_mismatch": {"note": "x"},
+                        "pending_order_batch": None,
+                    },
+                    "OLD": {"pending_order_batch": {"orders": []}},
+                }.items()
             }
         ),
         encoding="utf-8",
@@ -141,13 +150,24 @@ def test_state_hold_reports_unresolved_markers_without_writing(tmp_path):
     assert path.read_bytes() == before
 
 
-def test_state_hold_reports_unresolved_net_invested(tmp_path):
+@pytest.mark.parametrize(
+    "record,held",
+    [
+        ({"net_invested": 0.0, "net_invested_status": "unresolved"}, True),
+        ({"net_invested": -1.0, "net_invested_status": "unresolved"}, True),
+        ({"net_invested": 0.0}, True),  # status 누락 = unresolved
+        ({"net_invested": 0.0, "net_invested_status": "??"}, True),
+        ({"net_invested": 500.0, "net_invested_status": "unresolved"}, False),
+        ({"net_invested": 500.0}, False),  # 양수 레거시 state 는 기존 운용 유지
+        ({"net_invested": 0.0, "net_invested_status": "valid"}, False),
+    ],
+)
+def test_net_invested_hold_matches_strategy_gate(record, held, tmp_path):
     path = tmp_path / ".state.json"
-    path.write_text(
-        json.dumps({"TQQQ": _base_state(net_invested_status="unresolved")}),
-        encoding="utf-8",
+    path.write_text(json.dumps({"TQQQ": record}), encoding="utf-8")
+    assert session_gate.state_hold(path) == (
+        "TQQQ:net_invested_status" if held else ""
     )
-    assert session_gate.state_hold(path) == "TQQQ:net_invested_status"
 
 
 def test_state_hold_clean_and_missing_file(tmp_path):

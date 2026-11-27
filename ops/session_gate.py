@@ -64,8 +64,12 @@ def state_hold(state_path, symbols=""):
         if not isinstance(record, dict):
             raise ValueError(f"state 파일의 {symbol} 기록이 손상됐습니다 (객체가 아님)")
         holds.extend(f"{symbol}:{key}" for key in HOLD_KEYS if record.get(key))
-        # 순투입금을 신뢰할 수 없으면 신규 주문이 보류되는 상태입니다.
-        if record.get("net_invested_status") == "unresolved":
+        # 전략의 신규 주문 보류 조건(strategy.py "net_invested 신뢰성 게이트")과 같습니다:
+        # status 가 valid 가 아니고(누락 포함) 순투입금이 0 이하일 때만 보류입니다.
+        if (
+            record.get("net_invested_status") != "valid"
+            and float(record.get("net_invested", 0.0) or 0.0) <= 0
+        ):
             holds.append(f"{symbol}:net_invested_status")
     return ",".join(holds)
 
