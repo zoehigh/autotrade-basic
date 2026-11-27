@@ -229,3 +229,28 @@ def test_additional_loc_odno_에_남은_번호가_재사용된_신규_일반_매
     st["additional_loc_odno"] = [N]                            # 과거 미등록 추가매수가 같은 번호
     result = _settle(st, [_new_row(5, 10.0)])
     assert result["T"] == pytest.approx(5.5, abs=1e-3)         # 일반 매수이므로 T 가 올라야 함
+
+
+# ───────── 기존 state 의 0 마커 + 매도 효과 기록 (과잉 차단 방지, 기본 KIS 모의 환경 회귀) ─────────
+
+def _legacy_zero_marker_sell_meta():
+    """기존 state 형태: processed_filled_qty=0 이지만 버전 표식이 없어 '미반영'을 증명하지 못하는 메타."""
+    meta = _sell_meta(0)
+    del meta["fill_marker_version"]
+    return meta
+
+
+def test_미반영을_증명할_수_없는_0_마커와_매도_효과_기록은_번호_충돌로_보지_않는다():
+    """효과 기록이 있고 마커가 0 이어도, 버전 표식이 없으면 이미 반영된 같은 주문일 수 있어 기존 동작을 유지합니다."""
+    st = _state(_legacy_zero_marker_sell_meta(), last_updated=MID_WM)
+    st["sell_t_effects"] = {N: {"basis": 20, "factor": 0.75}}
+    assert state_module._ambiguous_reused_odnos(st, [(None, N, _sell_row(5))]) == {}
+    result = _settle(st, [_sell_row(5)])
+    assert result.get("_pending_amount_odnos") is None
+    assert "구분할 수 없" not in str(result.get("_settlement_hold_reason", ""))
+
+
+def test_미반영이_증명되는_신규_메타의_첫_매도_체결만_효과_기록과_충돌로_본다():
+    st = _state(_sell_meta(0), last_updated=MID_WM)                  # fill_marker_version 있음
+    st["sell_t_effects"] = {N: {"basis": 20, "factor": 0.75}}
+    assert list(state_module._ambiguous_reused_odnos(st, [(None, N, _sell_row(5))])) == [N]

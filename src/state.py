@@ -619,8 +619,9 @@ def _ambiguous_reused_odnos(state, recent_candidates):
     수량·금액 델타(deltas)와 매도 효과(sell_t_effects)는 주문번호만으로 저장·조회하므로(상태 스키마 변경 제외),
     구분이 불가능한 경우에는 잘못 반영하지 않고 정산을 보류합니다.
       1) 같은 번호의 서로 다른 날짜 체결 행이 한 묶음에 함께 들어온 경우
-      2) 매도 행의 번호가 이미 sell_t_effects 에 있는데, 그 행이 이 메타의 첫 체결(processed=0)이거나
-         다른 날짜 행인 경우 — 기존 기록이 다른 주문(같은 번호)의 누적 기준일 수 있음
+      2) 매도 행의 번호가 이미 sell_t_effects 에 있는데, 그 행이 신규 등록 메타(미반영이 증명되는 마커)의 첫 체결이거나
+         다른 날짜 행인 경우 — 기존 기록이 다른 주문(같은 번호)의 누적 기준일 수 있음.
+         미반영을 증명할 수 없는 기존 state 의 0 마커는 이미 반영된 주문일 수 있어 대상이 아님(기존 동작)
     """
     if not _zero_fill_rows_are_new_in_history():
         return {}
@@ -640,8 +641,10 @@ def _ambiguous_reused_odnos(state, recent_candidates):
         meta = orders_meta.get(odno)
         if meta is None:
             continue
-        _has_marker, processed = _parse_processed_qty_marker(meta)
-        if not _row_matches_meta_date(row, meta) or processed <= 0:
+        # "첫 체결"은 신규 등록 메타(버전 표식 + 수량 0 + 금액 0.0)만 증명할 수 있습니다. 기존 state 의 0 마커는
+        # 미반영의 증거가 아니므로(이미 반영된 매도 효과 기록이 있을 수 있음) 보류 대상에서 제외합니다 — 기존 정산 동작 유지.
+        first_fill_of_new_order = _marker_proves_unapplied(meta)
+        if not _row_matches_meta_date(row, meta) or first_fill_of_new_order:
             ambiguous[odno] = "매도 효과 기록이 이 행의 주문(같은 번호의 다른 주문일 수 있음)에 속하는지 구분 불가"
     return ambiguous
 
