@@ -1,0 +1,97 @@
+# 생성 파일 (ops/mock_actions/build.py) — main/PR 에 커밋하지 마세요.
+name: Mock 정산 근거 검증 (verify.yml 사본)
+jobs:
+  verify:
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: 코드 체크아웃
+      uses: actions/checkout@v4
+    - name: uv 설치
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: false
+    - name: Python 설정
+      run: uv python install
+    - name: 의존성 설치
+      run: uv sync
+    - name: 거래 job 결과 확인
+      run: echo "trade_result=${{ inputs.trade_result || 'unknown' }}"
+    - name: 주문 실행 검증 결과 (표시 전용 — 이 job 의 성패와 무관)
+      env:
+        ORDER_VERIFY_STATUS: ${{ inputs.order_verify_status }}
+        ORDER_VERIFY_SUMMARY: ${{ inputs.order_verify_summary }}
+      run: "export LC_ALL=C\n# 외부 컨텍스트 값이므로 셸에 직접 끼워 넣지 않고 env 로만 받아,\n# 로그에 찍을 때 개행·제어문자를 제거합니다 (워크플로 명령 주입 방지).\nsafe() { printf '%s' \"${1//[^[:print:]]/?}\"; }\nstatus=$(safe \"${ORDER_VERIFY_STATUS:-}\")\nsummary=$(safe \"${ORDER_VERIFY_SUMMARY:-}\")\nif [[ -z \"$status\" ]]; then\n  status=\"(기록 없음)\"\n  summary=\"거래 job 이 VERIFY 단계 전에 중단됐을 수 있습니다 — 주문 실행 검증 미완료\"\nfi\necho \"[주문 실행 검증(VERIFY)] ${status} — ${summary}\"\nif [[ \"$status\" != \"PASS\" && \"$status\" != \"SKIPPED\" ]]; then\n  echo \"::warning::주문 실행 검증(VERIFY)이 통과하지 않았습니다 (${status}). 정산 검증이 통과해도 주문 실행이 검증된 것은 아닙니다 — 거래 job 로그를 확인하세요.\"\nfi\necho \"[정산 검증] 이 job 이 아래에서 독립 검산합니다 — 위 주문 실행 검증과는 별개 결과입니다.\"\n"
+    - name: 정산 근거 다운로드
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: evidence
+    - name: 정산 근거 복호화
+      shell: bash
+      env:
+        PASSPHRASE: mock-passphrase-not-a-secret
+      run: "set -euo pipefail\numask 077\nshopt -s nullglob\nenc=(evidence/*.gpg)\nif [[ ${#enc[@]} -eq 0 ]]; then\n  echo \"[정보] 암호화본이 없습니다 (근거 없음 또는 구버전 평문 artifact)\"\n  exit 0\nfi\nif [[ -z \"$PASSPHRASE\" ]]; then\n  echo \"::error::복호화 패스프레이즈가 없어 정산 근거를 검증할 수 없습니다\"\n  exit 1\nfi\n# 임시 디렉터리에 먼저 풀고 전부 성공했을 때만 evidence/ 로 옮깁니다\n# (손상 암호문이 일부만 풀린 채 검산 단계로 넘어가는 것을 막습니다).\nstage=$(mktemp -d)\ntrap 'rm -rf \"$stage\"' EXIT\nfor f in \"${enc[@]}\"; do\n  gpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt \"$f\" \\\n    3< <(printf '%s' \"$PASSPHRASE\") | tar xz -C \"$stage\"\ndone\nmv \"$stage\"/* evidence/\n"
+    - name: 정산 근거 독립 검산
+      env:
+        BROKER: ${{ inputs.broker }}
+        MODE: ${{ inputs.mode }}
+        RUN_ID: ${{ inputs.run_id }}
+        RETRY_NUM: ${{ inputs.retry_num }}
+        CODE_VERSION: ${{ inputs.code_version }}
+        BROKER_MODE: ${{ inputs.broker_mode }}
+      run: "uv run python - <<'PY'\nimport glob\nimport os\nimport sys\nfrom pathlib import Path\n\nsys.path.insert(0, \"ops\")\nimport verify_run\n\n# 이 단계는 **정산 검증**만 합니다 (settlement-*.json 독립 재계산, 브로커 API 없음).\n# 주문 실행 검증(RUN_PHASE=VERIFY)은 거래 job 이 담당하며 이 결과와 별개입니다.\nprint(\"[정산 검증] settlement-*.json 독립 검산 (주문 실행 검증과 별개)\")\n\nfiles = sorted(glob.glob(\"evidence/settlement-*.json\"))\nif not files:\n    print(\"[정산 검증][실패] 정산 근거 파일이 없습니다 — 검증 불가\")\n    sys.exit(1)\n\nbroker = os.environ.get(\"BROKER\", \"\")\nmode = os.environ.get(\"MODE\", \"\")\nrun_id = os.environ.get(\"RUN_ID\", \"\")\nok, problems = verify_run.verify_evidence_dir(\n    \"evidence\",\n    broker,\n    mode,\n    run_id=run_id or None,\n    retry_num=os.environ.get(\"RETRY_NUM\") or None,\n    code_version=os.environ.get(\"CODE_VERSION\") or None,\n    broker_mode=os.environ.get(\"BROKER_MODE\") or None,\n)\nif ok:\n    print(f\"[정산 검증][OK ] evidence {len(files)}건 + 최종 스냅샷 검증 통과\")\nelse:\n    print(\"[정산 검증][!! ] 정산 검증 실패\")\n    for problem in problems:\n        print(f\"       - {problem}\")\n    sys.exit(1)\nPY\n"
+'on':
+  workflow_call:
+    inputs:
+      broker:
+        description: 증권사 (kis, kiwoom, ls, toss, nhplug, meritz)
+        required: true
+        type: string
+      mode:
+        description: 거래 모드 (DRY/LIVE) — 실행 job 이 확정한 값 (실패 시 빈 값)
+        required: false
+        type: string
+        default: ''
+      broker_mode:
+        description: 브로커 모드 (demo/real)
+        required: false
+        type: string
+        default: ''
+      run_id:
+        description: 실행 식별자
+        required: true
+        type: string
+      retry_num:
+        description: 재시도 회차
+        required: false
+        type: string
+        default: ''
+      code_version:
+        description: 코드 버전 (github.sha)
+        required: false
+        type: string
+        default: ''
+      trade_result:
+        description: 거래 job 결과 (success/failure/cancelled)
+        required: false
+        type: string
+        default: ''
+      order_verify_status:
+        description: 주문 실행 검증(RUN_PHASE=VERIFY, 거래 job) 결과 — PASS/FAIL/NOT_EXECUTED/SKIPPED/빈 값(미도달)
+        required: false
+        type: string
+        default: ''
+      order_verify_summary:
+        description: 주문 실행 검증 요약 (통과/실패/실행안됨 건수) — 이 job 의 정산 검증과 별개
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: 정산 근거 artifact 이름
+        required: false
+        type: string
+        default: settlement-evidence
+permissions:
+  contents: read

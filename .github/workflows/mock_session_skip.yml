@@ -1,0 +1,123 @@
+# 생성 파일 (ops/mock_actions/build.py) — main/PR 에 커밋하지 마세요.
+name: Mock 세션 SKIP 검증
+'on':
+  push:
+    branches:
+    - mock-verify/**
+permissions:
+  contents: read
+jobs:
+  mock:
+    if: ${{ !contains(github.event.head_commit.message, '[mock-cancel]') }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+        - scenario: orders
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: holiday-settle
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: skip
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: skip-late-failure
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'yes'
+        - scenario: dry-holiday
+          broker: kis
+          broker_mode: demo
+          trade_mode: DRY
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: hold-blocks-skip
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: gate-error
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: wait-budget
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: real-review-gate
+          broker: kis
+          broker_mode: real
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: evidence-missing
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: settle-failure
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: partial
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: killed
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+        - scenario: step-timeout
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: '1'
+          fail_after: 'no'
+    uses: ./.github/workflows/mock_session_skip_run.yml
+    with:
+      scenario: ${{ matrix.scenario }}
+      broker: ${{ matrix.broker }}
+      broker_mode: ${{ matrix.broker_mode }}
+      trade_mode: ${{ matrix.trade_mode }}
+      run_phase: ${{ matrix.run_phase }}
+      bot_timeout: ${{ matrix.bot_timeout }}
+      fail_after: ${{ matrix.fail_after }}

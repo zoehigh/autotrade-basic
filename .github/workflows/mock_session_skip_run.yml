@@ -1,0 +1,348 @@
+# 생성 파일 (ops/mock_actions/build.py) — main/PR 에 커밋하지 마세요.
+name: Mock 세션 SKIP 검증 (재사용)
+'on':
+  workflow_call:
+    inputs:
+      broker:
+        required: false
+        type: string
+        default: kis
+      broker_mode:
+        required: false
+        type: string
+        default: demo
+      trade_mode:
+        required: false
+        type: string
+        default: LIVE
+      run_phase:
+        required: false
+        type: string
+        default: LIFECYCLE
+      bot_timeout:
+        required: false
+        type: string
+        default: ''
+      fail_after:
+        required: false
+        type: string
+        default: 'no'
+      symbols:
+        required: false
+        type: string
+        default: ''
+      quiet_hours:
+        required: false
+        type: string
+        default: ''
+      commission_rate:
+        required: false
+        type: string
+        default: ''
+      reinvest:
+        required: false
+        type: string
+        default: ''
+      run_id:
+        required: false
+        type: string
+        default: ''
+      retry_num:
+        required: false
+        type: string
+        default: ''
+      reviewed:
+        required: false
+        type: string
+        default: ''
+      plan_hash:
+        required: false
+        type: string
+        default: ''
+      plan_id:
+        required: false
+        type: string
+        default: ''
+      approval_plan_id:
+        required: false
+        type: string
+        default: ''
+      auto_execute:
+        required: false
+        type: string
+        default: ''
+      scenario:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  run-trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: mock-skip-${{ inputs.scenario }}-${{ github.run_id }}
+      cancel-in-progress: false
+    outputs:
+      trade_mode: ${{ steps.resolve.outputs.trade_mode }}
+      order_verify_status: ${{ steps.bot.outputs.order_verify_status }}
+      order_verify_summary: ${{ steps.bot.outputs.order_verify_summary }}
+      run_outcome: ${{ steps.bot.outputs.run_outcome }}
+      run_reason: ${{ steps.bot.outputs.run_reason }}
+      settlement_status: ${{ steps.bot.outputs.settlement_status }}
+    steps:
+    - name: 실행 단계 정규화
+      id: phase-guard
+      env:
+        IN_RUN_PHASE: ${{ inputs.run_phase }}
+      run: "set -eo pipefail\n# 로케일에 따라 대소문자 변환이 달라지지 않도록 고정합니다 (self-hosted runner 대비)\nexport LC_ALL=C\nphase=$(printf '%s' \"${IN_RUN_PHASE:-}\" \\\n  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \\\n  | tr '[:lower:]' '[:upper:]')\npreserve=false\ncase \"$phase\" in\n  LIFECYCLE) ;;\n  SETTLE | PREVIEW | APPROVE | EXECUTE | VERIFY) preserve=true ;;\n  *) phase=\"\" ;;\nesac\necho \"[단계] RUN_PHASE='${phase:-<빈 값>}' / 작업 디렉터리 산출물 보존(clean: false)=$preserve\"\necho \"run_phase=$phase\" >> \"$GITHUB_OUTPUT\"\necho \"preserve_workdir=$preserve\" >> \"$GITHUB_OUTPUT\"\n"
+    - name: 코드 체크아웃
+      uses: actions/checkout@v4
+      with:
+        clean: ${{ steps.phase-guard.outputs.preserve_workdir != 'true' }}
+    - name: Mock 격리 (실제 봇 실행 불가, Mock state 준비)
+      run: 'printf ''%s\n'' ''raise SystemExit("mock workflow: real bot is disabled")'' > trading_bot.py
+
+        chmod +x ops/mock_actions/bin/uv
+
+        printf ''%s'' ''{"MOCK": {}}'' > .state.json
+
+        '
+    - name: uv 설치
+      uses: astral-sh/setup-uv@v5
+      with:
+        enable-cache: false
+    - name: Python 설정
+      run: uv python install
+    - name: 의존성 설치
+      run: uv sync
+    - name: 실행 시간 예산 검증
+      id: timeout-budget
+      env:
+        IN_BROKER: ${{ inputs.broker }}
+        IN_BROKER_MODE: ${{ inputs.broker_mode }}
+        IN_PHASE: ${{ steps.phase-guard.outputs.run_phase }}
+        VAR_JOB_TIMEOUT: ${{ '' }}
+        VAR_SELF_HOSTED_JOB_TIMEOUT: ${{ '' }}
+        VAR_BOT_STEP_TIMEOUT: ${{ inputs.bot_timeout }}
+        RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      run: "set -eo pipefail\nexport LC_ALL=C\nlower() { printf '%s' \"$1\" | tr '[:upper:]' '[:lower:]'; }\n# 정수 문자열만 허용합니다. 아니면 기본값으로 대체하고 경고를 남깁니다.\n# (경고를 stdout 으로 내보내므로 명령 치환 대신 전역 INT_VALUE 로 값을 돌려줍니다 —\n#  `$(...)` 로 감싸면 ::warning:: 문구가 값에 섞여 들어갑니다.)\nto_int() { # $1=값 $2=기본값 $3=변수명 → 전역 INT_VALUE\n  local v\n  v=$(printf '%s' \"${1:-}\" | tr -d '[:space:]')\n  # 미설정(빈 값)은 정상입니다 — 기본값을 조용히 사용합니다.\n  if [[ -z \"$v\" ]]; then\n    INT_VALUE=\"$2\"\n    return 0\n  fi\n  case \"$v\" in\n    *[!0-9]*) v=\"\" ;;\n  esac\n  if [[ -z \"$v\" || \"$v\" -le 0 ]]; then\n    echo \"::warning::$3 값이 양의 정수 문자열이 아니어서 기본값 $2 분을 사용합니다.\"\n    v=\"$2\"\n  fi\n  INT_VALUE=\"$v\"\n}\n\n# job-level timeout-minutes 와 같은 규칙으로 self-hosted 조합을 판정합니다.\nbroker_norm=$(lower \"${IN_BROKER:-kis}\")\nbroker_mode_norm=$(lower \"${IN_BROKER_MODE:-demo}\")\nif [[ ( \"$broker_norm\" == \"kiwoom\" || \"$broker_norm\" == \"toss\" ) && \"$broker_mode_norm\" == \"real\" ]]; then\n  to_int \"${VAR_SELF_HOSTED_JOB_TIMEOUT:-}\" 720 \"SELF_HOSTED_JOB_TIMEOUT_MINUTES\"\n  job_timeout=\"$INT_VALUE\"\nelse\n  to_int \"${VAR_JOB_TIMEOUT:-}\" 350 \"JOB_TIMEOUT_MINUTES\"\n  job_timeout=\"$INT_VALUE\"\nfi\n\nslack=10\nif [[ \"$job_timeout\" -le \"$slack\" ]]; then\n  echo \"::error::job timeout 이 ${job_timeout}분이라 사후 단계 여유(최소 ${slack}분)를 확보할 수 없습니다. vars.JOB_TIMEOUT_MINUTES / vars.SELF_HOSTED_JOB_TIMEOUT_MINUTES 를 ${slack}분보다 큰 값으로 설정하세요. 봇을 실행하지 않고 중단합니다 (state 변경 없음).\"\n  exit 1\nfi\n\nmax_bot=$((job_timeout - slack))\nto_int \"${VAR_BOT_STEP_TIMEOUT:-}\" \"$max_bot\" \"BOT_STEP_TIMEOUT_MINUTES\"\nbot_timeout=\"$INT_VALUE\"\nif [[ \"$bot_timeout\" -gt \"$max_bot\" ]]; then\n  echo \"::warning::BOT_STEP_TIMEOUT_MINUTES=${bot_timeout} 는 job timeout(${job_timeout}분) - 사후 예산(${slack}분) 을 넘습니다. ${max_bot}분으로 조정합니다 (사후 단계가 실행되도록).\"\n  bot_timeout=\"$max_bot\"\nfi\necho \"[시간 예산] 봇 실행 스텝 timeout=${bot_timeout}분 / job timeout=${job_timeout}분 (사후 단계 여유 $((job_timeout - bot_timeout))분, 러너=${RUNNER_ENVIRONMENT:-unknown})\"\necho \"bot_timeout_minutes=$bot_timeout\" >> \"$GITHUB_OUTPUT\"\n\n# ── 단독 단계는 앞 단계 산출물이 같은 작업 디렉터리에 남아 있어야 합니다 ──\n# hosted(fresh) 러너는 매 실행이 새 디렉터리이고, 체크아웃(clean)도 산출물을 지웁니다.\n# 근거 없이 실행·검증을 조용히 통과시키지 않도록 **봇 실행 전에** 중단합니다.\n# (산출물을 job artifact 로 넘기는 대안은 정산 근거·원장의 원문 주문번호를 평문으로\n#  업로드할 위험이 있어 채택하지 않았습니다.)\ncase \"${IN_PHASE:-}\" in\n  SETTLE | PREVIEW | APPROVE | EXECUTE | VERIFY)\n    if [[ \"${RUNNER_ENVIRONMENT:-}\" != \"self-hosted\" ]]; then\n      echo \"::error::run_phase=${IN_PHASE} 단독 실행은 앞 단계 산출물(plans/·approvals/·settlement-*.json)이 같은 작업 디렉터리에 남아 있어야 하는데, hosted 러너는 매 실행이 새 디렉터리이고 체크아웃도 산출물을 지웁니다. 실행 전에 중단합니다 (근거 없는 실행·검증을 조용히 통과시키지 않음). hosted 의 정식 경로는 run_phase=LIFECYCLE(한 job 연속 실행) + verify-settlement 이고, 단독 단계는 self-hosted 러너 또는 로컬에서 실행하세요.\"\n      exit 1\n    fi\n    echo \"::notice::run_phase=${IN_PHASE} 단독 실행 — self-hosted 작업 디렉터리 산출물을 보존합니다(체크아웃 clean: false). 같은 러너·같은 작업 디렉터리에서 앞 단계를 먼저 실행했어야 합니다.\"\n    ;;\nesac\n"
+    - name: state 캐시 복원
+      id: state-cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: .mock-cache/mock-state.json
+        key: mock-skip-${{ inputs.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: Resolve and log inputs
+      id: resolve
+      env:
+        IN_TRADE_MODE: ${{ inputs.trade_mode }}
+        VAR_TRADE_MODE: ${{ '' }}
+        IN_BROKER: ${{ inputs.broker }}
+        IN_BROKER_MODE: ${{ inputs.broker_mode }}
+        IN_SYMBOLS: ${{ inputs.symbols }}
+        VAR_SYMBOLS: ${{ '' }}
+      run: "# 로케일에 따라 [A-Z] 범위·대소문자 변환이 달라지지 않도록 고정합니다 (self-hosted runner 대비)\nexport LC_ALL=C\n# 로그에 외부 값을 찍을 때 개행·제어문자를 제거합니다 (`::` 워크플로 명령 주입 방지)\nsafe() { printf '%s' \"${1//[^[:print:]]/?}\"; }\n# 오래된 bash(3.x)에서도 동작하도록 소문자 변환을 tr 로 합니다 (GitHub 표현식의 대소문자 무시 비교와 동일)\nlower() { printf '%s' \"$1\" | tr '[:upper:]' '[:lower:]'; }\n\n# inputs.trade_mode || vars.TRADE_MODE || (broker_mode == 'real' && 'DRY') || 'LIVE'  (GitHub 표현식과 같은 우선순위)\nMODE=\"${IN_TRADE_MODE:-}\"\nif [[ -z \"$MODE\" ]]; then MODE=\"${VAR_TRADE_MODE:-}\"; fi\nif [[ -z \"$MODE\" && \"$(lower \"${IN_BROKER_MODE:-}\")\" == \"real\" ]]; then MODE=\"DRY\"; fi\nif [[ -z \"$MODE\" ]]; then MODE=\"LIVE\"; fi\n\n# 봇(src/config.py)은 TRADE_MODE 를 strip().upper() 로 정규화합니다. state 캐시 저장 가드가\n# 실제 실행 모드와 어긋나지 않도록 같은 방식으로 정규화합니다 (예: 'live ' → 'LIVE').\nMODE=$(printf '%s' \"$MODE\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')\n\n# 영문 대문자 외 값(개행·특수문자 포함)은 GITHUB_OUTPUT 에 쓰지 않고 INVALID 로 치환합니다.\n# 봇은 잘못된 값을 DRY 로 처리하고, 캐시 저장 가드도 저장하지 않습니다.\nif [[ ! \"$MODE\" =~ ^[A-Z]*$ ]]; then\n  echo \"::warning::유효하지 않은 TRADE_MODE 값을 INVALID 로 처리합니다 (봇은 DRY 로 동작, state 캐시 저장 안 함)\"\n  MODE=\"INVALID\"\nfi\n\n# Actions 에서의 REPAIR 는 차단합니다: REPAIR 핸들러는 settlement-*.json 을 만들지 않아 verify 가 항상\n# 실패하는데, state 캐시는 검증 job 보다 앞선 이 job 에서 이미 저장됩니다. REPAIR 전용 독립 검증이\n# 준비되기 전까지는 봇 실행·state 변경·캐시 저장이 일어나기 전에 여기서 중단합니다\n# (trade_mode 출력을 쓰지 않으므로 이후 state 캐시 저장 가드도 저장하지 않습니다).\nif [[ \"$MODE\" == \"REPAIR\" ]]; then\n  echo \"::error::Actions 에서의 TRADE_MODE=REPAIR 는 현재 차단됩니다 (REPAIR 전용 독립 검증 미구현: 정산 근거 없이 state 만 바뀝니다). 로컬에서 docs/marker-correction-runbook.md 절차로 실행하세요. 봇 실행·state 변경·캐시 저장 없이 중단합니다.\"\n  exit 1\nfi\necho \"trade_mode=$MODE\" >> \"$GITHUB_OUTPUT\"\n\nBROKER=\"${IN_BROKER:-kis}\"\nBROKER_MODE=\"${IN_BROKER_MODE:-demo}\"\nSYMBOLS=\"${IN_SYMBOLS:-}\"\nif [[ -z \"$SYMBOLS\" ]]; then SYMBOLS=\"${VAR_SYMBOLS:-}\"; fi\nif [[ -z \"$SYMBOLS\" && \"$(lower \"${IN_BROKER:-}\")\" == \"kiwoom\" ]]; then SYMBOLS=\"TQQQ:NAS,SOXL:NYS\"; fi\nif [[ -z \"$SYMBOLS\" ]]; then SYMBOLS=\"TQQQ:NAS,SOXL:AMS\"; fi\necho \"Resolved BROKER=$(safe \"$BROKER\")\"\necho \"Resolved BROKER_MODE=$(safe \"$BROKER_MODE\")\"\necho \"Resolved TRADE_MODE=$MODE\"\necho \"Resolved SYMBOLS=$(safe \"$SYMBOLS\")\"\necho \"Environment=$(safe \"${IN_BROKER}\")-$(safe \"${IN_BROKER_MODE}\")\"\n"
+    - name: 자동매매 봇 실행
+      id: bot
+      timeout-minutes: ${{ fromJSON(steps.timeout-budget.outputs.bot_timeout_minutes || '340') }}
+      env:
+        BROKER: ${{ inputs.broker || 'kis' }}
+        BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+        RUN_ID: ${{ inputs.run_id || github.run_id }}
+        RETRY_NUM: ${{ inputs.retry_num || '0' }}
+        CODE_VERSION: ${{ github.sha }}
+        KIS_APP_KEY: ${{ '' }}
+        KIS_APP_SECRET: ${{ '' }}
+        KIS_ACCOUNT_NO: ${{ '' }}
+        KIWOOM_APP_KEY: ${{ '' }}
+        KIWOOM_APP_SECRET: ${{ '' }}
+        LS_APP_KEY: ${{ '' }}
+        LS_APP_SECRET: ${{ '' }}
+        TOSS_APP_KEY: ${{ '' }}
+        TOSS_APP_SECRET: ${{ '' }}
+        TOSS_ACCOUNT_SEQ: ${{ '' }}
+        NHPLUG_APP_KEY: ${{ '' }}
+        NHPLUG_APP_SECRET: ${{ '' }}
+        NHPLUG_ACCT_NO: ${{ '' }}
+        NHPLUG_ACCT_TYPE: ${{ '' }}
+        MERITZ_APP_KEY: ${{ '' }}
+        MERITZ_APP_SECRET: ${{ '' }}
+        MERITZ_BASE_URL: ${{ '' }}
+        MERITZ_MAC_ADDRESS: ${{ '' }}
+        MERITZ_CONFIRM_WARNINGS: ${{ '' }}
+        TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
+        SYMBOLS: ${{ inputs.symbols || '' }}
+        TQQQ_SPLITS: ${{ '' }}
+        TQQQ_SYMBOL_TYPE: ${{ '' }}
+        TQQQ_SEED: ${{ '' }}
+        TQQQ_ADDITIONAL_LOC_LEVELS: ${{ '' }}
+        SOXL_SPLITS: ${{ '' }}
+        SOXL_SYMBOL_TYPE: ${{ '' }}
+        SOXL_SEED: ${{ '' }}
+        SOXL_ADDITIONAL_LOC_LEVELS: ${{ '' }}
+        ADDITIONAL_LOC_LEVELS: ${{ '' }}
+        FORCE_T_REINFERENCE: ${{ '' }}
+        TQQQ_FORCE_T: ${{ '' }}
+        SOXL_FORCE_T: ${{ '' }}
+        TQQQ_MAX_T: ${{ '' }}
+        SOXL_MAX_T: ${{ '' }}
+        QUIET_HOURS: ${{ inputs.quiet_hours || '' || (inputs.broker_mode == 'demo' && 'true') || 'false' }}
+        COMMISSION_RATE: ${{ inputs.commission_rate || '' || '0.0025' }}
+        REINVEST: ${{ inputs.reinvest || '' || 'true' }}
+        TELEGRAM_BOT_TOKEN: ${{ '' }}
+        TELEGRAM_CHAT_ID: ${{ '' }}
+        TELEGRAM_PERSONAL_CHAT_IDS: ${{ '' || '' }}
+        FINNHUB_API_KEY: ${{ '' }}
+        LS_DEMO_BYPASS_BUGS: ${{ '' || (inputs.broker == 'ls' && inputs.broker_mode == 'demo' && 'true') || 'false' }}
+        ORDER_HISTORY_VERBOSE: ${{ '' || 'false' }}
+        STATE_DIAGNOSTIC_ONLY: ${{ '' || 'false' }}
+        STATE_REPAIR_ONLY: ${{ '' || 'false' }}
+        STATE_REPAIR_SYMBOL: ${{ '' }}
+        STATE_REPAIR_EXPECT_T: ${{ '' }}
+        STATE_REPAIR_EXPECT_DAY_COUNT: ${{ '' }}
+        STATE_REPAIR_EXPECT_PROCEEDS: ${{ '' }}
+        STATE_REPAIR_EXPECT_LAST_UPDATED: ${{ '' }}
+        STATE_REPAIR_EXPECT_LAST_ORDNO: ${{ '' }}
+        STATE_REPAIR_EXPECT_REVERSE_IDS: ${{ '' }}
+        STATE_REPAIR_EXPECT_REVERSE_SUBMITTED_AT: ${{ '' }}
+        STATE_REPAIR_TARGET_T: ${{ '' }}
+        STATE_CLEAR_FENCE_ONLY: ${{ '' || 'false' }}
+        STATE_CLEAR_FENCE_SYMBOL: ${{ '' }}
+        STATE_CLEAR_FENCE_EXPECT_T: ${{ '' }}
+        STATE_CLEAR_FENCE_EXPECT_LAST_UPDATED: ${{ '' }}
+        STATE_CLEAR_FENCE_EXPECT_INTENT: ${{ '' }}
+        STATE_CLEAR_FENCE_EXPECT_BATCH: ${{ '' }}
+        STATE_REVERSE_AUDIT_ONLY: ${{ '' || 'false' }}
+        STATE_REVERSE_RECONCILE_ONLY: ${{ '' || 'false' }}
+        STATE_NET_INVESTED_REPAIR_ONLY: ${{ '' || 'false' }}
+        STATE_NET_INVESTED_REPAIR_SYMBOL: ${{ '' }}
+        STATE_NET_INVESTED_REPAIR_TARGET: ${{ '' }}
+        STATE_NET_INVESTED_REPAIR_EXPECT_HASH: ${{ '' }}
+        STATE_NET_INVESTED_REPAIR_EXPECT_NET_INVESTED: ${{ '' }}
+        STATE_NET_INVESTED_REPAIR_EXPECT_STATUS: ${{ '' }}
+        STATE_ASSUME_REVERSE_EXPIRY_ONLY: ${{ '' || 'false' }}
+        STATE_ASSUME_REVERSE_EXPIRY_SYMBOL: ${{ '' }}
+        STATE_ASSUME_REVERSE_EXPIRY_ORDER: ${{ '' }}
+        STATE_ASSUME_REVERSE_EXPIRY_EXPECT_HASH: ${{ '' }}
+        CONNECT_TIMEOUT: 30
+        PYTHONUNBUFFERED: 1
+        RUN_PHASE: ${{ inputs.run_phase }}
+        PLAN_ID: ${{ inputs.plan_id }}
+        APPROVAL_PLAN_ID: ${{ inputs.approval_plan_id }}
+        AUTO_EXECUTE: ${{ inputs.auto_execute }}
+        REVIEWED: ${{ inputs.reviewed }}
+        REVIEWED_PLAN_HASH: ${{ inputs.plan_hash }}
+        RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        LIFECYCLE_MAX_WAIT_SECONDS: ${{ '' }}
+        ACCOUNT_FINGERPRINT_SECRET: ${{ '' }}
+        MERITZ_ACCOUNT_BINDING: ${{ '' }}
+        BROKER_ACCOUNT_BINDING: ${{ '' }}
+        MOCK_SCENARIO: ${{ inputs.scenario }}
+      run: "# ── Mock 격리: 가짜 uv 만 사용합니다 ──\nexport PATH=\"$GITHUB_WORKSPACE/ops/mock_actions/bin:$PATH\"\nSTUB_CONFIG=\"$(python3 ops/mock_actions/scenarios.py stub \"$MOCK_SCENARIO\")\"\nexport STUB_CONFIG STUB_LOG=\"$RUNNER_TEMP/mock-calls.log\"\nset -eo pipefail\n\n# ══ 실행 결과 표식 (설명은 이 스텝 위의 주석) ══\nset_out() { printf '%s=%s\\n' \"$1\" \"$2\" >> \"$GITHUB_OUTPUT\"; }\nset_outcome() { set_out run_outcome \"$1\"; set_out run_reason \"$2\"; }\nset_out state_may_change false\nset_outcome NOT_STARTED \"봇 실행 전 중단 (게이트/설정 확인)\"\n# state 를 바꿀 수 있는 **봇 실행 직전에** 호출합니다.\nmark_state_may_change() {\n  set_out state_may_change true\n  set_outcome FAILED \"봇 실행 중 실패/중단\"\n}\n\n# 이전 실행의 주문번호 원장 제거 (설명은 이 스텝 위의 주석)\nrm -f odno-map-*.jsonl\n\nPLAN_DIR_DEFAULT=plans\nAPPROVALS_DIR_DEFAULT=approvals\n\n# RUN_PHASE 정규화 — 봇(config.read_run_phase)과 같은 규칙(앞뒤 공백 제거 + 대문자).\n# dispatch payload 등 외부에서 온 값이므로 항상 인용해 사용합니다 (셸 명령으로 해석 금지).\nphase=$(printf '%s' \"${RUN_PHASE:-}\" \\\n  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \\\n  | tr '[:lower:]' '[:upper:]')\nexport RUN_PHASE=\"$phase\"\n\n# ══ 주문 실행 검증(RUN_PHASE=VERIFY) 도우미 (설명은 이 스텝 위의 주석) ══\norder_verify_targets=0\norder_verify_pass=0\norder_verify_failed=0\norder_verify_not_executed=0\norder_verify_problem_ids=\"\"\n# 검증을 **명시적으로 요청**받았는지 (RUN_PHASE=VERIFY 단독 실행).\n# 대상이 0건일 때 \"검증 대상이 없어 생략(SKIPPED)\"과 \"요청받았는데 수행하지 못함(FAIL)\"을\n# 구분하기 위한 표식입니다 — 조용히 SKIPPED 로 덮으면 검증을 안 하고도 통과처럼 보입니다.\norder_verify_required=0\n# report_order_verify 가 계산한 종료 판정 (0=정상, 1=FAIL/NOT_EXECUTED/수행 불가)\norder_verify_exit=0\n\n# plan_id 하나를 검증합니다 (인자가 비면 상속된 APPROVAL_PLAN_ID 사용).\nrun_order_verify() {\n  local pid=\"$1\"\n  local rc=0\n  order_verify_targets=$((order_verify_targets + 1))\n  echo \"[VERIFY] approval_plan_id=${pid:-<환경변수 APPROVAL_PLAN_ID>}\"\n  if [[ -n \"$pid\" ]]; then\n    RUN_PHASE=VERIFY APPROVAL_PLAN_ID=\"$pid\" uv run python trading_bot.py || rc=$?\n  else\n    uv run python trading_bot.py || rc=$?\n  fi\n  case \"$rc\" in\n    0)\n      order_verify_pass=$((order_verify_pass + 1))\n      ;;\n    2)\n      # 승인만 되고 실행 기록이 없다 — \"검증 통과\"와 구분되는 상태입니다.\n      order_verify_not_executed=$((order_verify_not_executed + 1))\n      order_verify_problem_ids=\"$order_verify_problem_ids ${pid:-?}\"\n      echo \"::error::주문 실행 검증(VERIFY): 실행 안 됨(exit 2) plan_id=${pid:-?} — 승인만 존재하고 실행 기록이 없습니다 (검증 통과가 아닙니다)\"\n      ;;\n    *)\n      order_verify_failed=$((order_verify_failed + 1))\n      order_verify_problem_ids=\"$order_verify_problem_ids ${pid:-?}\"\n      echo \"::error::주문 실행 검증(VERIFY) 실패(exit $rc) plan_id=${pid:-?}\"\n      ;;\n  esac\n  return 0\n}\n\n# 검증 대상이 없을 때(DRY 미리보기·계획 없음) 상태를 남깁니다.\n# job output 은 값이 없으면 \"\" 이므로, 생략도 명시적으로 기록합니다.\nmark_order_verify_skipped() { # $1 = 생략 사유\n  echo \"::notice::주문 실행 검증(VERIFY) 생략 — $1 (정산 검증은 verify-settlement job 이 별도 수행)\"\n  echo \"order_verify_status=SKIPPED\" >> \"$GITHUB_OUTPUT\"\n  echo \"order_verify_summary=$1\" >> \"$GITHUB_OUTPUT\"\n  return 0\n}\n\n# 결과 요약 — 주문 실행 검증과 정산 검증을 **구분해서** 보고합니다.\n# 판정은 `order_verify_exit` 에 남기므로 호출 측은 이 값만 확인하면 됩니다\n# (FAIL·NOT_EXECUTED·\"요청했지만 대상 0건\"은 모두 1).\nreport_order_verify() {\n  local summary\n  order_verify_exit=0\n  order_verify_status=\"\"\n  summary=\"\"\n  if [[ \"$order_verify_targets\" -eq 0 ]]; then\n    if [[ \"$order_verify_required\" -eq 1 ]]; then\n      # VERIFY 를 요청받았는데 검증한 계획이 없습니다 (APPROVAL_PLAN_ID/APPROVAL_FILE\n      # 누락·빈 값). 이걸 \"생략(SKIPPED)\"으로 남기면 검증을 못 했는데도 통과처럼 보입니다.\n      order_verify_status=\"FAIL\"\n      summary=\"검증 대상 없음 — RUN_PHASE=VERIFY 를 요청했지만 수행한 계획이 없습니다 (APPROVAL_PLAN_ID/APPROVAL_FILE 확인 필요)\"\n      order_verify_exit=1\n    else\n      order_verify_status=\"SKIPPED\"\n      summary=\"검증 대상 없음 (이 실행은 EXECUTE 가 아니어서 주문 실행 검증 대상이 없습니다)\"\n    fi\n  elif [[ \"$order_verify_failed\" -gt 0 ]]; then\n    order_verify_status=\"FAIL\"\n    order_verify_exit=1\n  elif [[ \"$order_verify_not_executed\" -gt 0 ]]; then\n    order_verify_status=\"NOT_EXECUTED\"\n    order_verify_exit=1\n  else\n    order_verify_status=\"PASS\"\n  fi\n  if [[ \"$order_verify_targets\" -gt 0 ]]; then\n    summary=\"통과 ${order_verify_pass}건 / 실패 ${order_verify_failed}건 / 실행안됨 ${order_verify_not_executed}건\"\n    if [[ -n \"$order_verify_problem_ids\" ]]; then\n      summary=\"$summary (문제 plan_id:$order_verify_problem_ids)\"\n    fi\n  fi\n  order_verify_summary=\"$summary\"\n  echo \"::group::[주문 실행 검증(VERIFY) 결과]\"\n  echo \"[주문 실행 검증(VERIFY)] ${order_verify_status} — ${order_verify_summary}\"\n  echo \"[정산 검증] 이 job 이 아니라 별도 job(verify-settlement)이 담당합니다 —\"\n  echo \"             두 결과는 서로를 대신하지 않습니다 (합쳐서 '성공'으로 표시하지 않음).\"\n  echo \"::endgroup::\"\n  echo \"::notice::주문 실행 검증(VERIFY) 결과 ${order_verify_status} — ${order_verify_summary}\"\n  echo \"order_verify_status=$order_verify_status\" >> \"$GITHUB_OUTPUT\"\n  echo \"order_verify_summary=$order_verify_summary\" >> \"$GITHUB_OUTPUT\"\n  return 0\n}\n\n# ══ 실행 전 안전 게이트 (봇 실행·브로커 호출·state 변경 전) ══════════════════\n# 1) 운영 계좌(real) LIVE 사람 검토 표식 (설명은 이 스텝 위의 주석)\nbool_on() {\n  case \"$(printf '%s' \"${1:-}\" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')\" in\n    1|TRUE|YES|ON|Y) return 0 ;;\n    *) return 1 ;;\n  esac\n}\nbroker_mode_norm=$(printf '%s' \"${BROKER_MODE:-}\" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')\nlive_norm=$(printf '%s' \"${TRADE_MODE:-}\" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')\n\nplaces_orders=0\nif [[ \"$live_norm\" == \"LIVE\" ]]; then\n  case \"$phase\" in\n    # LIFECYCLE 은 내부에서 APPROVE 까지 자동으로 이어집니다 (EXECUTE 게이트 없음).\n    LIFECYCLE) places_orders=1 ;;\n    EXECUTE) places_orders=1 ;;\n    # PREVIEW + AUTO_EXECUTE 는 봇이 승인·실행까지 연쇄합니다.\n    PREVIEW) if bool_on \"${AUTO_EXECUTE:-}\"; then places_orders=1; fi ;;\n  esac\nfi\n\nif [[ \"$broker_mode_norm\" == \"REAL\" && \"$places_orders\" -eq 1 ]] && ! bool_on \"${REVIEWED:-}\"; then\n  echo \"::error::운영 계좌(real) LIVE 주문 경로에는 사람 검토 표식이 필요합니다 — RUN_PHASE=${phase:-레거시}, TRADE_MODE=$live_norm. dispatch payload 에 \\\"reviewed\\\":\\\"true\\\" 를 넣어 명시(권장: 저녁 dispatch)하거나, 아침에는 run_phase=PREVIEW 로 계획만 만들고 저녁 run_phase=EXECUTE 로 실행하세요. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음).\"\n  exit 1\nfi\n\n# 1-b) 수동 승인 경로의 계획 해시 바인딩 (설명은 이 스텝 위의 주석)\nmanual_approve=0\ncase \"$phase\" in\n  APPROVE|EXECUTE) manual_approve=1 ;;\nesac\nplan_hashes=()\nif [[ -n \"${REVIEWED_PLAN_HASH:-}\" ]]; then\n  while IFS= read -r one_hash; do\n    one_hash=$(printf '%s' \"$one_hash\" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')\n    [[ -z \"$one_hash\" ]] && continue\n    if ! printf '%s' \"$one_hash\" | grep -Eq '^[0-9a-f]{64}$'; then\n      echo \"::error::plan_hash 형식이 올바르지 않습니다 (64자리 hex 필요, 입력 앞 12자: ${one_hash:0:12}…) — PREVIEW 로그/plans/*.json 의 plan_hash 를 그대로 넣으세요. 봇을 실행하지 않고 중단합니다.\"\n      exit 1\n    fi\n    plan_hashes+=(\"$one_hash\")\n  done < <(printf '%s\\n' \"$REVIEWED_PLAN_HASH\" | tr ',' '\\n')\nfi\nif [[ \"$broker_mode_norm\" == \"REAL\" && \"$live_norm\" == \"LIVE\" && \"$manual_approve\" -eq 1 ]]; then\n  if [[ \"${#plan_hashes[@]}\" -eq 0 ]]; then\n    echo \"::error::운영 계좌(real) LIVE 수동 승인(RUN_PHASE=$phase)에는 사람이 검토한 plan_hash 가 필요합니다 — dispatch 입력 plan_hash 에 PREVIEW 로그/plans/*.json 의 plan_hash 를 넣으세요 (다중 대상은 쉼표로 같은 개수). reviewed=true 만으로는 무엇을 검토했는지 증명되지 않습니다. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음).\"\n    exit 1\n  fi\nfi\n# LIFECYCLE(완전 자동)에는 바인딩할 사람 검토 값이 없습니다 — 남아 있는 값을\n# 그대로 쓰면 의미 없는 불일치로 자동 체인이 실패하므로 비웁니다.\nif [[ \"$phase\" == \"LIFECYCLE\" && \"${#plan_hashes[@]}\" -gt 0 ]]; then\n  echo \"::notice::RUN_PHASE=LIFECYCLE 은 완전 자동 경로라 plan_hash 입력을 사용하지 않습니다 (사람 검토 바인딩 없음). 수동 승인은 run_phase=APPROVE/EXECUTE + plan_hash 로 실행하세요.\"\n  plan_hashes=()\nfi\n\n# 2) 주문 대상 세션 판정 + hosted 대기 시간 예산 (설명은 이 스텝 위의 주석)\nwindow_state=\"\"\ngate_out=\"\"\ngate_value() { printf '%s\\n' \"$gate_out\" | sed -n \"s/^$1=//p\" | head -n 1; }\nif [[ \"$live_norm\" == \"LIVE\" && ( \"$phase\" == \"LIFECYCLE\" || \"$phase\" == \"EXECUTE\" ) ]]; then\n  if ! gate_out=$(uv run python ops/session_gate.py); then\n    echo \"::error::주문 대상 세션을 판정하지 못했습니다 (캘린더/state 파일 오류). 정상 SKIP 으로 처리하지 않고 봇 실행 전에 중단합니다.\"\n    set_outcome NOT_STARTED \"세션 게이트 판정 실패\"\n    exit 1\n  fi\n  window_state=$(gate_value window)\n  wait_seconds=$(gate_value wait_seconds)\n  case \"$window_state\" in\n    open | closed) ;;\n    *) window_state=\"\" ;;\n  esac\n  case \"$wait_seconds\" in\n    '' | *[!0-9]*) window_state=\"\" ;;\n  esac\n  if [[ -z \"$window_state\" ]]; then\n    echo \"::error::세션 게이트 출력이 올바르지 않습니다 — 봇 실행 전에 중단합니다.\"\n    set_outcome NOT_STARTED \"세션 게이트 출력 오류\"\n    exit 1\n  fi\n  echo \"[세션 게이트] window=$window_state 대상=$(gate_value session) 직전 마감=$(gate_value settled_session) 정산 가능=$(gate_value settlement_due)\"\n  echo \"[세션 게이트] $(gate_value reason)\"\n  if [[ \"$window_state\" == \"open\" && \"${RUNNER_ENVIRONMENT:-}\" != \"self-hosted\" ]]; then\n    wait_max=\"${LIFECYCLE_MAX_WAIT_SECONDS:-14400}\"\n    case \"$wait_max\" in\n      '' | *[!0-9]*) wait_max=14400 ;;\n    esac\n    echo \"[시간 예산] RUN_PHASE=$phase 프리장 대기 예상=$((wait_seconds / 60))분 (허용 $((wait_max / 60))분, 러너=${RUNNER_ENVIRONMENT:-unknown})\"\n    if [[ \"$wait_seconds\" -gt \"$wait_max\" ]]; then\n      echo \"::error::RUN_PHASE=$phase 를 지금 시작하면 프리장 개장까지 약 $((wait_seconds / 60))분을 기다립니다 (허용 $((wait_max / 60))분). GitHub hosted 러너는 6시간에서 강제 종료되어 Evidence·검증 단계가 실행되지 않습니다. **저녁(KST 17시 이후) dispatch 로 실행**하거나, 아침에는 run_phase=PREVIEW 로 계획만 만드세요. 봇을 실행하지 않고 중단합니다.\"\n      set_outcome NOT_STARTED \"프리장 대기 시간 예산 초과\"\n      exit 1\n    fi\n  fi\nfi\n\n# 이전 실행의 보류 표식이 state 에 남아 있으면 정상 SKIP 으로 숨기지 않고 실패합니다.\nrequire_no_state_hold() {\n  local hold\n  hold=$(gate_value state_hold)\n  if [[ -n \"$hold\" ]]; then\n    echo \"::error::state 에 이전 실행의 보류 표식이 남아 있어 정상 SKIP 으로 처리하지 않습니다 (${hold}). 브로커 이력과 대조해 확인하세요. 봇을 실행하지 않았고 state 는 바꾸지 않았습니다.\"\n    set_outcome NOT_STARTED \"보류 상태 잔존: $hold\"\n    exit 1\n  fi\n}\n# state 를 바꾸지 않았고 정산도 실행하지 않은 **정상 SKIP** (캐시 저장·정산 검증 없음).\nfinish_normal_skip() { # $1 = 사유\n\
+        \  echo \"::notice::정상 SKIP — $1\"\n  set_out state_may_change false\n  set_out settlement_status SKIPPED\n  set_outcome SKIPPED \"$1\"\n  mark_order_verify_skipped \"$1\"\n  exit 0\n}\n# 봇이 휴장일이라 정산까지 건너뛰었는지(DRY·레거시) 확인하는 표식 파일\nrun_legacy_bot() {\n  local marker\n  marker=$(mktemp)\n  RUN_PHASE= RUN_SKIP_MARKER=\"$marker\" uv run python trading_bot.py\n  if [[ -s \"$marker\" ]]; then\n    set_out settlement_status SKIPPED\n    set_outcome SKIPPED \"$(head -n 1 \"$marker\")\"\n    mark_order_verify_skipped \"$(head -n 1 \"$marker\")\"\n  else\n    set_outcome COMPLETED \"TRADE_MODE=${TRADE_MODE:-} 미리보기 완료 (주문 없음)\"\n    mark_order_verify_skipped \"TRADE_MODE=${TRADE_MODE:-} (DRY 미리보기 — 승인·실행이 없어 검증 대상 없음)\"\n  fi\n  rm -f \"$marker\"\n}\n# ══ 게이트 끝 ══════════════════════════════════════════════════════════════\n\n# ── 단일 단계 / 레거시 실행 ───────────────────────────────────\n# RUN_PHASE 가 비어 있으면 레거시 통합 실행입니다 (DRY 미리보기 전용 — LIVE 는 봇이 차단).\n# 단일 단계(APPROVE/EXECUTE/VERIFY)는 대상이 여러 개면 쉼표로 구분해 순서대로 실행합니다.\nif [[ \"$phase\" != \"LIFECYCLE\" ]]; then\n  refs=\"\"\n  case \"$phase\" in\n    APPROVE) refs=\"${PLAN_ID:-}\" ;;\n    EXECUTE|VERIFY) refs=\"${APPROVAL_PLAN_ID:-}\" ;;\n  esac\n  if [[ \"$phase\" == \"VERIFY\" ]]; then\n    # 검증을 명시적으로 요청했습니다 — 대상이 0건이면 \"생략\"이 아니라 실패로 기록합니다.\n    order_verify_required=1\n  fi\n  # 검토 해시 개수는 대상 개수와 같아야 합니다 (VERIFY 는 주문이 없어 제외).\n  if [[ \"$phase\" != \"VERIFY\" && \"${#plan_hashes[@]}\" -gt 0 ]]; then\n    ref_count=0\n    while IFS= read -r one; do\n      [[ -n \"$(printf '%s' \"$one\" | tr -d '[:space:]')\" ]] && ref_count=$((ref_count + 1))\n    done < <(printf '%s\\n' \"$refs\" | tr ',' '\\n')\n    if [[ \"$ref_count\" -ne \"${#plan_hashes[@]}\" ]]; then\n      echo \"::error::plan_hash 개수(${#plan_hashes[@]})가 승인 대상 개수($ref_count)와 다릅니다 — 대상과 같은 순서로 쉼표 구분해 넘기세요. 봇을 실행하지 않고 중단합니다 (브로커 호출·주문·state 변경 없음).\"\n      exit 1\n    fi\n  fi\n  # 주문 창이 닫힌 EXECUTE 도 봇을 실행합니다 — 승인 파일 존재·재사용·검토 해시는\n  # 봇이 확인해야 하며, 통과한 대상만 SKIP 표식을 남깁니다 (주문·state 저장 없음).\n  skip_marker=\"\"\n  if [[ \"$phase\" == \"EXECUTE\" && \"$window_state\" == \"closed\" ]]; then\n    require_no_state_hold\n    skip_marker=$(mktemp)\n    export RUN_SKIP_MARKER=\"$skip_marker\"\n  fi\n  if [[ -z \"$phase\" ]]; then\n    mark_state_may_change\n    run_legacy_bot\n    exit 0\n  fi\n  mark_state_may_change\n  case \"$phase\" in\n    SETTLE) set_out settlement_status ATTEMPTED ;;\n    EXECUTE) set_outcome PARTIAL_FAILURE \"EXECUTE 단계 실패 (주문 접수 여부는 VERIFY·로그 확인)\" ;;\n  esac\n  failed=0\n  if [[ \"$refs\" == *,* ]]; then\n    idx=0\n    while IFS= read -r one <&3; do\n      one=$(printf '%s' \"$one\" | tr -d '[:space:]')\n      [[ -z \"$one\" ]] && continue\n      # 대상과 같은 순서의 사람 검토 해시를 그대로 봇에 넘깁니다.\n      one_hash=\"\"\n      if [[ \"$phase\" != \"VERIFY\" ]]; then\n        one_hash=\"${plan_hashes[$idx]:-}\"\n      fi\n      echo \"[RUN_PHASE=$phase] 대상=$one (검토 plan_hash=${one_hash:0:12}${one_hash:+…})\"\n      if [[ \"$phase\" == \"APPROVE\" ]]; then\n        REVIEWED_PLAN_HASH=\"$one_hash\" PLAN_ID=\"$one\" uv run python trading_bot.py || failed=$((failed + 1))\n      elif [[ \"$phase\" == \"EXECUTE\" ]]; then\n        REVIEWED_PLAN_HASH=\"$one_hash\" APPROVAL_PLAN_ID=\"$one\" uv run python trading_bot.py || failed=$((failed + 1))\n      elif [[ \"$phase\" == \"VERIFY\" ]]; then\n        # VERIFY 는 종료코드(0=통과 / 1=실패 / 2=승인만·실행 안 됨)를 **집계**해야\n        # 하므로 run_order_verify 를 씁니다. `|| failed=...` 로 뭉개면\n        # \"실행 안 됨\"과 \"검증 실패\"를 구분해 보고할 수 없습니다.\n        run_order_verify \"$one\"\n      else\n        APPROVAL_PLAN_ID=\"$one\" uv run python trading_bot.py || failed=$((failed + 1))\n      fi\n      idx=$((idx + 1))\n    done 3< <(printf '%s\\n' \"$refs\" | tr ',' '\\n')\n  elif [[ \"$phase\" == \"EXECUTE\" ]]; then\n    # EXECUTE 는 실패해도 아래 주문 실행 검증(VERIFY)을 실행해 결과를 남깁니다\n    # (실패 원인과 \"실행이 검증됐는지\"는 다른 정보이므로 뭉개지 않습니다).\n    REVIEWED_PLAN_HASH=\"${plan_hashes[0]:-}\" uv run python trading_bot.py || failed=$((failed + 1))\n  elif [[ \"$phase\" == \"VERIFY\" ]]; then\n    # VERIFY 는 주문이 없어 검토 해시를 쓰지 않습니다.\n    # `set -e` 로 스크립트를 죽이면 **상태 기록 전에** 종료되어 job output 이 빈 값이\n    # 되므로(downstream 은 \"미완료\"인지 \"실패\"인지 알 수 없음), run_order_verify 로\n    # 종료코드를 집계한 뒤 아래에서 결과를 기록하고 종료합니다.\n    run_order_verify \"$(printf '%s' \"$refs\" | tr -d '[:space:]')\"\n  else\n    REVIEWED_PLAN_HASH=\"${plan_hashes[0]:-}\" uv run python trading_bot.py\n  fi\n  # VERIFY 는 실패해도 **상태를 먼저 기록**한 뒤 종료합니다 — 기록 전에 exit 하면\n  # downstream(verify-settlement 표시)이 빈 값만 보게 됩니다.\n  if [[ \"$failed\" -ne 0 && \"$phase\" != \"EXECUTE\" && \"$phase\" != \"VERIFY\" ]]; then\n    echo \"::error::RUN_PHASE=$phase 실패 ${failed}건\"\n    exit 1\n  fi\n\n  # 닫힌 창에서 **모든 대상**이 검증을 통과해 SKIP 했으면 정상 SKIP 입니다.\n  if [[ -n \"$skip_marker\" && \"$failed\" -eq 0 ]]; then\n    ref_total=$(printf '%s\\n' \"$refs\" | tr ',' '\\n' | grep -c '[^[:space:]]' || true)\n    skip_total=$(grep -c . \"$skip_marker\" || true)\n    if [[ \"$ref_total\" -gt 0 && \"$skip_total\" -eq \"$ref_total\" ]]; then\n      finish_normal_skip \"$(gate_value reason) (RUN_PHASE=EXECUTE — 주문 미실행)\"\n    fi\n  fi\n\n  # EXECUTE 단독 실행도 끝나면 주문 실행 검증(RUN_PHASE=VERIFY)을 자동 수행합니다.\n  # 같은 job·같은 작업 디렉터리라 승인 파일·정산 근거가 그대로 있습니다.\n  if [[ \"$phase\" == \"EXECUTE\" ]]; then\n    echo \"::group::[RUN_PHASE=EXECUTE → 주문 실행 검증(VERIFY)]\"\n    if [[ \"$refs\" == *,* ]]; then\n      while IFS= read -r one <&3; do\n        one=$(printf '%s' \"$one\" | tr -d '[:space:]')\n        [[ -z \"$one\" ]] && continue\n        run_order_verify \"$one\"\n      done 3< <(printf '%s\\n' \"$refs\" | tr ',' '\\n')\n    else\n      run_order_verify \"$(printf '%s' \"$refs\" | tr -d '[:space:]')\"\n    fi\n    echo \"::endgroup::\"\n    report_order_verify\n    if [[ \"$order_verify_exit\" -ne 0 ]]; then\n      failed=$((failed + 1))\n    fi\n  elif [[ \"$phase\" == \"VERIFY\" ]]; then\n    # 단독 VERIFY 결과 기록 (설명은 이 스텝 위의 주석)\n    report_order_verify\n    if [[ \"$order_verify_exit\" -ne 0 ]]; then\n      echo \"::error::RUN_PHASE=VERIFY 실패 — 주문 실행 검증 결과 ${order_verify_status} (${order_verify_summary})\"\n      exit 1\n    fi\n  else\n    mark_order_verify_skipped \"RUN_PHASE=$phase 단독 실행 (EXECUTE 가 아니므로 주문 실행 검증 대상 없음)\"\n  fi\n\n  if [[ \"$failed\" -ne 0 ]]; then\n    echo \"::error::RUN_PHASE=$phase 실패 ${failed}건\"\n    exit 1\n  fi\n  case \"$phase\" in\n    SETTLE) set_outcome SETTLE_ONLY \"RUN_PHASE=SETTLE 정산 완료\" ;;\n    EXECUTE) set_outcome ORDERS_EXECUTED \"RUN_PHASE=EXECUTE 실행·주문 실행 검증 통과\" ;;\n    *) set_outcome COMPLETED \"RUN_PHASE=$phase 완료\" ;;\n  esac\n  exit 0\nfi\n\n# ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY (설명은 이 스텝 위의 주석) ──\nif [[ \"${TRADE_MODE:-}\" != \"LIVE\" ]]; then\n  echo \"::notice::RUN_PHASE=LIFECYCLE + TRADE_MODE=${TRADE_MODE:-} → DRY 미리보기만 실행합니다 (APPROVE/EXECUTE/VERIFY 는 LIVE 전용)\"\n  mark_state_may_change\n  run_legacy_bot\n  exit 0\nfi\n\n# 주문 창이 닫힘(휴장/마감 후): 주문 단계는 정상 SKIP. 정산이 가능하면 SETTLE 만 실행합니다.\nif [[ \"$window_state\" == \"closed\" ]]; then\n  closed_reason=$(gate_value reason)\n  settled_session=$(gate_value settled_session)\n  if [[ \"$(gate_value settlement_due)\" != \"true\" ]]; then\n    require_no_state_hold\n    finish_normal_skip \"$closed_reason; 직전 세션 ${settled_session} 은 애프터아워 종료 전이라 다음 실행에서 정산합니다\"\n  fi\n  mark_state_may_change\n  set_out settlement_status ATTEMPTED\n  echo \"::group::[LIFECYCLE 1/5] SETTLE (주문 SKIP: $closed_reason)\"\n  RUN_PHASE=SETTLE uv run python trading_bot.py\n  echo \"::endgroup::\"\n  echo \"::notice::주문 SKIP — $closed_reason (SETTLE 만 실행, 직전 마감 세션 ${settled_session})\"\n  mark_order_verify_skipped \"$closed_reason (주문 미실행)\"\n  set_outcome SETTLE_ONLY \"$closed_reason — 정산(${settled_session})만 실행, 주문 없음\"\n  exit 0\nfi\n\nmkdir -p \"$PLAN_DIR_DEFAULT\" \"$APPROVALS_DIR_DEFAULT\"\n# self-hosted runner 작업 디렉터리 재사용에 대비해, PREVIEW 전후 계획 파일 목록을\n# 비교해 **이번 실행이 만든 계획**만 APPROVE 대상으로 삼습니다.\nplans_before=$(mktemp)\nls -1 \"$PLAN_DIR_DEFAULT\" 2>/dev/null | sort > \"$plans_before\"\n\nmark_state_may_change\nset_out settlement_status ATTEMPTED\necho \"::group::[LIFECYCLE 1/5] SETTLE\"\nRUN_PHASE=SETTLE uv run python trading_bot.py\necho \"::endgroup::\"\n# 이 뒤의 실패는 정산이 끝난 상태의 실패입니다 (주문이 일부 접수됐을 수 있음).\nset_outcome PARTIAL_FAILURE \"SETTLE 이후 단계 실패 (주문 접수 여부는 VERIFY·로그 확인)\"\n\necho \"::group::[LIFECYCLE 2/5] PREVIEW\"\n# AUTO_EXECUTE 는 이 경로에서 쓰지 않습니다 (승인·실행은 아래 단계가 담당).\nRUN_PHASE=PREVIEW AUTO_EXECUTE=false uv run python trading_bot.py\necho \"::endgroup::\"\n\nplans_after=$(mktemp)\nls -1 \"$PLAN_DIR_DEFAULT\" 2>/dev/null | sort > \"$plans_after\"\nnew_plans=$(mktemp)\ncomm -13 \"$plans_before\" \"$plans_after\" > \"$new_plans\" || true\nif [[ ! -s \"$new_plans\" ]]; then\n  echo \"::notice::PREVIEW 가 새 계획을 만들지 않았습니다 (이번 세션 주문 없음) — APPROVE/EXECUTE/VERIFY 생략\"\n  mark_order_verify_skipped \"PREVIEW 가 새 계획을 만들지 않음 (이번 세션 주문 없음)\"\n  set_outcome SETTLE_ONLY \"PREVIEW 가 새 계획을 만들지 않음 (이번 세션 주문 없음)\"\n  exit 0\nfi\n\n# 계획 파일에서 plan_id 를 읽는 도우미 (jq 의존 없이 uv 파이썬 사용)\nplan_id_reader=$(mktemp)\ncat > \"$plan_id_reader\" <<'PY'\nimport json\nimport sys\n\nwith open(sys.argv[1], encoding=\"utf-8\") as fh:\n    print(json.load(fh).get(\"plan_id\", \"\"))\nPY\n\necho \"::group::[LIFECYCLE 3/5] APPROVE\"\napproved=$(mktemp)\napprove_failed=0\nwhile IFS= read -r plan_file <&3; do\n  [[ -z \"$plan_file\" ]] && continue\n  plan_id=$(uv run python \"$plan_id_reader\" \"$PLAN_DIR_DEFAULT/$plan_file\")\n  if [[ -z \"$plan_id\" ]]; then\n    echo \"::error::계획 파일에서 plan_id 를 읽지 못했습니다: $plan_file\"\n    approve_failed=$((approve_failed + 1))\n    continue\n  fi\n  echo \"[APPROVE] plan_id=$plan_id (file=$plan_file)\"\n  # LIFECYCLE 은 완전 자동 경로입니다 — 사람 검토 해시 바인딩을 쓰지 않으므로\n  # env 의 REVIEWED_PLAN_HASH 를 비웁니다 (자동 체인이 불일치로 막히지 않게).\n  if REVIEWED_PLAN_HASH= RUN_PHASE=APPROVE PLAN_ID=\"$plan_id\" uv run python trading_bot.py; then\n    if [[ -f \"$APPROVALS_DIR_DEFAULT/$plan_id.json\" ]]; then\n      printf '%s\\n' \"$plan_id\" >> \"$approved\"\n    else\n      echo \"\
+        ::notice::$plan_id 는 승인 파일이 만들어지지 않았습니다 (주문 0건) — EXECUTE 제외\"\n    fi\n  else\n    echo \"::error::$plan_id APPROVE 실패 — EXECUTE 에서 제외합니다\"\n    approve_failed=$((approve_failed + 1))\n  fi\ndone 3< \"$new_plans\"\necho \"::endgroup::\"\n\necho \"::group::[LIFECYCLE 4/5] EXECUTE\"\nexecute_failed=0\nif [[ ! -s \"$approved\" ]]; then\n  echo \"::notice::승인된 계획이 없어 EXECUTE 를 생략합니다\"\nelse\n  while IFS= read -r plan_id <&3; do\n    [[ -z \"$plan_id\" ]] && continue\n    echo \"[EXECUTE] approval_plan_id=$plan_id\"\n    if ! REVIEWED_PLAN_HASH= RUN_PHASE=EXECUTE APPROVAL_PLAN_ID=\"$plan_id\" uv run python trading_bot.py; then\n      echo \"::error::$plan_id EXECUTE 실패 — 다음 종목은 계속 진행합니다\"\n      execute_failed=$((execute_failed + 1))\n    fi\n  done 3< \"$approved\"\nfi\necho \"::endgroup::\"\n\n# ── 5/5: 주문 실행 검증 (설명은 이 스텝 위의 주석)\necho \"::group::[LIFECYCLE 5/5] VERIFY (주문 실행 검증)\"\nif [[ ! -s \"$approved\" ]]; then\n  echo \"::notice::승인된 계획이 없어 주문 실행 검증(VERIFY)을 생략합니다\"\nelse\n  while IFS= read -r plan_id <&3; do\n    [[ -z \"$plan_id\" ]] && continue\n    run_order_verify \"$plan_id\"\n  done 3< \"$approved\"\nfi\necho \"::endgroup::\"\n\napproved_count=$(grep -c . \"$approved\" || true)\nrm -f \"$plans_before\" \"$plans_after\" \"$new_plans\" \"$plan_id_reader\" \"$approved\"\n\n# 주문 실행 검증 결과를 정산 검증과 구분해 보고합니다 (job output 포함).\nreport_order_verify\n\nif [[ \"$approve_failed\" -ne 0 || \"$execute_failed\" -ne 0 \\\n      || \"$order_verify_exit\" -ne 0 ]]; then\n  echo \"::error::라이프사이클 실패 — APPROVE ${approve_failed}건, EXECUTE ${execute_failed}건, 주문 실행 검증(VERIFY) 실패 ${order_verify_failed}건 / 실행안됨 ${order_verify_not_executed}건 (정산 검증은 별도 job 이며 이 결과와 합치지 않습니다)\"\n  set_outcome PARTIAL_FAILURE \"APPROVE ${approve_failed}건 / EXECUTE ${execute_failed}건 / 주문 검증 실패 ${order_verify_failed}건 · 실행안됨 ${order_verify_not_executed}건\"\n  exit 1\nfi\nif [[ \"$approved_count\" -eq 0 ]]; then\n  set_outcome SETTLE_ONLY \"승인된 계획 없음 (주문 없음)\"\nelse\n  set_outcome ORDERS_EXECUTED \"승인 계획 ${approved_count}건 실행·주문 실행 검증 통과\"\nfi\n"
+    - name: 최종 정산 스냅샷 생성
+      if: always()
+      env:
+        BROKER: ${{ inputs.broker || 'kis' }}
+        BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+        TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
+        RUN_ID: ${{ inputs.run_id || github.run_id }}
+        RETRY_NUM: ${{ inputs.retry_num || '0' }}
+        CODE_VERSION: ${{ github.sha }}
+        SYMBOLS: ${{ inputs.symbols || '' || (inputs.broker == 'kiwoom' && 'TQQQ:NAS,SOXL:NYS') || 'TQQQ:NAS,SOXL:AMS' }}
+      run: "uv run python - <<'PY'\nimport os\nfrom ops.verify_run import write_final_snapshot\n\nwrite_final_snapshot(\n    f\"final-settlement-{os.environ['RUN_ID']}.json\",\n    \".state.json\",\n    broker=os.environ.get(\"BROKER\", \"\"),\n    broker_mode=os.environ.get(\"BROKER_MODE\", \"\"),\n    trade_mode=os.environ.get(\"TRADE_MODE\", \"\"),\n    run_id=os.environ.get(\"RUN_ID\", \"\"),\n    retry_num=os.environ.get(\"RETRY_NUM\", \"\"),\n    code_version=os.environ.get(\"CODE_VERSION\", \"\"),\n    symbols=[s for s in os.environ.get(\"SYMBOLS\", \"\").split(\",\") if s.strip()],\n)\nPY\n"
+    - name: Mock 캐시 파일 준비
+      if: always()
+      run: 'mkdir -p .mock-cache
+
+        cp -f .state.json .mock-cache/mock-state.json
+
+        '
+    - name: state 캐시 저장
+      uses: actions/cache/save@v4
+      if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.state_may_change != 'false' }}
+      with:
+        path: .mock-cache/mock-state.json
+        key: mock-skip-${{ inputs.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+    - name: state 캐시 저장 생략 안내
+      if: ${{ always() && !((steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.state_may_change != 'false') }}
+      env:
+        RESOLVED_MODE: ${{ steps.resolve.outputs.trade_mode }}
+        STATE_MAY_CHANGE: ${{ steps.bot.outputs.state_may_change }}
+      run: "if [[ \"$RESOLVED_MODE\" == \"LIVE\" || \"$RESOLVED_MODE\" == \"REPAIR\" ]]; then\n  echo \"::notice::state 변경이 없어(state_may_change='${STATE_MAY_CHANGE//[^a-z]/?}', 게이트 중단 또는 정상 SKIP) 새 state 캐시를 저장하지 않습니다.\"\n  exit 0\nfi\necho \"::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구는 로컬에서 TRADE_MODE=REPAIR 로 실행하세요 (Actions 의 REPAIR 는 현재 차단됩니다).\"\n"
+    - name: 정산 근거 암호화
+      if: always()
+      shell: bash
+      env:
+        PASSPHRASE: mock-passphrase-not-a-secret
+      run: "set -euo pipefail\numask 077\nshopt -s nullglob\nout=evidence.tgz.gpg\npartial=evidence.tgz.gpg.partial\n# 가장 먼저 이전 실행의 암호문·부분 파일·평문 tgz 를 지웁니다 (self-hosted runner 작업 디렉터리\n# 재사용 시 오래된 Evidence 가 이번 실행 것으로 업로드되는 것을 막기 위해, 존재 검사보다 앞섭니다).\nrm -f \"$partial\" \"$out\" evidence.tgz\n# 주문번호 매핑 원장(odno-map-*.jsonl)은 공개 로그의 가명 토큰을 원문으로 되돌리는\n# 유일한 근거이므로 정산 근거와 함께 암호화합니다. 평문은 남기지 않습니다.\nfiles=(settlement-*.json final-settlement-*.json odno-map-*.jsonl)\nif [[ ${#files[@]} -eq 0 ]]; then\n  echo \"::warning::이번 실행에 정산 근거 파일이 없어 Evidence 를 업로드하지 않습니다 — 정산 검증 불가 (verify 단계가 실패로 보고합니다)\"\n  exit 0\nfi\n# trap 은 전제조건 검사보다 먼저 설치합니다. 패스프레이즈 없음·gpg 없음으로\n# 실패 종료해도 원문 주문번호가 든 평문 매핑 원장이 러너에 남지 않게 합니다.\n# 성공(rc=0) 시에는 동작하지 않고, 암호화 뒤 평문은 별도로 지웁니다.\n# 원문 주문번호가 든 매핑 원장(평문 JSONL)도 함께 지웁니다 (self-hosted runner 잔존 방지).\ntrap 'rc=$?; if [[ $rc -ne 0 ]]; then rm -f \"$partial\" \"$out\" evidence.tgz; rm -f odno-map-*.jsonl 2>/dev/null || true; fi' EXIT\nif [[ -z \"$PASSPHRASE\" ]]; then\n  echo \"::error::EVIDENCE_PASSPHRASE(또는 STATE_BACKUP_PASSPHRASE)가 없어 정산 근거를 업로드하지 않습니다\"\n  exit 1\nfi\ncommand -v gpg > /dev/null || { echo \"::error::gpg 가 없어 정산 근거를 암호화할 수 없습니다\"; exit 1; }\n\n# 어떤 이유로든 실패하면 불완전한 암호문(.partial)·최종 산출물·평문 tgz 를 남기지 않습니다.\n# (업로드 단계는 산출물이 없으면 올릴 파일이 없어 경고만 합니다)\n\n# tar → gpg 스트리밍: 중간 평문 압축파일(evidence.tgz)을 디스크에 만들지 않습니다.\n# 패스프레이즈는 stdin(압축 데이터)과 겹치지 않도록 fd 3 으로 전달합니다.\ntar czf - \"${files[@]}\" |\n  gpg --batch --yes --pinentry-mode loopback \\\n    --passphrase-fd 3 --symmetric \\\n    --cipher-algo AES256 --s2k-digest-algo SHA256 \\\n    --output \"$partial\" 3< <(printf '%s' \"$PASSPHRASE\")\ntest -s \"$partial\"\n\n# 업로드 전 왕복 검증: 복호화·압축 해제가 끝까지 되는지 확인합니다 (잘린/손상 암호문 차단).\ngpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt \"$partial\" \\\n  3< <(printf '%s' \"$PASSPHRASE\") | tar tz > /dev/null\n\nmv \"$partial\" \"$out\"\ntest -s \"$out\"\n\n# 암호화가 끝났으므로 평문 매핑 원장은 남기지 않습니다 (원문 주문번호 잔존 방지).\n# nullglob 이라 파일이 없으면 인자가 사라져 rm 이 실패하므로 || true 로 무시합니다.\nrm -f odno-map-*.jsonl 2>/dev/null || true\n"
+    - name: 정산 근거 업로드 (암호화본만)
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: mock-evidence-${{ github.run_id }}-${{ inputs.scenario }}
+        path: evidence.tgz.gpg
+        if-no-files-found: warn
+        retention-days: 14
+    - name: Mock 사후 단계 실패 주입
+      if: ${{ inputs.fail_after == 'yes' }}
+      run: 'echo ''mock: later step failure''; exit 1'
+    - name: 실행 결과 요약
+      if: always()
+      continue-on-error: true
+      env:
+        RUN_OUTCOME: ${{ steps.bot.outputs.run_outcome }}
+        RUN_REASON: ${{ steps.bot.outputs.run_reason }}
+        SETTLEMENT_STATUS: ${{ steps.bot.outputs.settlement_status }}
+        ORDER_VERIFY_STATUS: ${{ steps.bot.outputs.order_verify_status }}
+        BOT_OUTCOME: ${{ steps.bot.outcome }}
+        JOB_STATUS: ${{ job.status }}
+        BROKER: ${{ inputs.broker || 'kis' }}
+        BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+        TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
+        RUN_PHASE_LABEL: ${{ steps.phase-guard.outputs.run_phase }}
+        TELEGRAM_BOT_TOKEN: ${{ '' }}
+        TELEGRAM_CHAT_ID: ${{ '' }}
+      run: "export LC_ALL=C.UTF-8\n# 외부 입력이 섞일 수 있는 값은 개행·제어문자를 제거합니다.\nclean() { printf '%s' \"$1\" | tr -d '\\000-\\037\\177'; }\noutcome=\"${RUN_OUTCOME:-}\"\nreason=$(clean \"${RUN_REASON:-}\")\nif [[ -z \"$outcome\" ]]; then\n  if [[ -z \"${BOT_OUTCOME:-}\" || \"${BOT_OUTCOME:-}\" == \"skipped\" ]]; then\n    outcome=\"NOT_STARTED\"\n    reason=\"봇 실행 단계 전에 중단\"\n  else\n    outcome=\"UNKNOWN\"\n    reason=\"결과 표식 없음 — state 변경 가능성이 있습니다 (로그 확인)\"\n  fi\nfi\ncase \"$outcome\" in\n  NOT_STARTED) label=\"봇 미시작\" ;;\n  SKIPPED) label=\"정상 SKIP\" ;;\n  SETTLE_ONLY) label=\"정산 실행 (주문 없음)\" ;;\n  ORDERS_EXECUTED) label=\"주문 실행\" ;;\n  COMPLETED) label=\"단계 완료\" ;;\n  FAILED) label=\"실패\" ;;\n  PARTIAL_FAILURE) label=\"부분 실패\" ;;\n  *) label=\"확인 필요\" ;;\nesac\nif [[ \"${JOB_STATUS:-}\" != \"success\" ]]; then\n  case \"$outcome\" in\n    SKIPPED | SETTLE_ONLY | ORDERS_EXECUTED | COMPLETED)\n      label=\"$label — 이후 단계 실패(job ${JOB_STATUS:-unknown}), 로그 확인\" ;;\n  esac\nfi\nsettlement=\"${SETTLEMENT_STATUS:-(기록 없음)}\"\nverify=\"${ORDER_VERIFY_STATUS:-(기록 없음)}\"\nmessage=\"[$(clean \"$BROKER\")-$(clean \"$BROKER_MODE\")] 자동매매 실행 결과: $label\n모드: $(clean \"${TRADE_MODE:-?}\") / 단계: ${RUN_PHASE_LABEL:-레거시}\n결과: $outcome / 정산: $settlement / 주문 검증: $verify\n사유: ${reason:-없음}\nrun: ${GITHUB_RUN_ID:-?}\"\n{\n  echo \"### 자동매매 실행 결과: $label\"\n  echo '```text'\n  printf '%s\\n' \"$message\"\n  echo '```'\n} >> \"$GITHUB_STEP_SUMMARY\"\necho \"$message\"\nRUN_SUMMARY_MESSAGE=\"$message\" uv run python -c 'import os, sys; sys.path.insert(0, \"src\"); from notifier import notify; notify(os.environ[\"RUN_SUMMARY_MESSAGE\"], urgent=True)' \\\n  || echo \"::warning::실행 결과 텔레그램 발송에 실패했습니다 (job 결과에는 영향 없음).\"\n"
+  verify-settlement:
+    needs: run-trade
+    if: ${{ always() && !(needs.run-trade.result == 'success' && needs.run-trade.outputs.settlement_status == 'SKIPPED') }}
+    uses: ./.github/workflows/mock_session_skip_verify.yml
+    with:
+      broker: ${{ inputs.broker || 'kis' }}
+      broker_mode: ${{ inputs.broker_mode || 'demo' }}
+      mode: ${{ needs.run-trade.outputs.trade_mode }}
+      run_id: ${{ inputs.run_id || github.run_id }}
+      retry_num: ${{ inputs.retry_num || '0' }}
+      code_version: ${{ github.sha }}
+      trade_result: ${{ needs.run-trade.result }}
+      order_verify_status: ${{ needs.run-trade.outputs.order_verify_status }}
+      order_verify_summary: ${{ needs.run-trade.outputs.order_verify_summary }}
+      artifact_name: mock-evidence-${{ github.run_id }}-${{ inputs.scenario }}
+  assert:
+    name: assert
+    needs:
+    - run-trade
+    - verify-settlement
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Mock state 캐시 저장 여부 조회
+      id: lookup
+      uses: actions/cache/restore@v4
+      with:
+        path: .mock-cache/mock-state.json
+        key: mock-skip-${{ inputs.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+        lookup-only: true
+    - name: 기대값 대조
+      env:
+        SCENARIO: ${{ inputs.scenario }}
+        TRADE_RESULT: ${{ needs.run-trade.result }}
+        RUN_OUTCOME: ${{ needs.run-trade.outputs.run_outcome }}
+        SETTLEMENT_STATUS: ${{ needs.run-trade.outputs.settlement_status }}
+        CACHE_HIT: ${{ steps.lookup.outputs.cache-hit }}
+        VERIFY_RESULT: ${{ needs.verify-settlement.result }}
+      run: python3 ops/mock_actions/scenarios.py assert "$SCENARIO"

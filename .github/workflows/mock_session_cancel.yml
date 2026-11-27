@@ -1,0 +1,32 @@
+# 생성 파일 (ops/mock_actions/build.py) — main/PR 에 커밋하지 마세요.
+name: Mock 세션 취소 검증 (수동 취소)
+'on':
+  push:
+    branches:
+    - mock-verify/**
+permissions:
+  contents: read
+jobs:
+  mock:
+    if: ${{ contains(github.event.head_commit.message, '[mock-cancel]') }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+        - scenario: cancel
+          broker: kis
+          broker_mode: demo
+          trade_mode: LIVE
+          run_phase: LIFECYCLE
+          bot_timeout: ''
+          fail_after: 'no'
+    uses: ./.github/workflows/mock_session_skip_run.yml
+    with:
+      scenario: ${{ matrix.scenario }}
+      broker: ${{ matrix.broker }}
+      broker_mode: ${{ matrix.broker_mode }}
+      trade_mode: ${{ matrix.trade_mode }}
+      run_phase: ${{ matrix.run_phase }}
+      bot_timeout: ${{ matrix.bot_timeout }}
+      fail_after: ${{ matrix.fail_after }}
