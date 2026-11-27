@@ -37,62 +37,10 @@ def _step(name, job=RUN_TRADE):
     return next(s for s in job["steps"] if s.get("name") == name)
 
 
-FAKE_UV = r'''#!/usr/bin/env python3
-import json, os, signal, sys
-from pathlib import Path
-
-args = sys.argv[1:]
-assert args[:2] == ["run", "python"], args
-args = args[2:]
-config = json.loads(os.environ["STUB_CONFIG"])
-log = Path(os.environ["STUB_LOG"])
-
-def record(entry):
-    with log.open("a") as fh:
-        fh.write(entry + "\n")
-
-if args and args[0] == "ops/session_gate.py":
-    record("GATE")
-    if config.get("gate_rc", 0):
-        sys.exit(config["gate_rc"])
-    for key, value in config["gate"].items():
-        print(f"{key}={value}")
-    sys.exit(0)
-if args and args[0] == "-c":
-    record("SUMMARY")
-    Path(os.environ["STUB_SENT"]).write_text(os.environ["RUN_SUMMARY_MESSAGE"])
-    sys.exit(config.get("send_rc", 0))
-if args[0] != "trading_bot.py":
-    os.execv(sys.executable, [sys.executable, *args])
-
-phase = os.environ.get("RUN_PHASE", "") or "LEGACY"
-target = os.environ.get("PLAN_ID", "") if phase == "APPROVE" else ""
-if phase in ("EXECUTE", "VERIFY"):
-    target = os.environ.get("APPROVAL_PLAN_ID", "")
-key = f"{phase}:{target}" if f"{phase}:{target}" in config.get("rc", {}) else phase
-record(f"{phase} {target}".strip())
-if config.get("kill") == phase:
-    os.kill(os.getppid(), signal.SIGKILL)
-    sys.exit(1)
-rc = config.get("rc", {}).get(key, 0)
-if rc == 0 and phase == "SETTLE":
-    Path("settlement-TQQQ-x.json").write_text("{}")
-if rc == 0 and phase == "PREVIEW":
-    Path("plans").mkdir(exist_ok=True)
-    for plan_id in config.get("plans", ["P1"]):
-        Path("plans", f"{plan_id}.json").write_text(json.dumps({"plan_id": plan_id}))
-if rc == 0 and phase == "APPROVE":
-    Path("approvals").mkdir(exist_ok=True)
-    Path("approvals", f"{target}.json").write_text("{}")
-marker = os.environ.get("RUN_SKIP_MARKER", "")
-if phase == "LEGACY" and config.get("skip_marker"):
-    Path(marker).write_text(config["skip_marker"] + "\n")
-# 봇의 EXECUTE SKIP: 창이 닫혀 있고 승인 검증을 통과(exit 0)한 대상만 표식을 남깁니다.
-if phase == "EXECUTE" and marker and rc == 0 and target not in config.get("no_skip", []):
-    with open(marker, "a") as fh:
-        fh.write(f"{target} skip\n")
-sys.exit(rc)
-'''
+# Actions Mock 검증 워크플로와 **같은** 가짜 uv 를 씁니다.
+FAKE_UV = (_repo_root / "ops" / "mock_actions" / "bin" / "uv").read_text(
+    encoding="utf-8"
+)
 
 
 def _gate(window="open", wait=0, due=True, hold="", session="2026-11-27"):
