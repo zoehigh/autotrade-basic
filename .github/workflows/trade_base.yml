@@ -208,6 +208,16 @@ jobs:
       #   / 빈 값(게이트에서 중단되어 VERIFY 까지 가지 못함)
       order_verify_status: ${{ steps.bot.outputs.order_verify_status }}
       order_verify_summary: ${{ steps.bot.outputs.order_verify_summary }}
+      # 실행 결과 표식 (봇 실행 스텝이 기록):
+      #   NOT_STARTED(봇 미시작) / SKIPPED(정상 SKIP) / SETTLE_ONLY(정산 실행, 주문 없음) /
+      #   ORDERS_EXECUTED(주문 실행) / COMPLETED(주문 없는 단독 단계·DRY) /
+      #   FAILED(정산 단계 또는 단독 단계 실패) / PARTIAL_FAILURE(정산 이후·주문 단계 실패) /
+      #   빈 값(봇 스텝 미도달)
+      run_outcome: ${{ steps.bot.outputs.run_outcome }}
+      run_reason: ${{ steps.bot.outputs.run_reason }}
+      # SKIPPED = 정산을 **정상적으로** 실행하지 않음 (verify-settlement 제외 대상).
+      # ATTEMPTED = SETTLE 실행. 빈 값·그 외는 검증 대상입니다 (fail-closed).
+      settlement_status: ${{ steps.bot.outputs.settlement_status }}
     steps:
       # ── 실행 단계 정규화 (체크아웃 **이전**) ─────────────────────────────
       # actions/checkout 은 기본값 clean: true 로 `git clean -ffdx && git reset --hard HEAD` 를
@@ -421,6 +431,59 @@ jobs:
           echo "Resolved SYMBOLS=$(safe "$SYMBOLS")"
           echo "Environment=$(safe "${IN_BROKER}")-$(safe "${IN_BROKER_MODE}")"
 
+      # ═ 봇 실행 스크립트 설명 (run 블록 길이를 21,000자 아래로 유지하려고 YAML 주석에 둡니다) ═
+      # ── 실행 결과 표식 ──
+      # 같은 키를 여러 번 쓰면 마지막 값이 남습니다 → 중간에 죽어도 직전 표식이 남습니다.
+      # bot_started=false 는 "봇을 실행하지 않았다"는 **적극적인 증거**일 때만 남습니다.
+      # state 캐시 저장 가드는 이 값이 'false' 일 때만 저장을 생략합니다 (그 외는 보수적으로 저장).
+      # ── 세션 게이트 ──
+      # 주문 대상 세션 판정 + hosted 러너 대기 시간 예산.
+      #    LIVE 의 LIFECYCLE/EXECUTE 는 봇 실행 전에 ops/session_gate.py(봇과 같은 XNYS 캘린더,
+      #    읽기 전용)로 판정합니다.
+      #    - window=closed (대상일 휴장 / 정규장 마감 후, 조기폐장 포함): 주문은 **정상 SKIP**
+      #      합니다. 직전 마감 세션의 정산이 가능하면(애프터아워 종료 후) LIFECYCLE 은 SETTLE 만
+      #      실행합니다. 실제 처리는 아래 각 실행 분기에 있습니다.
+      #    - window=open: 기존 대기 규칙(정규장 진행 중이면 0, 그 외 KST 17/18시 프리장)을 따릅니다.
+      #      hosted 러너는 6시간에서 강제 종료되어 Evidence·검증 단계가 실행되지 않으므로, 예상
+      #      대기가 상한(LIFECYCLE_MAX_WAIT_SECONDS, 기본 4시간)을 넘으면 실행 전에 **실패**합니다
+      #      (SKIP 아님 — 실행 시각 설정 문제). self-hosted 러너는 제한이 없어 제외합니다.
+      #    - 판정 실패(캘린더·state 파일 오류)는 SKIP 으로 바꾸지 않고 실패합니다.
+      # ── 주문 실행 검증(RUN_PHASE=VERIFY) 도우미 ──
+      # EXECUTE 가 실제로 낸 주문을 승인 파일 + 전송 기록(.transmitted.json) + 브로커
+      # read-only 이력/잔고로 검증합니다. **정산 검증(verify-settlement job)** 과는 다른
+      # 축이므로 결과를 합치지 않고 따로 보고합니다 (정산 검증 성공 ≠ 주문 실행 검증 완료).
+      #
+      # 같은 job·같은 작업 디렉터리에서 돌기 때문에 VERIFY 에 필요한 산출물
+      # (approvals/*.json·settlement-*.json·.state.json·plans/)이 그대로 있습니다 —
+      # hosted fresh 러너에서도 산출물을 artifact 로 넘길 필요가 없습니다
+      # (artifact 로 넘기면 원문 주문번호가 든 원장까지 함께 올려야 해서 채택하지 않았습니다).
+      #
+      # 봇의 VERIFY 종료코드: 0=실행 후 검증 통과, 1=실행 실패/검증 실패,
+      #                        2=승인만 되고 실행되지 않음(검증 통과와 **다른** 상태)
+      # ── LIFECYCLE ──
+      # 한 job 안에서 단계를 순서대로(별도 프로세스로) 실행합니다. 각 단계는 봇의 게이트를
+      # 그대로 통과해야 하므로, APPROVE 가 남긴 승인 파일(plan_hash·세션·상태해시 바인딩,
+      # 허용오차, TTL)을 통과하지 못하면 EXECUTE 는 주문을 내지 않습니다.
+      # 승인 파일은 같은 작업 디렉터리에서 PREVIEW → APPROVE 로만 이어지므로
+      # plan_id 수동 복사가 필요 없지만, 승인 게이트 자체는 생략되지 않습니다.
+      # 5단계는 주문 실행 검증(RUN_PHASE=VERIFY)입니다 — EXECUTE 가 실제로 낸 주문이
+      # 접수·전송됐는지를 승인 파일·전송 기록·브로커 read-only 대조로 확인합니다.
+      # 정산 검증(ops/verify_run.py)은 이 job 이 아니라 별도 verify-settlement job 이 하며,
+      # 두 결과는 서로를 대신하지 않습니다 (합쳐서 "성공"으로 표시하지 않음).
+      # ── 실행 전 안전 게이트 ──
+      # 1) 운영 계좌(real)의 LIVE 주문 경로에 **사람 검토 표식**을 요구합니다.
+      #    LIFECYCLE 은 PREVIEW 산출물을 자동 승인·실행하므로(같은 job 안 연쇄), 사람이
+      #    개입하지 않으면 남는 것은 기계적 검증(plan_hash·세션·상태해시·허용오차·TTL)뿐입니다.
+      #    그래서 주문이 나갈 수 있는 경로는 reviewed=true 표식을 명시해야 합니다.
+      #    demo(모의 계좌)는 자동 체인을 그대로 허용합니다 (실계좌가 아님).
+      # 1-b) 수동 승인 경로의 **계획 해시 바인딩** (외부 리뷰 P1).
+      #      reviewed=true 는 "사람이 검토했다"는 선언일 뿐 무엇을 검토했는지 증명하지
+      #      않습니다. LIFECYCLE 처럼 PREVIEW **전에** 전달되면 사람이 가격·수량을 보지
+      #      않고 승인·실행까지 자동 진행됩니다. 그래서 수동 단계(APPROVE/EXECUTE)는
+      #      사람이 본 plan_id 와 plan_hash 를 함께 넘기게 하고, 봇이 계획 파일/승인
+      #      파일의 plan_hash 와 대조합니다 (불일치 = 승인/실행 중단).
+      #      완전 자동 경로(LIFECYCLE + reviewed=true)는 정책상 허용하되, 이 바인딩이
+      #      없으므로 "사람 검토"가 아니라 "자동 진행"입니다 (ops/cron.example 참고).
       - name: 자동매매 봇 실행
         # 주문 실행 검증(VERIFY) 결과를 job output 으로 넘기기 위한 id 입니다.
         # (정산 검증 결과와 구분해 보고하려고 verify-settlement job 으로도 전달합니다)
@@ -606,6 +669,17 @@ jobs:
         run: |
           set -eo pipefail
 
+          # ══ 실행 결과 표식 (설명은 이 스텝 위의 주석) ══
+          set_out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          set_outcome() { set_out run_outcome "$1"; set_out run_reason "$2"; }
+          set_out bot_started false
+          set_outcome NOT_STARTED "봇 실행 전 중단 (게이트/설정 확인)"
+          # **봇을 처음 실행하기 직전에** 호출합니다.
+          mark_bot_started() {
+            set_out bot_started true
+            set_outcome FAILED "봇 실행 중 실패/중단"
+          }
+
           # self-hosted runner 작업 디렉터리는 실행 간 재사용됩니다. 이전 실행이 남긴 주문번호 매핑
           # 원장(odno-map-*.jsonl)은 아래 Evidence 단계의 `odno-map-*.jsonl` 글롭에 그대로 걸려
           # **이번 실행의 암호화 Evidence 에 섞여** 업로드됩니다 (지난 실행 원문 주문번호가 이번
@@ -623,18 +697,7 @@ jobs:
             | tr '[:lower:]' '[:upper:]')
           export RUN_PHASE="$phase"
 
-          # ══ 주문 실행 검증(RUN_PHASE=VERIFY) 도우미 ═════════════════════════════════
-          # EXECUTE 가 실제로 낸 주문을 승인 파일 + 전송 기록(.transmitted.json) + 브로커
-          # read-only 이력/잔고로 검증합니다. **정산 검증(verify-settlement job)** 과는 다른
-          # 축이므로 결과를 합치지 않고 따로 보고합니다 (정산 검증 성공 ≠ 주문 실행 검증 완료).
-          #
-          # 같은 job·같은 작업 디렉터리에서 돌기 때문에 VERIFY 에 필요한 산출물
-          # (approvals/*.json·settlement-*.json·.state.json·plans/)이 그대로 있습니다 —
-          # hosted fresh 러너에서도 산출물을 artifact 로 넘길 필요가 없습니다
-          # (artifact 로 넘기면 원문 주문번호가 든 원장까지 함께 올려야 해서 채택하지 않았습니다).
-          #
-          # 봇의 VERIFY 종료코드: 0=실행 후 검증 통과, 1=실행 실패/검증 실패,
-          #                        2=승인만 되고 실행되지 않음(검증 통과와 **다른** 상태)
+          # ══ 주문 실행 검증(RUN_PHASE=VERIFY) 도우미 (설명은 이 스텝 위의 주석) ══
           order_verify_targets=0
           order_verify_pass=0
           order_verify_failed=0
@@ -733,11 +796,7 @@ jobs:
           }
 
           # ══ 실행 전 안전 게이트 (봇 실행·브로커 호출·state 변경 전) ══════════════════
-          # 1) 운영 계좌(real)의 LIVE 주문 경로에 **사람 검토 표식**을 요구합니다.
-          #    LIFECYCLE 은 PREVIEW 산출물을 자동 승인·실행하므로(같은 job 안 연쇄), 사람이
-          #    개입하지 않으면 남는 것은 기계적 검증(plan_hash·세션·상태해시·허용오차·TTL)뿐입니다.
-          #    그래서 주문이 나갈 수 있는 경로는 reviewed=true 표식을 명시해야 합니다.
-          #    demo(모의 계좌)는 자동 체인을 그대로 허용합니다 (실계좌가 아님).
+          # 1) 운영 계좌(real) LIVE 사람 검토 표식 (설명은 이 스텝 위의 주석)
           bool_on() {
             case "$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')" in
               1|TRUE|YES|ON|Y) return 0 ;;
@@ -763,14 +822,7 @@ jobs:
             exit 1
           fi
 
-          # 1-b) 수동 승인 경로의 **계획 해시 바인딩** (외부 리뷰 P1).
-          #      reviewed=true 는 "사람이 검토했다"는 선언일 뿐 무엇을 검토했는지 증명하지
-          #      않습니다. LIFECYCLE 처럼 PREVIEW **전에** 전달되면 사람이 가격·수량을 보지
-          #      않고 승인·실행까지 자동 진행됩니다. 그래서 수동 단계(APPROVE/EXECUTE)는
-          #      사람이 본 plan_id 와 plan_hash 를 함께 넘기게 하고, 봇이 계획 파일/승인
-          #      파일의 plan_hash 와 대조합니다 (불일치 = 승인/실행 중단).
-          #      완전 자동 경로(LIFECYCLE + reviewed=true)는 정책상 허용하되, 이 바인딩이
-          #      없으므로 "사람 검토"가 아니라 "자동 진행"입니다 (ops/cron.example 참고).
+          # 1-b) 수동 승인 경로의 계획 해시 바인딩 (설명은 이 스텝 위의 주석)
           manual_approve=0
           case "$phase" in
             APPROVE|EXECUTE) manual_approve=1 ;;
@@ -800,71 +852,77 @@ jobs:
             plan_hashes=()
           fi
 
-          # 2) hosted 러너 6시간 제한 — 프리장 개장까지 대기하는 단계는 아침 dispatch 에서
-          #    최대 ~7.5시간을 기다려 job 이 **강제 종료**됩니다. 강제 종료되면 Evidence 생성·
-          #    업로드와 정산 검증 job 이 실행되지 않아 실행 근거가 남지 않습니다.
-          #    그래서 대기 예상치가 상한(LIFECYCLE_MAX_WAIT_SECONDS, 기본 4시간)을 넘으면
-          #    실행 전에 중단하고 저녁 실행을 안내합니다. self-hosted 러너는 제한이 없어 제외합니다.
-          #    대기 규칙은 봇(src/pipeline_execute._wait_until_pre_market)과 **같습니다**:
-          #    미국 정규장(ET 09:30~16:00)이 이미 진행 중이면 대기 0 (KST 04:10 은 ET
-          #    14:10/15:10 으로 정규장 한복판 — 기다리면 하루를 놓칩니다),
-          #    그 외에는 KST 17시(미국 DST) / 18시(비 DST) 개장까지 대기, TRADE_MODE=DRY 는 대기 없음.
-          #    정규장 진행 판정은 봇과 같은 XNYS 캘린더(`us_session_in_progress`)를 씁니다.
-          if [[ "$live_norm" == "LIVE" && ( "$phase" == "LIFECYCLE" || "$phase" == "EXECUTE" ) \
-                && "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]]; then
-            wait_max="${LIFECYCLE_MAX_WAIT_SECONDS:-14400}"
-            case "$wait_max" in
-              '' | *[!0-9]*) wait_max=14400 ;;
+          # 2) 주문 대상 세션 판정 + hosted 대기 시간 예산 (설명은 이 스텝 위의 주석)
+          window_state=""
+          gate_out=""
+          gate_value() { printf '%s\n' "$gate_out" | sed -n "s/^$1=//p" | head -n 1; }
+          if [[ "$live_norm" == "LIVE" && ( "$phase" == "LIFECYCLE" || "$phase" == "EXECUTE" ) ]]; then
+            if ! gate_out=$(uv run python ops/session_gate.py); then
+              echo "::error::주문 대상 세션을 판정하지 못했습니다 (캘린더/state 파일 오류). 정상 SKIP 으로 처리하지 않고 봇 실행 전에 중단합니다."
+              set_outcome NOT_STARTED "세션 게이트 판정 실패"
+              exit 1
+            fi
+            window_state=$(gate_value window)
+            wait_seconds=$(gate_value wait_seconds)
+            case "$window_state" in
+              open | closed) ;;
+              *) window_state="" ;;
             esac
-            wait_reader=$(mktemp)
-            cat > "$wait_reader" <<'PY'
-          import sys
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-
-          # 봇과 **같은** 코드 경로를 쓰기 위해 src 를 경로에 추가합니다 (trading_bot.py 와 동일).
-          sys.path.append("src")
-
-          now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-          now_utc = now_kst.astimezone(ZoneInfo("UTC"))
-
-          # 1) 미국 정규장이 진행 중이면 대기 예상 = 0 (봇은 그때 즉시 실행합니다).
-          try:
-              from broker.market_utils import us_session_in_progress
-
-              in_session = us_session_in_progress(now_utc) is not None
-          except Exception:
-              # 판단 불가 시 대기 규칙(KST 17/18시)으로 넘깁니다 — 보수적 방향.
-              in_session = False
-
-          if in_session:
-              print(0)
-          else:
-              try:
-                  et = now_utc.astimezone(ZoneInfo("America/New_York"))
-                  dst = et.dst() is not None and et.dst().total_seconds() != 0
-              except Exception:
-                  # 판단 불가 시 **늦은 개장(18시)** 을 가정합니다 = 대기 시간을 크게 잡는 보수적 방향.
-                  dst = False
-              open_hour = 17 if dst else 18
-              target = now_kst.replace(hour=open_hour, minute=0, second=0, microsecond=0)
-              print(int(max(0, (target - now_kst).total_seconds())))
-          PY
-            wait_seconds=$(uv run python "$wait_reader" 2>/dev/null || true)
-            rm -f "$wait_reader"
             case "$wait_seconds" in
-              '' | *[!0-9]*)
-                echo "::warning::프리장 개장까지의 대기 시간을 계산하지 못해 시간 예산 게이트를 건너뜁니다 (job timeout-minutes 로 강제 종료는 방지됩니다)."
-                ;;
-              *)
-                echo "[시간 예산] RUN_PHASE=$phase 프리장 대기 예상=$((wait_seconds / 60))분 (허용 $((wait_max / 60))분, 러너=${RUNNER_ENVIRONMENT:-unknown})"
-                if [[ "$wait_seconds" -gt "$wait_max" ]]; then
-                  echo "::error::RUN_PHASE=$phase 를 지금 시작하면 프리장 개장까지 약 $((wait_seconds / 60))분을 기다립니다 (허용 $((wait_max / 60))분). GitHub hosted 러너는 6시간에서 강제 종료되어 Evidence·검증 단계가 실행되지 않습니다. **저녁(KST 17시 이후) dispatch 로 실행**하거나, 아침에는 run_phase=PREVIEW 로 계획만 만드세요. 봇을 실행하지 않고 중단합니다."
-                  exit 1
-                fi
-                ;;
+              '' | *[!0-9]*) window_state="" ;;
             esac
+            if [[ -z "$window_state" ]]; then
+              echo "::error::세션 게이트 출력이 올바르지 않습니다 — 봇 실행 전에 중단합니다."
+              set_outcome NOT_STARTED "세션 게이트 출력 오류"
+              exit 1
+            fi
+            echo "[세션 게이트] window=$window_state 대상=$(gate_value session) 직전 마감=$(gate_value settled_session) 정산 가능=$(gate_value settlement_due)"
+            echo "[세션 게이트] $(gate_value reason)"
+            if [[ "$window_state" == "open" && "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]]; then
+              wait_max="${LIFECYCLE_MAX_WAIT_SECONDS:-14400}"
+              case "$wait_max" in
+                '' | *[!0-9]*) wait_max=14400 ;;
+              esac
+              echo "[시간 예산] RUN_PHASE=$phase 프리장 대기 예상=$((wait_seconds / 60))분 (허용 $((wait_max / 60))분, 러너=${RUNNER_ENVIRONMENT:-unknown})"
+              if [[ "$wait_seconds" -gt "$wait_max" ]]; then
+                echo "::error::RUN_PHASE=$phase 를 지금 시작하면 프리장 개장까지 약 $((wait_seconds / 60))분을 기다립니다 (허용 $((wait_max / 60))분). GitHub hosted 러너는 6시간에서 강제 종료되어 Evidence·검증 단계가 실행되지 않습니다. **저녁(KST 17시 이후) dispatch 로 실행**하거나, 아침에는 run_phase=PREVIEW 로 계획만 만드세요. 봇을 실행하지 않고 중단합니다."
+                set_outcome NOT_STARTED "프리장 대기 시간 예산 초과"
+                exit 1
+              fi
+            fi
           fi
+
+          # 정산까지 실행하지 않는 **정상 SKIP** 으로 끝냅니다 (봇 미실행 → state 캐시 저장·정산 검증 없음).
+          # 이전 실행의 보류 표식이 state 에 남아 있으면 정상 SKIP 으로 숨기지 않고 실패합니다.
+          skip_without_bot() { # $1 = 사유
+            local hold
+            hold=$(gate_value state_hold)
+            if [[ -n "$hold" ]]; then
+              echo "::error::state 에 이전 실행의 보류 표식이 남아 있어 정상 SKIP 으로 처리하지 않습니다 (${hold}). 브로커 이력과 대조해 확인하세요. 봇을 실행하지 않았고 state 는 바꾸지 않았습니다."
+              set_outcome NOT_STARTED "보류 상태 잔존: $hold"
+              exit 1
+            fi
+            echo "::notice::정상 SKIP — $1"
+            set_out settlement_status SKIPPED
+            set_outcome SKIPPED "$1"
+            mark_order_verify_skipped "$1"
+            exit 0
+          }
+          # 봇이 휴장일이라 정산까지 건너뛰었는지(DRY·레거시) 확인하는 표식 파일
+          run_legacy_bot() {
+            local marker
+            marker=$(mktemp)
+            RUN_PHASE= RUN_SKIP_MARKER="$marker" uv run python trading_bot.py
+            if [[ -s "$marker" ]]; then
+              set_out settlement_status SKIPPED
+              set_outcome SKIPPED "$(head -n 1 "$marker")"
+              mark_order_verify_skipped "$(head -n 1 "$marker")"
+            else
+              set_outcome COMPLETED "TRADE_MODE=${TRADE_MODE:-} 미리보기 완료 (주문 없음)"
+              mark_order_verify_skipped "TRADE_MODE=${TRADE_MODE:-} (DRY 미리보기 — 승인·실행이 없어 검증 대상 없음)"
+            fi
+            rm -f "$marker"
+          }
           # ══ 게이트 끝 ══════════════════════════════════════════════════════════════
 
           # ── 단일 단계 / 레거시 실행 ───────────────────────────────────
@@ -891,6 +949,22 @@ jobs:
                 exit 1
               fi
             fi
+            # 주문 창이 닫힌 EXECUTE 는 봇을 실행하지 않고 정상 SKIP 합니다. 대상 지정이 없으면
+            # 설정 오류이므로 SKIP 하지 않고 봇이 실패하게 둡니다.
+            if [[ "$phase" == "EXECUTE" && "$window_state" == "closed" \
+                  && -n "$(printf '%s' "$refs" | tr -d '[:space:],')" ]]; then
+              skip_without_bot "$(gate_value reason) (RUN_PHASE=EXECUTE — 주문 미실행)"
+            fi
+            if [[ -z "$phase" ]]; then
+              mark_bot_started
+              run_legacy_bot
+              exit 0
+            fi
+            mark_bot_started
+            case "$phase" in
+              SETTLE) set_out settlement_status ATTEMPTED ;;
+              EXECUTE) set_outcome PARTIAL_FAILURE "EXECUTE 단계 실패 (주문 접수 여부는 VERIFY·로그 확인)" ;;
+            esac
             failed=0
             if [[ "$refs" == *,* ]]; then
               idx=0
@@ -972,23 +1046,37 @@ jobs:
               echo "::error::RUN_PHASE=$phase 실패 ${failed}건"
               exit 1
             fi
+            case "$phase" in
+              SETTLE) set_outcome SETTLE_ONLY "RUN_PHASE=SETTLE 정산 완료" ;;
+              EXECUTE) set_outcome ORDERS_EXECUTED "RUN_PHASE=EXECUTE 실행·주문 실행 검증 통과" ;;
+              *) set_outcome COMPLETED "RUN_PHASE=$phase 완료" ;;
+            esac
             exit 0
           fi
 
-          # ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY ───
-          # 한 job 안에서 단계를 순서대로(별도 프로세스로) 실행합니다. 각 단계는 봇의 게이트를
-          # 그대로 통과해야 하므로, APPROVE 가 남긴 승인 파일(plan_hash·세션·상태해시 바인딩,
-          # 허용오차, TTL)을 통과하지 못하면 EXECUTE 는 주문을 내지 않습니다.
-          # 승인 파일은 같은 작업 디렉터리에서 PREVIEW → APPROVE 로만 이어지므로
-          # plan_id 수동 복사가 필요 없지만, 승인 게이트 자체는 생략되지 않습니다.
-          # 5단계는 주문 실행 검증(RUN_PHASE=VERIFY)입니다 — EXECUTE 가 실제로 낸 주문이
-          # 접수·전송됐는지를 승인 파일·전송 기록·브로커 read-only 대조로 확인합니다.
-          # 정산 검증(ops/verify_run.py)은 이 job 이 아니라 별도 verify-settlement job 이 하며,
-          # 두 결과는 서로를 대신하지 않습니다 (합쳐서 "성공"으로 표시하지 않음).
+          # ── LIFECYCLE: SETTLE → PREVIEW → APPROVE → EXECUTE → VERIFY (설명은 이 스텝 위의 주석) ──
           if [[ "${TRADE_MODE:-}" != "LIVE" ]]; then
             echo "::notice::RUN_PHASE=LIFECYCLE + TRADE_MODE=${TRADE_MODE:-} → DRY 미리보기만 실행합니다 (APPROVE/EXECUTE/VERIFY 는 LIVE 전용)"
-            RUN_PHASE= uv run python trading_bot.py
-            mark_order_verify_skipped "TRADE_MODE=${TRADE_MODE:-} (DRY 미리보기 — 승인·실행이 없어 검증 대상 없음)"
+            mark_bot_started
+            run_legacy_bot
+            exit 0
+          fi
+
+          # 주문 창이 닫힘(휴장/마감 후): 주문 단계는 정상 SKIP. 정산이 가능하면 SETTLE 만 실행합니다.
+          if [[ "$window_state" == "closed" ]]; then
+            closed_reason=$(gate_value reason)
+            settled_session=$(gate_value settled_session)
+            if [[ "$(gate_value settlement_due)" != "true" ]]; then
+              skip_without_bot "$closed_reason; 직전 세션 ${settled_session} 은 애프터아워 종료 전이라 다음 실행에서 정산합니다"
+            fi
+            mark_bot_started
+            set_out settlement_status ATTEMPTED
+            echo "::group::[LIFECYCLE 1/5] SETTLE (주문 SKIP: $closed_reason)"
+            RUN_PHASE=SETTLE uv run python trading_bot.py
+            echo "::endgroup::"
+            echo "::notice::주문 SKIP — $closed_reason (SETTLE 만 실행, 직전 마감 세션 ${settled_session})"
+            mark_order_verify_skipped "$closed_reason (주문 미실행)"
+            set_outcome SETTLE_ONLY "$closed_reason — 정산(${settled_session})만 실행, 주문 없음"
             exit 0
           fi
 
@@ -998,9 +1086,13 @@ jobs:
           plans_before=$(mktemp)
           ls -1 "$PLAN_DIR_DEFAULT" 2>/dev/null | sort > "$plans_before"
 
+          mark_bot_started
+          set_out settlement_status ATTEMPTED
           echo "::group::[LIFECYCLE 1/5] SETTLE"
           RUN_PHASE=SETTLE uv run python trading_bot.py
           echo "::endgroup::"
+          # 이 뒤의 실패는 정산이 끝난 상태의 실패입니다 (주문이 일부 접수됐을 수 있음).
+          set_outcome PARTIAL_FAILURE "SETTLE 이후 단계 실패 (주문 접수 여부는 VERIFY·로그 확인)"
 
           echo "::group::[LIFECYCLE 2/5] PREVIEW"
           # AUTO_EXECUTE 는 이 경로에서 쓰지 않습니다 (승인·실행은 아래 단계가 담당).
@@ -1014,6 +1106,7 @@ jobs:
           if [[ ! -s "$new_plans" ]]; then
             echo "::notice::PREVIEW 가 새 계획을 만들지 않았습니다 (이번 세션 주문 없음) — APPROVE/EXECUTE/VERIFY 생략"
             mark_order_verify_skipped "PREVIEW 가 새 계획을 만들지 않음 (이번 세션 주문 없음)"
+            set_outcome SETTLE_ONLY "PREVIEW 가 새 계획을 만들지 않음 (이번 세션 주문 없음)"
             exit 0
           fi
 
@@ -1084,6 +1177,7 @@ jobs:
           fi
           echo "::endgroup::"
 
+          approved_count=$(grep -c . "$approved" || true)
           rm -f "$plans_before" "$plans_after" "$new_plans" "$plan_id_reader" "$approved"
 
           # 주문 실행 검증 결과를 정산 검증과 구분해 보고합니다 (job output 포함).
@@ -1092,7 +1186,13 @@ jobs:
           if [[ "$approve_failed" -ne 0 || "$execute_failed" -ne 0 \
                 || "$order_verify_exit" -ne 0 ]]; then
             echo "::error::라이프사이클 실패 — APPROVE ${approve_failed}건, EXECUTE ${execute_failed}건, 주문 실행 검증(VERIFY) 실패 ${order_verify_failed}건 / 실행안됨 ${order_verify_not_executed}건 (정산 검증은 별도 job 이며 이 결과와 합치지 않습니다)"
+            set_outcome PARTIAL_FAILURE "APPROVE ${approve_failed}건 / EXECUTE ${execute_failed}건 / 주문 검증 실패 ${order_verify_failed}건 · 실행안됨 ${order_verify_not_executed}건"
             exit 1
+          fi
+          if [[ "$approved_count" -eq 0 ]]; then
+            set_outcome SETTLE_ONLY "승인된 계획 없음 (주문 없음)"
+          else
+            set_outcome ORDERS_EXECUTED "승인 계획 ${approved_count}건 실행·주문 실행 검증 통과"
           fi
 
       - name: 최종 정산 스냅샷 생성
@@ -1123,24 +1223,32 @@ jobs:
           )
           PY
 
-      # state 캐시 저장 가드: 실제로 확정된 실행 모드(steps.resolve.outputs.trade_mode)가 LIVE 또는 REPAIR 일 때만
-      # 새 캐시를 만듭니다. DRY·미확정·잘못된 값은 저장하지 않아 "운영 복원 후보"가 생기지 않습니다.
+      # state 캐시 저장 가드: 실제로 확정된 실행 모드(steps.resolve.outputs.trade_mode)가 LIVE 또는 REPAIR 이고
+      # **봇이 시작됐을 가능성이 있을 때만** 새 캐시를 만듭니다. DRY·미확정·잘못된 값은 저장하지 않아
+      # "운영 복원 후보"가 생기지 않습니다.
+      # - 봇 스텝이 실행되지 않았거나(skipped) bot_started=false(게이트 중단·정상 SKIP)면 state 가 바뀌지 않았으므로
+      #   저장하지 않습니다. 표식이 비어 있으면(강제 종료 등) state 가 바뀌었을 수 있으므로 저장합니다.
       # - 복원(state 캐시 복원)은 모든 모드에서 허용합니다.
       # - always() 는 유지합니다: LIVE 실행이 일부 주문 처리 후 실패해도 state 를 보존해야 합니다 (success() 금지).
       # - 입력값/BROKER_MODE 로 판단하지 않습니다 (실제 실행 모드와 다를 수 있음).
       - name: state 캐시 저장
         uses: actions/cache/save@v4
-        if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') }}
+        if: ${{ always() && (steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.bot_started != 'false' }}
         with:
           path: .state.json
           key: state-${{ inputs.broker }}-${{ inputs.broker_mode }}-${{ github.run_id }}
 
       - name: state 캐시 저장 생략 안내
-        if: ${{ always() && !(steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') }}
+        if: ${{ always() && !((steps.resolve.outputs.trade_mode == 'LIVE' || steps.resolve.outputs.trade_mode == 'REPAIR') && steps.bot.outcome != 'skipped' && steps.bot.outputs.bot_started != 'false') }}
         # trade_mode 는 dispatch payload 에서 올 수 있는 외부 입력이므로 셸 스크립트에 직접 끼워 넣지 않고 env 로 전달합니다.
         env:
           RESOLVED_MODE: ${{ steps.resolve.outputs.trade_mode }}
+          BOT_STARTED: ${{ steps.bot.outputs.bot_started }}
         run: |
+          if [[ "$RESOLVED_MODE" == "LIVE" || "$RESOLVED_MODE" == "REPAIR" ]]; then
+            echo "::notice::봇을 실행하지 않아(bot_started='${BOT_STARTED//[^a-z]/?}', 게이트 중단 또는 정상 SKIP) 새 state 캐시를 저장하지 않습니다."
+            exit 0
+          fi
           echo "::notice::TRADE_MODE='${RESOLVED_MODE//[^A-Za-z0-9_ -]/?}' 이므로 새 state 캐시를 저장하지 않습니다 (LIVE/REPAIR 만 저장). FORCE_T·STATE_*_ONLY 복구는 로컬에서 TRADE_MODE=REPAIR 로 실행하세요 (Actions 의 REPAIR 는 현재 차단됩니다)."
 
       # 정산 근거에는 원문 주문번호(skipped_unverified 등)가 들어 있습니다. 공개 저장소의
@@ -1210,11 +1318,78 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # 실행 결과·SKIP 사유를 Actions 요약과 텔레그램에 남깁니다 (표시 전용 — 실패해도 job 결과 불변).
+      - name: 실행 결과 요약
+        if: always()
+        continue-on-error: true
+        env:
+          RUN_OUTCOME: ${{ steps.bot.outputs.run_outcome }}
+          RUN_REASON: ${{ steps.bot.outputs.run_reason }}
+          SETTLEMENT_STATUS: ${{ steps.bot.outputs.settlement_status }}
+          ORDER_VERIFY_STATUS: ${{ steps.bot.outputs.order_verify_status }}
+          BOT_OUTCOME: ${{ steps.bot.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          BROKER: ${{ inputs.broker || 'kis' }}
+          BROKER_MODE: ${{ inputs.broker_mode || 'demo' }}
+          TRADE_MODE: ${{ steps.resolve.outputs.trade_mode }}
+          RUN_PHASE_LABEL: ${{ steps.phase-guard.outputs.run_phase }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          export LC_ALL=C.UTF-8
+          # 외부 입력이 섞일 수 있는 값은 개행·제어문자를 제거합니다.
+          clean() { printf '%s' "$1" | tr -d '\000-\037\177'; }
+          outcome="${RUN_OUTCOME:-}"
+          reason=$(clean "${RUN_REASON:-}")
+          if [[ -z "$outcome" ]]; then
+            if [[ -z "${BOT_OUTCOME:-}" || "${BOT_OUTCOME:-}" == "skipped" ]]; then
+              outcome="NOT_STARTED"
+              reason="봇 실행 단계 전에 중단"
+            else
+              outcome="UNKNOWN"
+              reason="결과 표식 없음 — state 변경 가능성이 있습니다 (로그 확인)"
+            fi
+          fi
+          case "$outcome" in
+            NOT_STARTED) label="봇 미시작" ;;
+            SKIPPED) label="정상 SKIP" ;;
+            SETTLE_ONLY) label="정산 실행 (주문 없음)" ;;
+            ORDERS_EXECUTED) label="주문 실행" ;;
+            COMPLETED) label="단계 완료" ;;
+            FAILED) label="실패" ;;
+            PARTIAL_FAILURE) label="부분 실패" ;;
+            *) label="확인 필요" ;;
+          esac
+          if [[ "${JOB_STATUS:-}" != "success" ]]; then
+            case "$outcome" in
+              SKIPPED | SETTLE_ONLY | ORDERS_EXECUTED | COMPLETED)
+                label="$label — 이후 단계 실패(job ${JOB_STATUS:-unknown}), 로그 확인" ;;
+            esac
+          fi
+          settlement="${SETTLEMENT_STATUS:-(기록 없음)}"
+          verify="${ORDER_VERIFY_STATUS:-(기록 없음)}"
+          message="[$(clean "$BROKER")-$(clean "$BROKER_MODE")] 자동매매 실행 결과: $label
+          모드: $(clean "${TRADE_MODE:-?}") / 단계: ${RUN_PHASE_LABEL:-레거시}
+          결과: $outcome / 정산: $settlement / 주문 검증: $verify
+          사유: ${reason:-없음}
+          run: ${GITHUB_RUN_ID:-?}"
+          {
+            echo "### 자동매매 실행 결과: $label"
+            echo '```text'
+            printf '%s\n' "$message"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$message"
+          RUN_SUMMARY_MESSAGE="$message" uv run python -c 'import os, sys; sys.path.insert(0, "src"); from notifier import notify; notify(os.environ["RUN_SUMMARY_MESSAGE"], urgent=True)' \
+            || echo "::warning::실행 결과 텔레그램 발송에 실패했습니다 (job 결과에는 영향 없음)."
+
   # 정산 근거 독립 검산 — 브로커 계좌 API 호출 없이 evidence 만 검증합니다.
   verify-settlement:
     needs: run-trade
     # 거래 job 이 실패해도 evidence 가 있으면 검증하고, 없으면 검증 불가로 실패합니다.
-    if: always()
+    # 제외 대상은 **거래 job 이 성공**했고 정산을 정상 SKIP 했다고 명시한 경우뿐입니다.
+    # SETTLE 을 실행했거나 표식이 없는 실행은 모두 검증합니다 (Evidence 누락 = 실패).
+    if: ${{ always() && !(needs.run-trade.result == 'success' && needs.run-trade.outputs.settlement_status == 'SKIPPED') }}
     uses: ./.github/workflows/verify.yml
     secrets: inherit
     with:

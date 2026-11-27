@@ -5324,50 +5324,52 @@ def test_after_close_still_waits_for_pre_market():
     sleep.assert_called_once_with(6 * 3600 + 45 * 60)
 
 
-def test_weekend_is_not_in_session():
-    """미국 주말(ET 토요일)은 정규장 아님 → 대기 경로 (즉시 진행으로 오판 금지)."""
-    now = _kst(2026, 10, 31, 14, 0)  # ET 2026-10-31 01:00 (토요일)
+def _assert_wait_skips(now, session, status):
+    """주문 대상 세션이 휴장/마감이면 대기하지 않고 SKIP 신호를 냅니다 (sleep 0회)."""
     tb, sleep = _make_live_wait_probe(now)
     assert us_session_in_progress(now.astimezone(timezone.utc)) is None
 
-    assert pipeline_execute._wait_until_pre_market(tb) is None
+    with pytest.raises(pipeline_execute.OrderWindowClosed) as raised:
+        pipeline_execute._wait_until_pre_market(tb)
 
-    sleep.assert_called_once_with(3 * 3600)
+    assert (raised.value.window.session, raised.value.window.status) == (session, status)
+    sleep.assert_not_called()
 
 
-def test_monday_dawn_is_us_sunday_so_it_waits():
-    """월요일 04:10 KST = 미국 일요일(휴장) → 대기해야 합니다 (요일 계산은 캘린더에 위임)."""
-    now = _kst(2026, 11, 2, 4, 10)  # ET 2026-11-01 14:10 (일요일, DST 종료 후 = EST)
+def test_weekend_skips_without_waiting():
+    """미국 주말(ET 토요일)은 주문 대상 세션이 없음 → 다음 주까지 기다리지 않습니다."""
+    _assert_wait_skips(_kst(2026, 10, 31, 14, 0), "2026-10-31", "holiday")
+
+
+def test_monday_dawn_is_us_sunday_so_it_skips():
+    """월요일 04:10 KST = 미국 일요일 낮(휴장) → SKIP (요일 계산은 캘린더에 위임)."""
+    _assert_wait_skips(_kst(2026, 11, 2, 4, 10), "2026-11-01", "holiday")
+
+
+def test_monday_morning_prepares_monday_session():
+    """월요일 10:15 KST = ET 일요일 20:15 → 월요일 세션 준비 (프리장까지 대기 유지)."""
+    now = _kst(2026, 11, 2, 10, 15)
     tb, sleep = _make_live_wait_probe(now)
-    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
 
     assert pipeline_execute._wait_until_pre_market(tb) is None
 
-    # 동절기 프리장(18:00 KST)까지 13시간 50분.
-    sleep.assert_called_once_with(13 * 3600 + 50 * 60)
+    # 동절기 프리장(18:00 KST)까지 7시간 45분.
+    sleep.assert_called_once_with(7 * 3600 + 45 * 60)
 
 
-def test_us_holiday_is_not_in_session():
-    """미국 휴장일(추수감사절 2026-11-26 ET) → 정규장 아님 → 대기 경로."""
-    now = _kst(2026, 11, 27, 3, 0)  # ET 2026-11-26 13:00 (휴장일)
-    tb, sleep = _make_live_wait_probe(now)
-    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
-
-    assert pipeline_execute._wait_until_pre_market(tb) is None
-
-    # 동절기 프리장(18:00 KST)까지 15시간.
-    sleep.assert_called_once_with(15 * 3600)
+def test_us_holiday_skips_without_waiting():
+    """미국 휴장일(추수감사절 2026-11-26 ET 낮) → SKIP, 다음 세션까지 대기하지 않습니다."""
+    _assert_wait_skips(_kst(2026, 11, 27, 3, 0), "2026-11-26", "holiday")
 
 
-def test_early_close_is_not_in_session_after_close():
-    """조기폐장일(2026-11-27 ET 13:00 마감) 이후는 진행 중으로 오판하지 않습니다."""
-    now = _kst(2026, 11, 28, 4, 10)  # ET 2026-11-27 14:10 (조기폐장 후)
-    tb, sleep = _make_live_wait_probe(now)
-    assert us_session_in_progress(now.astimezone(timezone.utc)) is None
+def test_early_close_skips_after_close():
+    """조기폐장일(2026-11-27 ET 13:00 마감) 이후 → 마감으로 판정해 SKIP."""
+    _assert_wait_skips(_kst(2026, 11, 28, 4, 10), "2026-11-27", "after_close")
 
-    assert pipeline_execute._wait_until_pre_market(tb) is None
 
-    sleep.assert_called_once_with(13 * 3600 + 50 * 60)
+def test_regular_close_before_after_hours_end_skips():
+    """정규장 마감 후 애프터아워 중(2026-10-29 ET 16:30) → SKIP."""
+    _assert_wait_skips(_kst(2026, 10, 30, 5, 30), "2026-10-29", "after_close")
 
 
 def test_injected_now_skips_wait_without_reading_clock():

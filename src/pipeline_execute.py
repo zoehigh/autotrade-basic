@@ -5,10 +5,14 @@ SETTLE / PREVIEW / APPROVE 모듈(pipeline.py)은 주문 API 문자열을 포함
 `tests/test_pipeline_phases.py` 의 정적 가드가 이를 검증합니다.
 """
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from broker.market_utils import us_session_in_progress
+from broker.market_utils import (
+    pre_market_wait_seconds,
+    us_order_window,
+    us_session_in_progress,
+)
 from state import FILL_MARKER_VERSION, mask_odno
 
 from pipeline import (
@@ -46,6 +50,23 @@ def _tb():
     return trading_bot
 
 
+class OrderWindowClosed(Exception):
+    """휴장일·정규장 마감 후라 주문 대상 세션이 없습니다 — **정상 SKIP** 신호.
+
+    장애가 아닙니다. 캘린더/API/설정 오류는 이 예외로 바꾸지 않습니다.
+    """
+
+    def __init__(self, window):
+        super().__init__(window.reason)
+        self.window = window
+
+
+def closed_order_window(tb):
+    """지금(KST 시계 기준) 주문 창이 닫혀 있으면 `OrderWindow`, 열려 있으면 None."""
+    window = us_order_window(tb.get_kst_now().astimezone(timezone.utc))
+    return None if window.is_open else window
+
+
 def _wait_until_pre_market(tb, now=None):
     """프리장 개장 전이면 **먼저** 대기하고, 재검증에 쓸 기준 시각을 반환합니다.
 
@@ -56,19 +77,25 @@ def _wait_until_pre_market(tb, now=None):
     호출은 `execute_approved_plan()` 이 **전역 실행 잠금을 잡기 전에** 합니다
     (대기 중 다른 실행이 `.run.lock` 에 막히지 않도록).
 
-    **판정 기준은 KST 시각이 아니라 "미국 정규장 진행 여부" 입니다.**
+    **판정 기준은 KST 시각이 아니라 "미국 주문 대상 세션" 입니다.**
     KST 04:10 은 미국 ET 15:10(서머타임) / 14:10(동절기) 으로 **정규장 한복판**
     이므로, 그때 프리장(17/18시 KST)까지 기다리면 하루를 통째로 놓칩니다.
-    그래서 정규장이 진행 중이면 대기 없이 즉시 진행하고, 주말·휴장일·장 마감
-    뒤(조기폐장 포함)에만 기존 프리장 대기 경로를 탑니다. 요일·휴장일·서머타임
-    판정은 XNYS 캘린더(`us_session_in_progress`)에 위임합니다 (자체 요일 계산 금지).
+      - 정규장 진행 중 → 대기 없이 즉시 진행
+      - 대상 세션이 휴장이거나 이미 마감(조기폐장 포함) → `OrderWindowClosed`
+        (다음 세션까지 기다리지 않는 정상 SKIP)
+      - 대상 세션의 정규장 전 → 프리장 개장까지 대기
+    요일·휴장일·서머타임 판정은 XNYS 캘린더(`us_order_window`)에 위임합니다
+    (자체 요일 계산 금지).
 
-    `BROKER_MODE=demo` 라는 이유만으로 대기를 끄지 않습니다 — 장이 열리지 않은
-    시각(주말·휴장일·마감 후)에는 모의계좌도 주문할 수 없으므로 대기가 필요합니다.
+    `BROKER_MODE=demo` 라는 이유만으로 대기를 끄지 않습니다 — 프리장 개장 전에는
+    모의계좌도 대상 세션에 주문할 수 없으므로 대기가 필요합니다.
 
     Returns:
         datetime | None: 재검증 기준 시각. None 이면 실제 현재 시각을 사용합니다.
-        테스트/재생처럼 `now` 가 주어지면 대기하지 않고 그대로 반환합니다.
+        테스트/재생처럼 `now` 가 주어지면 대기·SKIP 판정 없이 그대로 반환합니다.
+
+    Raises:
+        OrderWindowClosed: 주문 대상 세션이 휴장이거나 마감됨 (LIVE 전용).
     """
     if now is not None:
         return now
@@ -82,19 +109,18 @@ def _wait_until_pre_market(tb, now=None):
     if us_session_in_progress(now_kst.astimezone(timezone.utc)) is not None:
         print("⏩ 미국 정규장 진행 중 — 프리장 대기를 건너뜁니다.")
         return None
-    pre_market_open_hour = 17 if tb.is_us_dst() else 18
-    if now_kst.hour < pre_market_open_hour:
-        target = now_kst.replace(
-            hour=pre_market_open_hour, minute=0, second=0, microsecond=0
-        )
-        wait_seconds = (target - now_kst).total_seconds()
+    window = us_order_window(now_kst.astimezone(timezone.utc))
+    if not window.is_open:
+        raise OrderWindowClosed(window)
+    wait_seconds = pre_market_wait_seconds(now_kst, tb.is_us_dst())
+    if wait_seconds > 0:
+        target = now_kst + timedelta(seconds=wait_seconds)
         print(
             f"⏳ 프리장 오픈 대기 중... (KST {now_kst.strftime('%H:%M:%S')} → "
             f"{target.strftime('%H:%M:%S')}, 약 {wait_seconds/60:.0f}분)"
         )
         tb.time.sleep(wait_seconds)
         # 대기 후에는 최신 시각으로 전체 게이트를 다시 통과해야 합니다.
-        return None
     return None
 
 
@@ -424,7 +450,11 @@ def execute_approved_plan(
     # 대기 중 다른 프로세스가 이 승인을 먼저 선점(consumed=true)하거나 state 를
     # 바꿀 수 있으므로, 잠금 안에서 디스크 승인/state 를 다시 읽어 blockers
     # 재검증 + claim 경합으로 걸러냅니다 (게이트 순서는 대기 전과 동일).
-    effective_now = _wait_until_pre_market(_tb(), now)
+    try:
+        effective_now = _wait_until_pre_market(_tb(), now)
+    except OrderWindowClosed as closed:
+        with global_lock():
+            return _skip_approved_plan(approval_or_id, approvals_dir, closed.window)
     with global_lock():
         return _execute_approved_plan(
             broker,
@@ -435,6 +465,38 @@ def execute_approved_plan(
             state_override=state_override,
             pre_market_waited=True,
         )
+
+
+def _skip_approved_plan(approval_or_id, approvals_dir, window):
+    """주문 창이 닫혀 승인을 실행하지 않습니다 (승인 미소비, 주문/state 변경 없음).
+
+    결과 파일에는 `approval-skipped` 를 남깁니다 — VERIFY 는 이 승인을 "실행 안 됨"
+    으로 계속 구분합니다 (실행 성공으로 보이지 않게 함).
+    """
+    approval = (
+        approval_or_id
+        if isinstance(approval_or_id, dict)
+        else load_approval(approval_or_id, approvals_dir)
+    )
+    reason = window.reason
+    symbol = approval.get("symbol", "")
+    print(f"⏭ [EXECUTE] {symbol} 주문 SKIP: {reason}")
+    _write_outcome_record(approval, "approval-skipped", f"order-window: {reason}")
+    try:
+        _tb().notify(f"⏭ {symbol} 주문 SKIP\n{reason}", urgent=True)
+    except Exception as notify_error:
+        # 알림은 표시 전용입니다 — 발송 실패가 SKIP 판정을 바꾸지 않습니다.
+        print(f"  ⚠️ SKIP 알림 발송 실패: {_tb()._safe_error_text(notify_error)}")
+    return {
+        "symbol": symbol,
+        "executed": 0,
+        "reserved": 0,
+        "failed": 0,
+        "errors": [],
+        "transmitted_orders": [],
+        "outcome": "approval-skipped",
+        "skipped": reason,
+    }
 
 
 def _execute_approved_plan(

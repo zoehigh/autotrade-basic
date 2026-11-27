@@ -5,6 +5,7 @@ KIS, 키움, LS 등 모든 증권사가 공통으로 사용하는
 시간 계산, 미국 장 영업일 확인 등의 유틸리티를 제공합니다.
 """
 import os
+from dataclasses import dataclass
 from datetime import date as _date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -310,6 +311,91 @@ def us_session_last_closed_date(now_utc: datetime | None = None) -> str | None:
             return None
         session_str = nxt.strftime("%Y-%m-%d")
     return None
+
+
+ORDER_WINDOW_OPEN = "open"
+ORDER_WINDOW_HOLIDAY = "holiday"
+ORDER_WINDOW_AFTER_CLOSE = "after_close"
+
+
+@dataclass(frozen=True)
+class OrderWindow:
+    """지금 시작하는 실행의 **주문 대상 거래일**과 주문 가능 여부.
+
+    Attributes:
+        session: 주문 대상 거래일(ET) "YYYY-MM-DD". 휴장이면 그 휴장일입니다.
+        status: `open`(주문 가능 — 필요하면 프리장까지 대기) /
+                `holiday`(대상일이 휴장·주말) / `after_close`(대상 세션이 이미 마감).
+    """
+
+    session: str
+    status: str
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == ORDER_WINDOW_OPEN
+
+    @property
+    def reason(self) -> str:
+        if self.status == ORDER_WINDOW_HOLIDAY:
+            return f"{self.session} 미국 증시 휴장일 — 이번 실행의 주문 대상 세션이 없습니다"
+        if self.status == ORDER_WINDOW_AFTER_CLOSE:
+            return f"{self.session} 미국 정규장 마감 후 — 이번 실행의 주문 대상 세션이 끝났습니다"
+        return f"{self.session} 세션 주문 가능"
+
+
+def us_order_window(now_utc: datetime | None = None) -> OrderWindow:
+    """주문 대상 거래일과 주문 가능 여부를 XNYS 캘린더로 판정합니다.
+
+    대상 거래일 규칙:
+      - ET 오늘이 세션이고 정규장 마감(조기폐장 포함) 전 → 오늘 (프리장 전이면 대기 대상)
+      - ET 오늘 세션이 마감됐고 애프터아워 종료 전 → 오늘, `after_close`
+      - 애프터아워 종료 시각(기본 20:00 ET) 이후 → **다음 날**이 대상 (다음 세션 준비)
+      - 그 외 대상일이 세션이 아니면 `holiday`
+
+    애프터아워 종료를 경계로 쓰는 이유는 SETTLE 도 그 전에는 직전 세션을 확정하지
+    않기 때문입니다 (`us_session_after_hours_end`) — 그 전에는 다음 세션을 준비할 수 없습니다.
+
+    캘린더 오류(범위 밖 날짜 등)는 **그대로 예외**로 올립니다. 판정 불가를
+    "휴장" 으로 바꾸면 장애가 정상 SKIP 으로 숨습니다.
+    """
+    cal = _get_xnys_calendar()
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_utc = now_utc.astimezone(timezone.utc)
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    today = now_et.date().isoformat()
+
+    if cal.is_session(today):
+        if now_utc < cal.session_close(today).to_pydatetime():
+            return OrderWindow(today, ORDER_WINDOW_OPEN)
+        if not us_session_after_hours_end(today, now_utc):
+            return OrderWindow(today, ORDER_WINDOW_AFTER_CLOSE)
+
+    target = now_et.date()
+    if now_et.hour >= after_hours_end_et_hour():
+        target += timedelta(days=1)
+    target_str = target.isoformat()
+    if not cal.is_session(target_str):
+        return OrderWindow(target_str, ORDER_WINDOW_HOLIDAY)
+    if now_utc >= cal.session_close(target_str).to_pydatetime():
+        return OrderWindow(target_str, ORDER_WINDOW_AFTER_CLOSE)
+    return OrderWindow(target_str, ORDER_WINDOW_OPEN)
+
+
+def pre_market_wait_seconds(now_kst: datetime, is_dst: bool) -> float:
+    """오늘(KST) 프리장 개장(서머타임 17시 / 동절기 18시)까지 남은 초. 지났으면 0.
+
+    **주문 가능 창(`us_order_window`)이 열려 있고 정규장 진행 중이 아닐 때** 쓰는
+    대기 규칙입니다. 봇(EXECUTE 대기)과 Actions 시간 예산 게이트가 같이 씁니다.
+    """
+    open_hour = 17 if is_dst else 18
+    if now_kst.hour >= open_hour:
+        return 0.0
+    target = now_kst.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+    return (target - now_kst).total_seconds()
 
 
 def normalize_daily_candle_date(value) -> str | None:
